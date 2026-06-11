@@ -1,0 +1,29 @@
+[package]
+name = "rv-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Content-addressed storage for Raeva"
+
+[dependencies]
+rv-config.workspace = true
+
+anyhow.workspace = true
+bytes.workspace = true
+fs2.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

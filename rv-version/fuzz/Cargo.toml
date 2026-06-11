@@ -1,0 +1,29 @@
+[package]
+name = "rv-version-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.rv-version]
+path = ".."
+
+[[bin]]
+name = "fuzz_version_parse"
+path = "fuzz_targets/fuzz_version_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_version_range"
+path = "fuzz_targets/fuzz_version_range.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]

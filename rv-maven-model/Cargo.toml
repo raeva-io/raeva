@@ -1,0 +1,26 @@
+[package]
+name = "rv-maven-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Maven POM parsing and effective model computation for Raeva"
+
+[dependencies]
+rv-version.workspace = true
+
+indexmap.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+temp-env.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "pom_parse"
+harness = false

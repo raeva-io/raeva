@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raeva.dev/schemas/rv-lock.json",
+  "title": "rv.lock",
+  "description": "Raeva lockfile schema. Reflects the structure emitted by rv-config's `Lockfile`, `LockPlatform`, `LockPackage`, `LockEdge`, and `Checksum` structs at LOCKFILE_SCHEMA_VERSION = 3. Unknown top-level fields round-trip through `extra` (`#[serde(flatten)]`) on each struct so newer writers do not break older readers; the schema therefore declares `additionalProperties: true` on every object that carries an `extra` map. (Pre-v1 lockfiles wrote a `[variants]` table; the current writer does not emit it, and any such legacy content round-trips through the top-level `extra` map.)",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "On-disk schema version. The current writer emits 3; the reader accepts 1, 2, or 3.",
+      "minimum": 1
+    },
+    "config_hash": {
+      "type": "string",
+      "description": "SHA-256 of the input rv.toml / pom.xml that produced this lockfile. Used by `rv sync --frozen` for staleness detection."
+    },
+    "platforms": {
+      "type": "array",
+      "description": "Per-platform package + edge lists.",
+      "items": { "$ref": "#/$defs/lockPlatform" }
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form string-to-string metadata. Reserved for tools that want to round-trip auxiliary information through the lockfile without bumping the schema.",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "lockPlatform": {
+      "type": "object",
+      "description": "One platform's resolved package set. `platforms[*].platform` is unique within its containing list. Round-trips unknown fields through `extra`.",
+      "additionalProperties": true,
+      "required": ["platform"],
+      "properties": {
+        "platform": {
+          "type": "string",
+          "description": "Platform identifier (e.g. `linux-x86_64`, `macos-aarch64`, `windows-x86_64`)."
+        },
+        "packages": {
+          "type": "array",
+          "description": "Resolved artifacts for this platform.",
+          "items": { "$ref": "#/$defs/lockPackage" }
+        },
+        "edges": {
+          "type": "array",
+          "description": "Adjacency list over `packages`; `from` and `to` are indexes into the sibling `packages` array.",
+          "items": { "$ref": "#/$defs/lockEdge" }
+        }
+      }
+    },
+    "lockPackage": {
+      "type": "object",
+      "description": "A single resolved Maven artifact. The on-disk content is keyed by `checksum.digest`. Round-trips unknown fields through `extra`.",
+      "additionalProperties": true,
+      "required": ["group_id", "artifact_id", "version", "packaging"],
+      "properties": {
+        "group_id": { "type": "string" },
+        "artifact_id": { "type": "string" },
+        "version": {
+          "type": "string",
+          "description": "Resolved version. For SNAPSHOTs this is the requested base version; the actual timestamped form lives in `snapshot_timestamp`."
+        },
+        "snapshot_timestamp": {
+          "type": "string",
+          "description": "For timestamped Maven SNAPSHOT artifacts, the `YYYYMMDD.HHMMSS` timestamp parsed from the resolved version. Absent for releases and `-SNAPSHOT`-suffixed builds."
+        },
+        "packaging": {
+          "type": "string",
+          "description": "Maven packaging (jar, war, pom, etc.)."
+        },
+        "classifier": {
+          "type": "string",
+          "description": "Optional Maven classifier (e.g. `sources`, `javadoc`)."
+        },
+        "repo_url": {
+          "type": "string",
+          "description": "Repository the artifact was fetched from. May be empty for system-scoped packages."
+        },
+        "checksum": { "$ref": "#/$defs/checksum" },
+        "system_path": {
+          "type": "string",
+          "description": "Absolute filesystem path for system-scoped artifacts."
+        },
+        "direct_scope": {
+          "type": "string",
+          "description": "If this package is a direct dependency (in the input manifest), the Maven scope declared there."
+        }
+      }
+    },
+    "lockEdge": {
+      "type": "object",
+      "description": "A `from -> to` edge in the resolved dependency graph. Indexes refer to the sibling platform's `packages` array. Round-trips unknown fields through `extra`.",
+      "additionalProperties": true,
+      "required": ["from", "to"],
+      "properties": {
+        "from": {
+          "type": "integer",
+          "description": "Index in `packages` of the depending artifact.",
+          "minimum": 0
+        },
+        "to": {
+          "type": "integer",
+          "description": "Index in `packages` of the depended-upon artifact.",
+          "minimum": 0
+        },
+        "scope": {
+          "type": "string",
+          "description": "Maven scope carried by this edge (compile, runtime, test, provided, system, import)."
+        },
+        "optional": {
+          "type": "boolean",
+          "description": "Whether the edge was declared `<optional>true</optional>` in the source POM.",
+          "default": false
+        }
+      }
+    },
+    "checksum": {
+      "type": "object",
+      "description": "Algorithm-tagged content digest. `algorithm` is normalized at parse time; canonical values are `sha256` and `sha1`.",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": {
+          "type": "string",
+          "description": "Hash algorithm. Accepted (case-insensitive, with or without dash): `sha256` / `sha-256`, `sha1` / `sha-1`. Canonicalized to lowercase, dash-free.",
+          "pattern": "^[Ss][Hh][Aa]-?(256|1)$"
+        },
+        "digest": {
+          "type": "string",
+          "description": "Lowercase hex digest. 64 chars for sha256, 40 chars for sha1.",
+          "pattern": "^[0-9a-fA-F]+$"
+        }
+      }
+    }
+  }
+}

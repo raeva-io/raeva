@@ -1,0 +1,34 @@
+[package]
+name = "rv-resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dependency resolution for Raeva"
+
+[dependencies]
+rv-config.workspace = true
+rv-maven-model.workspace = true
+rv-repo.workspace = true
+rv-store.workspace = true
+rv-version.workspace = true
+
+futures.workspace = true
+indexmap.workspace = true
+lru.workspace = true
+petgraph.workspace = true
+serde.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rustls.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "graph_build"
+harness = false

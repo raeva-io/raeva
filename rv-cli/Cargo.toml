@@ -1,0 +1,62 @@
+[package]
+name = "rv-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Raeva CLI - lockfile companion for Maven projects"
+default-run = "rv"
+
+[dependencies]
+rv-config.workspace = true
+rv-maven-model.workspace = true
+rv-repo.workspace = true
+rv-resolver.workspace = true
+rv-store.workspace = true
+rv-version.workspace = true
+
+chrono.workspace = true
+clap.workspace = true
+clap_complete = { workspace = true, features = ["unstable-dynamic"] }
+dirs.workspace = true
+fs2.workspace = true
+futures.workspace = true
+hex.workspace = true
+indicatif.workspace = true
+owo-colors.workspace = true
+pathdiff.workspace = true
+petgraph.workspace = true
+quick-xml.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+strum.workspace = true
+subtle.workspace = true
+tabled.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+quick-xml.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "rv"
+path = "src/bin/rv.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/rv-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "rv-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

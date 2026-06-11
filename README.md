@@ -68,8 +68,37 @@ Raeva reads Maven's `~/.m2/settings.xml` for mirrors, proxies, and server creden
 
 ## Install
 
+macOS / Linux:
+
 ```bash
-cargo install --path rv-cli
+curl -fsSL https://raeva.io/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raeva.io/install.ps1 | iex
+```
+
+Homebrew:
+
+```bash
+brew install raeva-io/tap/rv
+```
+
+Manual downloads, including Windows `.msi` installers, are available from
+[GitHub Releases](https://github.com/raeva-io/raeva/releases).
+
+Rust users can also install with prebuilt binaries via `cargo-binstall`:
+
+```bash
+cargo binstall rv-cli
+```
+
+or build from source:
+
+```bash
+cargo install rv-cli
 ```
 
 ## License

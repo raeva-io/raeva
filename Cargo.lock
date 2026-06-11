@@ -1939,7 +1939,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rv-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "rv-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "rv-maven-model"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "indexmap",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "rv-repo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "backon",
@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "rv-resolver"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "futures",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "rv-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "rv-version"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "criterion",
  "derive_more",

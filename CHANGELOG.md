@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-06-11
+
+### Added
+
+- `dist`-based release packaging for Linux, macOS, and Windows.
+- Shell and PowerShell installers for the latest GitHub Release.
+- Windows MSI installers.
+- Homebrew tap publishing for `brew install raeva-io/tap/rv`.
+- `cargo-binstall` metadata for Rust users who want prebuilt binaries.
+
 ## [0.1.0] - 2026-06-11
 
 Initial public release.
@@ -41,4 +51,5 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
+[0.1.1]: https://github.com/raeva-io/raeva/releases/tag/v0.1.1
 [0.1.0]: https://github.com/raeva-io/raeva/releases/tag/v0.1.0

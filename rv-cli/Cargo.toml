@@ -2,8 +2,10 @@
 name = "rv-cli"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 description = "Raeva CLI - lockfile companion for Maven projects"
 default-run = "rv"
 
@@ -53,10 +55,22 @@ tempfile.workspace = true
 name = "rv"
 path = "src/bin/rv.rs"
 
+[package.metadata.dist]
+dist = true
+display-name = "Raeva"
+formula = "rv"
+install-success-msg = "rv is installed. Run 'rv --help' to get started."
+
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/rv-v{ version }-{ target }{ archive-suffix }"
-bin-dir = "rv-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-url = "{ repo }/releases/download/v{ version }/rv-cli-{ target }{ archive-suffix }"
+bin-dir = "rv-cli-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
 pkg-fmt = "zip"
+
+[package.metadata.wix]
+upgrade-guid = "669B33CA-33F8-40D6-BDFA-291F8F8C54C8"
+path-guid = "82D9CE98-C2E5-447E-87FE-E70DE6714C1B"
+license = false
+eula = false

@@ -11,19 +11,21 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+authors = ["Raeva"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/raeva-io/raeva"
+homepage = "https://raeva.io"
 
 [workspace.dependencies]
 # Workspace crates
-rv-config = { path = "rv-config", version = "0.1.0" }
-rv-maven-model = { path = "rv-maven-model", version = "0.1.0" }
-rv-repo = { path = "rv-repo", version = "0.1.0" }
-rv-resolver = { path = "rv-resolver", version = "0.1.0" }
-rv-store = { path = "rv-store", version = "0.1.0" }
-rv-version = { path = "rv-version", version = "0.1.0" }
+rv-config = { path = "rv-config", version = "0.1.1" }
+rv-maven-model = { path = "rv-maven-model", version = "0.1.1" }
+rv-repo = { path = "rv-repo", version = "0.1.1" }
+rv-resolver = { path = "rv-resolver", version = "0.1.1" }
+rv-store = { path = "rv-store", version = "0.1.1" }
+rv-version = { path = "rv-version", version = "0.1.1" }
 
 # Third-party dependencies (alphabetical)
 aes = "0.8"
@@ -80,3 +82,8 @@ url = "2.5"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with.
+[profile.dist]
+inherits = "release"
+lto = "thin"

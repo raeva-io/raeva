@@ -16,14 +16,20 @@ use crate::{Qualifier, VersionError};
 ///
 /// # Compatibility target
 ///
-/// This implementation targets **pre-MNG-6240 (pre-Maven-3.6) `ComparableVersion`
-/// semantics**. Maven 3.6 (MNG-6240) reworked `ComparableVersion` to make its
-/// ordering a total order; the pre-3.6 algorithm reproduced here is **not
-/// transitive** for mixed-style qualifier metadata (e.g. the triple
-/// `1.0.alpha`, `1.0.final`, `1.0-sp`). A port to the Maven 3.6+ algorithm is
-/// planned post-launch. Until then, the known divergence is pinned by the
-/// regression test in this module (search for "KNOWN DIVERGENCE") so the port
-/// can flip it deliberately rather than by accident.
+/// This implementation targets **current Apache Maven `ComparableVersion`
+/// semantics** (Maven 3.9.x), including the transitivity/normalization fixes
+/// [MNG-6524], [MNG-6964], and [MNG-7644]. In particular a string qualifier that
+/// is attached with a `.` (or directly, as in `1.0.alpha` or `1.0.0RC1`) is
+/// treated exactly like a `-`-introduced qualifier (`1.0-alpha`): it is parsed
+/// into its own sub-list rather than left as a bare item in the parent list.
+/// This is the piece that makes the ordering a genuine, transitive total order
+/// (e.g. `1.0.alpha < 1.0 < 1.0-sp` and, transitively, `1.0.alpha < 1.0-sp`).
+/// The transitivity guarantee is exercised by the property test in this module
+/// (search for `transitivity`).
+///
+/// [MNG-6524]: https://issues.apache.org/jira/browse/MNG-6524
+/// [MNG-6964]: https://issues.apache.org/jira/browse/MNG-6964
+/// [MNG-7644]: https://issues.apache.org/jira/browse/MNG-7644
 ///
 /// # Examples
 ///
@@ -207,10 +213,9 @@ impl StringItem {
             Some(Item::Integer(_)) => Ordering::Less,
             Some(Item::String(other)) => self.qualifier.cmp(&other.qualifier),
             // Maven's `StringItem.compareTo(ListItem) == -1`: a bare qualifier
-            // segment sorts BEFORE a hyphen-introduced sub-list. Returning
-            // `Greater` here inverts `1.alpha` vs `1-alpha` and every other
-            // case where a String segment meets a List segment at the same
-            // position.
+            // item sorts BEFORE a sub-list at the same position (e.g. `1-a` vs
+            // `1-0.a`, which parse as `[1,[a]]` and `[1,[[a]]]`). Returning
+            // `Greater` here would invert that ordering relative to Maven.
             Some(Item::List(_)) => Ordering::Less,
         }
     }
@@ -275,10 +280,11 @@ impl ListItem {
         match other {
             None => self.cmp_null(),
             Some(Item::List(other)) => self.cmp_list(other),
-            // Maven's `ListItem.compareTo(IntegerItem) == -1` (list < integer)
-            // but `ListItem.compareTo(StringItem) == +1` (list > string). The
-            // two cases need separate arms; collapsing them into a single
-            // `Less` arm inverts the string-vs-list ordering relative to Maven.
+            // Maven's `ListItem.compareTo(IntegerItem) == -1` (list < integer,
+            // "1-1 < 1.0.x") but `ListItem.compareTo(StringItem) == +1` (list >
+            // string, "1-1 > 1-sp"). The two cases need separate arms;
+            // collapsing them into a single `Less` arm would invert the
+            // string-vs-list ordering relative to Maven.
             Some(Item::Integer(_)) => Ordering::Less,
             Some(Item::String(_)) => Ordering::Greater,
         }
@@ -322,12 +328,20 @@ fn parse_items(version: &str) -> Result<ListItem, VersionError> {
         } else if ch.is_ascii_digit() {
             if !is_digit && idx > start {
                 let segment = &version[start..idx];
+                // MNG-7644: a letter run that is glued to a following digit
+                // (`X1`) is treated exactly like the `-`-introduced form `-X1`.
+                // Maven puts the qualifier `X` into its own sub-list first when
+                // the current list is not empty, so `1.0.0.rc1` (dot-attached)
+                // parses identically to `1.0.0-rc1` (hyphen-attached). Without
+                // this, `1.0.0.rc1` would keep `rc` as a bare item in the parent
+                // list and mis-order against `1.0.0-rc2`.
+                if !current_list_is_empty(&root, &path)? {
+                    push_list(&mut root, &mut path)?;
+                }
                 push_item(&mut root, &path, parse_segment(segment, false, true))?;
                 start = idx;
-                // A letter->digit transition opens a sub-list exactly like a
-                // `-` separator does (`alpha1` parses as `alpha-1`). Maven has
-                // done this in every release; skipping it inverts orderings
-                // like `1.0-alpha-2` vs `1.0-alpha1`.
+                // The digit run that follows opens its own sub-list, exactly like
+                // a `-` separator does (`alpha1` parses as `alpha-1`).
                 push_list(&mut root, &mut path)?;
             }
             is_digit = true;
@@ -345,6 +359,15 @@ fn parse_items(version: &str) -> Result<ListItem, VersionError> {
 
     if start < version.len() {
         let segment = &version[start..];
+        // MNG-7644: a trailing qualifier attached with a `.` (or glued directly,
+        // as in `1.0.alpha` or `2.0.a`) is treated like the `-`-introduced form
+        // (`1.0-alpha`). When the current list already has items, the qualifier
+        // goes into its own sub-list so that `2.0.alpha` parses identically to
+        // `2-alpha`. This is what makes the order transitive: the qualifier is
+        // always compared list-against-list, never bare-item-against-list.
+        if !is_digit && !current_list_is_empty(&root, &path)? {
+            push_list(&mut root, &mut path)?;
+        }
         push_item(&mut root, &path, parse_segment(segment, is_digit, false))?;
     } else {
         push_item(&mut root, &path, Item::Integer(IntegerItem::new("0")))?;
@@ -422,6 +445,23 @@ fn current_list_mut<'a>(
         list = inner;
     }
     Ok(list)
+}
+
+/// Whether the list at `path` currently holds no items. Checked *before*
+/// opening a sub-list (i.e. before any trailing-null trimming), matching
+/// Maven's raw `!list.isEmpty()` guard in the MNG-7644 handling: a qualifier
+/// only gets its own sub-list when the list it would join is non-empty.
+fn current_list_is_empty(root: &ListItem, path: &[usize]) -> Result<bool, VersionError> {
+    let mut list = root;
+    for &idx in path {
+        let Item::List(inner) = &list.items[idx] else {
+            return Err(VersionError::InvalidVersion(format!(
+                "internal error: version path contains non-list item at index {idx}"
+            )));
+        };
+        list = inner;
+    }
+    Ok(list.items.is_empty())
 }
 
 fn normalize_digits(value: &str) -> Cow<'_, str> {
@@ -658,18 +698,28 @@ mod tests {
         assert!(matches!(err, VersionError::UnresolvedProperty(_)));
     }
 
-    /// Regression for the String-vs-List ordering finding: a `StringItem`
-    /// sorts BEFORE a `ListItem` (Maven `ComparableVersion` semantics).
-    ///
-    /// `1.alpha` parses as `[Integer(1), String(alpha)]`; `1-alpha` parses as
-    /// `[Integer(1), List([String(alpha)])]`. At the second index we compare
-    /// a bare `String` against a `List`, which Maven defines as `string < list`.
-    /// An earlier inversion made `1.alpha > 1-alpha`.
+    /// A dot-attached qualifier parses identically to the hyphen-attached form
+    /// (Maven MNG-7644): `1.alpha` and `1-alpha` both parse as
+    /// `[Integer(1), List([String(alpha)])]`, so they are equal. (Before the
+    /// MNG-7644 fix `1.alpha` kept `alpha` as a bare `StringItem` in the parent
+    /// list and sorted strictly below `1-alpha`.)
+    #[test]
+    fn dot_attached_qualifier_equals_hyphen_attached() {
+        assert_eq!(v("1.alpha"), v("1-alpha"));
+        assert_eq!(v("2.0.alpha"), v("2-alpha"));
+        assert_eq!(v("1.0.0.RC1"), v("1.0.0-rc1"));
+    }
+
+    /// A `StringItem` still sorts BEFORE a `ListItem` at the same position
+    /// (Maven `StringItem.compareTo(ListItem) == -1`). This arm is exercised by
+    /// structures where a bare qualifier meets a sub-list, e.g. `1-a`
+    /// (`[1, [a]]`) vs `1-0.a` (`[1, [[a]]]`): at the sub-list's first index a
+    /// bare `String(a)` is compared against a `List([a])`.
     #[test]
     fn string_item_sorts_before_list_item() {
-        assert!(v("1.alpha") < v("1-alpha"));
+        assert!(v("1-a") < v("1-0.a"));
         // Mirror: `ListItem.compareTo(StringItem) == +1`.
-        assert!(v("1-alpha") > v("1.alpha"));
+        assert!(v("1-0.a") > v("1-a"));
     }
 
     #[test]
@@ -692,37 +742,26 @@ mod tests {
         assert!(!set.contains(&v("1.0-alpha")));
     }
 
-    // ===================================================================
-    // KNOWN DIVERGENCE FROM MAVEN 3.6+ (post-MNG-6240) ComparableVersion
-    //
-    // This crate targets the pre-Maven-3.6 ComparableVersion algorithm,
-    // whose ordering is NOT transitive for mixed-style qualifier metadata.
-    // The test below pins the CURRENT (pre-3.6) behavior so a future port
-    // to the 3.6+ total order flips it deliberately, not by accident. The
-    // assertion documents the divergence, not a claim that the behavior is
-    // "correct" under modern Maven. Tracked for post-launch port.
-    // ===================================================================
-
-    /// KNOWN DIVERGENCE FROM MAVEN 3.6+ ComparableVersion. Tracked for
-    /// post-launch port.
-    ///
-    /// The classic non-transitive triple. With a transitive order, the chain
-    /// `1.0.alpha < 1.0.final < 1.0-sp` would force `1.0.alpha < 1.0-sp`, but
-    /// the pre-3.6 algorithm yields `1.0.alpha > 1.0-sp`, so `<` is not a total
-    /// order over these three. We assert the current (intransitive) outcome.
+    /// The classic non-transitive triple, now transitive under the MNG-7644
+    /// parse fix. Before the fix `1.0.alpha` kept `alpha` as a bare item glued
+    /// to the trailing `0`, so it compared `Integer(0)`-against-`List` and
+    /// sorted ABOVE `1.0-sp` even though `1.0.alpha < 1.0 < 1.0-sp`. Now
+    /// `1.0.alpha` parses as `[1, [alpha]]` and the chain is consistent.
     #[test]
-    fn known_divergence_non_transitive_alpha_final_sp() {
-        // First two comparisons of the chain.
+    fn alpha_final_sp_triple_is_transitive() {
+        // `1.0.final` == `1.0` == `1` (final is a release alias, trailing zeros
+        // trimmed), so the middle of the chain is the plain release.
+        assert_eq!(v("1.0.final"), v("1.0"));
+
         assert!(v("1.0.alpha") < v("1.0.final"));
         assert!(v("1.0.final") < v("1.0-sp"));
-        // Transitivity would imply `1.0.alpha < 1.0-sp`; pre-3.6 yields the
-        // opposite. THIS IS THE DIVERGENCE.
-        assert!(v("1.0.alpha") > v("1.0-sp"));
+        // Transitivity now holds: alpha < final < sp implies alpha < sp.
+        assert!(v("1.0.alpha") < v("1.0-sp"));
 
-        // Anti-symmetry of the pairwise results is still internally consistent.
+        // Anti-symmetry.
         assert!(v("1.0.final") > v("1.0.alpha"));
         assert!(v("1.0-sp") > v("1.0.final"));
-        assert!(v("1.0-sp") < v("1.0.alpha"));
+        assert!(v("1.0-sp") > v("1.0.alpha"));
     }
 
     /// A digit/letter transition opens a sub-list exactly like a `-`
@@ -753,5 +792,372 @@ mod tests {
         assert!(req.matches(&v("1.0-alpha2")));
         assert!(req.matches(&v("1.0a2")));
         assert!(!req.matches(&v("1.0-alpha-5")));
+    }
+
+    // ===================================================================
+    // Differential tests against Apache Maven `ComparableVersion`
+    // (maven-artifact 3.9.x). Every expectation below is taken verbatim
+    // from Maven's own `ComparableVersionTest`, so this crate's ordering is
+    // pinned to the reference implementation's behavior.
+    // ===================================================================
+
+    /// Assert that `versions` is strictly increasing under `<` for EVERY pair
+    /// `i < j` (not just adjacent pairs), plus antisymmetry of `>`. This mirrors
+    /// Maven's `checkVersionsOrder(String[])`, and an all-pairs strict order is
+    /// exactly a transitive total order over the list.
+    fn assert_strictly_increasing_all_pairs(versions: &[&str]) {
+        let parsed: Vec<Version> = versions.iter().map(|s| v(s)).collect();
+        for i in 0..parsed.len() {
+            for j in (i + 1)..parsed.len() {
+                assert!(
+                    parsed[i] < parsed[j],
+                    "expected {} < {}",
+                    versions[i],
+                    versions[j]
+                );
+                assert!(
+                    parsed[j] > parsed[i],
+                    "expected {} > {}",
+                    versions[j],
+                    versions[i]
+                );
+            }
+        }
+    }
+
+    /// Maven `VERSIONS_QUALIFIER` ordered corpus (testVersionsQualifier).
+    #[test]
+    fn maven_qualifier_corpus_is_ordered() {
+        assert_strictly_increasing_all_pairs(&[
+            "1-alpha2snapshot",
+            "1-alpha2",
+            "1-alpha-123",
+            "1-beta-2",
+            "1-beta123",
+            "1-m2",
+            "1-m11",
+            "1-rc",
+            "1-cr2",
+            "1-rc123",
+            "1-SNAPSHOT",
+            "1",
+            "1-sp",
+            "1-sp2",
+            "1-sp123",
+            "1-abc",
+            "1-def",
+            "1-pom-1",
+            "1-1-snapshot",
+            "1-1",
+            "1-2",
+            "1-123",
+        ]);
+    }
+
+    /// Maven `VERSIONS_NUMBER` ordered corpus (testVersionsNumber). Includes the
+    /// dot-attached qualifier forms (`2.0.a`, `11.a2`, `11.a`) that only order
+    /// correctly with the MNG-7644 parse fix.
+    #[test]
+    fn maven_number_corpus_is_ordered() {
+        assert_strictly_increasing_all_pairs(&[
+            "2.0", "2.0.a", "2-1", "2.0.2", "2.0.123", "2.1.0", "2.1-a", "2.1b", "2.1-c", "2.1-1",
+            "2.1.0.1", "2.2", "2.123", "11.a2", "11.a11", "11.b2", "11.b11", "11.m2", "11.m11",
+            "11", "11.a", "11b", "11c", "11m",
+        ]);
+    }
+
+    /// Maven `testVersionComparing` pairs.
+    #[test]
+    fn maven_version_comparing_pairs() {
+        let less_pairs = [
+            ("1", "2"),
+            ("1.5", "2"),
+            ("1", "2.5"),
+            ("1.0", "1.1"),
+            ("1.1", "1.2"),
+            ("1.0.0", "1.1"),
+            ("1.0.1", "1.1"),
+            ("1.1", "1.2.0"),
+            ("1.0-alpha-1", "1.0"),
+            ("1.0-alpha-1", "1.0-alpha-2"),
+            ("1.0-alpha-1", "1.0-beta-1"),
+            ("1.0-beta-1", "1.0-SNAPSHOT"),
+            ("1.0-SNAPSHOT", "1.0"),
+            ("1.0-alpha-1-SNAPSHOT", "1.0-alpha-1"),
+            ("1.0", "1.0-1"),
+            ("1.0-1", "1.0-2"),
+            ("1.0.0", "1.0-1"),
+            ("2.0-1", "2.0.1"),
+            ("2.0.1-klm", "2.0.1-lmn"),
+            ("2.0.1", "2.0.1-xyz"),
+            ("2.0.1", "2.0.1-123"),
+            ("2.0.1-xyz", "2.0.1-123"),
+        ];
+        for (a, b) in less_pairs {
+            assert!(v(a) < v(b), "expected {a} < {b}");
+            assert!(v(b) > v(a), "expected {b} > {a}");
+        }
+    }
+
+    /// Maven `checkVersionsEqual` corpus (testVersionsEqual + testVersionsEqualNumber
+    /// + testVersionsEqualQualifier) plus the case-insensitivity assertions.
+    #[test]
+    fn maven_equal_pairs() {
+        let equal_pairs = [
+            ("1", "1.0"),
+            ("1", "1.0.0"),
+            ("1.0", "1.0.0"),
+            ("1", "1-0"),
+            ("1", "1.0-0"),
+            ("1.0", "1.0-0"),
+            // no separator between number and qualifier
+            ("1a", "1-a"),
+            ("1a", "1.0-a"),
+            ("1a", "1.0.0-a"),
+            ("1.0a", "1-a"),
+            ("1.0.0a", "1-a"),
+            ("1x", "1-x"),
+            ("1x", "1.0-x"),
+            ("1x", "1.0.0-x"),
+            ("1.0x", "1-x"),
+            ("1.0.0x", "1-x"),
+            // aliases
+            ("1ga", "1"),
+            ("1release", "1"),
+            ("1final", "1"),
+            ("1cr", "1rc"),
+            // special "aliases" a, b and m for alpha, beta and milestone
+            ("1a1", "1-alpha-1"),
+            ("1b2", "1-beta-2"),
+            ("1m3", "1-milestone-3"),
+            // case-insensitive
+            ("1X", "1x"),
+            ("1A", "1a"),
+            ("1B", "1b"),
+            ("1M", "1m"),
+            ("1Ga", "1"),
+            ("1GA", "1"),
+            ("1RELEASE", "1"),
+            ("1RELeaSE", "1"),
+            ("1Final", "1"),
+            ("1FINAL", "1"),
+            ("1Cr", "1Rc"),
+            ("1m3", "1Milestone3"),
+            ("1m3", "1MILESTONE3"),
+        ];
+        for (a, b) in equal_pairs {
+            assert_eq!(v(a), v(b), "expected {a} == {b}");
+            // Hash must agree with equality.
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut ha = DefaultHasher::new();
+            let mut hb = DefaultHasher::new();
+            v(a).hash(&mut ha);
+            v(b).hash(&mut hb);
+            assert_eq!(ha.finish(), hb.finish(), "hash mismatch for {a} and {b}");
+        }
+    }
+
+    /// Maven MNG-5568: `6.1.0rc3 < 6.1.0` and `6.1.0rc3 < 6.1H.5-beta < ...`
+    /// with the transitive consequence `6.1.0 < 6.1H.5-beta`.
+    #[test]
+    fn mng5568() {
+        let (a, b, c) = ("6.1.0", "6.1.0rc3", "6.1H.5-beta");
+        assert!(v(b) < v(a));
+        assert!(v(b) < v(c));
+        assert!(v(a) < v(c));
+    }
+
+    /// Maven MNG-6572: large-magnitude numeric segments order by value.
+    #[test]
+    fn mng6572() {
+        let a = "20190126.230843";
+        let b = "1234567890.12345";
+        let c = "123456789012345.1H.5-beta";
+        let d = "12345678901234567890.1H.5-beta";
+        assert!(v(a) < v(b));
+        assert!(v(b) < v(c));
+        assert!(v(a) < v(c));
+        assert!(v(c) < v(d));
+        assert!(v(b) < v(d));
+        assert!(v(a) < v(d));
+    }
+
+    /// Maven MNG-6964: qualifiers that start with `-0.` used to make `A == C` and
+    /// `B == C` while `A < B` (a non-transitive triple). They must all order.
+    #[test]
+    fn mng6964() {
+        let (a, b, c) = ("1-0.alpha", "1-0.beta", "1");
+        assert!(v(a) < v(c));
+        assert!(v(b) < v(c));
+        assert!(v(a) < v(b));
+    }
+
+    /// Deliberate Maven parity, NOT a bug: Apache Maven's `ComparableVersion`
+    /// (through 3.9.x) is still not a perfect total order for the pathological
+    /// `-0.<qualifier>` form. `1-0.alpha` normalizes to a doubly-nested list
+    /// `[1, [[alpha]]]` (the leading `0` is trimmed), so at the second position
+    /// it is compared list-against-list, and its inner `[alpha]` meets `sp`'s
+    /// bare `String(sp)` as `List > String`. The result is the intransitive
+    /// chain `1-0.alpha < 1 < 1-sp` with `1-0.alpha > 1-sp`.
+    ///
+    /// We reproduce Maven exactly here rather than "repairing" the order:
+    /// diverging would mis-resolve these versions relative to real Maven, which
+    /// is worse than mirroring Maven's own (rare, pathological) quirk. Realistic
+    /// versions never hit this shape; `total_order_is_transitive` guards the
+    /// forms that actually occur.
+    #[test]
+    fn residual_maven_non_total_order_for_nested_zero_qualifier() {
+        assert!(v("1-0.alpha") < v("1"));
+        assert!(v("1") < v("1-sp"));
+        // Maven 3.9.x yields this; a repaired total order would flip it.
+        assert!(v("1-0.alpha") > v("1-sp"));
+        // The `.`/`-` leading-zero spellings still agree with each other.
+        assert_eq!(v("1-0.alpha"), v("1.0-0.alpha"));
+    }
+
+    /// Maven MNG-7644: `1.0.0.X1 < 1.0.0-X2` for any string X, and
+    /// `2.0.X == 2-X == 2.0.0.X`. This is the fix at the heart of this change.
+    #[test]
+    fn mng7644() {
+        for x in [
+            "abc",
+            "alpha",
+            "a",
+            "beta",
+            "b",
+            "def",
+            "milestone",
+            "m",
+            "RC",
+        ] {
+            assert!(
+                v(&format!("1.0.0.{x}1")) < v(&format!("1.0.0-{x}2")),
+                "expected 1.0.0.{x}1 < 1.0.0-{x}2"
+            );
+            assert_eq!(
+                v(&format!("2-{x}")),
+                v(&format!("2.0.{x}")),
+                "expected 2-{x} == 2.0.{x}"
+            );
+            assert_eq!(
+                v(&format!("2-{x}")),
+                v(&format!("2.0.0.{x}")),
+                "expected 2-{x} == 2.0.0.{x}"
+            );
+            assert_eq!(
+                v(&format!("2.0.{x}")),
+                v(&format!("2.0.0.{x}")),
+                "expected 2.0.{x} == 2.0.0.{x}"
+            );
+        }
+    }
+
+    /// The core regression guard: the comparator induces a genuine transitive
+    /// total order. Over a mixed corpus (releases, snapshots, every qualifier
+    /// class, SPs, unknown qualifiers, and both `-` and `.`/glued transition
+    /// spellings, including the shapes that broke before MNG-7644) verify, for
+    /// every triple, that ordering is antisymmetric, transitive, and consistent
+    /// with equality — the properties `Ord` requires and that a corrupt
+    /// comparator would violate.
+    #[test]
+    fn total_order_is_transitive() {
+        use std::cmp::Ordering;
+
+        let corpus = [
+            "0.9",
+            "1.0-alpha2snapshot",
+            "1.0-alpha",
+            "1.0.alpha",
+            "1.0-alpha-1",
+            "1.0-alpha1",
+            "1.0-alpha-1-SNAPSHOT",
+            "1.0-beta",
+            "1.0-milestone",
+            "1.0-milestone-2",
+            "1.0-rc",
+            "1.0-rc1",
+            "1.0-cr1",
+            "1.0-snapshot",
+            "1.0-SNAPSHOT",
+            "1",
+            "1.0",
+            "1.0.0",
+            "1.0.final",
+            "1.0-ga",
+            "1.0-sp",
+            "1.0-sp1",
+            "1.0-a",
+            "1.0-abc",
+            "1.0-1",
+            "1.0-2",
+            "1.0.0.rc1",
+            "1.0.0-rc2",
+            "1.0.1",
+            "1.1",
+            "2-alpha",
+            "2.0.alpha",
+            "2.0",
+        ];
+        let parsed: Vec<Version> = corpus.iter().map(|s| v(s)).collect();
+
+        let n = parsed.len();
+        // Reflexivity + antisymmetry + equality/hash consistency.
+        for i in 0..n {
+            assert_eq!(parsed[i].cmp(&parsed[i]), Ordering::Equal);
+            for j in 0..n {
+                assert_eq!(
+                    parsed[i].cmp(&parsed[j]),
+                    parsed[j].cmp(&parsed[i]).reverse(),
+                    "antisymmetry violated for {} vs {}",
+                    corpus[i],
+                    corpus[j]
+                );
+                if parsed[i] == parsed[j] {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let (mut hi, mut hj) = (DefaultHasher::new(), DefaultHasher::new());
+                    parsed[i].hash(&mut hi);
+                    parsed[j].hash(&mut hj);
+                    assert_eq!(
+                        hi.finish(),
+                        hj.finish(),
+                        "equal versions {} and {} must hash the same",
+                        corpus[i],
+                        corpus[j]
+                    );
+                }
+            }
+        }
+
+        // Transitivity of `<`, and equality-consistency: for every triple,
+        // a < b && b < c => a < c, and a == b => cmp(a, c) == cmp(b, c).
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    if parsed[i] < parsed[j] && parsed[j] < parsed[k] {
+                        assert!(
+                            parsed[i] < parsed[k],
+                            "transitivity violated: {} < {} < {} but not {} < {}",
+                            corpus[i],
+                            corpus[j],
+                            corpus[k],
+                            corpus[i],
+                            corpus[k]
+                        );
+                    }
+                    if parsed[i] == parsed[j] {
+                        assert_eq!(
+                            parsed[i].cmp(&parsed[k]),
+                            parsed[j].cmp(&parsed[k]),
+                            "equality inconsistency: {} == {} but they order differently vs {}",
+                            corpus[i],
+                            corpus[j],
+                            corpus[k]
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -771,8 +771,11 @@ async fn optional_dependencies_of_optional_dependencies_are_not_resolved() {
     assert_eq!(find_version(&graph, "com.example", "b"), None);
 }
 
+/// A direct test dep carries its compile children onto the test classpath, in
+/// both modes. The child is emitted at `test` scope (test applied to compile is
+/// test), not its declared `compile`.
 #[tokio::test]
-async fn test_scope_does_not_traverse_in_default_mode() {
+async fn direct_test_dep_traverses_compile_child() {
     let root = coord("com.example:root:1.0");
     let test = coord("com.example:test:1.0");
     let test_child = coord("com.example:test-child:1.0");
@@ -784,21 +787,38 @@ async fn test_scope_does_not_traverse_in_default_mode() {
         .with_project(&test, vec![dep("com.example", "test-child", "1.0")])
         .with_project(&test_child, Vec::new());
 
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_test],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
+    for strict in [false, true] {
+        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
+        let graph = solver
+            .solve(SolverRoot {
+                coord: root.clone(),
+                dependencies: vec![dep_test.clone()],
+                scope: Scope::Compile,
+            })
+            .await
+            .unwrap();
 
-    assert_eq!(
-        find_version(&graph, "com.example", "test"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(find_version(&graph, "com.example", "test-child"), None);
+        assert_eq!(
+            find_version(&graph, "com.example", "test"),
+            Some("1.0".to_string()),
+            "direct test dep must be included (strict={strict})"
+        );
+        assert_eq!(
+            find_version(&graph, "com.example", "test-child"),
+            Some("1.0".to_string()),
+            "a direct test dep's compile child must be traversed (strict={strict})"
+        );
+        let child = graph
+            .node_indices()
+            .filter_map(|idx| graph.node(idx))
+            .find(|n| n.coord.artifact_id.as_str() == "test-child")
+            .expect("test-child in graph");
+        assert_eq!(
+            child.scope,
+            Scope::Test,
+            "test dep's compile child must be classified test (strict={strict})"
+        );
+    }
 }
 
 /// Maven includes the compile/runtime children of a direct provided dep,
@@ -842,16 +862,15 @@ async fn direct_provided_dep_traverses_children() {
     }
 }
 
-/// In Maven-compat mode, test-scoped dependencies' compile children are included.
+/// A direct test dep's compile children are included on the test classpath.
 ///
-/// Dependency graph:
-///   root -> test-lib:test
-///   test-lib -> compile-lib:compile
+///   root -> test-lib (test)
+///   test-lib -> compile-lib (compile)
 ///
-/// With strict_maven_compat=true: compile-lib is included (scope=test)
-/// With strict_maven_compat=false (default): compile-lib is NOT included
+/// `mvn dependency:list` puts `compile-lib` on the test classpath. rv must
+/// match in both modes.
 #[tokio::test]
-async fn strict_maven_compat_traverses_test_dep_compile_children() {
+async fn test_dep_compile_children_are_included() {
     let root = coord("com.example:root:1.0");
     let test_lib = coord("com.example:test-lib:1.0");
     let compile_lib = coord("com.example:compile-lib:1.0");
@@ -863,49 +882,28 @@ async fn strict_maven_compat_traverses_test_dep_compile_children() {
         .with_project(&test_lib, vec![dep("com.example", "compile-lib", "1.0")])
         .with_project(&compile_lib, Vec::new());
 
-    // Default mode (rv.toml compat): compile-lib should NOT be included
-    let solver_default = Solver::new(&backend);
-    let graph_default = solver_default
-        .solve(SolverRoot {
-            coord: root.clone(),
-            dependencies: vec![dep_test_lib.clone()],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
+    for strict in [false, true] {
+        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
+        let graph = solver
+            .solve(SolverRoot {
+                coord: root.clone(),
+                dependencies: vec![dep_test_lib.clone()],
+                scope: Scope::Compile,
+            })
+            .await
+            .unwrap();
 
-    assert_eq!(
-        find_version(&graph_default, "com.example", "test-lib"),
-        Some("1.0".to_string()),
-        "test-lib should be included in both modes"
-    );
-    assert_eq!(
-        find_version(&graph_default, "com.example", "compile-lib"),
-        None,
-        "compile-lib should NOT be included in rv.toml mode"
-    );
-
-    // Maven-compat mode (pom.xml): compile-lib SHOULD be included as test scope
-    let solver_maven = Solver::new(&backend).with_strict_maven_compat(true);
-    let graph_maven = solver_maven
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_test_lib],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph_maven, "com.example", "test-lib"),
-        Some("1.0".to_string()),
-        "test-lib should be included in maven-compat mode"
-    );
-    assert_eq!(
-        find_version(&graph_maven, "com.example", "compile-lib"),
-        Some("1.0".to_string()),
-        "compile-lib should be included in maven-compat mode (as transitive test dep)"
-    );
+        assert_eq!(
+            find_version(&graph, "com.example", "test-lib"),
+            Some("1.0".to_string()),
+            "test-lib should be included (strict={strict})"
+        );
+        assert_eq!(
+            find_version(&graph, "com.example", "compile-lib"),
+            Some("1.0".to_string()),
+            "compile-lib (a test dep's compile child) must be included (strict={strict})"
+        );
+    }
 }
 
 /// Test that NearestWins and HighestWins strategies produce different results.
@@ -1320,8 +1318,9 @@ async fn scope_promotion_compile_chain_in_compat_mode() {
     );
 }
 
-/// Test→compile chain: in default (non-compat) mode, test deps do NOT traverse.
-/// In strict_maven_compat mode, they DO traverse and child appears as test scope.
+/// Test→compile chain: a direct test dep C traverses into its compile child D,
+/// and D is narrowed to test scope (test → compile = test). This holds in both
+/// resolution modes.
 #[tokio::test]
 async fn scope_promotion_test_chain_narrowing() {
     let root = coord("com.example:root:1.0");
@@ -1335,61 +1334,220 @@ async fn scope_promotion_test_chain_narrowing() {
         .with_project(&c, vec![dep("com.example", "d", "1.0")])
         .with_project(&d, Vec::new());
 
-    // Default mode: test dep does not traverse; D is not included
-    let solver_default = Solver::new(&backend);
-    let graph_default = solver_default
-        .solve(SolverRoot {
-            coord: root.clone(),
-            dependencies: vec![dep_c.clone()],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
+    for strict in [false, true] {
+        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
+        let graph = solver
+            .solve(SolverRoot {
+                coord: root.clone(),
+                dependencies: vec![dep_c.clone()],
+                scope: Scope::Compile,
+            })
+            .await
+            .unwrap();
 
-    assert_eq!(
-        find_version(&graph_default, "com.example", "c"),
-        Some("1.0".to_string()),
-        "C (test dep) must be in graph"
-    );
-    assert_eq!(
-        find_version(&graph_default, "com.example", "d"),
-        None,
-        "D must NOT be in graph: test dep doesn't traverse in default mode"
-    );
+        assert_eq!(
+            find_version(&graph, "com.example", "c"),
+            Some("1.0".to_string()),
+            "C (test dep) must be in graph (strict={strict})"
+        );
+        assert_eq!(
+            find_version(&graph, "com.example", "d"),
+            Some("1.0".to_string()),
+            "D must be in graph: test→compile=test (strict={strict})"
+        );
 
-    // compat mode: test→compile = test, so D IS included
-    let solver_compat = Solver::new(&backend).with_strict_maven_compat(true);
-    let graph_compat = solver_compat
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_c],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
+        // D was narrowed from its declared compile scope to test via the test edge.
+        let d_node = graph
+            .node_indices()
+            .filter_map(|idx| graph.node(idx))
+            .find(|n| n.coord.artifact_id.as_str() == "d")
+            .expect("d should be in graph");
+        assert_eq!(
+            d_node.scope,
+            Scope::Test,
+            "D scope must be narrowed to test by the test→compile chain (strict={strict})"
+        );
+    }
+}
 
-    assert_eq!(
-        find_version(&graph_compat, "com.example", "c"),
-        Some("1.0".to_string()),
-        "C must be in graph in compat mode"
-    );
-    assert_eq!(
-        find_version(&graph_compat, "com.example", "d"),
-        Some("1.0".to_string()),
-        "D must be in graph: test→compile=test in strict_maven_compat mode"
-    );
+/// The real jackson-databind / guava-testlib case, checked against `mvn
+/// dependency:list`: a test-scoped direct dep whose POM pulls a compile dep
+/// that has its own transitive dep.
+///
+///   jackson-databind (root)
+///     └─ com.google.guava:guava-testlib  (scope=test, direct)
+///          └─ junit:junit                (compile in testlib's POM)
+///               └─ org.hamcrest:hamcrest-core (compile in junit's POM)
+///
+/// Maven puts all three on the test classpath (test applied to compile stays
+/// test, transitively), so rv resolves all three at `test` in both modes.
+#[tokio::test]
+async fn test_direct_dep_carries_full_compile_subtree_at_test_scope() {
+    let root = coord("com.fasterxml.jackson.core:jackson-databind:2.18.2");
+    let testlib = coord("com.google.guava:guava-testlib:31.1-jre");
+    let junit = coord("junit:junit:4.13.2");
+    let hamcrest = coord("org.hamcrest:hamcrest-core:1.3");
 
-    // Verify D's scope is test (it was narrowed from compile to test via the test edge)
-    let d_node = graph_compat
-        .node_indices()
-        .filter_map(|idx| graph_compat.node(idx))
-        .find(|n| n.coord.artifact_id.as_str() == "d")
-        .expect("d should be in compat graph");
-    assert_eq!(
-        d_node.scope,
-        Scope::Test,
-        "D scope must be narrowed to test by the test→compile chain"
-    );
+    // root depends on guava-testlib at <scope>test</scope> (direct edge).
+    let mut dep_testlib = dep("com.google.guava", "guava-testlib", "31.1-jre");
+    dep_testlib.scope = Some("test".to_string());
+    // guava-testlib's own POM carries junit at compile ("testlib must carry
+    // these transitively"); junit's POM carries hamcrest-core at compile.
+    let dep_junit = dep("junit", "junit", "4.13.2");
+    let dep_hamcrest = dep("org.hamcrest", "hamcrest-core", "1.3");
+
+    let backend = MockBackend::default()
+        .with_project(&testlib, vec![dep_junit])
+        .with_project(&junit, vec![dep_hamcrest])
+        .with_project(&hamcrest, Vec::new());
+
+    let scope_of = |graph: &Graph, artifact: &str| -> Option<Scope> {
+        graph
+            .node_indices()
+            .filter_map(|idx| graph.node(idx))
+            .find(|n| n.coord.artifact_id.as_str() == artifact)
+            .map(|n| n.scope)
+    };
+
+    for strict in [false, true] {
+        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
+        let graph = solver
+            .solve(SolverRoot {
+                coord: root.clone(),
+                dependencies: vec![dep_testlib.clone()],
+                scope: Scope::Compile,
+            })
+            .await
+            .unwrap();
+
+        for (group, artifact, version) in [
+            ("com.google.guava", "guava-testlib", "31.1-jre"),
+            ("junit", "junit", "4.13.2"),
+            ("org.hamcrest", "hamcrest-core", "1.3"),
+        ] {
+            assert_eq!(
+                find_version(&graph, group, artifact),
+                Some(version.to_string()),
+                "{artifact} must be resolved (strict={strict})"
+            );
+            assert_eq!(
+                scope_of(&graph, artifact),
+                Some(Scope::Test),
+                "{artifact} must be classified test (strict={strict})"
+            );
+        }
+    }
+}
+
+/// Provided-scope analog of the above: a direct `provided` dep's compile
+/// subtree is carried on the provided classpath, transitively, in both modes.
+#[tokio::test]
+async fn provided_direct_dep_carries_full_compile_subtree_at_provided_scope() {
+    let root = coord("com.example:root:1.0");
+    let api = coord("com.example:api:1.0");
+    let impl_ = coord("com.example:impl:1.0");
+    let util = coord("com.example:util:1.0");
+
+    let mut dep_api = dep("com.example", "api", "1.0");
+    dep_api.scope = Some("provided".to_string());
+    let dep_impl = dep("com.example", "impl", "1.0");
+    let dep_util = dep("com.example", "util", "1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&api, vec![dep_impl])
+        .with_project(&impl_, vec![dep_util])
+        .with_project(&util, Vec::new());
+
+    let scope_of = |graph: &Graph, artifact: &str| -> Option<Scope> {
+        graph
+            .node_indices()
+            .filter_map(|idx| graph.node(idx))
+            .find(|n| n.coord.artifact_id.as_str() == artifact)
+            .map(|n| n.scope)
+    };
+
+    for strict in [false, true] {
+        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
+        let graph = solver
+            .solve(SolverRoot {
+                coord: root.clone(),
+                dependencies: vec![dep_api.clone()],
+                scope: Scope::Compile,
+            })
+            .await
+            .unwrap();
+
+        for artifact in ["api", "impl", "util"] {
+            assert_eq!(
+                find_version(&graph, "com.example", artifact),
+                Some("1.0".to_string()),
+                "{artifact} must be resolved (strict={strict})"
+            );
+            assert_eq!(
+                scope_of(&graph, artifact),
+                Some(Scope::Provided),
+                "{artifact} must be classified provided (strict={strict})"
+            );
+        }
+    }
+}
+
+/// Guard against over-broadening: only the compile and runtime children of a
+/// direct test dep are carried. A test or provided grandchild (a transitive
+/// test/provided edge at depth > 1) is still dropped, like `mvn dependency:list`.
+#[tokio::test]
+async fn direct_test_dep_still_drops_test_and_provided_grandchildren() {
+    let root = coord("com.example:root:1.0");
+    let test_lib = coord("com.example:test-lib:1.0");
+    let compile_kid = coord("com.example:compile-kid:1.0");
+    let test_kid = coord("com.example:test-kid:1.0");
+    let provided_kid = coord("com.example:provided-kid:1.0");
+
+    let mut dep_test_lib = dep("com.example", "test-lib", "1.0");
+    dep_test_lib.scope = Some("test".to_string());
+
+    let dep_compile_kid = dep("com.example", "compile-kid", "1.0");
+    let mut dep_test_kid = dep("com.example", "test-kid", "1.0");
+    dep_test_kid.scope = Some("test".to_string());
+    let mut dep_provided_kid = dep("com.example", "provided-kid", "1.0");
+    dep_provided_kid.scope = Some("provided".to_string());
+
+    let backend = MockBackend::default()
+        .with_project(
+            &test_lib,
+            vec![dep_compile_kid, dep_test_kid, dep_provided_kid],
+        )
+        .with_project(&compile_kid, Vec::new())
+        .with_project(&test_kid, Vec::new())
+        .with_project(&provided_kid, Vec::new());
+
+    for strict in [false, true] {
+        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
+        let graph = solver
+            .solve(SolverRoot {
+                coord: root.clone(),
+                dependencies: vec![dep_test_lib.clone()],
+                scope: Scope::Compile,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            find_version(&graph, "com.example", "compile-kid"),
+            Some("1.0".to_string()),
+            "compile grandchild of a direct test dep is carried (strict={strict})"
+        );
+        assert_eq!(
+            find_version(&graph, "com.example", "test-kid"),
+            None,
+            "a test transitive of a test dep must be dropped (strict={strict})"
+        );
+        assert_eq!(
+            find_version(&graph, "com.example", "provided-kid"),
+            None,
+            "a provided transitive of a test dep must be dropped (strict={strict})"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

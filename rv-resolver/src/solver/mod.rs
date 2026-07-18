@@ -371,25 +371,21 @@ async fn resolve_item<'a, B: Backend>(
     // both for whether we descend (None drops the subtree) and for the
     // scope our children inherit as their `parent_scope`.
     //
-    // For a direct `provided` dep, `transitive_from(Compile, Provided)`
-    // returns `None` because `Provided.is_transitive() == false`, and a
-    // `child_scope = None` would drop the provided dep's compile/runtime
-    // children. Maven's matrix says a provided dep emits those children as
-    // `provided`, so for direct `provided` deps the lookup is promoted to
-    // `transitive_from(Provided, Compile|Runtime)` by passing
-    // `effective_scope` (which is `Provided` here) as the parent. Children
-    // of the provided dep then carry `parent_scope = Provided` and
-    // propagate via the matrix.
+    // A direct `provided` or `test` dep needs a special case: `transitive_from`
+    // returns `None` for it (neither scope is transitive), which would drop its
+    // compile/runtime children. Maven keeps those children on the provided/test
+    // classpath, so a direct provided/test dep descends at its own scope and its
+    // children inherit it (a compile child of a test dep is a `test` child).
+    // Deeper provided/test transitive edges stay dropped by the `depth > 1` skip
+    // above, matching Maven.
     //
     // Direct `optional` deps are handled by the early skip above.
     let child_scope = if item.dependency.effective_optional() && item.depth > 1 {
         // Should not reach here (skipped above), but be safe
         None
-    } else if item.depth == 1 && dep_scope == Scope::Provided {
-        // Direct provided deps descend as provided in both modes;
-        // `transitive_from` would return None and silently drop the
-        // subtree, which doesn't match Maven for direct provided.
-        Some(Scope::Provided)
+    } else if item.depth == 1 && matches!(dep_scope, Scope::Provided | Scope::Test) {
+        // Descend at the dep's own scope; see the note above.
+        Some(dep_scope)
     } else if solver.strict_maven_compat {
         Scope::transitive_from_maven_compat(item.parent_scope, dep_scope)
     } else {

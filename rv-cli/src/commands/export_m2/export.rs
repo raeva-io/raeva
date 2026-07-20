@@ -149,24 +149,45 @@ impl<'a> Exporter<'a> {
         let mut accumulated: HashSet<(String, String, String, String, Option<String>)> =
             HashSet::new();
 
+        // Support POMs are overwhelmingly on Central; an unmapped repo_url
+        // falls back to the `central` marker id. Prefer the project's primary
+        // repo when it has one.
+        let root_repo_url = lock
+            .platforms
+            .first()
+            .and_then(|p| p.packages.first())
+            .map(|pkg| pkg.repo_url.clone())
+            .unwrap_or_default();
+
+        // Seed the closure with the coordinates `rv sync` recorded for every
+        // support POM it fetched (each dependency's `<parent>` ancestry and
+        // import-scoped BOMs). We can't always re-derive an import BOM's
+        // coordinate from a POM alone: a transitive dep may import a BOM whose
+        // version is a `${property}` defined in that dep's parent, which
+        // `read_support_refs` can't resolve from the child POM and so skips,
+        // dropping the BOM and breaking offline `mvn -o`. The recorded
+        // provenance already holds the resolved coordinate, so seeding from it
+        // (then letting `enqueue_support_closure` recurse into each POM's own
+        // parents and imports) materializes the whole transitive closure. The
+        // sources/javadocs passes re-seed idempotently.
+        if !self.support_repo_ids.is_empty() {
+            let seed_refs: Vec<(String, String, String)> = self
+                .support_repo_ids
+                .keys()
+                .filter_map(|coord| parse_gav(coord))
+                .collect();
+            self.enqueue_support_closure(seed_refs, &root_repo_url, &mut enqueued_poms, &mut units)
+                .await?;
+        }
+
         // The root project's own pom.xml lives on disk (not in the lock), but
         // its `<parent>` and imported BOMs must also be in ~/.m2 for `mvn -o`
-        // to build the root model. That is the single most common shape ("no
-        // parent, import spring-boot-dependencies/junit-bom" or "inherit
-        // spring-boot-starter-parent"). Walk that closure first. Only the
-        // primary export passes a root pom; the sources/javadocs passes reuse
-        // the same per-call dedupe set and skip it.
+        // to build the root model (e.g. inheriting spring-boot-starter-parent
+        // or importing spring-boot-dependencies). Walk that closure too. Only
+        // the primary export passes a root pom; the sources/javadocs passes
+        // reuse the same dedupe set and skip it.
         if let Some(root_pom) = root_pom {
             let refs = read_support_refs(root_pom).unwrap_or_default();
-            // Support POMs are overwhelmingly on Central; an unmapped repo_url
-            // falls back to the `central` marker id. Bias toward the project's
-            // primary repo when it has one.
-            let root_repo_url = lock
-                .platforms
-                .first()
-                .and_then(|p| p.packages.first())
-                .map(|pkg| pkg.repo_url.clone())
-                .unwrap_or_default();
             self.enqueue_support_closure(refs, &root_repo_url, &mut enqueued_poms, &mut units)
                 .await?;
         }
@@ -1393,6 +1414,20 @@ fn synthetic_pom_package(
         system_path: None,
         direct_scope: None,
         extra: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Split a bare `"group:artifact:version"` (as recorded in the support-POM
+/// provenance) into its three parts. Returns `None` unless there are exactly
+/// three non-empty colon-separated segments. Maven coordinates never contain a
+/// `:` inside a part, so `splitn(3)` is unambiguous.
+fn parse_gav(coord: &str) -> Option<(String, String, String)> {
+    let mut parts = coord.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(g), Some(a), Some(v)) if !g.is_empty() && !a.is_empty() && !v.is_empty() => {
+            Some((g.to_string(), a.to_string(), v.to_string()))
+        }
+        _ => None,
     }
 }
 
@@ -2895,6 +2930,153 @@ its format can be changed without prior notice."
             .join("_remote.repositories");
         let body = fs::read_to_string(&parent_marker).expect("parent marker");
         assert!(body.contains("parent-2.0.0.pom>central="));
+    }
+
+    /// An import-scoped BOM referenced by a transitive dependency, whose version
+    /// is a `${property}` defined only in that dependency's `<parent>`, must
+    /// still be exported.
+    ///
+    /// `read_support_refs` interpolates an import BOM's version against the child
+    /// POM's own `<properties>` only, so a parent-defined version stays `${...}`
+    /// and gets skipped. But `rv sync` already resolved the BOM and recorded its
+    /// coordinate in the support-POM provenance, so the exporter seeds the
+    /// closure from that provenance and materializes the BOM. This is the
+    /// spring-petclinic shape: `thymeleaf-spring6` imports `spring-framework-bom`,
+    /// whose absence breaks offline `mvn -o`.
+    #[tokio::test]
+    async fn transitive_import_bom_with_parent_defined_version_is_exported() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+
+        let jar_id = store.put_bytes(b"mid-jar").await.expect("jar");
+        // `mid` is a transitive dep. Its POM inherits `the-bom.version` from
+        // `mid-parent` and imports `the-bom` with that (parent-defined)
+        // property, so the raw child POM alone cannot resolve the coordinate.
+        let mid_pom = b"<project><modelVersion>4.0.0</modelVersion>\
+<parent><groupId>com.example</groupId><artifactId>mid-parent</artifactId>\
+<version>1.0</version></parent>\
+<artifactId>mid</artifactId>\
+<dependencyManagement><dependencies>\
+<dependency><groupId>com.example</groupId><artifactId>the-bom</artifactId>\
+<version>${the-bom.version}</version><type>pom</type><scope>import</scope></dependency>\
+</dependencies></dependencyManagement></project>";
+        let mid_parent_pom = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>mid-parent</artifactId>\
+<version>1.0</version><packaging>pom</packaging>\
+<properties><the-bom.version>2.0</the-bom.version></properties></project>";
+        let the_bom_pom = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>the-bom</artifactId>\
+<version>2.0</version><packaging>pom</packaging></project>";
+
+        let mid_pom_id = store.put_bytes(mid_pom).await.expect("mid pom");
+        let mid_parent_pom_id = store.put_bytes(mid_parent_pom).await.expect("parent pom");
+        let the_bom_pom_id = store.put_bytes(the_bom_pom).await.expect("bom pom");
+
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "mid", "1.0", "jar", None),
+                &jar_id,
+            )
+            .await
+            .expect("jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "mid", "1.0", "pom", None),
+                &mid_pom_id,
+            )
+            .await
+            .expect("mid pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "mid-parent", "1.0", "pom", None),
+                &mid_parent_pom_id,
+            )
+            .await
+            .expect("parent pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "the-bom", "2.0", "pom", None),
+                &the_bom_pom_id,
+            )
+            .await
+            .expect("bom pom");
+
+        let platform = Platform::new("linux", "x86_64").expect("platform");
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![LockPlatform {
+            platform,
+            packages: vec![LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "mid".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "jar".to_string(),
+                classifier: None,
+                repo_url: "https://repo1.maven.org/maven2/".to_string(),
+                checksum: Some(Checksum::new("sha256", jar_id.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            }],
+            edges: vec![],
+            extra: Default::default(),
+        }];
+
+        // Provenance `rv sync` records for the support POMs it fetched during
+        // resolution (parent + import BOM), keyed on bare `g:a:v`.
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:mid-parent:1.0".to_string(),
+            "central".to_string(),
+        );
+        support.insert("com.example:the-bom:2.0".to_string(), "central".to_string());
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let options = ExportOptions {
+            dry_run: false,
+            overwrite: false,
+            link_strategy: LinkStrategy::Copy,
+            m2_path: m2.clone(),
+        };
+        let exporter = Exporter::new(options, &store).with_support_repo_ids(support);
+        exporter.export_lock(&lock, None).await.expect("export");
+
+        // The import BOM must be materialized even though its version was a
+        // parent-defined property the child POM alone could not resolve.
+        let bom = m2
+            .join("com")
+            .join("example")
+            .join("the-bom")
+            .join("2.0")
+            .join("the-bom-2.0.pom");
+        assert!(
+            bom.exists(),
+            "transitive parent-versioned import BOM must be exported at {bom:?}"
+        );
+        assert_eq!(fs::read(&bom).expect("read bom"), the_bom_pom);
+
+        // Its `_remote.repositories` marker must carry the recorded source id.
+        let bom_marker = m2
+            .join("com")
+            .join("example")
+            .join("the-bom")
+            .join("2.0")
+            .join("_remote.repositories");
+        let body = fs::read_to_string(&bom_marker).expect("bom marker");
+        assert!(
+            body.contains("the-bom-2.0.pom>central="),
+            "import BOM marker must use its recorded source repo id, got: {body}"
+        );
+
+        // The parent is still walked normally (read from the child POM).
+        let parent = m2
+            .join("com")
+            .join("example")
+            .join("mid-parent")
+            .join("1.0")
+            .join("mid-parent-1.0.pom");
+        assert!(parent.exists(), "parent POM must be exported at {parent:?}");
     }
 
     /// A parent named by a POM but absent from the store must NOT fail the

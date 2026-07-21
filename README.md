@@ -38,6 +38,34 @@ from a prior online build or your base image; if you start from a pristine
 going offline. `rv export-m2` followed by `mvn -o` gives you a reproducible
 **dependency** set, not a from-scratch clean-room offline build.
 
+## Verified against real projects
+
+Raeva is checked against real open-source Maven projects. For each one, three
+things are verified from a cold cache:
+
+1. `rv sync` reads the project's `pom.xml` and writes `rv.lock`.
+2. rv's locked set is compared against Maven's own resolution
+   (`mvn dependency:list`). *Exact* means the two sets are identical,
+   coordinate for coordinate.
+3. Every locked artifact is deleted from a scratch `~/.m2` so rv is the sole
+   provider, then `rv export-m2` and `mvn -o dependency:resolve` must succeed.
+   (Build plugins are seeded separately, since they are out of scope; see
+   [Scope](#scope) above.)
+
+| Project | Dependencies | Parity | Offline `mvn -o` |
+| --- | ---: | --- | --- |
+| commons-lang | 23 | exact | pass |
+| commons-collections | 31 | exact | pass |
+| gson | 12 | exact | pass |
+| guava | 5 | exact | pass |
+| junit4 | 2 | exact | pass |
+| jackson-databind 2.18.2 | 28 | exact | pass |
+| spring-petclinic | 171 | exact | pass |
+
+Every project's lockfile matches Maven's own resolution exactly and resolves
+offline against the exported set. Tested at each project's current main branch,
+with jackson-databind at release 2.18.2.
+
 ## Commands
 
 | Command | Description |

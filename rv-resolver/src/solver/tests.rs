@@ -37,6 +37,35 @@ impl MockBackend {
         self
     }
 
+    /// Like [`with_project`] but also attaches the artifact's effective
+    /// `<dependencyManagement>`. Mirrors what the model layer produces for a
+    /// fetched POM: parent-chain and BOM management already merged in. Used to
+    /// exercise the solver's version-fill for a versionless child.
+    fn with_project_and_mgmt(
+        mut self,
+        coord: &Coord,
+        deps: Vec<Dependency>,
+        management: Vec<Dependency>,
+    ) -> Self {
+        let project = Project {
+            group_id: coord.group_id.to_string(),
+            artifact_id: coord.artifact_id.to_string(),
+            version: coord.version.to_string(),
+            packaging: "jar".to_string(),
+            properties: Default::default(),
+            dependency_management: DependencyManagement {
+                dependencies: management,
+            },
+            dependencies: deps,
+            repositories: Vec::new(),
+            profiles: Vec::new(),
+            modules: Vec::new(),
+            relocation: None,
+        };
+        self.projects.insert(coord.to_string(), project);
+        self
+    }
+
     fn with_relocated_project(
         mut self,
         coord: &Coord,
@@ -174,6 +203,30 @@ fn dep(group_id: &str, artifact_id: &str, version: &str) -> Dependency {
     }
 }
 
+/// A dependency that declares no `<scope>`, so a managed scope may fill it in.
+fn dep_no_scope(group_id: &str, artifact_id: &str, version: &str) -> Dependency {
+    Dependency {
+        scope: None,
+        ..dep(group_id, artifact_id, version)
+    }
+}
+
+/// A dependency with an explicit scope but no `<version>`, so the version must
+/// be supplied by the resolving artifact's dependencyManagement.
+fn dep_versionless(group_id: &str, artifact_id: &str, scope: &str) -> Dependency {
+    Dependency {
+        group_id: group_id.to_string(),
+        artifact_id: artifact_id.to_string(),
+        version: None,
+        type_: None,
+        classifier: None,
+        scope: Some(scope.to_string()),
+        optional: None,
+        exclusions: Vec::new(),
+        system_path: None,
+    }
+}
+
 fn dep_with_classifier(
     group_id: &str,
     artifact_id: &str,
@@ -206,6 +259,17 @@ fn find_version(graph: &Graph, group_id: &str, artifact_id: &str) -> Option<Stri
                 && node.coord.artifact_id.as_str() == artifact_id
         })
         .map(|node| node.coord.version.to_string())
+}
+
+fn find_scope(graph: &Graph, group_id: &str, artifact_id: &str) -> Option<Scope> {
+    graph
+        .node_indices()
+        .filter_map(|idx| graph.node(idx))
+        .find(|node| {
+            node.coord.group_id.as_str() == group_id
+                && node.coord.artifact_id.as_str() == artifact_id
+        })
+        .map(|node| node.scope)
 }
 
 #[tokio::test]
@@ -2199,9 +2263,10 @@ async fn managed_exclusions_apply_to_transitive_nodes() {
     );
 }
 
-/// Root depMgmt forces `<scope>test</scope>` on a coordinate that appears
-/// transitively. Maven derives the managed scope onto the node, and a
-/// test-scoped transitive is dropped from the closure.
+/// Root depMgmt forces `<scope>test</scope>` on an unscoped transitive
+/// coordinate: the managed scope fills the blank, and the test-scoped
+/// transitive is then dropped from the closure. A dependency that declared its
+/// own scope keeps it (see `managed_scope_does_not_override_declared_child_scope`).
 #[tokio::test]
 async fn managed_scope_test_prunes_transitive() {
     let root = coord("com.example:root:1.0");
@@ -2209,7 +2274,7 @@ async fn managed_scope_test_prunes_transitive() {
     let extra = coord("com.example:extra:1.0");
 
     let backend = MockBackend::default()
-        .with_project(&lib, vec![dep("com.example", "extra", "1.0")])
+        .with_project(&lib, vec![dep_no_scope("com.example", "extra", "1.0")])
         .with_project(&extra, Vec::new());
 
     let mut constraints = PlatformConstraints::new();
@@ -2235,7 +2300,7 @@ async fn managed_scope_test_prunes_transitive() {
     assert_eq!(
         find_version(&graph, "com.example", "extra"),
         None,
-        "managed test scope must drop the transitive dependency"
+        "managed test scope must fill in an unscoped transitive and drop it"
     );
 }
 
@@ -2275,6 +2340,164 @@ async fn managed_optional_prunes_transitive() {
         find_version(&graph, "com.example", "extra"),
         None,
         "managed optional=true must drop the transitive dependency"
+    );
+}
+
+/// guava-testlib shape: a resolved artifact D (whose parent manages child C's
+/// version) declares C with no `<version>` and an explicit `<scope>compile`.
+/// C's version must come from D's effective dependencyManagement, C must keep
+/// its compile scope (not the management entry's test scope, which would drop it
+/// under the depth > 1 test prune), and C's own transitive dep must be pulled in.
+///
+/// `testlib` is a direct test dep, as jackson-databind declares guava-testlib.
+/// If the management entry's `test` scope were stamped onto `junit`, `junit`
+/// would be pruned at depth 2 and both it and `hamcrest` would vanish.
+#[tokio::test]
+async fn versionless_child_version_from_transitive_depmgmt() {
+    let root = coord("com.example:root:1.0");
+    let testlib = coord("com.example:testlib:1.0");
+    let junit = coord("com.example:junit:4.13.2");
+    let hamcrest = coord("com.example:hamcrest:1.3");
+
+    // Management entry as the model would surface it after merging P's
+    // dependencyManagement into D: version 4.13.2, scope test.
+    let managed_junit = Dependency {
+        scope: Some("test".to_string()),
+        ..dep("com.example", "junit", "4.13.2")
+    };
+
+    let backend = MockBackend::default()
+        .with_project_and_mgmt(
+            &testlib,
+            // D declares junit with an explicit compile scope and NO version.
+            vec![dep_versionless("com.example", "junit", "compile")],
+            vec![managed_junit],
+        )
+        .with_project(&junit, vec![dep("com.example", "hamcrest", "1.3")])
+        .with_project(&hamcrest, Vec::new());
+
+    // testlib is a direct test dependency, as jackson-databind declares
+    // guava-testlib.
+    let testlib_dep = Dependency {
+        scope: Some("test".to_string()),
+        ..dep("com.example", "testlib", "1.0")
+    };
+
+    // strict Maven compatibility mirrors pom.xml resolution, where a direct
+    // test dependency's compile children are traversed.
+    let solver = Solver::new(&backend).with_strict_maven_compat(true);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![testlib_dep],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_version(&graph, "com.example", "junit"),
+        Some("4.13.2".to_string()),
+        "versionless child must take its version from the artifact's dependencyManagement"
+    );
+    // The management entry's test scope was not stamped onto the declared
+    // compile scope; junit rides in on testlib's test edge instead of being
+    // pruned as a depth > 1 test dependency, matching `mvn dependency:tree`
+    // (junit:junit:4.13.2:test under a test-scoped guava-testlib).
+    assert_eq!(
+        find_scope(&graph, "com.example", "junit"),
+        Some(Scope::Test),
+        "junit must be included as a test dependency, not dropped"
+    );
+    assert_eq!(
+        find_version(&graph, "com.example", "hamcrest"),
+        Some("1.3".to_string()),
+        "the managed child's own transitive dependency must be pulled in"
+    );
+}
+
+/// The management-supplied version fills a blank only. An explicit
+/// `<version>` on the child always wins over a differing dependencyManagement
+/// entry for the same coordinate.
+#[tokio::test]
+async fn explicit_child_version_wins_over_transitive_depmgmt() {
+    let root = coord("com.example:root:1.0");
+    let lib = coord("com.example:lib:1.0");
+    let child_2 = coord("com.example:child:2.0");
+
+    let managed_child = dep("com.example", "child", "1.0");
+
+    let backend = MockBackend::default()
+        .with_project_and_mgmt(
+            &lib,
+            // Declared with an explicit 2.0; management says 1.0.
+            vec![dep("com.example", "child", "2.0")],
+            vec![managed_child],
+        )
+        .with_project(&child_2, Vec::new());
+
+    let solver = Solver::new(&backend);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![dep("com.example", "lib", "1.0")],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_version(&graph, "com.example", "child"),
+        Some("2.0".to_string()),
+        "an explicit child version must win over the dependencyManagement entry"
+    );
+}
+
+/// Root dependencyManagement that carries a `<scope>test</scope>` for a
+/// coordinate must NOT override a transitive dependency that declares its own
+/// scope explicitly. `lib` (compile) declares `child` with an explicit
+/// compile scope; the root management pins `child` to test. The declared
+/// compile scope wins, so `child` stays on the graph rather than being pruned
+/// as a transitive test dependency.
+#[tokio::test]
+async fn managed_scope_does_not_override_declared_child_scope() {
+    let root = coord("com.example:root:1.0");
+    let lib = coord("com.example:lib:1.0");
+    let child = coord("com.example:child:1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&lib, vec![dep("com.example", "child", "1.0")])
+        .with_project(&child, Vec::new());
+
+    let mut constraints = PlatformConstraints::new();
+    constraints.add_constraint(PlatformConstraint {
+        group: "com.example".to_string(),
+        module: "child".to_string(),
+        type_: "jar".to_string(),
+        classifier: None,
+        scope: Some("test".to_string()),
+        ..Default::default()
+    });
+
+    let solver = Solver::new(&backend).with_platform_constraints(constraints);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![dep("com.example", "lib", "1.0")],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_version(&graph, "com.example", "child"),
+        Some("1.0".to_string()),
+        "an explicitly declared compile scope must survive a managed test scope"
+    );
+    assert_eq!(
+        find_scope(&graph, "com.example", "child"),
+        Some(Scope::Compile),
+        "the child must keep its declared compile scope, not the managed test scope"
     );
 }
 

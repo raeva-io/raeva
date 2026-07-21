@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use futures::stream::{self, StreamExt};
-use rv_maven_model::{Dependency, Project, Scope};
+use rv_maven_model::{Dependency, DependencyManagement, Project, Scope};
 use rv_version::{Coord, Version, VersionReq};
 
 use crate::ResolutionStrategy;
@@ -284,12 +284,17 @@ enum RequestedRequirement {
     DynamicIntegration,
 }
 
-/// Apply the root dependency management's non-version metadata to a
-/// transitive dependency, the way Maven's ClassicDependencyManager does from
-/// depth >= 2: a managed `<scope>`/`<optional>` overrides the declared one,
-/// and managed `<exclusions>` are unioned with the declared set. Depth 1 is
-/// the model layer's job (management only fills in blanks for the project's
-/// own dependencies), and versions are handled by `resolve_version_str`.
+/// Apply the root dependency management's non-version metadata to a transitive
+/// dependency (depth >= 2): a managed `<scope>`/`<optional>` fills a blank the
+/// dependency left, and managed `<exclusions>` union with the declared set.
+/// Depth 1 is the model layer's job, and versions come from
+/// `resolve_version_str`.
+///
+/// A managed scope only fills a blank; an explicitly declared scope wins, as in
+/// the model layer's `apply_managed_dependency`. Otherwise a dep that declares
+/// `<scope>compile</scope>` (as guava-testlib does for its `junit` child) would
+/// be forced to the root's managed `test` scope and then pruned at depth > 1,
+/// dropping its whole subtree.
 fn apply_managed_metadata(constraints: &PlatformConstraints, mut item: QueueItem) -> QueueItem {
     if item.depth <= 1 {
         return item;
@@ -306,10 +311,14 @@ fn apply_managed_metadata(constraints: &PlatformConstraints, mut item: QueueItem
         return item;
     }
     let dep = Arc::make_mut(&mut item.dependency);
-    if let Some(scope) = &managed.scope {
+    if let Some(scope) = &managed.scope
+        && dep.scope.is_none()
+    {
         dep.scope = Some(scope.clone());
     }
-    if let Some(optional) = &managed.optional {
+    if let Some(optional) = &managed.optional
+        && dep.optional.is_none()
+    {
         dep.optional = Some(optional.clone());
     }
     for exclusion in &managed.exclusions {
@@ -984,7 +993,18 @@ fn queue_children(
     let next_path = PathNode::extend(&item.path, key.clone());
     let next_exclusions = extend_exclusions(&item.exclusions, &item.dependency.exclusions);
     let coord_version = Arc::new(coord_version.clone());
-    for dep in resolved_project.project.dependencies.iter().cloned() {
+    let dep_mgmt = &resolved_project.project.dependency_management;
+    for mut dep in resolved_project.project.dependencies.iter().cloned() {
+        // A child with no <version> takes it from the resolving artifact's own
+        // effective dependencyManagement (its entries plus the parent chain and
+        // import BOMs, already merged by the model layer), as Maven does for
+        // every artifact, not just the root. Only the version is filled here; an
+        // explicit version wins and the declared scope is left untouched.
+        if dep.version.is_none()
+            && let Some(version) = managed_child_version(dep_mgmt, &dep)
+        {
+            dep.version = Some(version);
+        }
         let declared_at = *next_declared_at;
         *next_declared_at += 1;
         push_queue(
@@ -1002,6 +1022,23 @@ fn queue_children(
         )?;
     }
     Ok(())
+}
+
+/// Find the version a resolved artifact's effective dependencyManagement
+/// supplies for one of its child dependencies, matched by Maven's management
+/// key `(groupId, artifactId, type, classifier)`. Returns `None` when the
+/// child is unmanaged or the matching entry carries no version (a management
+/// entry may manage only scope/exclusions).
+fn managed_child_version(mgmt: &DependencyManagement, dep: &Dependency) -> Option<String> {
+    mgmt.dependencies
+        .iter()
+        .find(|managed| {
+            managed.group_id == dep.group_id
+                && managed.artifact_id == dep.artifact_id
+                && managed.effective_type() == dep.effective_type()
+                && managed.effective_classifier() == dep.effective_classifier()
+        })
+        .and_then(|managed| managed.version.clone())
 }
 
 fn inherit_scope(parent: Scope, child: Scope) -> Scope {

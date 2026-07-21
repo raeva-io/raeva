@@ -66,6 +66,25 @@ Every project's lockfile matches Maven's own resolution exactly and resolves
 offline against the exported set. Tested at each project's current main branch,
 with jackson-databind at release 2.18.2.
 
+### Speed
+
+With a warm cache, `rv` resolves an offline dependency graph in tens to a few
+hundred milliseconds. The same graph through `mvn dependency:list` takes about a
+second, most of it JVM startup:
+
+| Project | Deps | `rv sync --offline` | `mvn -o dependency:list` | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| junit4 | 2 | 0.03 s | 0.76 s | ~26x |
+| guava | 5 | 0.05 s | 0.94 s | ~20x |
+| gson | 12 | 0.07 s | 0.78 s | ~11x |
+| commons-lang | 23 | 0.11 s | 0.81 s | ~8x |
+| commons-collections | 31 | 0.10 s | 0.79 s | ~8x |
+| jackson-databind 2.18.2 | 28 | 0.10 s | 1.04 s | ~10x |
+| spring-petclinic | 171 | 0.27 s | 0.99 s | ~4x |
+
+Both read from a warm cache, so this is tool overhead, not network. Median of
+five runs on one machine.
+
 ## Commands
 
 | Command | Description |

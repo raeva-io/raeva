@@ -38,6 +38,32 @@ from a prior online build or your base image; if you start from a pristine
 going offline. `rv export-m2` followed by `mvn -o` gives you a reproducible
 **dependency** set, not a from-scratch clean-room offline build.
 
+Raeva v0.2 locks single-module projects only. `rv sync` rejects a multi-module
+reactor POM and tells you to run from an individual module's directory.
+Multi-module reactor support is on the roadmap.
+
+## Vulnerability scans and SBOMs
+
+`rv vuln` scans the dependencies in `rv.lock` against OSV. It writes a table by
+default and also supports JSON and SARIF 2.1.0. Exit code 0 means the scan
+completed without findings at or above the `--fail-on` threshold, 1 means it
+completed with findings, and 2 means the scan did not complete. CI can
+distinguish a finding from a network, API, or input failure.
+
+`rv sbom` generates CycloneDX 1.5 or SPDX 2.3 from `rv.lock`. Documents include
+the locked SHA-256 hashes, stable ordering, and content-derived identifiers.
+CycloneDX output is byte-identical for the same lock; SPDX includes its required
+creation timestamp. Set `SOURCE_DATE_EPOCH` to a Unix timestamp for
+byte-identical SPDX output. `rv.lock` does not carry license evidence, so SPDX
+license fields are `NOASSERTION` and CycloneDX omits licenses.
+
+```bash
+rv vuln
+rv vuln --format sarif --fail-on high
+rv sbom --format cyclonedx -o bom.cdx.json
+rv sbom --format spdx -o bom.spdx.json
+```
+
 ## Verified against real projects
 
 Raeva is checked against real open-source Maven projects. For each one, three
@@ -98,6 +124,8 @@ five runs on one machine.
 | `rv doctor` | Diagnose connectivity, auth, and TLS issues |
 | `rv lock` | Inspect or verify the lockfile |
 | `rv export-checksums` | Emit lockfile checksums in Maven Trusted Checksums format |
+| `rv vuln` | Scan locked dependencies against OSV |
+| `rv sbom` | Generate a CycloneDX or SPDX SBOM from rv.lock |
 
 ## Authentication
 
@@ -108,6 +136,7 @@ Raeva reads Maven's `~/.m2/settings.xml` for mirrors, proxies, and server creden
 | Variable | Effect |
 | --- | --- |
 | `RAEVA_HOME` | Root for Raeva's config, store, and cache directories. When unset, the platform config/data/cache directories are used. |
+| `SOURCE_DATE_EPOCH` | Unix timestamp used as the SPDX creation time for reproducible output. |
 | `RV_TIMEOUT` | Per-request network timeout in seconds. Overrides `network.timeout` from `rv.toml`. |
 | `RV_RETRIES` | Number of network retry attempts. Overrides `network.retries` from `rv.toml`. |
 

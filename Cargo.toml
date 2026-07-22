@@ -5,13 +5,15 @@ members = [
     "rv-maven-model",
     "rv-repo",
     "rv-resolver",
+    "rv-sbom",
     "rv-store",
     "rv-version",
+    "rv-vuln",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Raeva"]
 license = "MIT OR Apache-2.0"
@@ -20,16 +22,19 @@ homepage = "https://raeva.io"
 
 [workspace.dependencies]
 # Workspace crates
-rv-config = { path = "rv-config", version = "0.1.1" }
-rv-maven-model = { path = "rv-maven-model", version = "0.1.1" }
-rv-repo = { path = "rv-repo", version = "0.1.1" }
-rv-resolver = { path = "rv-resolver", version = "0.1.1" }
-rv-store = { path = "rv-store", version = "0.1.1" }
-rv-version = { path = "rv-version", version = "0.1.1" }
+rv-config = { path = "rv-config", version = "0.2.0" }
+rv-maven-model = { path = "rv-maven-model", version = "0.2.0" }
+rv-repo = { path = "rv-repo", version = "0.2.0" }
+rv-resolver = { path = "rv-resolver", version = "0.2.0" }
+rv-sbom = { path = "rv-sbom", version = "0.2.0" }
+rv-store = { path = "rv-store", version = "0.2.0" }
+rv-version = { path = "rv-version", version = "0.2.0" }
+rv-vuln = { path = "rv-vuln", version = "0.2.0" }
 
 # Third-party dependencies (alphabetical)
 aes = "0.8"
 anyhow = "1.0"
+backoff = { version = "0.4", features = ["tokio"] }
 backon = { version = "1.6", default-features = false, features = ["std", "tokio-sleep"] }
 base64 = "0.22"
 bytes = "1.11"
@@ -38,6 +43,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
 criterion = { version = "0.5", features = ["html_reports"] }
+cvss = "2"
 derive_more = { version = "1.0", features = ["as_ref", "deref", "display", "from"] }
 dirs = "6.0"
 dunce = "1.0"
@@ -48,8 +54,11 @@ futures-util = "0.3"
 hex = "0.4"
 indexmap = { version = "2.12", features = ["serde"] }
 indicatif = "0.17"
+jsonschema = { version = "=0.48.2", default-features = false }
 lru = "0.12"
+moka = { version = "0.12", features = ["future", "sync"] }
 owo-colors = "4"
+packageurl = "0.7"
 pathdiff = "0.2"
 petgraph = "0.8"
 quick-xml = { version = "0.38", features = ["serialize"] }
@@ -77,6 +86,7 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"
+uuid = { version = "1.23", features = ["serde", "v4"] }
 
 [profile.release]
 lto = "thin"

@@ -14,8 +14,10 @@ rv-config.workspace = true
 rv-maven-model.workspace = true
 rv-repo.workspace = true
 rv-resolver.workspace = true
+rv-sbom.workspace = true
 rv-store.workspace = true
 rv-version.workspace = true
+rv-vuln.workspace = true
 
 chrono.workspace = true
 clap.workspace = true
@@ -47,6 +49,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+jsonschema.workspace = true
 quick-xml.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

@@ -73,17 +73,26 @@ pub enum Commands {
     Lock(commands::LockArgs),
     /// Export checksums in Maven Trusted Checksums format
     ExportChecksums(commands::ExportChecksumsArgs),
+    /// Scan locked dependencies for known vulnerabilities
+    Vuln(commands::VulnArgs),
+    /// Generate a software bill of materials from rv.lock
+    Sbom(commands::SbomArgs),
 }
 
 pub async fn rv() -> Result<()> {
     let cli = RvCli::parse();
-    if cli.json {
+    let json_mode = cli.json
+        || matches!(
+            &cli.command,
+            Commands::Vuln(args) if args.json_output()
+        );
+    if json_mode {
         crate::output::set_quiet(true);
         crate::output::set_json_mode(true);
     } else {
         crate::output::set_quiet(cli.quiet);
     }
-    init_tracing(cli.verbose, cli.json);
+    init_tracing(cli.verbose, json_mode);
 
     match cli.command {
         Commands::Sync(args) => commands::sync::run(&args, &cli.project_root).await?,
@@ -105,6 +114,11 @@ pub async fn rv() -> Result<()> {
             let project_root = cli.project_root.clone();
             spawn_blocking_command(move || commands::export_checksums::run(&args, &project_root))
                 .await?
+        }
+        Commands::Vuln(args) => commands::vuln::run(&args, &cli.project_root).await?,
+        Commands::Sbom(args) => {
+            let project_root = cli.project_root.clone();
+            spawn_blocking_command(move || commands::sbom::run(&args, &project_root)).await?
         }
     }
 

@@ -21,6 +21,16 @@ pub enum ConfigError {
     Utf8(#[from] std::str::Utf8Error),
     #[error("invalid settings.xml: {0}")]
     InvalidSettings(String),
+    #[error("failed to read project input {path}: {source}")]
+    ProjectInputIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("project input {path} exceeds {limit}-byte limit")]
+    ProjectInputTooLarge { path: PathBuf, limit: usize },
+    #[error("project input {path} is not valid UTF-8")]
+    ProjectInputEncoding { path: PathBuf },
     // Append a hint pointing at the env vars that drive the lookup so the
     // user has somewhere to start. We deliberately do not call
     // `dirs::config_dir()` from `Display` because the env can change

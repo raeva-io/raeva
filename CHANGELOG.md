@@ -5,7 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-22
+
+### Added
+
+- `rv vuln` scans the locked dependency set against OSV with table, JSON, and
+  SARIF 2.1.0 output. `--fail-on` selects the severity threshold; exit code 0
+  means no finding met it, 1 means findings met it, and 2 means the scan did
+  not complete.
+- `rv sbom` generates CycloneDX 1.5 and SPDX 2.3 documents from `rv.lock`,
+  includes locked SHA-256 hashes, and uses stable ordering and content-derived
+  identifiers. SPDX license fields are `NOASSERTION` because `rv.lock` carries
+  no license evidence.
 
 ### Fixed
 
@@ -67,6 +78,6 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
-[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.1.1...HEAD
+[0.2.0]: https://github.com/raeva-io/raeva/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/raeva-io/raeva/releases/tag/v0.1.1
 [0.1.0]: https://github.com/raeva-io/raeva/releases/tag/v0.1.0

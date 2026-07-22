@@ -200,6 +200,13 @@ pub(crate) fn render_reqwest_error(err: &reqwest::Error) -> String {
     message
 }
 
+pub(crate) fn render_vuln_error(err: &rv_vuln::VulnError) -> String {
+    match err {
+        rv_vuln::VulnError::Http(source) => render_reqwest_error(source),
+        _ => err.to_string(),
+    }
+}
+
 fn render_dependency_not_found(coord: &str, searched: &[RepoSearchStatus]) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Dependency not found: {coord}");
@@ -418,6 +425,7 @@ fn with_doctor_hint(message: String) -> String {
 mod tests {
     use super::{
         MAX_NESTED_ERRORS, redact_url, render_pom_error, render_resolve_error, render_store_error,
+        render_vuln_error,
     };
     use rv_maven_model::PomError;
     use rv_resolver::{RepoSearchStatus, RepoStatus, ResolveError};
@@ -483,6 +491,27 @@ mod tests {
     fn redact_url_returns_non_url_unchanged() {
         let raw = "not a url at all";
         assert_eq!(redact_url(raw), raw);
+    }
+
+    #[tokio::test]
+    async fn vulnerability_http_error_redacts_base_url_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept request");
+            drop(stream);
+        });
+        let error = reqwest::get(format!(
+            "http://user:secret@{address}/v1/query?token=private"
+        ))
+        .await
+        .expect_err("closed connection must fail");
+        server.join().expect("test server");
+
+        let rendered = render_vuln_error(&rv_vuln::VulnError::Http(error));
+        assert!(!rendered.contains("secret"), "rendered={rendered}");
+        assert!(!rendered.contains("private"), "rendered={rendered}");
+        assert!(rendered.contains("127.0.0.1"), "rendered={rendered}");
     }
 
     // --- Searched: section URL redaction ---

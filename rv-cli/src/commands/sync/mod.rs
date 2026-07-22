@@ -10,7 +10,6 @@ mod disk;
 mod system_scope;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -421,16 +420,28 @@ const MAX_PARENT_CHAIN: usize = 32;
 /// `.mvn/maven.config`, `rv.toml`, and the active settings/profiles. Each
 /// input is folded in with a labelled, length-prefixed framing so two
 /// distinct input sets cannot collide.
-fn compute_config_hash(config: &Config, pom_path: &Path) -> Result<String> {
+pub(crate) fn compute_config_hash(config: &Config, pom_path: &Path) -> Result<String> {
+    let pom_xml = rv_config::read_project_input_string(pom_path)?;
+    compute_config_hash_with_pom(config, pom_path, &pom_xml)
+}
+
+pub(crate) fn compute_config_hash_with_pom(
+    config: &Config,
+    pom_path: &Path,
+    pom_xml: &str,
+) -> Result<String> {
     let mut hasher = Sha256::new();
 
     // 1. Root pom.xml (always present at this call site).
-    hash_labelled_file(&mut hasher, "pom.xml", pom_path)?;
+    hash_labelled_bytes(&mut hasher, "pom.xml", pom_xml.as_bytes());
 
     // 2. The local parent-POM chain, followed via <relativePath> (default
     //    `../pom.xml`). An empty relativePath disables the local lookup, which
     //    also terminates the walk.
-    for (idx, parent_path) in local_parent_chain(pom_path).into_iter().enumerate() {
+    for (idx, parent_path) in local_parent_chain(pom_path, pom_xml)?
+        .into_iter()
+        .enumerate()
+    {
         hash_labelled_file(&mut hasher, &format!("parent[{idx}]"), &parent_path)?;
     }
 
@@ -526,18 +537,25 @@ fn tristate(value: Option<bool>) -> u8 {
 fn hash_labelled_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<()> {
     hasher.update(label.as_bytes());
     hasher.update(b":");
-    match fs::read(path) {
-        Ok(bytes) => {
-            hasher.update(b"present:");
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(&bytes);
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    match rv_config::read_optional_project_input(path)? {
+        Some(bytes) => hash_present_bytes(hasher, &bytes),
+        None => {
             hasher.update(b"missing");
         }
-        Err(err) => return Err(err.into()),
     }
     Ok(())
+}
+
+fn hash_labelled_bytes(hasher: &mut Sha256, label: &str, bytes: &[u8]) {
+    hasher.update(label.as_bytes());
+    hasher.update(b":");
+    hash_present_bytes(hasher, bytes);
+}
+
+fn hash_present_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(b"present:");
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
 }
 
 /// Resolve the chain of local parent POMs reachable from `pom_path` via
@@ -545,17 +563,23 @@ fn hash_labelled_file(hasher: &mut Sha256, label: &str, path: &Path) -> Result<(
 /// disk, has an empty relativePath (Maven's "skip local lookup" sentinel), or
 /// fails to parse. Those parents resolve from the repository and are pinned by
 /// the lockfile, not by a local file. Bounded by [`MAX_PARENT_CHAIN`].
-fn local_parent_chain(pom_path: &Path) -> Vec<std::path::PathBuf> {
+fn local_parent_chain(pom_path: &Path, root_pom_xml: &str) -> Result<Vec<std::path::PathBuf>> {
     let mut chain = Vec::new();
     let mut current = pom_path.to_path_buf();
+    let mut first = true;
     let mut seen: HashSet<std::path::PathBuf> = HashSet::new();
     seen.insert(current.canonicalize().unwrap_or_else(|_| current.clone()));
 
     for _ in 0..MAX_PARENT_CHAIN {
-        let Ok(xml) = fs::read_to_string(&current) else {
-            break;
+        let owned_xml;
+        let xml = if first {
+            first = false;
+            root_pom_xml
+        } else {
+            owned_xml = rv_config::read_project_input_string(&current)?;
+            &owned_xml
         };
-        let Ok(pom) = Pom::parse(&xml) else {
+        let Ok(pom) = Pom::parse(xml) else {
             break;
         };
         let Some(parent) = pom.parent.as_ref() else {
@@ -588,7 +612,7 @@ fn local_parent_chain(pom_path: &Path) -> Vec<std::path::PathBuf> {
         current = candidate;
     }
 
-    chain
+    Ok(chain)
 }
 
 fn count_dependencies(lock: &Lockfile) -> usize {
@@ -1157,12 +1181,9 @@ fn clone_repo_error(err: &rv_repo::RepoError) -> rv_repo::RepoError {
     }
 }
 
-/// Reject multi-module reactor POMs. v1 is single-module only; the reactor
-/// implementation lives behind a v1.1 milestone. We parse just enough of the
-/// POM to detect a non-empty `<modules>` block and fail fast with a clear
-/// message before the resolver tries to walk parent / module chains.
+/// Reject reactor POMs with declared modules before resolution starts.
 fn reject_multi_module_pom(path: &Path) -> Result<()> {
-    let xml = std::fs::read_to_string(path)?;
+    let xml = rv_config::read_project_input_string(path)?;
     let pom = Pom::parse(&xml).map_err(|err| {
         CliError::Message(format!("invalid pom.xml at {}: {err}", path.display()))
     })?;
@@ -1178,10 +1199,11 @@ fn reject_multi_module_pom(path: &Path) -> Result<()> {
 mod tests {
     use super::{
         LOCK_REPO_IDS_KEY, LOCK_SUPPORT_REPO_IDS_KEY, StrategyArg, SyncArgs,
-        carry_forward_lock_data, check_frozen_config_hash, digest_algorithm_name,
-        elapsed_saturating, filter_lock, format_checksum_failure_details, lock_resolution_matches,
-        require_lock_for_platforms,
+        carry_forward_lock_data, check_frozen_config_hash, compute_config_hash,
+        digest_algorithm_name, elapsed_saturating, filter_lock, format_checksum_failure_details,
+        lock_resolution_matches, require_lock_for_platforms,
     };
+    use crate::error::CliError;
     use clap::Parser;
     use rv_config::{LockPackage, LockPlatform, Lockfile, Platform};
     use rv_resolver::ResolutionStrategy;
@@ -2020,7 +2042,8 @@ mod tests {
         let before = compute_config_hash(&make_config(), &child_pom).expect("hash before");
 
         // The walk must actually have found the parent.
-        let chain = super::local_parent_chain(&child_pom);
+        let child_xml = rv_config::read_project_input_string(&child_pom).expect("read child pom");
+        let chain = super::local_parent_chain(&child_pom, &child_xml).expect("local parent chain");
         assert_eq!(chain.len(), 1, "expected to walk exactly one local parent");
 
         // Editing the parent POM changes the hash.
@@ -2037,5 +2060,26 @@ mod tests {
             before, after,
             "editing a local parent POM must change config_hash"
         );
+    }
+
+    #[test]
+    fn config_hash_rejects_oversized_pom() {
+        use rv_config::{Config, ResolvedPaths};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pom_path = dir.path().join("pom.xml");
+        std::fs::write(&pom_path, vec![b'x'; rv_config::MAX_PROJECT_INPUT_SIZE + 1])
+            .expect("write oversized pom");
+        let config = Config::for_testing_with_repos(
+            dir.path().to_path_buf(),
+            ResolvedPaths::from_raeva_home(dir.path().join("raeva-home")),
+            Vec::new(),
+        );
+
+        let error = compute_config_hash(&config, &pom_path).expect_err("oversized POM must fail");
+        assert!(matches!(
+            error,
+            CliError::Config(rv_config::ConfigError::ProjectInputTooLarge { .. })
+        ));
     }
 }

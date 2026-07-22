@@ -2,7 +2,7 @@
 //!
 //! This crate wires together the dispatch entry point, individual subcommand
 //! implementations (`sync`, `tree`, `why`, `doctor`, `lock`, `export-m2`,
-//! `export-checksums`), the typed error hierarchy with stable exit codes, and
+//! `export-checksums`, `vuln`, `sbom`), the typed error hierarchy with stable exit codes, and
 //! the human/JSON output layer. The library is consumed by the `rv` binary in
 //! `src/bin/rv.rs`. Everything user-facing (flag parsing, exit codes, stdout
 //! vs stderr discipline, JSON envelope shape) is part of the v0.1 CLI

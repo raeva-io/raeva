@@ -1,6 +1,5 @@
 //! System-scope policy enforcement and warnings (warn-only for v0.1).
 
-use std::fs;
 use std::path::Path;
 
 use rv_config::Lockfile;
@@ -26,7 +25,7 @@ pub(super) fn enforce_system_scope_policy(pom_path: &Path) -> Result<()> {
 }
 
 fn collect_system_scope_entries(pom_path: &Path) -> Result<Vec<SystemScopeEntry>> {
-    let xml = fs::read_to_string(pom_path)?;
+    let xml = rv_config::read_project_input_string(pom_path)?;
     let pom = Pom::parse(&xml).map_err(|err| {
         CliError::Message(format!("invalid pom.xml at {}: {err}", pom_path.display()))
     })?;

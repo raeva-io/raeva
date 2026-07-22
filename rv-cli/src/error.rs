@@ -11,9 +11,7 @@ pub type Result<T> = std::result::Result<T, CliError>;
 /// Code assignments:
 /// - 0: success (not listed here; `ExitCode::SUCCESS` is used directly)
 /// - 1: general / unclassified error (`GENERAL_ERROR`)
-/// - 2: usage error (clap exits with 2 on bad flags / subcommands; not surfaced
-///   by Raeva's own error paths but reserved here so the full table is
-///   self-documenting)
+/// - 2: usage error, or an incomplete `rv vuln` scan
 /// - 3: configuration error, e.g. bad rv.toml, bad URL, auth problem (`CONFIG_ERROR`)
 /// - 4: network error, e.g. timeout, DNS, proxy (`NETWORK_ERROR`)
 /// - 5: dependency resolution failure (`RESOLUTION_ERROR`)
@@ -23,9 +21,8 @@ pub type Result<T> = std::result::Result<T, CliError>;
 pub struct ExitCodes;
 impl ExitCodes {
     pub const GENERAL_ERROR: i32 = 1;
-    /// Clap exits with 2 on usage errors (unknown flag, missing required arg,
-    /// etc.). Raeva's own error paths never produce this code, but it is named
-    /// here so scripts can distinguish usage mistakes from runtime failures.
+    /// Clap uses 2 for usage errors. `rv vuln` also uses it for scan failures
+    /// as part of that command's 0/1/2 contract.
     #[allow(dead_code)]
     pub const USAGE_ERROR: i32 = 2;
     pub const CONFIG_ERROR: i32 = 3;
@@ -77,6 +74,15 @@ pub enum CliError {
     #[error("HTTP request error: {0}")]
     Reqwest(#[from] reqwest::Error),
 
+    #[error("vulnerability error: {0}")]
+    Vuln(#[from] rv_vuln::VulnError),
+
+    #[error("vulnerability scan failed: {details}")]
+    VulnerabilityScan { details: String },
+
+    #[error("SBOM generation failed: {0}")]
+    Sbom(#[from] rv_sbom::SbomError),
+
     // Surfaced when our own serialization (output envelopes, doctor
     // reports) fails. The raw serde error message leaks internal field
     // names and is unactionable for users, so wrap it behind a generic
@@ -106,7 +112,7 @@ pub enum CliError {
     InvalidScope { value: String },
 
     #[error(
-        "multi-module reactor POM at {path} is not supported in v1; run rv from an individual module's directory (follow-up: v1.1)"
+        "multi-module reactor POM at {path} is not supported; run rv from an individual module's directory"
     )]
     MultiModuleNotSupported { path: PathBuf },
 
@@ -125,6 +131,7 @@ impl CliError {
             CliError::Pom(err) => report::render_pom_error(err),
             CliError::Repo(err) => report::render_repo_error(err, None),
             CliError::Reqwest(err) => report::render_reqwest_error(err),
+            CliError::Vuln(err) => report::render_vuln_error(err),
             CliError::Store(err) => report::render_store_error(err),
             _ => self.to_string(),
         }
@@ -138,6 +145,8 @@ impl CliError {
             | CliError::Pom(_) => ExitCodes::CONFIG_ERROR,
 
             CliError::Reqwest(_) => ExitCodes::NETWORK_ERROR,
+
+            CliError::VulnerabilityScan { .. } => ExitCodes::USAGE_ERROR,
 
             CliError::Repo(err) => {
                 if err.is_transient() {
@@ -163,6 +172,8 @@ impl CliError {
             | CliError::Io(_)
             | CliError::IoWithPath { .. }
             | CliError::Internal(_)
+            | CliError::Sbom(_)
+            | CliError::Vuln(_)
             | CliError::Message(_) => ExitCodes::GENERAL_ERROR,
 
             CliError::AlreadyReported { exit_code } => *exit_code,
@@ -174,8 +185,7 @@ impl CliError {
 mod tests {
     use super::ExitCodes;
 
-    /// `USAGE_ERROR` must equal 2 (clap's exit code for bad flags/args)
-    /// and must not collide with any other named constant.
+    /// `USAGE_ERROR` must equal Clap's exit code for bad flags and arguments.
     #[test]
     fn usage_error_is_2_and_unique() {
         assert_eq!(

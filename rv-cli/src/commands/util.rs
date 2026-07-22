@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 
 /// Convert a filesystem path to a forward-slash string, regardless of the
@@ -9,6 +10,35 @@ use std::path::Path;
 /// forward slashes matches what every Maven-adjacent tool expects.
 pub fn path_to_forward_slashes(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+pub fn write_atomic(path: &Path, contents: &[u8]) -> crate::error::Result<()> {
+    use crate::error::CliError;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp =
+        tempfile::NamedTempFile::new_in(parent).map_err(|source| CliError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temp.as_file_mut()
+        .write_all(contents)
+        .and_then(|_| temp.as_file().sync_all())
+        .map_err(|source| CliError::IoWithPath {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    temp.persist(path).map_err(|error| CliError::IoWithPath {
+        path: path.to_path_buf(),
+        source: error.error,
+    })?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 pub fn read_lockfile(config: &rv_config::Config) -> crate::error::Result<rv_config::Lockfile> {
@@ -50,6 +80,37 @@ pub fn read_lockfile(config: &rv_config::Config) -> crate::error::Result<rv_conf
         }
     }
     Ok(rv_config::Lockfile::read(&config.lock_path)?)
+}
+
+pub fn read_fresh_lockfile(
+    config: &rv_config::Config,
+) -> crate::error::Result<rv_config::Lockfile> {
+    read_fresh_lockfile_with_pom(config).map(|(lock, _)| lock)
+}
+
+pub fn read_fresh_lockfile_with_pom(
+    config: &rv_config::Config,
+) -> crate::error::Result<(rv_config::Lockfile, String)> {
+    use crate::error::CliError;
+
+    let lock = read_lockfile(config)?;
+    let pom_path = config.project_root.join("pom.xml");
+    if !pom_path.is_file() {
+        return Err(CliError::ProjectFileMissing { path: pom_path });
+    }
+
+    let pom_xml = rv_config::read_project_input_string(&pom_path)?;
+    let current_hash =
+        crate::commands::sync::compute_config_hash_with_pom(config, &pom_path, &pom_xml)?;
+    match lock.config_hash.as_deref() {
+        Some(stored_hash) if stored_hash == current_hash => Ok((lock, pom_xml)),
+        Some(_) => Err(CliError::LockfileMismatch {
+            details: "rv.lock is out of date (pom.xml or resolution inputs changed)".to_string(),
+        }),
+        None => Err(CliError::LockfileMismatch {
+            details: "rv.lock has no config_hash and cannot be checked for staleness".to_string(),
+        }),
+    }
 }
 
 pub fn parse_scope(value: &str) -> Result<rv_maven_model::Scope, String> {
@@ -187,7 +248,7 @@ impl CommandContext {
 
 #[cfg(test)]
 mod tests {
-    use super::read_lockfile;
+    use super::{read_lockfile, write_atomic};
     use crate::error::CliError;
     use rv_config::{Config, ResolvedPaths};
     use tempfile::TempDir;
@@ -216,5 +277,17 @@ mod tests {
             matches!(err, CliError::LockfileNotAFile { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_file() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("bom.json");
+        std::fs::write(&path, "old content").expect("write old content");
+
+        write_atomic(&path, b"new content").expect("atomic write");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new content");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 }

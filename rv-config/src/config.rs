@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -7,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use rv_maven_model::ActivationContext;
 
-use crate::error::{ConfigError, io_error_with_context, toml_de_error_with_context};
+use crate::error::{ConfigError, toml_de_error_with_context};
 use crate::maven_settings::{MavenProfile, MavenSettings};
 use crate::paths::ResolvedPaths;
 use crate::settings::{AuthConfig, MirrorConfig, ProxyConfig, RepoConfig};
@@ -963,14 +962,8 @@ fn warn_ignored_sink_field(source: &Path, field: &str, present: bool) {
 fn load_optional_toml<T: for<'de> Deserialize<'de> + Default>(
     path: &Path,
 ) -> Result<T, ConfigError> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
-        Err(err) => {
-            return Err(Err(err)
-                .with_context(|| format!("failed to read config {}", path.display()))
-                .map_err(|err| ConfigError::Io(io_error_with_context(err)))?);
-        }
+    let Some(contents) = crate::read_optional_project_input_string(path)? else {
+        return Ok(T::default());
     };
     toml::from_str(&contents)
         .with_context(|| format!("failed to parse TOML config {}", path.display()))
@@ -987,6 +980,20 @@ mod tests {
     fn write_toml(path: &Path, config: &impl serde::Serialize) {
         let contents = toml::to_string(config).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn project_config_rejects_oversized_input() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("rv.toml");
+        fs::write(&path, vec![b'x'; crate::MAX_PROJECT_INPUT_SIZE + 1])
+            .expect("write oversized config");
+
+        let error = ProjectConfig::load(&path).expect_err("oversized config must fail");
+        assert!(matches!(
+            error,
+            crate::ConfigError::ProjectInputTooLarge { .. }
+        ));
     }
 
     fn with_raeva_home<F: FnOnce(&Path)>(f: F) {

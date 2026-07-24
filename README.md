@@ -177,6 +177,12 @@ or build from source:
 cargo install rv-cli
 ```
 
+## Raeva Cloud
+
+A hosted private Maven registry that works with `rv`, plain Maven, and Gradle: a repository URL and a token, nothing else to run. Releases are immutable, downloads are checksummed and served from object storage. It is in private beta; join the waitlist at [raeva.io](https://raeva.io).
+
+`rv` needs no special support for it. Point a repository or mirror at your registry URL in `rv.toml` or `settings.xml` and sync as usual.
+
 ## License
 
 MIT OR Apache-2.0

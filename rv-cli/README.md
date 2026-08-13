@@ -8,15 +8,20 @@ This crate produces a single binary, **`rv`**, a lockfile companion for Maven pr
 
 ## Commands
 
-`rv` exposes seven subcommands:
+`rv` exposes 12 subcommands:
 
+*   **`login`**: Store repository credentials in the OS credential store.
+*   **`logout`**: Remove repository credentials from the OS credential store.
+*   **`auth`**: List stored credential metadata (`auth list`), never secrets.
 *   **`sync`**: Resolve dependencies, download and verify artifacts, and write/update `rv.lock`.
-*   **`export-m2`**: Populate `~/.m2/repository` from the locked artifacts so `mvn -o` can build offline.
+*   **`export-m2`**: Populate `~/.m2/repository` from the locked external union so that `mvn -o package` and `mvn -o -pl <module> -am package` resolve dependencies offline from the reactor root. A build started from inside a module directory is not guaranteed to resolve offline.
 *   **`tree`**: Show the dependency tree recorded in `rv.lock` (supports `--scope` and `--depth`).
 *   **`why`**: Explain why a dependency is present by listing the paths from a root to the given coordinate.
 *   **`doctor`**: Diagnose repository connectivity, TLS, auth, and proxy configuration.
 *   **`lock`**: Inspect (`lock info`) or verify (`lock verify [--download]`) the lockfile against the content store.
 *   **`export-checksums`**: Write Maven 4 Trusted Checksums sidecars to `.mvn/checksums/`.
+*   **`vuln`**: Scan the dependencies locked in `rv.lock` against OSV for known vulnerabilities.
+*   **`sbom`**: Generate a CycloneDX 1.5 or SPDX 2.3 software bill of materials from `rv.lock`.
 
 Global flags (available on every subcommand): `-C/--project-root <PATH>`, `-v/--verbose`, `-q/--quiet`, and `--json` (machine-readable output; implies `--quiet`).
 

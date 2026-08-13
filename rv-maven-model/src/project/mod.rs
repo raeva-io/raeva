@@ -7,7 +7,7 @@
 
 mod bom;
 mod dep_management;
-mod profiles;
+pub(crate) mod profiles;
 mod relocation;
 mod repositories;
 
@@ -102,6 +102,17 @@ impl Project {
             for profile in &active_profiles {
                 props.extend(&profile.properties);
             }
+            if let Some(maven) = pom
+                .prerequisites
+                .as_ref()
+                .and_then(|prerequisites| prerequisites.maven.as_ref())
+            {
+                // Maven exposes model fields through its expression evaluator.
+                // These are synthesized model values, not ordinary user
+                // properties, so they take precedence over same-named entries.
+                props.insert("project.prerequisites.maven", maven);
+                props.insert("pom.prerequisites.maven", maven);
+            }
             props
         };
         let relocation = resolve_relocation(raw_relocation, &effective_properties, &project_info)?;
@@ -173,8 +184,19 @@ impl Project {
 
         let repositories =
             resolve_repositories(combined_repositories, &effective_properties, &project_info)?;
-        // Move pom.modules since we own it
-        let modules = resolve_modules(pom.modules, &effective_properties, &project_info)?;
+        // Aggregation is never inherited. `apply_inheritance` already limits
+        // base modules to the current raw POM. Only active profiles
+        // originating in that same POM may add modules here.
+        let combined_modules = {
+            let mut modules = pom.modules;
+            for profile in &active_profiles {
+                if profile.origin_level == 0 {
+                    modules.extend_from_slice(&profile.modules);
+                }
+            }
+            modules
+        };
+        let modules = resolve_modules(combined_modules, &effective_properties, &project_info)?;
         let profiles = resolve_profiles(
             pom.profiles,
             &base_dependency_management,

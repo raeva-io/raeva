@@ -114,6 +114,111 @@ packaging = "jar"
 }
 
 #[test]
+fn frozen_accepts_v3_lock_without_rewriting() {
+    let project = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    fs::write(
+        project.path().join("pom.xml"),
+        r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>test</groupId>
+  <artifactId>legacy-frozen</artifactId>
+  <version>1.0</version>
+</project>
+"#,
+    )
+    .unwrap();
+
+    let initial = Command::new(rv_bin())
+        .args(["-C", project.path().to_str().unwrap(), "sync", "--offline"])
+        .env("RAEVA_HOME", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()
+        .expect("initial sync");
+    assert!(
+        initial.status.success(),
+        "initial sync failed: {}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let generated =
+        rv_config::Lockfile::read(&project.path().join("rv.lock")).expect("read generated lock");
+    let config_hash = generated.config_hash.as_deref().expect("config hash");
+    let platform = generated.platforms[0].platform.to_string();
+    let v3 = format!(
+        "schema_version = 3\nconfig_hash = \"{config_hash}\"\n\n\
+         [[platforms]]\nplatform = \"{platform}\"\n"
+    );
+    fs::write(project.path().join("rv.lock"), &v3).expect("write v3 lock");
+
+    let frozen = Command::new(rv_bin())
+        .args([
+            "-C",
+            project.path().to_str().unwrap(),
+            "sync",
+            "--frozen",
+            "--offline",
+        ])
+        .env("RAEVA_HOME", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()
+        .expect("frozen sync");
+    assert!(
+        frozen.status.success(),
+        "frozen v3 validation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&frozen.stdout),
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(project.path().join("rv.lock")).expect("read v3 after frozen"),
+        v3,
+        "--frozen must not rewrite a valid schema-3 lock"
+    );
+
+    // Online --frozen resolves schema-4 locks afresh, but a schema 1-3 lock has
+    // no reactor identity to resolve against, so it keeps the local-inputs-only
+    // check rather than reporting drift for every valid legacy lock.
+    let frozen_online = Command::new(rv_bin())
+        .args(["-C", project.path().to_str().unwrap(), "sync", "--frozen"])
+        .env("RAEVA_HOME", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()
+        .expect("online frozen sync");
+    assert!(
+        frozen_online.status.success(),
+        "online frozen v3 validation failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&frozen_online.stdout),
+        String::from_utf8_lossy(&frozen_online.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(project.path().join("rv.lock")).expect("read v3 after online frozen"),
+        v3,
+        "--frozen must not rewrite a valid schema-3 lock"
+    );
+
+    let upgrade = Command::new(rv_bin())
+        .args(["-C", project.path().to_str().unwrap(), "sync", "--offline"])
+        .env("RAEVA_HOME", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .output()
+        .expect("normal sync upgrade");
+    assert!(
+        upgrade.status.success(),
+        "normal v3 upgrade failed: {}",
+        String::from_utf8_lossy(&upgrade.stderr)
+    );
+    assert_eq!(
+        rv_config::Lockfile::read(&project.path().join("rv.lock"))
+            .expect("read upgraded lock")
+            .schema_version,
+        rv_config::LOCKFILE_SCHEMA_VERSION
+    );
+}
+
+#[test]
 fn test_lock_info_rejects_non_file_lockfile() {
     // Regression for the `lock info` not-a-file diagnostic: a directory (or
     // any non-regular file) at the rv.lock path must be reported as

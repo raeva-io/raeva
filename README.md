@@ -38,9 +38,10 @@ from a prior online build or your base image; if you start from a pristine
 going offline. `rv export-m2` followed by `mvn -o` gives you a reproducible
 **dependency** set, not a from-scratch clean-room offline build.
 
-Raeva v0.2 locks single-module projects only. `rv sync` rejects a multi-module
-reactor POM and tells you to run from an individual module's directory.
-Multi-module reactor support is on the roadmap.
+Raeva v0.3 locks single-module projects and multi-module Maven reactors. Run
+`rv sync` at the reactor root. One lockfile records every active module. For
+frozen, partial-platform, and offline-build behavior, see
+[Maven reactor and offline scope](#maven-reactor-and-offline-scope).
 
 ## Vulnerability scans and SBOMs
 
@@ -66,8 +67,8 @@ rv sbom --format spdx -o bom.spdx.json
 
 ## Verified against real projects
 
-Raeva is checked against real open-source Maven projects. For each one, three
-things are verified from a cold cache:
+Raeva is checked against real open-source Maven projects. The single-module
+offline matrix verifies three things from a cold cache:
 
 1. `rv sync` reads the project's `pom.xml` and writes `rv.lock`.
 2. rv's locked set is compared against Maven's own resolution
@@ -80,7 +81,7 @@ things are verified from a cold cache:
 
 | Project | Dependencies | Parity | Offline `mvn -o` |
 | --- | ---: | --- | --- |
-| commons-lang | 23 | exact | pass |
+| commons-lang | 22 | exact | pass |
 | commons-collections | 31 | exact | pass |
 | gson | 12 | exact | pass |
 | guava | 5 | exact | pass |
@@ -88,9 +89,21 @@ things are verified from a cold cache:
 | jackson-databind 2.18.2 | 28 | exact | pass |
 | spring-petclinic | 171 | exact | pass |
 
-Every project's lockfile matches Maven's own resolution exactly and resolves
-offline against the exported set. Tested at each project's current main branch,
-with jackson-databind at release 2.18.2.
+The reactor corpus compares every module graph against Maven's resolution:
+
+| Project | Modules | Parity |
+| --- | ---: | --- |
+| Apache PDFBox | 12 | exact |
+| Dropwizard | 42 | exact |
+| Apache Maven | 38 | exact |
+| JaCoCo | 29 | exact |
+| Gson | 8 | exact |
+| AssertJ | 13 | exact |
+
+Every listed module matches Maven's own resolution exactly. The single-module
+projects also resolve offline against the exported set. Each checkout tracks the
+project's current main branch, except jackson-databind, which is pinned to
+release 2.18.2.
 
 ### Speed
 
@@ -103,7 +116,7 @@ second, most of it JVM startup:
 | junit4 | 2 | 0.03 s | 0.76 s | ~26x |
 | guava | 5 | 0.05 s | 0.94 s | ~20x |
 | gson | 12 | 0.07 s | 0.78 s | ~11x |
-| commons-lang | 23 | 0.11 s | 0.81 s | ~8x |
+| commons-lang | 22 | 0.11 s | 0.81 s | ~8x |
 | commons-collections | 31 | 0.10 s | 0.79 s | ~8x |
 | jackson-databind 2.18.2 | 28 | 0.10 s | 1.04 s | ~10x |
 | spring-petclinic | 171 | 0.27 s | 0.99 s | ~4x |
@@ -118,6 +131,9 @@ five runs on one machine.
 | `rv sync` | Resolve dependencies and update rv.lock |
 | `rv sync --frozen` | CI mode: fail if lockfile would change |
 | `rv sync --offline` | Use only cached metadata and artifacts |
+| `rv login <url-or-id>` | Store credentials in the OS credential store |
+| `rv logout <url-or-id>` | Remove credentials from the OS credential store |
+| `rv auth list` | List stored credential metadata (never secrets) |
 | `rv export-m2` | Export locked artifacts to ~/.m2/repository |
 | `rv tree` | Show dependency tree from rv.lock |
 | `rv why <coord>` | Explain why a dependency is included |
@@ -127,9 +143,151 @@ five runs on one machine.
 | `rv vuln` | Scan locked dependencies against OSV |
 | `rv sbom` | Generate a CycloneDX or SPDX SBOM from rv.lock |
 
+## Maven reactor and offline scope
+
+Run `rv sync` at a Maven reactor root. Raeva discovers active `<modules>`
+recursively, including modules declared in profiles, and writes one schema-4
+`rv.lock` at that root. Each platform section holds a graph for every active
+module and one deduplicated union of external artifacts. Reactor siblings are
+workspace nodes with full graph edges. Raeva does not download or export them
+as repository artifacts.
+
+`rv sync --frozen` rediscovers the active reactor and rejects drift in
+configuration, active profiles, the module set, effective GAVs, local POMs, and
+the resolution strategy recorded in `rv.lock`. It then resolves the dependency
+graph again and compares it against the lockfile in canonical order, so a
+changed version-range or `LATEST` selection, or a republished release POM, is
+reported as drift rather than accepted. The comparison covers the POM pins as
+well as the graph, so a companion, parent, or imported-BOM POM republished with
+different bytes and identical dependency edges is reported too.
+
+`rv sync --frozen --offline` is the weaker contract. It cannot reach a
+repository, so on a schema-4 lockfile it checks the local inputs above and
+stops there, and it does not detect upstream drift. One case is the exception:
+when the lockfile records an artifact origin the current configuration no
+longer declares, Raeva resolves the graph again offline to rediscover which
+repositories the POMs themselves authorize, because repository trust comes from
+the model and never from lockfile metadata. That resolve reads only the local
+model and the repository data a previous sync cached, and it reports drift the
+same way an online `--frozen` run does. An expired SNAPSHOT update policy is
+not an exception offline: the cached metadata such a resolve would need carries
+the same TTL that expired the pins, so it can only report that the data is not
+cached. Run `--frozen` online to check a stale SNAPSHOT.
+
+A schema 1-3 lockfile gets the weaker check even online, unconditionally,
+because it carries no reactor identity to resolve against. Neither an expired
+SNAPSHOT update policy nor a recorded origin the current configuration no
+longer declares makes Raeva resolve a schema 1-3 lockfile afresh, so an
+advanced snapshot goes unreported on one. Such a lockfile also records no
+resolution strategy, so `--frozen` refuses a run that asks for a non-default
+`--strategy` rather than reporting a check it cannot make; the default keeps
+passing. The next non-frozen sync rewrites it to schema 4. Use plain `--frozen`
+on a schema-4 lockfile as the CI gate.
+
+A schema-4 lockfile written before POM pinning is read as it stands, but Raeva
+does not reuse it unchanged: for each selected platform, a plain `rv sync`
+resolves again and rewrites that platform's entries with the pins, once. `--frozen` never rewrites a lockfile, so an offline frozen
+run accepts the older shape as it is, while an online one resolves and reports
+the missing pins as drift, the same answer it gives for anything else a plain
+sync would write.
+
+A partial `--platforms` sync keeps an unselected platform only if its
+rediscovered model hash still matches, it was locked under the same
+configuration hash and resolution strategy, and it pins the same POMs this run
+resolved for the coordinates they share. Maven reads one `.pom` per coordinate,
+so two platforms pinning different bytes for one coordinate describe a local
+repository no export could write. Raeva drops stale platform sections and
+reports a diagnostic naming the `rv sync --platforms` command that restores
+them.
+
+After `rv export-m2`, these commands resolve dependencies offline:
+
+- `mvn -o package` from the reactor root.
+- `mvn -o -pl <module> -am package` from the reactor root.
+
+`cd <module> && mvn -o package` is not guaranteed to resolve offline, because
+Maven does not have the reactor root model in that invocation. Build plugins
+fall outside the export contract and must already be present in the Maven local
+repository.
+
+Reactor support has these restrictions:
+
+- No partial sync with `-pl` or `-am`.
+- `pom.xml` models only. Polyglot models and extensions are unsupported.
+- No build-plugin resolution.
+- Settings-profile properties do not yet apply to POM models.
+- Only the root `rv.toml` applies.
+- Raeva does not model Maven build order.
+
 ## Authentication
 
-Raeva reads Maven's `~/.m2/settings.xml` for mirrors, proxies, and server credentials (including encrypted passwords). You do not need to configure anything separately.
+Raeva can store Basic or bearer credentials in the OS credential store:
+
+```bash
+# Prompts for the username and password on a terminal.
+rv login https://repo.example/repository/releases/
+
+# Non-interactive Basic login. Registry tokens that act as Basic passwords,
+# including Raeva registry tokens, belong here rather than under bearer auth.
+printf '%s\n' "$RAEVA_TOKEN" |
+  rv login corp --username "$RAEVA_USER" --password-stdin
+
+# A repository that explicitly uses HTTP Bearer authentication.
+printf '%s\n' "$BEARER_TOKEN" |
+  rv login https://repo.example/maven2/ --auth-type bearer --password-stdin
+
+rv auth list
+rv logout corp
+```
+
+An ID passed to `login` or `logout` must identify exactly one configured
+repository or mirror. If it does not, pass the URL instead. Raeva scopes
+credentials to an exact normalized endpoint: scheme, lowercase host, non-default
+port, and base path with a trailing slash. Raeva elides explicit default ports
+(`http:80`, `https:443`) and rejects userinfo, query strings, and fragments.
+`rv login` does not make a verification request. It reports
+`stored; not remotely verified`.
+
+`rv auth list` reads an atomic index under Raeva's config directory. The index
+holds only the endpoint, display ID, username, and auth type. Secrets stay in
+the OS credential store, and Raeva never enumerates or prints them.
+
+Raeva also reads credentials from project `rv.toml`, the user config, and
+Maven's `~/.m2/settings.xml` (including encrypted Maven passwords). Resolution
+runs after mirror substitution and selects one complete credential in this
+order:
+
+1. OS credential store entry for the exact resolved endpoint.
+2. Project `rv.toml` entry matching the resolved repository or mirror ID.
+3. User config entry matching that ID.
+4. `settings.xml` server entry matching that ID.
+5. An ID-less default entry.
+
+A Basic entry must contain a username and a password. A bearer entry must
+contain a token. An incomplete entry at a higher precedence is an error, and
+Raeva never borrows fields from a lower source. A mirror request looks up the
+mirror endpoint. If Raeva falls back to the origin, it performs a separate
+lookup for the origin endpoint. Raeva suppresses ID-less defaults when mirror
+substitution crosses hosts.
+
+If the OS credential store is unavailable, or an expected endpoint entry is
+missing, Raeva warns once and continues with the configured sources. A corrupt
+stored record is a hard error. `rv sync` never prompts on stdin.
+
+In CI, use `settings.xml` environment interpolation rather than the OS
+credential store:
+
+```xml
+<settings>
+  <servers>
+    <server>
+      <id>corp</id>
+      <username>${env.RAEVA_USER}</username>
+      <password>${env.RAEVA_TOKEN}</password>
+    </server>
+  </servers>
+</settings>
+```
 
 ## Environment variables
 

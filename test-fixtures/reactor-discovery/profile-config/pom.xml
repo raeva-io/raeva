@@ -1,0 +1,24 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>profile-root</artifactId>
+  <version>${revision}</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>module-a</module>
+  </modules>
+  <profiles>
+    <profile>
+      <id>extras</id>
+      <modules>
+        <module>extra</module>
+      </modules>
+    </profile>
+    <profile>
+      <id>disabled</id>
+      <modules>
+        <module>disabled</module>
+      </modules>
+    </profile>
+  </profiles>
+</project>

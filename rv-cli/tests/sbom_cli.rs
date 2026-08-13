@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use common::{rv_command, temp_project};
-use rv_config::{Checksum, LockEdge, LockPackage, Lockfile};
+use rv_config::{Checksum, LockEdge, LockPackage, LockPlatform, Lockfile};
 
 fn write_pom(project_root: &Path) {
     fs::write(
@@ -56,17 +56,28 @@ fn write_fresh_lock(project_root: &Path, home: &Path) {
     let lock_path = project_root.join("rv.lock");
     let mut lock = Lockfile::read(&lock_path).expect("read generated lock");
     let platform = lock.platforms.first_mut().expect("generated platform");
-    platform.packages = vec![
-        package("zeta", "test-jar", Some("tests")),
-        package("alpha", "jar", None),
-    ];
-    platform.edges = vec![LockEdge {
-        from: 0,
-        to: 1,
-        scope: Some("compile".to_string()),
-        optional: false,
-        extra: BTreeMap::new(),
-    }];
+    let module = platform.modules.first().expect("generated module");
+    let mut converted = LockPlatform::single_module(
+        platform.platform.clone(),
+        platform.model_hash.clone(),
+        &module.path,
+        module.gav.clone(),
+        &module.packaging,
+        vec![
+            package("zeta", "test-jar", Some("tests")),
+            package("alpha", "jar", None),
+        ],
+        vec![LockEdge {
+            from: 0,
+            to: 1,
+            scope: Some("compile".to_string()),
+            optional: false,
+            extra: BTreeMap::new(),
+        }],
+    );
+    platform.artifacts = std::mem::take(&mut converted.artifacts);
+    platform.modules[0].packages = std::mem::take(&mut converted.modules[0].packages);
+    platform.modules[0].edges = std::mem::take(&mut converted.modules[0].edges);
     lock.write_atomic(&lock_path).expect("write fixture lock");
 }
 

@@ -18,6 +18,11 @@ pub struct Node {
     pub scope: Scope,
     pub repo_url: Option<Arc<str>>,
     pub checksum: Option<Checksum>,
+    /// Canonical workspace-root-relative POM path for a reactor project.
+    ///
+    /// Workspace projects have no repository provenance or artifact checksum;
+    /// the requested packaging/classifier remain on `coord`.
+    pub workspace_module: Option<String>,
     pub local: bool,
     /// Local file path for system-scoped dependencies.
     pub system_path: Option<String>,
@@ -41,10 +46,19 @@ pub(crate) struct CoordKey {
 
 impl From<&Coord> for CoordKey {
     fn from(coord: &Coord) -> Self {
+        // Maven conflict mediation keys artifacts by the artifact handler's
+        // extension and classifier, not by the dependency's literal type.
+        // `maven-plugin` uses the `jar` extension, so a direct jar and a
+        // transitive maven-plugin declaration compete for one node. Keep the
+        // winning node's requested type on `Coord` and normalize only the key.
+        let packaging = match coord.packaging.as_deref() {
+            None | Some("jar") | Some("maven-plugin") => None,
+            Some(_) => coord.packaging.clone(),
+        };
         Self {
             group_id: coord.group_id.clone(),
             artifact_id: coord.artifact_id.clone(),
-            packaging: coord.packaging.clone(),
+            packaging,
             classifier: coord.classifier.clone(),
         }
     }
@@ -238,6 +252,7 @@ mod tests {
             scope: Scope::Compile,
             repo_url: None,
             checksum: None,
+            workspace_module: None,
             local: false,
             system_path: None,
         }
@@ -260,6 +275,17 @@ mod tests {
         let key = CoordKey::from(&lib.coord);
         assert_eq!(graph.node_index(&key), Some(idx));
         assert_eq!(graph.node_indices().count(), 2);
+    }
+
+    #[test]
+    fn maven_plugin_and_jar_share_mediation_identity_but_classifiers_do_not() {
+        let jar = Coord::parse("com.example:plugin:1").unwrap();
+        let mut plugin = jar.clone();
+        plugin.packaging = Some("maven-plugin".to_string());
+        assert_eq!(CoordKey::from(&jar), CoordKey::from(&plugin));
+
+        plugin.classifier = Some("javadoc".to_string());
+        assert_ne!(CoordKey::from(&jar), CoordKey::from(&plugin));
     }
 
     /// Diamond pattern regression: when evicting a parent (A1) that shares

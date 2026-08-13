@@ -1,0 +1,27 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>reactor</artifactId>
+  <version>1</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>parent</module>
+    <module>lib</module>
+    <module>app</module>
+    <module>range-app</module>
+    <module>range-higher-app</module>
+    <module>dynamic-lib</module>
+    <module>dynamic-app</module>
+    <module>mismatch-app</module>
+    <module>bom</module>
+    <module>bom-app</module>
+    <module>snapshot</module>
+    <module>snapshot-app</module>
+    <module>classifier-app</module>
+    <module>remote-parent-child</module>
+    <module>revision-child</module>
+    <module>revision-app</module>
+    <module>repo-owner</module>
+    <module>repo-app</module>
+  </modules>
+</project>

@@ -92,24 +92,28 @@ fn warn_system_scope_entries(entries: &[SystemScopeEntry]) {
 pub(super) fn warn_system_scope_from_lock(lock: &Lockfile) {
     let mut entries = Vec::new();
     for platform in &lock.platforms {
-        for package in &platform.packages {
-            let Some(path) = package.system_path.as_deref() else {
-                continue;
-            };
-            entries.push(SystemScopeEntry {
-                coords: format!(
-                    "{}:{}:{}",
-                    package.group_id, package.artifact_id, package.version
-                ),
-                path: {
-                    let trimmed = path.trim();
-                    if trimmed.is_empty() {
-                        "<unspecified>".to_string()
-                    } else {
-                        trimmed.to_string()
-                    }
-                },
-            });
+        for module in &platform.modules {
+            for package in &module.packages {
+                let Some(path) = package.system_path.as_deref() else {
+                    continue;
+                };
+                entries.push(SystemScopeEntry {
+                    coords: format!(
+                        "{}:{}:{}",
+                        package.coordinate.group,
+                        package.coordinate.artifact,
+                        package.coordinate.version
+                    ),
+                    path: {
+                        let trimmed = path.trim();
+                        if trimmed.is_empty() {
+                            "<unspecified>".to_string()
+                        } else {
+                            trimmed.to_string()
+                        }
+                    },
+                });
+            }
         }
     }
     warn_system_scope_entries(&entries);

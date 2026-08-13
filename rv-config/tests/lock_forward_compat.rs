@@ -49,8 +49,8 @@ future_edge_field = "edge-extra-value"
     let lock = Lockfile::read(&in_path).expect("read with nested extras");
 
     assert_eq!(lock.platforms.len(), 1);
-    assert_eq!(lock.platforms[0].packages.len(), 1);
-    assert_eq!(lock.platforms[0].edges.len(), 1);
+    assert_eq!(lock.platforms[0].modules[0].packages.len(), 1);
+    assert_eq!(lock.platforms[0].modules[0].edges.len(), 1);
 
     assert!(
         lock.platforms[0]
@@ -59,13 +59,13 @@ future_edge_field = "edge-extra-value"
         "platform-level extras lost on read",
     );
     assert!(
-        lock.platforms[0].packages[0]
+        lock.platforms[0].modules[0].packages[0]
             .extra
             .contains_key("future_package_field"),
         "package-level extras lost on read",
     );
     assert!(
-        lock.platforms[0].edges[0]
+        lock.platforms[0].modules[0].edges[0]
             .extra
             .contains_key("future_edge_field"),
         "edge-level extras lost on read",
@@ -82,14 +82,14 @@ future_edge_field = "edge-extra-value"
         Some("platform-extra-value"),
     );
     assert_eq!(
-        reread.platforms[0].packages[0]
+        reread.platforms[0].modules[0].packages[0]
             .extra
             .get("future_package_field")
             .and_then(|v| v.as_str()),
         Some("package-extra-value"),
     );
     assert_eq!(
-        reread.platforms[0].edges[0]
+        reread.platforms[0].modules[0].edges[0]
             .extra
             .get("future_edge_field")
             .and_then(|v| v.as_str()),

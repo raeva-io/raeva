@@ -1,0 +1,13 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>snapshot-app</artifactId>
+  <version>1</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>snapshot</artifactId>
+      <version>1-SNAPSHOT</version>
+    </dependency>
+  </dependencies>
+</project>

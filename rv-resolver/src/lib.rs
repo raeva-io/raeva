@@ -9,12 +9,23 @@ mod solver;
 mod sync_bridge;
 mod tree;
 mod util;
+mod workspace;
 
 pub use context::{ResolveContext, ResolveState};
-pub use error::{RepoSearchStatus, RepoStatus, ResolveError};
+pub use error::{ConflictingPom, RepoSearchStatus, RepoStatus, ResolveError};
 pub use graph::{Edge, Graph, Node};
-pub use resolver::{ResolutionResult, Resolver, RootSpec};
+pub use parent_resolver::{
+    accepted_local_parents, build_activation_context, local_parent_boundary, parse_maven_config,
+};
+pub use resolver::{
+    MAX_WORKSPACE_ARTIFACT_POPULATIONS, MAX_WORKSPACE_MODULE_CONCURRENCY,
+    MAX_WORKSPACE_NETWORK_CONCURRENCY, ResolutionResult, Resolver, RootSpec, SupportPomProvenance,
+    WorkspaceModuleResolution, WorkspaceResolution,
+};
+/// Depth bound shared by inheritance resolution and [`accepted_local_parents`].
+pub use rv_maven_model::MAX_PARENT_CHAIN_DEPTH;
 pub use tree::Tree;
+pub use workspace::{Workspace, WorkspaceError, WorkspaceModule};
 
 /// Strategy for resolving version conflicts when the same dependency is
 /// requested at different versions from multiple paths.

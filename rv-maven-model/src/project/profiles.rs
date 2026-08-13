@@ -50,6 +50,11 @@ pub(super) fn resolve_profiles(
                     project,
                 )?,
                 repositories: resolve_repositories(profile.repositories, properties, project)?,
+                modules: profile
+                    .modules
+                    .into_iter()
+                    .map(|module| properties.interpolate_str(&module, project))
+                    .collect::<Result<_, _>>()?,
                 properties: profile.properties,
                 dependency_management: resolved_management,
                 origin_level: profile.origin_level,
@@ -58,7 +63,7 @@ pub(super) fn resolve_profiles(
         .collect()
 }
 
-pub(super) fn resolve_profiles_for_activation(
+pub(crate) fn resolve_profiles_for_activation(
     profiles: &[Profile],
     properties: &PropertyMap,
     project: &ProjectInfo,
@@ -75,6 +80,7 @@ pub(super) fn resolve_profiles_for_activation(
                     .transpose()?,
                 dependencies: profile.dependencies.clone(),
                 repositories: profile.repositories.clone(),
+                modules: profile.modules.clone(),
                 properties: profile.properties.clone(),
                 dependency_management: profile.dependency_management.clone(),
                 origin_level: profile.origin_level,

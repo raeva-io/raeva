@@ -62,7 +62,7 @@ impl<'de> Deserialize<'de> for Repository {
         };
 
         let releases_enabled = parse_enabled(&xml.releases, true);
-        let snapshots_enabled = parse_enabled(&xml.snapshots, false);
+        let snapshots_enabled = parse_enabled(&xml.snapshots, true);
         let releases_update_policy = extract_update_policy(&xml.releases);
         let snapshots_update_policy = extract_update_policy(&xml.snapshots);
 
@@ -110,5 +110,20 @@ mod tests {
         assert_eq!(repo.url, "https://repo1.maven.org/maven2");
         assert!(repo.releases_enabled);
         assert!(!repo.snapshots_enabled);
+    }
+
+    #[test]
+    fn omitted_snapshot_policy_defaults_to_enabled() {
+        let xml = r"
+        <repository>
+          <id>apache.snapshots</id>
+          <url>https://repository.apache.org/snapshots</url>
+          <releases><enabled>false</enabled></releases>
+        </repository>
+        ";
+        let repo: Repository = quick_xml::de::from_str(xml).unwrap();
+
+        assert!(!repo.releases_enabled);
+        assert!(repo.snapshots_enabled);
     }
 }

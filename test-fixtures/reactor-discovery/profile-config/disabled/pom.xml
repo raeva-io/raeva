@@ -1,0 +1,9 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>profile-root</artifactId>
+    <version>${revision}</version>
+  </parent>
+  <artifactId>disabled</artifactId>
+</project>

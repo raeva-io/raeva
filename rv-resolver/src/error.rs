@@ -47,6 +47,24 @@ impl RepoStatus {
     }
 }
 
+/// Which parts of a reactor disagreed about a POM's bytes, and what each one
+/// resolved.
+///
+/// Boxed into the `Conflicting*PomBytes` variants: five inline `String`s would
+/// make every `Result` in the crate wider for the sake of one error nobody
+/// hits twice.
+#[derive(Debug)]
+pub struct ConflictingPom {
+    /// The POM's bare `g:a:v`.
+    pub coord: String,
+    /// Where the first observation came from: a reactor module path, or a
+    /// `platform/module` pair when the two sides are on different platforms.
+    pub first_origin: String,
+    pub second_origin: String,
+    pub first_sha256: String,
+    pub second_sha256: String,
+}
+
 #[derive(Debug, Error)]
 pub enum ResolveError {
     #[error("version conflict for {coord}: requested {requested}, selected {selected}")]
@@ -57,6 +75,50 @@ pub enum ResolveError {
     },
     #[error("relocation cycle detected: {0}")]
     RelocationCycle(String),
+    #[error("workspace dependency cycle detected: {cycle}")]
+    WorkspaceDependencyCycle { cycle: String },
+    #[error(
+        "artifact {coord} resolved to different bytes in reactor modules \
+         {first_module} ({first_blob}) and {second_module} ({second_blob})"
+    )]
+    ConflictingArtifactBytes {
+        coord: String,
+        first_module: String,
+        second_module: String,
+        first_blob: String,
+        second_blob: String,
+    },
+    #[error(
+        "support POM {} (parent or imported BOM) resolved to different bytes in reactor \
+         modules {} ({}) and {} ({}); one lockfile cannot pin both",
+        .0.coord, .0.first_origin, .0.first_sha256, .0.second_origin, .0.second_sha256
+    )]
+    ConflictingSupportPomBytes(Box<ConflictingPom>),
+    #[error(
+        "companion POM for {} resolved to different bytes in {} ({}) and {} ({}); \
+         Maven has one local-repository path per coordinate, so one lockfile cannot pin both",
+        .0.coord, .0.first_origin, .0.first_sha256, .0.second_origin, .0.second_sha256
+    )]
+    ConflictingCompanionPomBytes(Box<ConflictingPom>),
+    #[error(
+        "pom-packaged dependency {coord} resolved its artifact to {artifact_sha256} and its \
+         companion POM to {pom_sha256}, but for packaging=pom those are the same Maven file; \
+         one lockfile row cannot pin both. Re-run `rv sync --update`"
+    )]
+    ConflictingPomPackagedBytes {
+        coord: String,
+        artifact_sha256: String,
+        pom_sha256: String,
+    },
+    #[error(
+        "POM {coord} was fetched more than once during resolution and returned different \
+         bytes ({first_sha256}, {second_sha256}); one lockfile cannot pin both"
+    )]
+    ConflictingResolvedPomBytes {
+        coord: String,
+        first_sha256: String,
+        second_sha256: String,
+    },
     #[error("artifact not found: {coord}")]
     ArtifactNotFound {
         coord: String,
@@ -105,6 +167,24 @@ pub enum ResolveError {
     Io(#[from] std::io::Error),
     #[error("solver invariant violated: {detail}")]
     SolverInvariant { detail: String },
+    /// The all-reactor resolution raised no progress event for
+    /// `stalled_for_secs` — no module started or finished a phase, no request
+    /// was attempted, no response or failure came back, no blob was verified,
+    /// no support POM was written. That is not slowness (real work raises
+    /// events as it goes, and a failing repository raises them too); it means
+    /// the resolution can no longer make progress, so this fails loudly
+    /// instead of hanging a build forever.
+    #[error(
+        "reactor resolution stalled: no progress for {stalled_for_secs}s while resolving {modules}. \
+         This is a bug in rv, not in your project; please report it with this message. \
+         Set RV_WORKSPACE_STALL_TIMEOUT_SECS to raise the limit, or to 0 to disable the check."
+    )]
+    WorkspaceStalled {
+        /// The modules that were still in flight, comma separated. Empty when
+        /// the stall happened between phases.
+        modules: String,
+        stalled_for_secs: u64,
+    },
     #[error("internal error: {0}")]
     InternalError(String),
     #[error("{} artifact fetch error(s), first: {first}", .rest.len() + 1)]

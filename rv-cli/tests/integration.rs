@@ -177,15 +177,73 @@ fn select_platform(lock: &Lockfile) -> &LockPlatform {
     lock.platforms.first().expect("lockfile has platform data")
 }
 
+/// Index of a package in the first module's graph.
+///
+/// Only meaningful for single-module projects. A workspace lockfile keeps one
+/// package list per module, so a reactor assertion that goes through this
+/// helper can only ever see the root/first module and would silently ignore
+/// every other one — use [`module_package_index`] there instead.
 fn package_index(
     platform: &LockPlatform,
     group: &str,
     artifact: &str,
     version: &str,
 ) -> Option<usize> {
-    platform.packages.iter().position(|pkg| {
-        pkg.group_id == group && pkg.artifact_id == artifact && pkg.version == version
+    let module_path = platform.modules.first()?.path.clone();
+    module_package_index(platform, &module_path, group, artifact, version)
+}
+
+/// Index of a package in the named module's own graph.
+///
+/// `module_path` is the lockfile's root-relative POM path, e.g. `pom.xml` for
+/// the root module and `module-b/pom.xml` for a reactor child.
+fn module_package_index(
+    platform: &LockPlatform,
+    module_path: &str,
+    group: &str,
+    artifact: &str,
+    version: &str,
+) -> Option<usize> {
+    platform
+        .modules
+        .iter()
+        .find(|module| module.path == module_path)
+        .unwrap_or_else(|| {
+            panic!(
+                "lockfile has no module {module_path}; modules present: {}",
+                module_paths(platform).join(", ")
+            )
+        })
+        .packages
+        .iter()
+        .position(|package| {
+            package.coordinate.group == group
+                && package.coordinate.artifact == artifact
+                && package.coordinate.version == version
+        })
+}
+
+/// Index of a coordinate in the platform-wide artifact table, which the
+/// per-module graphs reference and which carries the download/checksum data.
+fn artifact_index(
+    platform: &LockPlatform,
+    group: &str,
+    artifact: &str,
+    version: &str,
+) -> Option<usize> {
+    platform.artifacts.iter().position(|entry| {
+        entry.coordinate.group == group
+            && entry.coordinate.artifact == artifact
+            && entry.coordinate.version == version
     })
+}
+
+fn module_paths(platform: &LockPlatform) -> Vec<String> {
+    platform
+        .modules
+        .iter()
+        .map(|module| module.path.clone())
+        .collect()
 }
 
 fn coord(group: &str, artifact: &str, version: &str) -> String {
@@ -252,6 +310,9 @@ fn test_sync_with_transitives() {
 
     assert!(
         platform
+            .modules
+            .first()
+            .expect("root module")
             .edges
             .iter()
             .any(|edge| edge.from == junit_idx && edge.to == hamcrest_idx),
@@ -308,18 +369,21 @@ fn test_sync_frozen_mode() {
 /// the lockfile-mismatch code (not zero). No network required.
 #[test]
 fn frozen_without_manifest_errors_when_lock_has_config_hash() {
-    use rv_config::{LockPlatform, Lockfile, Platform};
+    use rv_config::{LockGav, LockPlatform, Lockfile, Platform};
 
     let (project, home) = temp_project();
     // No pom.xml, no rv.toml — but a lockfile that was clearly produced
     // against some prior manifest.
     let mut lock = Lockfile::new();
-    lock.platforms.push(LockPlatform {
-        platform: Platform::current().expect("current platform"),
-        packages: Vec::new(),
-        edges: Vec::new(),
-        extra: std::collections::BTreeMap::new(),
-    });
+    lock.platforms.push(LockPlatform::single_module(
+        Platform::current().expect("current platform"),
+        "",
+        "pom.xml",
+        LockGav::new("com.example", "missing", "1"),
+        "pom",
+        Vec::new(),
+        Vec::new(),
+    ));
     lock.config_hash = Some("deadbeef".to_string());
     lock.write_atomic(&project.path().join("rv.lock"))
         .expect("write rv.lock");
@@ -639,14 +703,83 @@ fn test_workspace_sync_multi_module() {
     // if the workspace walk skipped one module entirely.
     let lock = read_lock(project.path());
     let platform = select_platform(&lock);
+
+    // The reactor's three POMs each get their own module entry.
+    let paths = module_paths(platform);
+    for expected in ["pom.xml", "module-a/pom.xml", "module-b/pom.xml"] {
+        assert!(
+            paths.iter().any(|path| path == expected),
+            "workspace sync should record module {expected}; modules present: {}",
+            paths.join(", ")
+        );
+    }
+
+    // Each module's direct dependency lands in that module's own graph. Going
+    // through the whole-platform view here would hide a per-module regression:
+    // both coordinates are in the lockfile either way, and only the per-module
+    // lookup proves they were attributed to the right reactor child.
     assert!(
-        package_index(platform, SIMPLE_GROUP, SIMPLE_ARTIFACT, SIMPLE_VERSION).is_some(),
-        "workspace sync should resolve module-a's dependency on \
+        module_package_index(
+            platform,
+            "module-a/pom.xml",
+            SIMPLE_GROUP,
+            SIMPLE_ARTIFACT,
+            SIMPLE_VERSION
+        )
+        .is_some(),
+        "module-a's graph should contain its dependency on \
          {SIMPLE_GROUP}:{SIMPLE_ARTIFACT}:{SIMPLE_VERSION}"
     );
     assert!(
-        package_index(platform, JUNIT_GROUP, JUNIT_ARTIFACT, JUNIT_VERSION).is_some(),
-        "workspace sync should resolve module-b's dependency on \
+        module_package_index(
+            platform,
+            "module-b/pom.xml",
+            JUNIT_GROUP,
+            JUNIT_ARTIFACT,
+            JUNIT_VERSION
+        )
+        .is_some(),
+        "module-b's graph should contain its dependency on \
          {JUNIT_GROUP}:{JUNIT_ARTIFACT}:{JUNIT_VERSION}"
     );
+    assert!(
+        module_package_index(
+            platform,
+            "module-b/pom.xml",
+            HAMCREST_GROUP,
+            HAMCREST_ARTIFACT,
+            HAMCREST_VERSION
+        )
+        .is_some(),
+        "module-b's graph should contain junit's transitive \
+         {HAMCREST_GROUP}:{HAMCREST_ARTIFACT}:{HAMCREST_VERSION}"
+    );
+
+    // Per-module graphs stay separate: module-a never declared junit, so its
+    // graph must not pick it up from its sibling.
+    assert!(
+        module_package_index(
+            platform,
+            "module-a/pom.xml",
+            JUNIT_GROUP,
+            JUNIT_ARTIFACT,
+            JUNIT_VERSION
+        )
+        .is_none(),
+        "module-a's graph should not contain module-b's dependency on \
+         {JUNIT_GROUP}:{JUNIT_ARTIFACT}:{JUNIT_VERSION}"
+    );
+
+    // Both modules' dependencies share the one platform-wide artifact table,
+    // which is what actually carries repo URLs and checksums.
+    for (group, artifact, version) in [
+        (SIMPLE_GROUP, SIMPLE_ARTIFACT, SIMPLE_VERSION),
+        (JUNIT_GROUP, JUNIT_ARTIFACT, JUNIT_VERSION),
+        (HAMCREST_GROUP, HAMCREST_ARTIFACT, HAMCREST_VERSION),
+    ] {
+        assert!(
+            artifact_index(platform, group, artifact, version).is_some(),
+            "shared artifact table should contain {group}:{artifact}:{version}"
+        );
+    }
 }

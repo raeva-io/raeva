@@ -1,0 +1,29 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.test</groupId>
+    <artifactId>external-parent</artifactId>
+    <version>1</version>
+    <relativePath />
+  </parent>
+  <groupId>com.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib</artifactId>
+      <version>1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.test</groupId>
+      <artifactId>shared</artifactId>
+      <version>1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.test</groupId>
+      <artifactId>app-only</artifactId>
+      <version>1</version>
+    </dependency>
+  </dependencies>
+</project>

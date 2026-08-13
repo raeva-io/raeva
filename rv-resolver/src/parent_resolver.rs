@@ -1,12 +1,15 @@
 //! Parent POM resolution: local `<relativePath>`, remote fetch with the
 //! missing-parent cache, and activation-context construction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rv_config::{Config, Platform};
-use rv_maven_model::{ActivationContext, Parent, Pom, PomError};
+use rv_config::{Config, ConfigError, Platform};
+use rv_maven_model::{
+    ActivationContext, MAX_PARENT_CHAIN_DEPTH, Parent, Pom, PomError, interpolate_parent,
+    interpolate_parent_with_user_properties,
+};
 use rv_version::{Coord, Version};
 
 use crate::context::{MissingParentKey, ResolveContext};
@@ -84,12 +87,28 @@ fn read_and_validate_pom(
     Some(pom)
 }
 
-fn load_local_parent_at(
-    base_dir: Option<&Path>,
-    project_root: Option<&Path>,
+/// One accepted hop of a local parent chain: where the parent POM was read
+/// from, and its parsed model.
+struct LocalParentHop {
+    path: PathBuf,
+    pom: Pom,
+}
+
+/// The single gate every local `<relativePath>` parent passes through.
+///
+/// `None` means the hop is not an accepted local parent and the caller falls
+/// back to repository resolution: the relativePath is the empty "skip local
+/// lookup" sentinel, it escapes `boundary` after symlink-aware
+/// canonicalization, the file is absent, unreadable, larger than
+/// [`rv_config::MAX_PROJECT_INPUT_SIZE`], or unparseable, or the POM found
+/// there does not carry the declared parent coordinates. An oversize file is a
+/// rejected parent rather than a hard error, so resolution and the hash
+/// traversal agree on it exactly as they do on an escaping or mismatched one.
+fn accept_local_parent(
+    base_dir: &Path,
+    boundary: Option<&Path>,
     parent: &Parent,
-) -> Option<Pom> {
-    let base_dir = base_dir?;
+) -> Option<LocalParentHop> {
     let relative = match parent.relative_path.as_deref() {
         Some("") => return None,
         Some(path) => path,
@@ -100,7 +119,7 @@ fn load_local_parent_at(
     // Reject `<relativePath>` values that escape the project tree (e.g.
     // `<relativePath>../../../../etc/passwd</relativePath>`); fall through
     // to remote resolution.
-    if let Some(root) = project_root
+    if let Some(root) = boundary
         && !path_within_root(&path, root)
     {
         tracing::debug!(
@@ -116,25 +135,43 @@ fn load_local_parent_at(
         path.push("pom.xml");
     }
 
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => read_and_validate_pom(&path, &contents, parent, false),
-        Err(e) if e.kind() == std::io::ErrorKind::IsADirectory => {
+    let pom = match rv_config::read_project_input_string(&path) {
+        Ok(contents) => read_and_validate_pom(&path, &contents, parent, false)?,
+        Err(e) if io_error_kind(&e) == Some(std::io::ErrorKind::IsADirectory) => {
             // Pre-check missed a directory (TOCTOU); retry with pom.xml appended.
             path.push("pom.xml");
-            let contents = std::fs::read_to_string(&path).ok()?;
-            read_and_validate_pom(&path, &contents, parent, true)
+            let contents = rv_config::read_project_input_string(&path).ok()?;
+            read_and_validate_pom(&path, &contents, parent, true)?
         }
         Err(e) => {
-            if e.kind() != std::io::ErrorKind::NotFound {
+            if io_error_kind(&e) != Some(std::io::ErrorKind::NotFound) {
                 tracing::warn!(
                     "Failed to read local parent POM at {}: {}",
                     path.display(),
                     e
                 );
             }
-            None
+            return None;
         }
+    };
+    Some(LocalParentHop { path, pom })
+}
+
+/// Underlying `io::ErrorKind` of a bounded-read failure, if it was an I/O
+/// error at all; oversize and encoding failures carry none.
+fn io_error_kind(error: &ConfigError) -> Option<std::io::ErrorKind> {
+    match error {
+        ConfigError::ProjectInputIo { source, .. } => Some(source.kind()),
+        _ => None,
     }
+}
+
+fn load_local_parent_at(
+    base_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    parent: &Parent,
+) -> Option<Pom> {
+    accept_local_parent(base_dir?, project_root, parent).map(|hop| hop.pom)
 }
 
 impl<F: RemotePomFetcher + Sync> ParentResolverBase<F> {
@@ -260,6 +297,106 @@ impl<F: RemotePomFetcher + Sync> ParentResolverBase<F> {
     }
 }
 
+/// The directory a local `<relativePath>` parent must stay inside, for a
+/// reactor rooted at `root` with `module_count` active modules.
+///
+/// A discovered reactor is its own containment boundary. A one-module
+/// workspace can also be a deliberately selected submodule (for example
+/// `guava/guava`) whose Maven parent is the immediate `../pom.xml`, so exactly
+/// one directory level above the root is admitted; deeper escapes such as
+/// `../../etc/passwd` stay rejected. Multi-module roots already contain their
+/// local parents, so they keep the tighter boundary.
+///
+/// Reactor discovery, `rv sync`'s model hashing, and resolution all derive
+/// their boundary here, so all three accept exactly the same set of local
+/// parents.
+pub fn local_parent_boundary(root: &Path, module_count: usize) -> PathBuf {
+    if module_count == 1 {
+        root.parent().unwrap_or(root).to_path_buf()
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// Walk the chain of local parent POMs reachable from `pom_path` (whose bytes
+/// are `pom_xml`) via `<parent><relativePath>`, in child-to-ancestor order.
+///
+/// This is the one accepted-local-parent traversal: a hop is yielded only when
+/// resolution itself would load that file as the parent, i.e. it stays inside
+/// `boundary` after symlink-aware canonicalization, exists, is within the
+/// project input size limit, parses, and declares the coordinates the child
+/// asked for — the coordinates [`interpolate_parent`] derives from the
+/// declaration, so a `${revision}` parent version names the same POM here as it
+/// does during inheritance. The walk stops at the first hop that fails any of
+/// those, and at a cycle.
+///
+/// Depth is bounded by [`MAX_PARENT_CHAIN_DEPTH`], the same limit inheritance
+/// resolution applies: a chain within the limit is reported in full, and a
+/// chain that needs one more hop is rejected by inheritance itself, so no
+/// resolution result can depend on a parent this walk did not report.
+///
+/// `user_properties` are the reactor root's `.mvn/maven.config` `-D` entries
+/// (see [`parse_maven_config`]), which resolution overlays on the POM it
+/// starts from before inheritance runs. They therefore apply to this walk's
+/// first hop and to no other: an ancestor is loaded from disk with its own
+/// properties alone, exactly as resolution loads it. Pass an empty map only
+/// where resolution has no user properties either.
+///
+/// Callers derive `boundary` from [`local_parent_boundary`] (or
+/// [`Workspace::local_parent_boundary`](crate::Workspace::local_parent_boundary)).
+pub fn accepted_local_parents(
+    pom_path: &Path,
+    pom_xml: &str,
+    boundary: &Path,
+    user_properties: &HashMap<String, String>,
+) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let Ok(mut pom) = Pom::parse(pom_xml) else {
+        return chain;
+    };
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    seen.insert(canonical_or_owned(pom_path));
+    let mut base_dir = pom_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+
+    for depth in 0..MAX_PARENT_CHAIN_DEPTH {
+        let Some(raw_parent) = pom.parent.as_ref() else {
+            break;
+        };
+        // The declaration is not the parent's identity: `${revision}`-style
+        // coordinates name a different POM once expanded. Inheritance expands
+        // them with the declaring POM's own properties before it resolves the
+        // hop, so the walk must too, or a parent that resolution loads goes
+        // unhashed. The starting POM additionally carries the user properties
+        // resolution injected into it, so a parent version supplied only by
+        // `.mvn/maven.config` names the same POM here as it does there.
+        // An interpolation failure ends the walk: inheritance surfaces the same
+        // failure as an error, so no resolution result survives it.
+        let interpolated = if depth == 0 {
+            interpolate_parent_with_user_properties(&pom.properties, user_properties, raw_parent)
+        } else {
+            interpolate_parent(&pom.properties, raw_parent)
+        };
+        let Ok(parent) = interpolated else {
+            break;
+        };
+        let Some(hop) = accept_local_parent(&base_dir, Some(boundary), &parent) else {
+            break;
+        };
+        if !seen.insert(canonical_or_owned(&hop.path)) {
+            break;
+        }
+        base_dir = hop.path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        chain.push(hop.path);
+        pom = hop.pom;
+    }
+
+    chain
+}
+
+fn canonical_or_owned(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// True when `candidate` resolves inside `root`. Canonicalizes the deepest
 /// existing prefix so symlink targets are honored; fails closed (returns
 /// false) when canonicalization fails.
@@ -275,13 +412,19 @@ fn path_within_root(candidate: &Path, root: &Path) -> bool {
 
 /// Parse `.mvn/maven.config` for CI-friendly `-Drevision=...` properties.
 /// One arg per line or space-separated; bare `-Dkey` becomes `key=true`.
-#[cfg(test)]
-pub(crate) fn parse_maven_config(project_root: &Path) -> HashMap<String, String> {
+///
+/// These are Maven user properties: resolution overlays them on the POM it
+/// starts from, so any traversal that has to name the same parents
+/// ([`accepted_local_parents`]) needs them too.
+pub fn parse_maven_config(project_root: &Path) -> HashMap<String, String> {
     let config_path = project_root.join(".mvn").join("maven.config");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+    let content = match rv_config::read_optional_project_input_string(&config_path) {
+        Ok(Some(content)) => content,
+        Ok(None) => return HashMap::new(),
         Err(err) => {
+            // Oversize and unreadable configs are ignored with a warning, the
+            // same as any other read failure here: this helper has no error
+            // channel and its callers build an activation context regardless.
             tracing::warn!(
                 path = %config_path.display(),
                 error = %err,
@@ -297,9 +440,9 @@ pub(crate) fn parse_maven_config(project_root: &Path) -> HashMap<String, String>
 /// blocking the executor on the (typically tiny) config read.
 pub(crate) async fn parse_maven_config_async(project_root: &Path) -> HashMap<String, String> {
     let config_path = project_root.join(".mvn").join("maven.config");
-    let content = match tokio::fs::read_to_string(&config_path).await {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+    let content = match read_optional_project_input_string_async(&config_path).await {
+        Ok(Some(content)) => content,
+        Ok(None) => return HashMap::new(),
         Err(err) => {
             tracing::warn!(
                 path = %config_path.display(),
@@ -312,16 +455,76 @@ pub(crate) async fn parse_maven_config_async(project_root: &Path) -> HashMap<Str
     parse_maven_config_content(&content)
 }
 
+/// Async mirror of [`rv_config::read_optional_project_input_string`]: `Ok(None)`
+/// when the file is absent, and the same bounded read otherwise so an oversize
+/// file cannot drive an unbounded allocation.
+async fn read_optional_project_input_string_async(
+    path: &Path,
+) -> Result<Option<String>, ConfigError> {
+    match read_project_input_string_async(path).await {
+        Ok(contents) => Ok(Some(contents)),
+        Err(ConfigError::ProjectInputIo { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Async mirror of [`rv_config::read_project_input_string`]: the same
+/// [`rv_config::MAX_PROJECT_INPUT_SIZE`] bound, applied without blocking the
+/// executor, so an oversize project input cannot drive an unbounded allocation
+/// on an async path.
+pub(crate) async fn read_project_input_string_async(path: &Path) -> Result<String, ConfigError> {
+    use tokio::io::AsyncReadExt;
+
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|source| ConfigError::ProjectInputIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    let mut bytes = Vec::new();
+    file.take(rv_config::MAX_PROJECT_INPUT_SIZE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|source| ConfigError::ProjectInputIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > rv_config::MAX_PROJECT_INPUT_SIZE {
+        return Err(ConfigError::ProjectInputTooLarge {
+            path: path.to_path_buf(),
+            limit: rv_config::MAX_PROJECT_INPUT_SIZE,
+        });
+    }
+
+    String::from_utf8(bytes).map_err(|_| ConfigError::ProjectInputEncoding {
+        path: path.to_path_buf(),
+    })
+}
+
 fn parse_maven_config_content(content: &str) -> HashMap<String, String> {
     let mut properties = HashMap::new();
-    for token in content.split_whitespace() {
-        if let Some(rest) = token.strip_prefix("-D") {
-            if let Some((key, value)) = rest.split_once('=') {
+    let tokens: Vec<&str> = content.split_whitespace().collect();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index];
+        let property = if token == "-D" {
+            index += 1;
+            tokens.get(index).copied()
+        } else {
+            token.strip_prefix("-D")
+        };
+        if let Some(property) = property.filter(|property| !property.is_empty()) {
+            let (key, value) = property.split_once('=').unwrap_or((property, "true"));
+            if !key.is_empty() {
                 properties.insert(key.to_string(), value.to_string());
-            } else if !rest.is_empty() {
-                properties.insert(rest.to_string(), "true".to_string());
             }
         }
+        index += 1;
     }
     if !properties.is_empty() {
         tracing::debug!(
@@ -332,8 +535,13 @@ fn parse_maven_config_content(content: &str) -> HashMap<String, String> {
     properties
 }
 
-#[cfg(test)]
-pub(crate) fn build_activation_context(
+/// Build the effective Maven activation context for a reactor discovery or
+/// model resolution targeting `target_platform`.
+///
+/// This is public so the CLI can rediscover a reactor for `--frozen` without
+/// performing repository resolution while still using exactly the same
+/// profile/property/platform inputs as the resolver.
+pub fn build_activation_context(
     base_dir: Option<PathBuf>,
     config: &Config,
     target_platform: Option<&Platform>,
@@ -447,6 +655,7 @@ fn maven_os_family(rust_os: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use rv_config::ResolvedPaths;
+    use rv_maven_model::EffectiveDescriptor;
 
     #[derive(Clone)]
     struct MockFetcher;
@@ -630,6 +839,728 @@ mod tests {
         );
     }
 
+    /// Child POM referencing `parent` by coordinates and `relative_path`.
+    fn child_xml(artifact_id: &str, parent_artifact_id: &str, relative_path: &str) -> String {
+        format!(
+            r#"<project>
+                <modelVersion>4.0.0</modelVersion>
+                <parent>
+                    <groupId>com.example</groupId>
+                    <artifactId>{parent_artifact_id}</artifactId>
+                    <version>1.0.0</version>
+                    <relativePath>{relative_path}</relativePath>
+                </parent>
+                <artifactId>{artifact_id}</artifactId>
+            </project>"#
+        )
+    }
+
+    /// POM at an explicit version, carrying a raw `<properties>` block.
+    fn versioned_pom_xml(artifact_id: &str, version: &str, properties: &str) -> String {
+        format!(
+            r#"<project>
+                <modelVersion>4.0.0</modelVersion>
+                <groupId>com.example</groupId>
+                <artifactId>{artifact_id}</artifactId>
+                <version>{version}</version>
+                <packaging>pom</packaging>
+                {properties}
+            </project>"#
+        )
+    }
+
+    /// Child POM carrying a raw `<properties>` block, declaring its parent at
+    /// `parent_version` (which may be a `${{...}}` reference) and itself at
+    /// `version`.
+    fn child_xml_with_properties(
+        artifact_id: &str,
+        version: &str,
+        properties: &str,
+        parent_artifact_id: &str,
+        parent_version: &str,
+        relative_path: &str,
+    ) -> String {
+        format!(
+            r#"<project>
+                <modelVersion>4.0.0</modelVersion>
+                {properties}
+                <parent>
+                    <groupId>com.example</groupId>
+                    <artifactId>{parent_artifact_id}</artifactId>
+                    <version>{parent_version}</version>
+                    <relativePath>{relative_path}</relativePath>
+                </parent>
+                <artifactId>{artifact_id}</artifactId>
+                <version>{version}</version>
+            </project>"#
+        )
+    }
+
+    /// Walk a chain the way a project without `.mvn/maven.config` is walked.
+    /// The user-property layering has its own tests below.
+    fn walk_parents(pom_path: &Path, pom_xml: &str, boundary: &Path) -> Vec<PathBuf> {
+        accepted_local_parents(pom_path, pom_xml, boundary, &HashMap::new())
+    }
+
+    fn user_properties(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn accepted_local_parents_walks_the_whole_chain() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let child_dir = root.join("a").join("b");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(root.join("pom.xml"), pom_xml("grandparent")).unwrap();
+        std::fs::write(
+            root.join("a").join("pom.xml"),
+            child_xml("parent", "grandparent", "../pom.xml"),
+        )
+        .unwrap();
+        let child_pom = child_dir.join("pom.xml");
+        let xml = child_xml("child", "parent", "../pom.xml");
+        std::fs::write(&child_pom, &xml).unwrap();
+
+        let chain = walk_parents(&child_pom, &xml, root);
+
+        let chain: Vec<PathBuf> = chain.iter().map(|path| canonical_or_owned(path)).collect();
+        assert_eq!(
+            chain,
+            [
+                canonical_or_owned(&root.join("a").join("pom.xml")),
+                canonical_or_owned(&root.join("pom.xml")),
+            ]
+        );
+    }
+
+    /// Security: the walker must not read (or report) a file outside the
+    /// boundary, which is what put an arbitrary local path and digest into the
+    /// commit-bound lockfile's model hash.
+    #[test]
+    fn accepted_local_parents_rejects_escape_outside_boundary() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let boundary = tmp_dir.path().join("project");
+        let module_dir = boundary.join("module");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let outside = tmp_dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("pom.xml"), pom_xml("evil")).unwrap();
+
+        let pom_path = module_dir.join("pom.xml");
+        let xml = child_xml("child", "evil", "../../outside/pom.xml");
+        std::fs::write(&pom_path, &xml).unwrap();
+
+        assert!(walk_parents(&pom_path, &xml, &boundary).is_empty());
+    }
+
+    /// The containment check canonicalizes, so a symlink that points out of
+    /// the boundary is rejected even though the literal path stays inside.
+    #[cfg(unix)]
+    #[test]
+    fn accepted_local_parents_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let boundary = tmp_dir.path().join("project");
+        std::fs::create_dir_all(&boundary).unwrap();
+        let outside = tmp_dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("pom.xml"), pom_xml("evil")).unwrap();
+        symlink(&outside, boundary.join("escape")).unwrap();
+
+        let pom_path = boundary.join("pom.xml");
+        let xml = child_xml("child", "evil", "escape/pom.xml");
+        std::fs::write(&pom_path, &xml).unwrap();
+
+        assert!(walk_parents(&pom_path, &xml, &boundary).is_empty());
+    }
+
+    /// A contained file that is not the declared parent is not a parent, so it
+    /// is neither loaded by resolution nor reported by the walker.
+    #[test]
+    fn accepted_local_parents_rejects_declared_gav_mismatch() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        std::fs::write(root.join("pom.xml"), pom_xml("actual-parent")).unwrap();
+        let module_dir = root.join("module");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let pom_path = module_dir.join("pom.xml");
+        let xml = child_xml("child", "declared-parent", "../pom.xml");
+        std::fs::write(&pom_path, &xml).unwrap();
+
+        assert!(walk_parents(&pom_path, &xml, root).is_empty());
+    }
+
+    /// The CI-friendly `<revision>` pattern: the parent version is a property,
+    /// so the raw declaration matches nothing. Resolution interpolates it and
+    /// loads the local parent, so the walk must report that same file — the
+    /// divergence this guards let an edit to a resolved parent slip past the
+    /// model hash.
+    #[test]
+    fn accepted_local_parents_interpolates_a_property_parent_version() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let parent_pom = root.join("pom.xml");
+        std::fs::write(
+            &parent_pom,
+            versioned_pom_xml(
+                "parent",
+                "2.0.0",
+                "<properties><localrev>7.7.7</localrev></properties>",
+            ),
+        )
+        .unwrap();
+        let module_dir = root.join("module");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let pom_path = module_dir.join("pom.xml");
+        let xml = child_xml_with_properties(
+            "child",
+            "${localrev}",
+            "<properties><revision>2.0.0</revision></properties>",
+            "parent",
+            "${revision}",
+            "../pom.xml",
+        );
+        std::fs::write(&pom_path, &xml).unwrap();
+
+        let chain = walk_parents(&pom_path, &xml, root);
+        assert_eq!(
+            chain
+                .iter()
+                .map(|path| canonical_or_owned(path))
+                .collect::<Vec<_>>(),
+            [canonical_or_owned(&parent_pom)],
+            "the parent resolution loads must be hashed"
+        );
+
+        // `localrev` is declared only by the local parent, so an effective
+        // version of 7.7.7 proves resolution read that same file.
+        let descriptor = resolve_with_local_parents(root, &pom_path, &xml).expect("resolves");
+        assert_eq!(descriptor.gav.version, "7.7.7");
+    }
+
+    /// A parent version supplied only by `.mvn/maven.config`. Resolution
+    /// overlays those `-D` entries on the POM before inheritance, so it loads
+    /// the local parent; the walk must layer the same entries or the parent
+    /// that shapes the resolved graph is never hashed and an edit to it slips
+    /// past `--frozen` and the fast path.
+    #[test]
+    fn accepted_local_parents_layers_user_properties_on_the_starting_pom() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let parent_pom = root.join("pom.xml");
+        std::fs::write(
+            &parent_pom,
+            versioned_pom_xml(
+                "parent",
+                "1.2.3",
+                "<properties><localrev>7.7.7</localrev></properties>",
+            ),
+        )
+        .unwrap();
+        let module_dir = root.join("module");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let pom_path = module_dir.join("pom.xml");
+        // No `<properties>` of its own: only `-DparentVersion=1.2.3` can name
+        // this parent.
+        let xml = child_xml_with_properties(
+            "child",
+            "${localrev}",
+            "",
+            "parent",
+            "${parentVersion}",
+            "../pom.xml",
+        );
+        std::fs::write(&pom_path, &xml).unwrap();
+        let properties = user_properties(&[("parentVersion", "1.2.3")]);
+
+        assert_eq!(
+            accepted_local_parents(&pom_path, &xml, root, &properties)
+                .iter()
+                .map(|path| canonical_or_owned(path))
+                .collect::<Vec<_>>(),
+            [canonical_or_owned(&parent_pom)],
+            "the parent resolution loads must be hashed"
+        );
+        assert_eq!(
+            resolve_with_user_properties(root, &pom_path, &xml, &properties)
+                .expect("resolves")
+                .gav
+                .version,
+            "7.7.7",
+            "`localrev` comes only from the parent, so resolution read that file"
+        );
+
+        // Without the user properties neither side can name the parent, which
+        // is what made the two agree before: the walk reports nothing and
+        // inheritance cannot even parse the unexpanded version as a coordinate.
+        assert!(walk_parents(&pom_path, &xml, root).is_empty());
+        assert!(resolve_with_local_parents(root, &pom_path, &xml).is_err());
+    }
+
+    /// Maven user properties sit above POM `<properties>`, so a `-D` entry
+    /// wins over a same-named declaration in the POM and can retarget the
+    /// parent hop. The walk applies that precedence exactly as the model layer
+    /// does.
+    #[test]
+    fn accepted_local_parents_lets_user_properties_override_pom_properties() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let parent_pom = root.join("pom.xml");
+        std::fs::write(
+            &parent_pom,
+            versioned_pom_xml(
+                "parent",
+                "2.0.0",
+                "<properties><localrev>7.7.7</localrev></properties>",
+            ),
+        )
+        .unwrap();
+        let module_dir = root.join("module");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let pom_path = module_dir.join("pom.xml");
+        let xml = child_xml_with_properties(
+            "child",
+            "${localrev}",
+            "<properties><revision>1.0.0</revision></properties>",
+            "parent",
+            "${revision}",
+            "../pom.xml",
+        );
+        std::fs::write(&pom_path, &xml).unwrap();
+
+        // The POM's own `revision` names a parent version that is not on disk.
+        assert!(walk_parents(&pom_path, &xml, root).is_empty());
+
+        let properties = user_properties(&[("revision", "2.0.0")]);
+        assert_eq!(
+            accepted_local_parents(&pom_path, &xml, root, &properties)
+                .iter()
+                .map(|path| canonical_or_owned(path))
+                .collect::<Vec<_>>(),
+            [canonical_or_owned(&parent_pom)],
+            "the `-D` entry outranks the POM property, here and in resolution"
+        );
+        assert_eq!(
+            resolve_with_user_properties(root, &pom_path, &xml, &properties)
+                .expect("resolves")
+                .gav
+                .version,
+            "7.7.7"
+        );
+    }
+
+    /// User properties reach the POM the walk starts from and no other:
+    /// resolution overlays them on the model it builds, then loads every
+    /// ancestor from disk with that ancestor's own properties alone.
+    #[test]
+    fn accepted_local_parents_does_not_layer_user_properties_on_ancestors() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let top_dir = root.join("top");
+        let mid_dir = root.join("mid");
+        let child_dir = root.join("child");
+        for dir in [&top_dir, &mid_dir, &child_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        std::fs::write(
+            top_dir.join("pom.xml"),
+            versioned_pom_xml("top", "3.0.0", ""),
+        )
+        .unwrap();
+        let mid_pom = mid_dir.join("pom.xml");
+        // `topVersion` is declared nowhere in `mid`, so this hop names nothing
+        // whatever the user properties say.
+        std::fs::write(
+            &mid_pom,
+            child_xml_with_properties("mid", "2.0.0", "", "top", "${topVersion}", "../top/pom.xml"),
+        )
+        .unwrap();
+        let child_pom = child_dir.join("pom.xml");
+        let xml = child_xml_with_properties(
+            "child",
+            "1.0.0",
+            "",
+            "mid",
+            "${midVersion}",
+            "../mid/pom.xml",
+        );
+        std::fs::write(&child_pom, &xml).unwrap();
+
+        let properties = user_properties(&[("midVersion", "2.0.0"), ("topVersion", "3.0.0")]);
+        let chain = accepted_local_parents(&child_pom, &xml, root, &properties);
+        assert_eq!(
+            chain
+                .iter()
+                .map(|path| canonical_or_owned(path))
+                .collect::<Vec<_>>(),
+            [canonical_or_owned(&mid_pom)],
+            "the walk stops where inheritance stops: `mid` cannot expand its own parent version"
+        );
+        assert!(
+            resolve_with_user_properties(root, &child_pom, &xml, &properties).is_err(),
+            "inheritance fails on `mid`'s unexpanded parent version, so no \
+             resolution result depends on `top`"
+        );
+    }
+
+    /// Every hop interpolates its own `<parent>` with its own `<properties>`,
+    /// exactly as inheritance does: `revision` means 2.0.0 in the child and
+    /// 3.0.0 in the intermediate parent, and each hop resolves against the one
+    /// its own POM declares.
+    #[test]
+    fn accepted_local_parents_interpolates_each_hop_with_its_own_properties() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let top_dir = root.join("top");
+        let mid_dir = root.join("mid");
+        let child_dir = root.join("child");
+        for dir in [&top_dir, &mid_dir, &child_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let top_pom = top_dir.join("pom.xml");
+        std::fs::write(
+            &top_pom,
+            versioned_pom_xml(
+                "top",
+                "3.0.0",
+                "<properties><localrev>7.7.7</localrev></properties>",
+            ),
+        )
+        .unwrap();
+        let mid_pom = mid_dir.join("pom.xml");
+        std::fs::write(
+            &mid_pom,
+            child_xml_with_properties(
+                "mid",
+                "2.0.0",
+                "<properties><revision>3.0.0</revision></properties>",
+                "top",
+                "${revision}",
+                "../top/pom.xml",
+            ),
+        )
+        .unwrap();
+        let child_pom = child_dir.join("pom.xml");
+        let xml = child_xml_with_properties(
+            "child",
+            "${localrev}",
+            "<properties><revision>2.0.0</revision></properties>",
+            "mid",
+            "${revision}",
+            "../mid/pom.xml",
+        );
+        std::fs::write(&child_pom, &xml).unwrap();
+
+        let chain = walk_parents(&child_pom, &xml, root);
+        assert_eq!(
+            chain
+                .iter()
+                .map(|path| canonical_or_owned(path))
+                .collect::<Vec<_>>(),
+            [canonical_or_owned(&mid_pom), canonical_or_owned(&top_pom)],
+            "each hop must expand its own ${{revision}}"
+        );
+
+        // Only the top of the chain declares `localrev`.
+        let descriptor = resolve_with_local_parents(root, &child_pom, &xml).expect("resolves");
+        assert_eq!(descriptor.gav.version, "7.7.7");
+    }
+
+    /// Properties flow parent-to-child only after the chain is walked, so a
+    /// property a parent declares cannot name that parent's own parent.
+    /// Inheritance leaves such a reference literal and stops resolving the
+    /// chain there; the walk must stop at the same hop rather than hash an
+    /// ancestor resolution never reads.
+    #[test]
+    fn parent_properties_do_not_reach_their_own_parent_coordinates() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let top_dir = root.join("top");
+        let mid_dir = root.join("mid");
+        let child_dir = root.join("child");
+        for dir in [&top_dir, &mid_dir, &child_dir] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        // `toprev` is declared by the top POM, which is exactly the POM the
+        // intermediate parent tries to name with it.
+        std::fs::write(
+            top_dir.join("pom.xml"),
+            versioned_pom_xml(
+                "top",
+                "3.0.0",
+                "<properties><toprev>3.0.0</toprev></properties>",
+            ),
+        )
+        .unwrap();
+        let mid_pom = mid_dir.join("pom.xml");
+        std::fs::write(
+            &mid_pom,
+            child_xml_with_properties("mid", "2.0.0", "", "top", "${toprev}", "../top/pom.xml"),
+        )
+        .unwrap();
+        let child_pom = child_dir.join("pom.xml");
+        let xml = child_xml_with_properties("child", "1.0.0", "", "mid", "2.0.0", "../mid/pom.xml");
+        std::fs::write(&child_pom, &xml).unwrap();
+
+        let chain = walk_parents(&child_pom, &xml, root);
+        assert_eq!(
+            chain
+                .iter()
+                .map(|path| canonical_or_owned(path))
+                .collect::<Vec<_>>(),
+            [canonical_or_owned(&mid_pom)],
+            "the unresolvable hop and everything past it stays out of the hash"
+        );
+    }
+
+    /// Interpolation is not a free pass: coordinates that still disagree once
+    /// expanded are a rejected parent for the walk and for resolution alike.
+    #[test]
+    fn accepted_local_parents_rejects_interpolated_gav_mismatch() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        std::fs::write(root.join("pom.xml"), pom_xml("parent")).unwrap();
+        let module_dir = root.join("module");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let pom_path = module_dir.join("pom.xml");
+        // `parent` is at 1.0.0; ${revision} expands to a version it never had.
+        let xml = child_xml_with_properties(
+            "child",
+            "9.9.9",
+            "<properties><revision>9.9.9</revision></properties>",
+            "parent",
+            "${revision}",
+            "../pom.xml",
+        );
+        std::fs::write(&pom_path, &xml).unwrap();
+
+        assert!(walk_parents(&pom_path, &xml, root).is_empty());
+
+        let mut resolver = ParentResolverBase::new(Some(module_dir), MockFetcher, false);
+        resolver.project_root = Some(root.to_path_buf());
+        let parent = Parent {
+            group_id: "com.example".to_string(),
+            artifact_id: "parent".to_string(),
+            version: "9.9.9".to_string(),
+            relative_path: Some("../pom.xml".to_string()),
+        };
+        assert!(resolver.load_local_parent(&parent).is_none());
+    }
+
+    /// Local parent chain `root/p1 -> root/p2 -> ... -> root/p{length}`, with a
+    /// leaf at `root/child/pom.xml` whose parent is `p1`. Returns the leaf POM
+    /// path and its XML.
+    fn write_local_parent_chain(root: &Path, length: usize) -> (PathBuf, String) {
+        for index in 1..=length {
+            let dir = root.join(format!("p{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let xml = if index < length {
+                child_xml(
+                    &format!("p{index}"),
+                    &format!("p{}", index + 1),
+                    &format!("../p{}/pom.xml", index + 1),
+                )
+            } else {
+                pom_xml(&format!("p{index}"))
+            };
+            std::fs::write(dir.join("pom.xml"), xml).unwrap();
+        }
+
+        let child_dir = root.join("child");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        let xml = child_xml("child", "p1", "../p1/pom.xml");
+        let child_pom = child_dir.join("pom.xml");
+        std::fs::write(&child_pom, &xml).unwrap();
+        (child_pom, xml)
+    }
+
+    /// Resolves parents from the local chain only; remote lookups return
+    /// `None`, as they do for a reactor rooted in a tempdir.
+    struct LocalOnlyResolver {
+        base: ParentResolverBase<MockFetcher>,
+    }
+
+    impl rv_maven_model::ParentResolver for LocalOnlyResolver {
+        fn resolve_parent(&self, parent: &Parent) -> Result<Option<Pom>, PomError> {
+            self.base.resolve_parent(parent)
+        }
+
+        fn strict_parent_resolution(&self) -> bool {
+            false
+        }
+    }
+
+    fn resolve_with_local_parents(
+        root: &Path,
+        child_pom: &Path,
+        xml: &str,
+    ) -> Result<EffectiveDescriptor, PomError> {
+        let mut base = ParentResolverBase::new(
+            child_pom.parent().map(Path::to_path_buf),
+            MockFetcher,
+            false,
+        );
+        base.project_root = Some(root.to_path_buf());
+        Pom::parse(xml)?.effective_descriptor_with_inheritance(
+            LocalOnlyResolver { base },
+            &ActivationContext::default(),
+        )
+    }
+
+    /// [`resolve_with_local_parents`] with `.mvn/maven.config` in play: the
+    /// `-D` entries are overlaid on the starting POM before inheritance, which
+    /// is what `Resolver::load_root_project` and workspace module resolution
+    /// do with the reactor root's config.
+    fn resolve_with_user_properties(
+        root: &Path,
+        child_pom: &Path,
+        xml: &str,
+        user_properties: &HashMap<String, String>,
+    ) -> Result<EffectiveDescriptor, PomError> {
+        let mut base = ParentResolverBase::new(
+            child_pom.parent().map(Path::to_path_buf),
+            MockFetcher,
+            false,
+        );
+        base.project_root = Some(root.to_path_buf());
+        let mut pom = Pom::parse(xml)?;
+        for (key, value) in user_properties {
+            pom.properties.insert(key.as_str(), value.as_str());
+        }
+        pom.effective_descriptor_with_inheritance(
+            LocalOnlyResolver { base },
+            &ActivationContext::default(),
+        )
+    }
+
+    /// A chain at the shared limit is reported in full, so editing its deepest
+    /// parent changes the model hash, and resolution accepts exactly the same
+    /// parents.
+    #[test]
+    fn accepted_local_parents_covers_a_chain_at_the_depth_limit() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let (child_pom, xml) = write_local_parent_chain(root, MAX_PARENT_CHAIN_DEPTH);
+
+        let chain = walk_parents(&child_pom, &xml, root);
+
+        assert_eq!(chain.len(), MAX_PARENT_CHAIN_DEPTH);
+        assert_eq!(
+            canonical_or_owned(chain.last().unwrap()),
+            canonical_or_owned(
+                &root
+                    .join(format!("p{MAX_PARENT_CHAIN_DEPTH}"))
+                    .join("pom.xml")
+            ),
+            "the deepest parent resolution reads must be hashed"
+        );
+        resolve_with_local_parents(root, &child_pom, &xml).expect("a chain at the limit resolves");
+    }
+
+    /// The divergence this guards: a parent past the shared limit must not
+    /// participate in resolution while sitting outside the model hash. The walk
+    /// stops at the limit, and resolution rejects the chain outright, so
+    /// editing the unhashed deepest parent cannot change a successful
+    /// resolution.
+    #[test]
+    fn depth_limit_rejects_a_chain_past_the_limit_on_both_paths() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        let (child_pom, xml) = write_local_parent_chain(root, MAX_PARENT_CHAIN_DEPTH + 1);
+
+        let chain = walk_parents(&child_pom, &xml, root);
+        assert_eq!(chain.len(), MAX_PARENT_CHAIN_DEPTH);
+        let deepest = canonical_or_owned(
+            &root
+                .join(format!("p{}", MAX_PARENT_CHAIN_DEPTH + 1))
+                .join("pom.xml"),
+        );
+        assert!(
+            !chain.iter().any(|path| canonical_or_owned(path) == deepest),
+            "the over-limit parent must not be hashed"
+        );
+
+        let error = resolve_with_local_parents(root, &child_pom, &xml)
+            .expect_err("a chain past the limit must be rejected");
+        assert!(
+            error.to_string().contains("parent chain exceeds the limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A local parent over the project input limit is a rejected parent, not an
+    /// unbounded read: resolution falls through to the repository and the walk
+    /// reports nothing, so both agree.
+    #[test]
+    fn oversized_local_parent_is_rejected() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let root = tmp_dir.path();
+        std::fs::write(
+            root.join("pom.xml"),
+            vec![b'x'; rv_config::MAX_PROJECT_INPUT_SIZE + 1],
+        )
+        .unwrap();
+        let module_dir = root.join("module");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let pom_path = module_dir.join("pom.xml");
+        let xml = child_xml("child", "parent", "../pom.xml");
+        std::fs::write(&pom_path, &xml).unwrap();
+
+        let mut resolver = ParentResolverBase::new(Some(module_dir), MockFetcher, false);
+        resolver.project_root = Some(root.to_path_buf());
+        let parent = Parent {
+            group_id: "com.example".to_string(),
+            artifact_id: "parent".to_string(),
+            version: "1.0.0".to_string(),
+            relative_path: Some("../pom.xml".to_string()),
+        };
+
+        assert!(resolver.load_local_parent(&parent).is_none());
+        assert!(walk_parents(&pom_path, &xml, root).is_empty());
+    }
+
+    /// An oversized `.mvn/maven.config` is ignored rather than read whole.
+    #[test]
+    fn parse_maven_config_rejects_oversized_input() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let mvn_dir = tmp_dir.path().join(".mvn");
+        std::fs::create_dir(&mvn_dir).unwrap();
+        let mut content = b"-Drevision=1.0.0\n".to_vec();
+        content.resize(rv_config::MAX_PROJECT_INPUT_SIZE + 1, b'\n');
+        std::fs::write(mvn_dir.join("maven.config"), content).unwrap();
+
+        assert!(parse_maven_config(tmp_dir.path()).is_empty());
+    }
+
+    /// The async reader bounds the same input as its sync sister.
+    #[tokio::test]
+    async fn parse_maven_config_async_rejects_oversized_input() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let mvn_dir = tmp_dir.path().join(".mvn");
+        std::fs::create_dir(&mvn_dir).unwrap();
+        let mut content = b"-Drevision=1.0.0\n".to_vec();
+        content.resize(rv_config::MAX_PROJECT_INPUT_SIZE + 1, b'\n');
+        std::fs::write(mvn_dir.join("maven.config"), content).unwrap();
+
+        assert!(parse_maven_config_async(tmp_dir.path()).await.is_empty());
+    }
+
+    #[test]
+    fn local_parent_boundary_widens_only_for_a_lone_module() {
+        let root = Path::new("/workspace/module");
+
+        assert_eq!(local_parent_boundary(root, 1), Path::new("/workspace"));
+        assert_eq!(local_parent_boundary(root, 2), root);
+    }
+
     #[test]
     fn parse_maven_config_extracts_properties() {
         let tmp_dir = tempfile::tempdir().unwrap();
@@ -672,5 +1603,24 @@ mod tests {
         assert_eq!(props.get("revision").map(String::as_str), Some("1.0.0"));
         assert_eq!(props.get("changelist").map(String::as_str), Some(""));
         assert_eq!(props.get("flag").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn parse_maven_config_handles_standalone_d_switch() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let mvn_dir = tmp_dir.path().join(".mvn");
+        std::fs::create_dir(&mvn_dir).unwrap();
+        std::fs::write(
+            mvn_dir.join("maven.config"),
+            "-D\nrevision=4.1.0\n-D\napache.snapshots\n",
+        )
+        .unwrap();
+
+        let props = parse_maven_config(tmp_dir.path());
+        assert_eq!(props.get("revision").map(String::as_str), Some("4.1.0"));
+        assert_eq!(
+            props.get("apache.snapshots").map(String::as_str),
+            Some("true")
+        );
     }
 }

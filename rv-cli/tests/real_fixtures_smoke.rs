@@ -74,6 +74,7 @@ fn smoke_parses_fixture_and_builds_tree() {
         scope: Scope::Compile,
         repo_url: None,
         checksum: None,
+        workspace_module: None,
         local: false,
         system_path: None,
     };
@@ -98,6 +99,7 @@ fn smoke_parses_fixture_and_builds_tree() {
             scope: dep.effective_scope(),
             repo_url: None,
             checksum: None,
+            workspace_module: None,
             local: false,
             system_path: None,
         };

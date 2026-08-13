@@ -38,6 +38,9 @@ pub enum CliError {
     #[error("configuration error: {0}")]
     Config(#[from] rv_config::ConfigError),
 
+    #[error("credential error: {0}")]
+    Credential(#[from] rv_config::CredentialError),
+
     #[error("dependency resolution failed: {0}")]
     Resolve(#[from] rv_resolver::ResolveError),
 
@@ -111,11 +114,6 @@ pub enum CliError {
     #[error("invalid scope: '{value}'")]
     InvalidScope { value: String },
 
-    #[error(
-        "multi-module reactor POM at {path} is not supported; run rv from an individual module's directory"
-    )]
-    MultiModuleNotSupported { path: PathBuf },
-
     #[error("{0}")]
     Message(String),
 
@@ -140,6 +138,7 @@ impl CliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             CliError::Config(_)
+            | CliError::Credential(_)
             | CliError::Toml(_)
             | CliError::ProjectFileMissing { .. }
             | CliError::Pom(_) => ExitCodes::CONFIG_ERROR,
@@ -164,8 +163,7 @@ impl CliError {
 
             CliError::LockfileMissing { .. }
             | CliError::LockfileNotAFile { .. }
-            | CliError::PlatformMissing { .. }
-            | CliError::MultiModuleNotSupported { .. } => ExitCodes::CONFIG_ERROR,
+            | CliError::PlatformMissing { .. } => ExitCodes::CONFIG_ERROR,
 
             CliError::Store(_)
             | CliError::Export(_)

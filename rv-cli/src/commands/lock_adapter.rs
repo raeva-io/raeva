@@ -1,4 +1,6 @@
-use rv_config::{LockPackage, LockPlatform};
+use std::collections::{BTreeMap, BTreeSet};
+
+use rv_config::{LockArtifact, LockCoordinate, LockModule, LockModulePackage, LockPlatform};
 use rv_sbom::{Component, Hash, HashAlgorithm};
 use rv_vuln::Dependency;
 
@@ -14,115 +16,330 @@ pub(crate) enum LockAdapterError {
     },
 }
 
-pub(crate) struct AdaptedDependencies {
-    pub vuln_dependencies: Vec<Dependency>,
+pub(crate) struct VulnerabilityDependencies {
+    pub dependencies: Vec<Dependency>,
+    pub reachability: BTreeMap<String, Vec<String>>,
+}
+
+pub(crate) struct SbomDependencies {
+    pub root: Component,
     pub components: Vec<Component>,
-    pub root_dependencies: Vec<String>,
 }
 
-impl AdaptedDependencies {
-    pub fn into_parts(self) -> (Vec<Dependency>, Vec<Component>, Vec<String>) {
-        (
-            self.vuln_dependencies,
-            self.components,
-            self.root_dependencies,
-        )
-    }
-}
-
-pub(crate) fn adapt_platform(
+pub(crate) fn adapt_sbom_modules(
     platform: &LockPlatform,
-) -> Result<AdaptedDependencies, LockAdapterError> {
-    let mut dependencies = Vec::with_capacity(platform.packages.len());
-    let mut purls = Vec::with_capacity(platform.packages.len());
+    modules: &[&LockModule],
+    fallback_root: Component,
+) -> Result<SbomDependencies, LockAdapterError> {
+    let root_module = modules
+        .iter()
+        .copied()
+        .find(|module| module.path == "pom.xml")
+        .or_else(|| modules.first().copied());
+    let root = root_module
+        .filter(|module| !module.is_legacy_placeholder())
+        .map(module_component)
+        .transpose()?
+        .unwrap_or(fallback_root);
 
-    for package in &platform.packages {
-        let dependency = dependency_from_package(package);
-        purls.push(dependency.purl()?);
-        dependencies.push(dependency);
-    }
+    let artifact_by_coordinate = platform
+        .artifacts
+        .iter()
+        .map(|artifact| (&artifact.coordinate, artifact))
+        .collect::<BTreeMap<_, _>>();
+    let module_by_path = platform
+        .modules
+        .iter()
+        .map(|module| (module.path.as_str(), module))
+        .collect::<BTreeMap<_, _>>();
+    let mut components = BTreeMap::<String, Component>::new();
 
-    let mut component_dependencies = vec![Vec::new(); platform.packages.len()];
-    let mut has_incoming = vec![false; platform.packages.len()];
-    for edge in &platform.edges {
-        if edge.from >= platform.packages.len() || edge.to >= platform.packages.len() {
-            return Err(LockAdapterError::InvalidEdge {
-                from: edge.from,
-                to: edge.to,
-                packages: platform.packages.len(),
-            });
+    for module in modules {
+        let graph_module = if module.is_legacy_placeholder()
+            && root_module.is_some_and(|root_module| root_module.path == module.path)
+        {
+            root.clone()
+        } else {
+            module_component(module)?
+        };
+        let module_purl = graph_module.purl.clone();
+        insert_component(&mut components, graph_module)?;
+        let package_purls = module
+            .packages
+            .iter()
+            .map(|package| package_purl(package, &module_by_path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (index, package) in module.packages.iter().enumerate() {
+            let component = package_component(
+                package,
+                &artifact_by_coordinate,
+                &module_by_path,
+                package_purls[index].clone(),
+            )?;
+            insert_component(&mut components, component)?;
         }
-        component_dependencies[edge.from].push(purls[edge.to].clone());
-        has_incoming[edge.to] = true;
-    }
-    for dependency_purls in &mut component_dependencies {
-        dependency_purls.sort();
-        dependency_purls.dedup();
+
+        for edge in &module.edges {
+            if edge.from >= module.packages.len() || edge.to >= module.packages.len() {
+                return Err(LockAdapterError::InvalidEdge {
+                    from: edge.from,
+                    to: edge.to,
+                    packages: module.packages.len(),
+                });
+            }
+            add_dependency(
+                &mut components,
+                &package_purls[edge.from],
+                package_purls[edge.to].clone(),
+            )?;
+        }
+
+        let direct = root_package_indices(module);
+        for index in direct {
+            add_dependency(&mut components, &module_purl, package_purls[index].clone())?;
+        }
     }
 
-    let mut components: Vec<Component> = platform
-        .packages
+    let selected_paths = modules
         .iter()
-        .zip(purls.iter())
-        .zip(component_dependencies)
-        .map(|((package, purl), dependencies)| Component {
-            name: package.artifact_id.clone(),
-            version: package.version.clone(),
-            group: Some(package.group_id.clone()),
-            purl: purl.clone(),
-            license_expression: None,
-            hashes: sha256_hash(package).into_iter().collect(),
-            dependencies,
-        })
-        .collect();
-    components.sort_by(|left, right| left.purl.cmp(&right.purl));
-
-    let mut vuln_dependencies: Vec<(String, Dependency)> =
-        purls.iter().cloned().zip(dependencies).collect();
-    vuln_dependencies.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let has_direct_scope = platform
-        .packages
+        .map(|module| module.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let reachable_workspace_paths = modules
         .iter()
-        .any(|package| package.direct_scope.is_some());
-    let mut root_dependencies: Vec<String> = if has_direct_scope {
-        purls
-            .iter()
-            .zip(&platform.packages)
-            .filter(|(_, package)| package.direct_scope.is_some())
-            .map(|(purl, _)| purl.clone())
-            .collect()
-    } else {
-        purls
-            .iter()
-            .zip(has_incoming)
-            .filter(|(_, incoming)| !incoming)
-            .map(|(purl, _)| purl.clone())
-            .collect()
-    };
-    if !has_direct_scope && root_dependencies.is_empty() && !purls.is_empty() {
-        root_dependencies.clone_from(&purls);
+        .flat_map(|module| &module.packages)
+        .filter_map(|package| package.workspace_module.as_deref())
+        .collect::<BTreeSet<_>>();
+    for path in reachable_workspace_paths.difference(&selected_paths) {
+        if let Some(module) = module_by_path.get(path) {
+            insert_component(&mut components, module_component(module)?)?;
+        }
     }
-    root_dependencies.sort();
-    root_dependencies.dedup();
 
-    Ok(AdaptedDependencies {
-        vuln_dependencies: vuln_dependencies
-            .into_iter()
-            .map(|(_, dependency)| dependency)
-            .collect(),
-        components,
-        root_dependencies,
+    let root_graph = components.remove(&root.purl);
+    for component in components.values_mut() {
+        component.dependencies.sort();
+        component.dependencies.dedup();
+    }
+    let mut root = root;
+    if let Some(component) = root_graph {
+        root.dependencies = component.dependencies;
+    }
+    root.dependencies.sort();
+    root.dependencies.dedup();
+
+    Ok(SbomDependencies {
+        root,
+        components: components.into_values().collect(),
     })
 }
 
-pub(crate) fn dependency_from_package(package: &LockPackage) -> Dependency {
+fn root_package_indices(module: &LockModule) -> Vec<usize> {
+    if module
+        .packages
+        .iter()
+        .any(|package| package.direct_scope.is_some())
+    {
+        return module
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.direct_scope.is_some())
+            .map(|(index, _)| index)
+            .collect();
+    }
+    let mut incoming = vec![false; module.packages.len()];
+    for edge in &module.edges {
+        if let Some(value) = incoming.get_mut(edge.to) {
+            *value = true;
+        }
+    }
+    let roots = incoming
+        .iter()
+        .enumerate()
+        .filter(|(_, incoming)| !**incoming)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if roots.is_empty() && !module.packages.is_empty() {
+        (0..module.packages.len()).collect()
+    } else {
+        roots
+    }
+}
+
+fn package_component(
+    package: &LockModulePackage,
+    artifacts: &BTreeMap<&LockCoordinate, &LockArtifact>,
+    modules: &BTreeMap<&str, &LockModule>,
+    purl: String,
+) -> Result<Component, LockAdapterError> {
+    let (name, version, group) = if let Some(path) = package.workspace_module.as_deref() {
+        let module = modules.get(path).copied();
+        (
+            module
+                .map(|module| module.gav.artifact.clone())
+                .unwrap_or_else(|| package.coordinate.artifact.clone()),
+            module
+                .map(|module| module.gav.version.clone())
+                .unwrap_or_else(|| package.coordinate.version.clone()),
+            Some(
+                module
+                    .map(|module| module.gav.group.clone())
+                    .unwrap_or_else(|| package.coordinate.group.clone()),
+            ),
+        )
+    } else {
+        (
+            package.coordinate.artifact.clone(),
+            package.coordinate.version.clone(),
+            Some(package.coordinate.group.clone()),
+        )
+    };
+    let hashes = if package.workspace_module.is_some() || package.system_path.is_some() {
+        Vec::new()
+    } else {
+        artifacts
+            .get(&package.coordinate)
+            .and_then(|artifact| {
+                artifact
+                    .checksums
+                    .iter()
+                    .find(|checksum| checksum.algorithm == "sha256")
+            })
+            .map(|checksum| {
+                vec![Hash {
+                    algorithm: HashAlgorithm::Sha256,
+                    value: checksum.digest.clone(),
+                }]
+            })
+            .unwrap_or_default()
+    };
+    Ok(Component {
+        name,
+        version,
+        group,
+        purl,
+        license_expression: None,
+        hashes,
+        dependencies: Vec::new(),
+    })
+}
+
+fn module_component(module: &LockModule) -> Result<Component, LockAdapterError> {
+    Ok(Component {
+        name: module.gav.artifact.clone(),
+        version: module.gav.version.clone(),
+        group: Some(module.gav.group.clone()),
+        purl: maven_purl(
+            &module.gav.group,
+            &module.gav.artifact,
+            &module.gav.version,
+            &module.packaging,
+        )?,
+        license_expression: None,
+        hashes: Vec::new(),
+        dependencies: Vec::new(),
+    })
+}
+
+fn coordinate_purl(coordinate: &LockCoordinate) -> Result<String, LockAdapterError> {
+    Ok(dependency_from_coordinate(coordinate).purl()?)
+}
+
+fn package_purl(
+    package: &LockModulePackage,
+    modules: &BTreeMap<&str, &LockModule>,
+) -> Result<String, LockAdapterError> {
+    if let Some(path) = package.workspace_module.as_deref()
+        && let Some(module) = modules.get(path)
+    {
+        return Ok(module_component(module)?.purl);
+    }
+    coordinate_purl(&package.coordinate)
+}
+
+fn insert_component(
+    components: &mut BTreeMap<String, Component>,
+    component: Component,
+) -> Result<(), LockAdapterError> {
+    components
+        .entry(component.purl.clone())
+        .and_modify(|existing| {
+            existing.dependencies.extend(component.dependencies.clone());
+            if existing.hashes.is_empty() {
+                existing.hashes.clone_from(&component.hashes);
+            }
+        })
+        .or_insert(component);
+    Ok(())
+}
+
+fn add_dependency(
+    components: &mut BTreeMap<String, Component>,
+    source: &str,
+    target: String,
+) -> Result<(), LockAdapterError> {
+    let component = components.get_mut(source).ok_or_else(|| {
+        LockAdapterError::Purl(rv_vuln::VulnError::InvalidPurl(format!(
+            "missing SBOM component for {source}"
+        )))
+    })?;
+    component.dependencies.push(target);
+    Ok(())
+}
+
+/// Build the OSV query set from module-local graphs.
+///
+/// The purl-keyed map deduplicates across modules before the scanner sees the
+/// dependencies. The paired module-path set records every module that can
+/// reach each external. Workspace and system nodes never enter the query set.
+pub(crate) fn adapt_vulnerability_modules(
+    modules: &[&LockModule],
+) -> Result<VulnerabilityDependencies, LockAdapterError> {
+    let mut by_purl = BTreeMap::<String, (Dependency, BTreeSet<String>)>::new();
+    for module in modules {
+        for package in &module.packages {
+            if package.workspace_module.is_some() || package.system_path.is_some() {
+                continue;
+            }
+            let dependency = dependency_from_coordinate(&package.coordinate);
+            let purl = dependency.purl()?;
+            by_purl
+                .entry(purl)
+                .and_modify(|(_, paths)| {
+                    paths.insert(module.path.clone());
+                })
+                .or_insert_with(|| {
+                    (
+                        dependency,
+                        BTreeSet::from_iter(std::iter::once(module.path.clone())),
+                    )
+                });
+        }
+    }
+
+    let mut dependencies = Vec::with_capacity(by_purl.len());
+    let mut reachability = BTreeMap::new();
+    for (purl, (dependency, modules)) in by_purl {
+        dependencies.push(dependency);
+        reachability.insert(purl, modules.into_iter().collect());
+    }
+    Ok(VulnerabilityDependencies {
+        dependencies,
+        reachability,
+    })
+}
+
+pub(crate) fn dependency_from_coordinate(coordinate: &LockCoordinate) -> Dependency {
     Dependency {
-        group_id: package.group_id.clone(),
-        artifact_id: package.artifact_id.clone(),
-        version: package.version.clone(),
-        packaging: package.packaging.clone(),
-        classifier: package.classifier.clone().filter(|value| !value.is_empty()),
+        group_id: coordinate.group.clone(),
+        artifact_id: coordinate.artifact.clone(),
+        version: coordinate.version.clone(),
+        packaging: coordinate.packaging.clone(),
+        classifier: coordinate
+            .classifier
+            .clone()
+            .filter(|value| !value.is_empty()),
     }
 }
 
@@ -137,123 +354,42 @@ pub(crate) fn maven_purl(
     Ok(dependency.purl()?)
 }
 
-fn sha256_hash(package: &LockPackage) -> Option<Hash> {
-    let checksum = package.checksum.as_ref()?;
-    let algorithm = checksum.algorithm.replace('-', "");
-    if !algorithm.eq_ignore_ascii_case("sha256") {
-        return None;
-    }
-    Some(Hash {
-        algorithm: HashAlgorithm::Sha256,
-        value: checksum.digest.clone(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use rv_config::{Checksum, LockEdge, LockPackage, LockPlatform, Platform};
-    use rv_sbom::{Component, CycloneDxGenerator, SpdxGenerator};
+    use rv_config::{
+        LockArtifact, LockCoordinate, LockEdge, LockGav, LockModule, LockModulePackage,
+        LockPlatform, Platform,
+    };
+    use rv_sbom::Component;
 
-    use super::adapt_platform;
+    use super::adapt_sbom_modules;
 
-    fn package(packaging: &str, classifier: Option<&str>, checksum: Checksum) -> LockPackage {
-        LockPackage {
-            group_id: "org.example".to_string(),
-            artifact_id: "demo".to_string(),
-            version: "1.0.0".to_string(),
-            snapshot_timestamp: None,
-            packaging: packaging.to_string(),
-            classifier: classifier.map(str::to_string),
-            repo_url: "https://repo.example/maven2".to_string(),
-            checksum: Some(checksum),
+    fn package(
+        group: &str,
+        artifact: &str,
+        workspace_module: Option<&str>,
+        direct: bool,
+    ) -> LockModulePackage {
+        LockModulePackage {
+            coordinate: LockCoordinate::new(group, artifact, "1", "jar", None),
+            direct_scope: direct.then(|| "compile".to_string()),
+            workspace_module: workspace_module.map(str::to_string),
             system_path: None,
-            direct_scope: Some("compile".to_string()),
             extra: BTreeMap::new(),
         }
     }
 
     #[test]
-    fn maps_qualifiers_hashes_and_edges_without_collapsing_artifacts() {
-        let platform = LockPlatform {
-            platform: "linux-x86_64".parse::<Platform>().expect("platform"),
-            packages: vec![
-                package(
-                    "jar",
-                    None,
-                    Checksum::new(
-                        "sha256",
-                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    ),
-                ),
-                package("test-jar", Some("tests"), Checksum::new("sha1", "abcd")),
-            ],
-            edges: vec![LockEdge {
-                from: 0,
-                to: 1,
-                scope: Some("test".to_string()),
-                optional: false,
-                extra: BTreeMap::new(),
-            }],
-            extra: BTreeMap::new(),
-        };
-
-        let adapted = adapt_platform(&platform).expect("adapt lock platform");
-        assert_eq!(adapted.vuln_dependencies.len(), 2);
-        assert_eq!(adapted.components.len(), 2);
-
-        let purls: Vec<&str> = adapted
-            .components
-            .iter()
-            .map(|component| component.purl.as_str())
-            .collect();
-        assert_eq!(
-            purls,
-            vec![
-                "pkg:maven/org.example/demo@1.0.0",
-                "pkg:maven/org.example/demo@1.0.0?classifier=tests&type=test-jar",
-            ]
-        );
-        assert_eq!(adapted.components[0].hashes.len(), 1);
-        assert!(adapted.components[0].license_expression.is_none());
-        assert!(adapted.components[1].hashes.is_empty());
-        assert_eq!(
-            adapted.components[0].dependencies,
-            vec!["pkg:maven/org.example/demo@1.0.0?classifier=tests&type=test-jar"]
-        );
-        assert_eq!(
-            adapted.root_dependencies,
-            vec![
-                "pkg:maven/org.example/demo@1.0.0",
-                "pkg:maven/org.example/demo@1.0.0?classifier=tests&type=test-jar",
-            ]
-        );
-    }
-
-    #[test]
-    fn direct_dependencies_remain_root_dependencies_when_they_have_incoming_edges() {
-        let mut direct_a = package(
-            "jar",
-            None,
-            Checksum::new(
-                "sha256",
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            ),
-        );
-        direct_a.artifact_id = "a".to_string();
-        let mut direct_b = package(
-            "jar",
-            None,
-            Checksum::new(
-                "sha256",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            ),
-        );
-        direct_b.artifact_id = "b".to_string();
-        let platform = LockPlatform {
-            platform: "linux-x86_64".parse::<Platform>().expect("platform"),
-            packages: vec![direct_a, direct_b],
+    fn workspace_package_uses_target_modules_canonical_purl() {
+        let workspace = package("com.example", "lib", Some("lib/pom.xml"), true);
+        let external = package("org.example", "shared", None, false);
+        let app = LockModule {
+            path: "app/pom.xml".to_string(),
+            gav: LockGav::new("com.example", "app", "1"),
+            packaging: "jar".to_string(),
+            packages: vec![workspace, external.clone()],
             edges: vec![LockEdge {
                 from: 0,
                 to: 1,
@@ -263,96 +399,62 @@ mod tests {
             }],
             extra: BTreeMap::new(),
         };
-        let adapted = adapt_platform(&platform).expect("adapt lock platform");
-        assert_eq!(
-            adapted.root_dependencies,
-            vec![
-                "pkg:maven/org.example/a@1.0.0",
-                "pkg:maven/org.example/b@1.0.0"
-            ]
-        );
-
-        let root = Component {
-            name: "root".to_string(),
-            version: "1.0.0".to_string(),
-            group: Some("org.example".to_string()),
-            purl: "pkg:maven/org.example/root@1.0.0".to_string(),
-            license_expression: None,
-            hashes: Vec::new(),
-            dependencies: adapted.root_dependencies.clone(),
-        };
-        let cyclonedx = CycloneDxGenerator {
-            root_component: Some(root.clone()),
-            timestamp: None,
-            serial_number: None,
-            ..CycloneDxGenerator::default()
-        }
-        .generate(&adapted.components)
-        .expect("CycloneDX");
-        let cyclonedx: serde_json::Value =
-            serde_json::from_str(&cyclonedx).expect("CycloneDX JSON");
-        let root_dependencies = cyclonedx["dependencies"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|entry| entry["ref"] == root.purl)
-            .unwrap()["dependsOn"]
-            .as_array()
-            .unwrap();
-        assert_eq!(root_dependencies.len(), 2);
-
-        let spdx = SpdxGenerator {
-            root_component: Some(root),
-            ..SpdxGenerator::default()
-        }
-        .generate(&adapted.components)
-        .expect("SPDX");
-        let spdx: serde_json::Value = serde_json::from_str(&spdx).expect("SPDX JSON");
-        let root_id = spdx["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|package| package["name"] == "root")
-            .unwrap()["SPDXID"]
-            .as_str()
-            .unwrap();
-        let root_dependencies = spdx["relationships"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|relationship| {
-                relationship["spdxElementId"] == root_id
-                    && relationship["relationshipType"] == "DEPENDS_ON"
-            })
-            .count();
-        assert_eq!(root_dependencies, 2);
-    }
-
-    #[test]
-    fn old_locks_fall_back_to_no_incoming_root_heuristic() {
-        let mut a = package("jar", None, Checksum::new("sha1", "abcd"));
-        a.artifact_id = "a".to_string();
-        a.direct_scope = None;
-        let mut b = package("jar", None, Checksum::new("sha1", "abcd"));
-        b.artifact_id = "b".to_string();
-        b.direct_scope = None;
-        let platform = LockPlatform {
-            platform: "linux-x86_64".parse::<Platform>().expect("platform"),
-            packages: vec![a, b],
-            edges: vec![LockEdge {
-                from: 0,
-                to: 1,
-                scope: None,
-                optional: false,
-                extra: BTreeMap::new(),
+        let lib = LockModule {
+            path: "lib/pom.xml".to_string(),
+            gav: LockGav::new("com.example", "lib", "1"),
+            packaging: "bundle".to_string(),
+            packages: vec![LockModulePackage {
+                direct_scope: Some("compile".to_string()),
+                ..external
             }],
+            edges: Vec::new(),
             extra: BTreeMap::new(),
         };
+        let platform = LockPlatform {
+            platform: Platform::new("linux", "x86_64").expect("platform"),
+            model_hash: "a".repeat(64),
+            artifacts: vec![LockArtifact {
+                coordinate: LockCoordinate::new("org.example", "shared", "1", "jar", None),
+                repo_url: "https://repo.example/".to_string(),
+                checksums: Vec::new(),
+                snapshot: None,
+                pom_sha256: None,
+                extra: BTreeMap::new(),
+            }],
+            modules: vec![app, lib],
+            extra: BTreeMap::new(),
+        };
+        let fallback = Component {
+            name: "root".to_string(),
+            version: "1".to_string(),
+            group: Some("com.example".to_string()),
+            purl: "pkg:maven/com.example/root@1".to_string(),
+            license_expression: None,
+            hashes: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        let selected = vec![&platform.modules[0]];
+        let adapted =
+            adapt_sbom_modules(&platform, &selected, fallback).expect("adapt selected module");
 
-        let adapted = adapt_platform(&platform).expect("adapt lock platform");
-        assert_eq!(
-            adapted.root_dependencies,
-            vec!["pkg:maven/org.example/a@1.0.0"]
+        let canonical = "pkg:maven/com.example/lib@1?type=bundle";
+        let legacy_workspace_shape = "pkg:maven/com.example/lib@1";
+        let lib = adapted
+            .components
+            .iter()
+            .find(|component| component.purl == canonical)
+            .expect("canonical sibling component");
+        assert!(
+            lib.dependencies
+                .iter()
+                .any(|dependency| dependency == "pkg:maven/org.example/shared@1")
+        );
+        assert!(
+            adapted
+                .components
+                .iter()
+                .all(|component| component.purl != legacy_workspace_shape),
+            "workspace package must not create a second first-party component"
         );
     }
 }

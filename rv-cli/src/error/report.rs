@@ -69,6 +69,12 @@ pub(crate) fn render_resolve_error(err: &ResolveError) -> String {
             render_multiple_artifact_errors(first, rest)
         }
         ResolveError::RelocationCycle(_)
+        | ResolveError::WorkspaceDependencyCycle { .. }
+        | ResolveError::ConflictingArtifactBytes { .. }
+        | ResolveError::ConflictingSupportPomBytes(_)
+        | ResolveError::ConflictingCompanionPomBytes(_)
+        | ResolveError::ConflictingResolvedPomBytes { .. }
+        | ResolveError::ConflictingPomPackagedBytes { .. }
         | ResolveError::MissingVersion { .. }
         | ResolveError::InvalidVersionRequirement { .. }
         | ResolveError::VersionNotFound { .. }
@@ -80,6 +86,7 @@ pub(crate) fn render_resolve_error(err: &ResolveError) -> String {
         | ResolveError::Version(_)
         | ResolveError::Io(_)
         | ResolveError::SolverInvariant { .. }
+        | ResolveError::WorkspaceStalled { .. }
         | ResolveError::InternalError(_) => err.to_string(),
     }
 }

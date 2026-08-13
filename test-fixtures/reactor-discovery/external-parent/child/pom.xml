@@ -1,0 +1,10 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>external-parent</artifactId>
+    <version>1</version>
+  </parent>
+  <artifactId>selected-child</artifactId>
+  <version>${revision}</version>
+</project>

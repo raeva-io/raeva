@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 
@@ -79,41 +79,90 @@ impl<R: ParentResolver + ?Sized> ParentResolver for &R {
     }
 }
 
-/// Cap on parent-POM chain depth. Real-world POMs rarely chain past four
-/// levels; 100 leaves room for unusual layouts without permitting an
-/// infinite-loop POM to wedge resolution.
-const MAX_INHERITANCE_DEPTH: usize = 100;
+/// Maximum number of `<parent>` hops any parent chain may traverse.
+///
+/// Every traversal of a parent chain shares this one limit so that the parents
+/// inheritance resolves, the parents reactor discovery tolerates, and the
+/// parents `rv sync`'s model hash covers are the same set. A chain within the
+/// limit is walked in full by all of them; a chain that needs one more hop is
+/// rejected here before any resolution result can depend on the extra parent.
+/// Real-world POMs rarely chain past four levels; the cap exists to keep a
+/// pathological chain from spinning forever.
+pub const MAX_PARENT_CHAIN_DEPTH: usize = 100;
+
+/// The coordinates a `<parent>` declaration actually names, with `${...}`
+/// references expanded against `properties`.
+///
+/// The CI-friendly `<properties><revision>` pattern puts a property in the
+/// parent version, so the raw declaration is not the parent's identity. Every
+/// traversal of a parent chain must derive the hop it looks up through this one
+/// function, or the parents inheritance resolves, the parents reactor discovery
+/// tolerates, and the parents `rv sync`'s model hash covers stop being the same
+/// set — an ancestor the hash walker skipped could still change resolution.
+///
+/// `properties` are the declaring POM's own `<properties>`, exactly what
+/// [`apply_inheritance`] has at the hop: a parent's properties are merged into
+/// the child only after the whole chain is walked, so they cannot name their
+/// own POM's parent. A traversal that starts at a POM whose properties
+/// resolution overlays with `-D` user properties must expand that first hop
+/// through [`interpolate_parent_with_user_properties`] instead, or it names a
+/// different POM than resolution loads.
+pub fn interpolate_parent(properties: &PropertyMap, parent: &Parent) -> Result<Parent, PomError> {
+    Ok(Parent {
+        group_id: properties.interpolate_str_no_project(&parent.group_id)?,
+        artifact_id: properties.interpolate_str_no_project(&parent.artifact_id)?,
+        version: properties.interpolate_str_no_project(&parent.version)?,
+        relative_path: parent.relative_path.clone(),
+    })
+}
+
+/// [`interpolate_parent`] with Maven user properties (`-D` entries, in
+/// practice `.mvn/maven.config`) layered above the declaring POM's own
+/// `<properties>`.
+///
+/// User properties sit ABOVE POM properties in Maven's precedence chain, so a
+/// same-named entry here wins — the same overwrite the model layer applies
+/// before it builds an effective POM. A `<parent><version>${parentVersion}</version>`
+/// naming a property only `.mvn/maven.config` defines therefore resolves to
+/// the POM resolution actually loads, and every traversal that expands a
+/// parent declaration with the same user properties names that same POM.
+pub fn interpolate_parent_with_user_properties(
+    properties: &PropertyMap,
+    user_properties: &HashMap<String, String>,
+    parent: &Parent,
+) -> Result<Parent, PomError> {
+    if user_properties.is_empty() {
+        return interpolate_parent(properties, parent);
+    }
+    let mut merged = properties.clone();
+    for (key, value) in user_properties {
+        merged.insert(key.as_str(), value.as_str());
+    }
+    interpolate_parent(&merged, parent)
+}
 
 pub fn apply_inheritance(pom: Pom, resolver: &impl ParentResolver) -> Result<Pom, PomError> {
     let mut chain = Vec::new();
     let mut current_pom = pom;
     let mut visited = HashSet::new();
+    let mut depth = 0usize;
 
     loop {
-        if chain.len() >= MAX_INHERITANCE_DEPTH {
-            return Err(PomError::InvalidModel(format!(
-                "inheritance depth exceeded limit of {}",
-                MAX_INHERITANCE_DEPTH
-            )));
-        }
-
         let Some(raw_parent) = current_pom.parent.clone() else {
             chain.push(current_pom);
             break;
         };
 
-        let parent = Parent {
-            group_id: current_pom
-                .properties
-                .interpolate_str_no_project(&raw_parent.group_id)?,
-            artifact_id: current_pom
-                .properties
-                .interpolate_str_no_project(&raw_parent.artifact_id)?,
-            version: current_pom
-                .properties
-                .interpolate_str_no_project(&raw_parent.version)?,
-            relative_path: raw_parent.relative_path.clone(),
-        };
+        // Counted per hop actually taken, so the chain a full walk accepts is
+        // exactly the chain `accepted_local_parents` reports.
+        if depth == MAX_PARENT_CHAIN_DEPTH {
+            return Err(PomError::InvalidModel(format!(
+                "parent chain exceeds the limit of {MAX_PARENT_CHAIN_DEPTH} parents"
+            )));
+        }
+        depth += 1;
+
+        let parent = interpolate_parent(&current_pom.properties, &raw_parent)?;
         current_pom.parent = Some(parent.clone());
 
         let parent_key = (
@@ -393,16 +442,22 @@ fn merge_dependency_management(
             // Use IndexMap to preserve insertion order and deduplicate by key
             let mut merged_map: IndexMap<DependencyManagementKey, Dependency> = IndexMap::new();
 
-            // Insert parent dependencies first
-            for dep in parent.dependencies {
+            // Maven's model merger is source-dominant: child-declared
+            // management comes before inherited management. Order matters
+            // because imported BOM payloads expand later against a first-wins
+            // index. Parent-first order would let an inherited BOM beat a
+            // child BOM on coordinates whose import entries have different
+            // keys and so never collide here.
+            for dep in child.dependencies {
                 let key = dependency_management_key(&dep);
                 merged_map.insert(key, dep);
             }
 
-            // Insert child dependencies (overriding parent where keys match)
-            for dep in child.dependencies {
+            // Retain only parent entries the child did not override, in the
+            // parent's declaration order.
+            for dep in parent.dependencies {
                 let key = dependency_management_key(&dep);
-                merged_map.insert(key, dep);
+                merged_map.entry(key).or_insert(dep);
             }
 
             // WHY: build the result with an explicit field list instead of
@@ -1012,5 +1067,67 @@ mod tests {
         };
         let result = apply_inheritance(child, &resolver);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    /// [`MAX_PARENT_CHAIN_DEPTH`] is the boundary every parent-chain traversal
+    /// shares (notably `rv_resolver::accepted_local_parents`, which feeds the
+    /// lockfile model hash). Inheritance must therefore accept a chain of
+    /// exactly that many parents and reject one hop more, rather than
+    /// resolving past the depth the other walks stop at.
+    #[test]
+    fn parent_chain_limit_is_the_shared_boundary() {
+        struct ChainResolver {
+            length: usize,
+        }
+
+        fn ancestor(index: usize) -> Parent {
+            Parent {
+                group_id: "com.base".to_string(),
+                artifact_id: format!("p{index}"),
+                version: "1.0.0".to_string(),
+                relative_path: Some(String::new()),
+            }
+        }
+
+        impl ParentResolver for ChainResolver {
+            fn resolve_parent(&self, parent: &Parent) -> Result<Option<Pom>, PomError> {
+                let index: usize = parent.artifact_id[1..].parse().expect("chain index");
+                let mut pom = Pom::default();
+                pom.group_id = Some("com.base".to_string());
+                pom.artifact_id = Some(parent.artifact_id.clone());
+                pom.version = Some("1.0.0".to_string());
+                if index < self.length {
+                    pom.parent = Some(ancestor(index + 1));
+                }
+                Ok(Some(pom))
+            }
+        }
+
+        let child = || {
+            let mut child = Pom::default();
+            child.artifact_id = Some("child".to_string());
+            child.parent = Some(ancestor(1));
+            child
+        };
+
+        apply_inheritance(
+            child(),
+            &ChainResolver {
+                length: MAX_PARENT_CHAIN_DEPTH,
+            },
+        )
+        .expect("a chain at the limit resolves");
+
+        let error = apply_inheritance(
+            child(),
+            &ChainResolver {
+                length: MAX_PARENT_CHAIN_DEPTH + 1,
+            },
+        )
+        .expect_err("a chain past the limit must be rejected");
+        assert!(
+            error.to_string().contains("parent chain exceeds the limit"),
+            "unexpected error: {error}"
+        );
     }
 }

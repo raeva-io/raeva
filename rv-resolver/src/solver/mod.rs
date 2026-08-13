@@ -22,7 +22,7 @@ use self::queue::{ExclusionKey, PathNode, QueueItem, extend_exclusions, is_exclu
 #[cfg(test)]
 mod tests;
 
-pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Default parallel POM fetches. 32 saturates most home and corporate
 /// connections without overwhelming the typical Maven repository's per-host
@@ -46,10 +46,15 @@ pub(crate) struct ResolvedVersion {
 pub(crate) struct ResolvedProject {
     pub project: Project,
     pub repo_url: Option<Arc<str>>,
+    pub workspace_module: Option<String>,
     pub platform_constraints: Option<PlatformConstraints>,
 }
 
 pub(crate) trait Backend {
+    fn workspace_module(&self, _coord: &Coord) -> Option<String> {
+        None
+    }
+
     fn resolve_version<'a>(
         &'a self,
         group_id: &'a str,
@@ -128,6 +133,7 @@ impl<'a, B: Backend> Solver<'a, B> {
         let root_version = coord.version.clone();
         let root_version_arc = Arc::new(root_version.clone());
         let root_node = Node {
+            workspace_module: self.backend.workspace_module(&coord),
             coord,
             scope,
             repo_url: None,
@@ -720,6 +726,7 @@ async fn process_batch<'a, B: Backend>(
                     scope: Scope::System,
                     repo_url: None,
                     checksum: None,
+                    workspace_module: None,
                     local: true,
                     system_path: item.dependency.system_path.clone(),
                 };
@@ -767,6 +774,13 @@ async fn process_batch<'a, B: Backend>(
                     requested: item.dependency.version.clone(),
                 };
 
+                if let Some(workspace_module) = resolved_project.workspace_module.as_deref()
+                    && let Some(cycle) =
+                        workspace_dependency_cycle(&item, workspace_module, graph, selected)
+                {
+                    return Err(ResolveError::WorkspaceDependencyCycle { cycle });
+                }
+
                 if item.path.contains(&key) {
                     if let Some(existing) = selected.get(&key) {
                         graph.add_edge(item.parent, existing.node, edge);
@@ -785,6 +799,7 @@ async fn process_batch<'a, B: Backend>(
                             scope: effective_scope,
                             repo_url: resolved.repo_url.clone(),
                             checksum: None,
+                            workspace_module: resolved_project.workspace_module.clone(),
                             local: false,
                             system_path: item.dependency.system_path.clone(),
                         };
@@ -860,9 +875,11 @@ async fn process_batch<'a, B: Backend>(
                             let orphaned_keys = graph.replace_node_version(node_idx, new_coord);
                             if let Some(node) = graph.node_mut(node_idx) {
                                 node.scope = effective_scope;
-                                if node.repo_url.is_none() {
-                                    node.repo_url = resolved.repo_url.clone();
-                                }
+                                node.repo_url = resolved
+                                    .repo_url
+                                    .clone()
+                                    .or_else(|| resolved_project.repo_url.clone());
+                                node.workspace_module = resolved_project.workspace_module.clone();
                             }
 
                             selected.insert(
@@ -879,12 +896,6 @@ async fn process_batch<'a, B: Backend>(
                             }
                             #[cfg(debug_assertions)]
                             graph.assert_index_consistent();
-
-                            if let Some(node) = graph.node_mut(node_idx)
-                                && node.repo_url.is_none()
-                            {
-                                node.repo_url = resolved_project.repo_url.clone();
-                            }
 
                             // #50: the batch-level merge above already folded
                             // in this outcome's constraints; no per-outcome
@@ -944,6 +955,32 @@ async fn process_batch<'a, B: Backend>(
     }
 
     Ok(())
+}
+
+fn workspace_dependency_cycle(
+    item: &QueueItem,
+    target_module: &str,
+    graph: &Graph,
+    selected: &HashMap<CoordKey, Selected>,
+) -> Option<String> {
+    let mut coordinates = Vec::new();
+    let mut current = Some(item.path.as_ref());
+    while let Some(path) = current {
+        let selected_node = selected.get(&path.key)?;
+        let node = graph.node(selected_node.node)?;
+        let workspace_module = node.workspace_module.as_deref()?;
+        coordinates.push(format!(
+            "{}:{}",
+            node.coord.group_id, node.coord.artifact_id
+        ));
+        if workspace_module == target_module {
+            coordinates.reverse();
+            coordinates.push(coordinates.first().expect("cycle contains target").clone());
+            return Some(coordinates.join(" -> "));
+        }
+        current = path.parent.as_deref();
+    }
+    None
 }
 
 #[cfg(test)]

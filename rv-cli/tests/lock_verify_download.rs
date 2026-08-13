@@ -1,11 +1,9 @@
 //! Regression tests for `rv lock verify --download`.
 //!
 //! Spin up an in-process HTTP stub, point a tempdir-rooted rv install at it,
-//! and run the binary under test. The fix being guarded here routes downloads
-//! through `RepoClient::fetch_artifact_to_store_and_index` so the artifact
-//! key → blob index commit happens under the same `StoreLock` as the blob
-//! persist (the GC race that the legacy two-step
-//! `fetch_artifact_to_store` → `Store::add_artifact` reopened).
+//! and run the binary under test. What these guard is the repair path's
+//! trust boundary: which origins it will contact, and which bytes it will
+//! let the shared content store's coordinate index point at.
 
 use std::fs;
 use std::path::Path;
@@ -31,16 +29,33 @@ async fn spawn_stub<F>(handler: F, expected_requests: u32) -> std::net::SocketAd
 where
     F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
 {
+    spawn_stub_counted(handler, expected_requests).await.0
+}
+
+/// `spawn_stub` plus a counter of accepted connections, for tests that must
+/// prove the origin was *never* contacted. The count is bumped on accept
+/// rather than after the response so a connection the client opens and drops
+/// still registers as a hit.
+async fn spawn_stub_counted<F>(
+    handler: F,
+    expected_requests: u32,
+) -> (std::net::SocketAddr, Arc<AtomicU32>)
+where
+    F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");
     let handler = Arc::new(handler);
     let served = Arc::new(AtomicU32::new(0));
+    let hits = Arc::new(AtomicU32::new(0));
+    let hits_out = hits.clone();
     tokio::spawn(async move {
         while served.load(Ordering::SeqCst) < expected_requests {
             let (mut sock, _) = match listener.accept().await {
                 Ok(pair) => pair,
                 Err(_) => break,
             };
+            hits.fetch_add(1, Ordering::SeqCst);
             let handler = handler.clone();
             let served = served.clone();
             tokio::spawn(async move {
@@ -71,7 +86,7 @@ where
             });
         }
     });
-    addr
+    (addr, hits_out)
 }
 
 fn http_ok(body: &[u8]) -> Vec<u8> {
@@ -133,13 +148,20 @@ checksum = {{ algorithm = "sha1", digest = "{sha1}" }}
 }
 
 fn write_project(project: &Path, repo_url: &str, sha256: &str) {
+    write_project_split(project, repo_url, repo_url, sha256);
+}
+
+/// Like [`write_project`], but the origin `rv.toml` declares and the origin
+/// `rv.lock` records are set independently, so a test can model a tampered
+/// lockfile that points at a repository the project never trusted.
+fn write_project_split(project: &Path, config_repo_url: &str, lock_repo_url: &str, sha256: &str) {
     fs::write(
         project.join("rv.toml"),
         format!(
             r#"
 [[repositories]]
 id = "stub"
-url = "{repo_url}"
+url = "{config_repo_url}"
 "#
         ),
     )
@@ -169,24 +191,20 @@ group_id = "com.example"
 artifact_id = "demo"
 version = "1.0.0"
 packaging = "jar"
-repo_url = "{repo_url}"
+repo_url = "{lock_repo_url}"
 checksum = {{ algorithm = "sha256", digest = "{sha256}" }}
 "#
     );
     fs::write(project.join("rv.lock"), lockfile).expect("write rv.lock");
 }
 
-/// Regression: `rv lock verify --download` must use the atomic
-/// `fetch_artifact_to_store_and_index` path, so the artifact-key → blob
-/// mapping is recorded under the same store lock as the blob persist. The
-/// legacy two-step sequence reopened the GC race window.
+/// Happy path: a configured origin serving bytes that match the recorded pin
+/// must still be downloaded *and* indexed.
 ///
 /// We assert the externally-observable effect: after a successful download,
-/// the SQLite index has a row mapping the artifact key to the blob. With the
-/// old code path the row landed in a separate `Store::add_artifact` call;
-/// with the new path it lands inside `put_stream_and_index`. Either way the
-/// row must be present; the test confirms the new code did not silently
-/// drop the index step.
+/// the SQLite index has a row mapping the artifact key to the blob. Holding
+/// the index write back until the pin check passes must not lose it — the
+/// row is what downstream consumers (e.g. `rv export-m2`) follow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lock_verify_download_indexes_artifact() {
     ensure_crypto_provider();
@@ -268,6 +286,230 @@ async fn lock_verify_download_indexes_artifact() {
         "artifact-key → blob mapping must exist after --download \
          (the atomic fetch_artifact_to_store_and_index path commits the \
          index row under the same store lock as the blob persist)"
+    );
+}
+
+/// Run the real binary against `project` with `RAEVA_HOME` pointed at `home`.
+async fn run_rv(project: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_rv").to_string();
+    let project = project.to_path_buf();
+    let home = home.to_path_buf();
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&bin)
+            .arg("-C")
+            .arg(&project)
+            .args(&args)
+            .env("RAEVA_HOME", &home)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("RUST_LOG")
+            .output()
+            .expect("spawn rv")
+    })
+    .await
+    .expect("join")
+}
+
+/// Serve a jar plus a matching `.sha256` sidecar; 404 everything else.
+fn jar_routes(body: Vec<u8>, sha256: String) -> impl Fn(&str) -> Vec<u8> + Send + Sync + 'static {
+    move |request_line: &str| {
+        if request_line.contains(".sha256") {
+            http_ok(sha256.as_bytes())
+        } else if request_line.contains(".jar") {
+            http_ok(&body)
+        } else {
+            http_404()
+        }
+    }
+}
+
+/// Security regression: `rv lock verify --download` must apply the same trust
+/// policy as `rv sync`. A tampered `rv.lock` that names a `repo_url` the
+/// project's `rv.toml` never declared must be refused as a verify finding,
+/// and the attacker origin must not be contacted at all — verify used to
+/// synthesize a `Repository` for whatever URL the lockfile carried, so
+/// `--download` would happily fetch from it (`rv sync` refuses the very same
+/// lockfile with `UntrustedRepoUrl` before any I/O).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_verify_download_refuses_untrusted_lockfile_origin() {
+    ensure_crypto_provider();
+
+    // The attacker rewrote both halves of the lockfile row: the origin *and*
+    // the pin, so the pin check alone would wave these bytes through.
+    let attacker_body: &[u8] = b"attacker-controlled-jar-bytes";
+    let attacker_sha256: String = Sha256::digest(attacker_body).encode_hex();
+
+    let (addr, hits) = spawn_stub_counted(
+        jar_routes(attacker_body.to_vec(), attacker_sha256.clone()),
+        32,
+    )
+    .await;
+
+    let project = tempdir().expect("temp project");
+    let home = tempdir().expect("temp raeva home");
+    let attacker_url = format!("http://{addr}/");
+    // `rv.toml` trusts an unrelated repository; the lockfile points at the
+    // attacker's stub.
+    write_project_split(
+        project.path(),
+        "https://repo.example/m2/",
+        &attacker_url,
+        &attacker_sha256,
+    );
+
+    let output = run_rv(
+        project.path(),
+        home.path(),
+        &["--json", "lock", "verify", "--download"],
+    )
+    .await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "verify must fail on a lockfile whose origin is not a trust root\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        panic!("stdout must be a single JSON envelope: {err}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert_eq!(
+        parsed["data"]["untrusted_origin"],
+        serde_json::json!(1),
+        "the untrusted origin must surface as its own finding: {parsed}"
+    );
+    assert_eq!(
+        parsed["data"]["untrusted_origin_artifacts"][0]["repo_url"],
+        serde_json::json!(attacker_url),
+        "the finding must name the refused origin: {parsed}"
+    );
+    assert_eq!(
+        parsed["data"]["downloaded"],
+        serde_json::json!(0),
+        "nothing may be downloaded from an untrusted origin: {parsed}"
+    );
+
+    // The load-bearing assertion: the attacker origin was never contacted.
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "verify must not open a connection to an origin outside the trust roots"
+    );
+
+    // ...and nothing was indexed for the coordinate.
+    let store_dir = home.path().join("store");
+    if store_dir.exists() {
+        let store = rv_store::Store::open(&store_dir).expect("open store");
+        let key = rv_store::ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
+        assert!(
+            store
+                .lookup_artifact(&key)
+                .await
+                .expect("lookup_artifact")
+                .is_none(),
+            "a refused download must leave the artifact index untouched"
+        );
+    }
+}
+
+/// Security regression: bytes that fail the lockfile pin must never be
+/// indexed. `--download` used to route through
+/// `fetch_artifact_to_store_and_index`, which repointed the artifact key at
+/// the fetched blob *before* comparing it to the pin — so a failed pin check
+/// still left the shared store's coordinate index aimed at whatever the
+/// origin served.
+///
+/// Here the origin is declared in `rv.toml` (so the trust gate passes and a
+/// fetch really happens) but serves bytes that do not match the recorded
+/// pin. The coordinate must still resolve to the blob it resolved to before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_verify_download_leaves_index_alone_when_the_pin_fails() {
+    ensure_crypto_provider();
+
+    // What the origin serves, with a self-consistent sidecar so the fetch
+    // itself succeeds and only the lockfile pin comparison can reject it.
+    let served_body: &[u8] = b"bytes-the-origin-actually-serves";
+    let served_sha256: String = Sha256::digest(served_body).encode_hex();
+    // What the lockfile pins: something else entirely.
+    let pinned_sha256: String = Sha256::digest(b"the-bytes-the-lockfile-pins").encode_hex();
+
+    let (addr, hits) =
+        spawn_stub_counted(jar_routes(served_body.to_vec(), served_sha256.clone()), 32).await;
+
+    let project = tempdir().expect("temp project");
+    let home = tempdir().expect("temp raeva home");
+    let repo_url = format!("http://{addr}/");
+    write_project(project.path(), &repo_url, &pinned_sha256);
+
+    // Seed the store so the coordinate already maps to a known blob; that
+    // mapping is what a redirect would overwrite.
+    let store_dir = home.path().join("store");
+    fs::create_dir_all(&store_dir).expect("mkdir store");
+    let key = rv_store::ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
+    let store = rv_store::Store::open(&store_dir).expect("open store");
+    let original_blob = store
+        .put_bytes(b"the-blob-the-store-already-had")
+        .await
+        .expect("put original bytes");
+    store
+        .add_artifact(&key, &original_blob)
+        .await
+        .expect("index original");
+    drop(store);
+
+    let output = run_rv(
+        project.path(),
+        home.path(),
+        &["--json", "lock", "verify", "--download"],
+    )
+    .await;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        !output.status.success(),
+        "verify must fail when the downloaded bytes miss the pin\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        panic!("stdout must be a single JSON envelope: {err}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+    assert_eq!(
+        parsed["data"]["pin_mismatch"],
+        serde_json::json!(1),
+        "the mismatched download must surface as its own finding: {parsed}"
+    );
+    assert_eq!(
+        parsed["data"]["downloaded"],
+        serde_json::json!(0),
+        "a download that fails the pin must not count as a repair: {parsed}"
+    );
+
+    // The origin really was contacted: this test exercises the pin gate, not
+    // the trust gate.
+    assert!(
+        hits.load(Ordering::SeqCst) > 0,
+        "the configured origin should have been fetched from"
+    );
+
+    // The load-bearing assertion: the coordinate still maps to the blob it
+    // mapped to before, not to the bytes the origin served.
+    let store = rv_store::Store::open(&store_dir).expect("reopen store");
+    let mapped = store
+        .lookup_artifact(&key)
+        .await
+        .expect("lookup_artifact")
+        .expect("the seeded mapping must survive a failed download");
+    assert_eq!(
+        mapped, original_blob,
+        "a download that fails the lockfile pin must not repoint the artifact index"
+    );
+    assert_ne!(
+        mapped.as_str(),
+        served_sha256,
+        "the index must not point at the bytes the origin served"
     );
 }
 

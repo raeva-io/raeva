@@ -59,6 +59,12 @@ pub struct RvCli {
 
 #[derive(Debug, Subcommand)]
 pub enum Commands {
+    /// Store repository credentials in the OS credential store
+    Login(commands::LoginArgs),
+    /// Remove repository credentials from the OS credential store
+    Logout(commands::LogoutArgs),
+    /// Inspect stored repository credential metadata
+    Auth(commands::AuthArgs),
     /// Resolve dependencies, download artifacts, and update rv.lock
     Sync(commands::SyncArgs),
     /// Export lockfile artifacts to ~/.m2/repository
@@ -95,6 +101,17 @@ pub async fn rv() -> Result<()> {
     init_tracing(cli.verbose, json_mode);
 
     match cli.command {
+        Commands::Login(args) => {
+            let project_root = cli.project_root.clone();
+            spawn_blocking_command(move || commands::auth::run_login(&args, &project_root)).await?
+        }
+        Commands::Logout(args) => {
+            let project_root = cli.project_root.clone();
+            spawn_blocking_command(move || commands::auth::run_logout(&args, &project_root)).await?
+        }
+        Commands::Auth(args) => {
+            spawn_blocking_command(move || commands::auth::run_auth(&args)).await?
+        }
         Commands::Sync(args) => commands::sync::run(&args, &cli.project_root).await?,
         Commands::ExportM2(args) => commands::export_m2::run(&args, &cli.project_root).await?,
         // tree / why / export-checksums are pure sync filesystem readers

@@ -183,6 +183,7 @@ impl Backend for MockBackend {
             Ok(ResolvedProject {
                 project,
                 repo_url: Some(Arc::from("mock://repo")),
+                workspace_module: None,
                 platform_constraints,
             })
         })

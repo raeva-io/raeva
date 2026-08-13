@@ -666,6 +666,62 @@ fn explicit_profile_deactivation_overrides_active_by_default() {
 }
 
 #[test]
+fn parent_profile_modules_are_not_inherited_into_child_aggregation() {
+    let parent = Pom::parse(
+        r#"
+        <project>
+          <modelVersion>4.0.0</modelVersion>
+          <groupId>com.example</groupId>
+          <artifactId>parent</artifactId>
+          <version>1</version>
+          <packaging>pom</packaging>
+          <modules><module>parent-base</module></modules>
+          <profiles>
+            <profile>
+              <id>parent-modules</id>
+              <activation><activeByDefault>true</activeByDefault></activation>
+              <modules><module>parent-profile</module></modules>
+            </profile>
+          </profiles>
+        </project>
+        "#,
+    )
+    .expect("parse parent");
+    let child = Pom::parse(
+        r#"
+        <project>
+          <modelVersion>4.0.0</modelVersion>
+          <parent>
+            <groupId>com.example</groupId>
+            <artifactId>parent</artifactId>
+            <version>1</version>
+          </parent>
+          <artifactId>child</artifactId>
+          <packaging>pom</packaging>
+          <modules><module>child-base</module></modules>
+          <profiles>
+            <profile>
+              <id>child-modules</id>
+              <activation><activeByDefault>true</activeByDefault></activation>
+              <modules><module>child-profile</module></modules>
+            </profile>
+          </profiles>
+        </project>
+        "#,
+    )
+    .expect("parse child");
+
+    let project = Project::from_pom_with_context(
+        child,
+        TestResolver { parent },
+        &ActivationContext::default(),
+    )
+    .expect("effective project");
+
+    assert_eq!(project.modules, ["child-base", "child-profile"]);
+}
+
+#[test]
 fn filters_dependencies_by_scope() {
     let project = Project {
         group_id: "g".to_string(),
@@ -1493,6 +1549,126 @@ fn local_dependency_management_overrides_bom() {
     let project = Project::from_pom(Pom::parse(pom_xml).unwrap(), resolver).unwrap();
     assert_eq!(project.dependencies.len(), 1);
     assert_eq!(project.dependencies[0].version.as_deref(), Some("1.2.3"));
+}
+
+#[test]
+fn child_bom_overrides_coordinates_from_inherited_bom() {
+    let parent = Pom::parse(
+        r"
+        <project>
+          <modelVersion>4.0.0</modelVersion>
+          <groupId>g</groupId>
+          <artifactId>parent</artifactId>
+          <version>1</version>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>g</groupId>
+                <artifactId>parent-bom</artifactId>
+                <version>1</version>
+                <type>pom</type>
+                <scope>import</scope>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+        </project>
+        ",
+    )
+    .unwrap();
+    let parent_bom = Pom::parse(
+        r"
+        <project>
+          <modelVersion>4.0.0</modelVersion>
+          <groupId>g</groupId>
+          <artifactId>parent-bom</artifactId>
+          <version>1</version>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>g</groupId>
+                <artifactId>target</artifactId>
+                <version>1</version>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+        </project>
+        ",
+    )
+    .unwrap();
+    let child_bom = Pom::parse(
+        r"
+        <project>
+          <modelVersion>4.0.0</modelVersion>
+          <groupId>g</groupId>
+          <artifactId>child-bom</artifactId>
+          <version>1</version>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>g</groupId>
+                <artifactId>target</artifactId>
+                <version>2</version>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+        </project>
+        ",
+    )
+    .unwrap();
+    let child = Pom::parse(
+        r"
+        <project>
+          <modelVersion>4.0.0</modelVersion>
+          <parent>
+            <groupId>g</groupId>
+            <artifactId>parent</artifactId>
+            <version>1</version>
+          </parent>
+          <artifactId>child</artifactId>
+          <dependencyManagement>
+            <dependencies>
+              <dependency>
+                <groupId>g</groupId>
+                <artifactId>child-bom</artifactId>
+                <version>1</version>
+                <type>pom</type>
+                <scope>import</scope>
+              </dependency>
+            </dependencies>
+          </dependencyManagement>
+          <dependencies>
+            <dependency>
+              <groupId>g</groupId>
+              <artifactId>target</artifactId>
+            </dependency>
+          </dependencies>
+        </project>
+        ",
+    )
+    .unwrap();
+
+    let mut parents = HashMap::new();
+    parents.insert(
+        ("g".to_string(), "parent".to_string(), "1".to_string()),
+        parent,
+    );
+    let mut boms = HashMap::new();
+    for (artifact, pom) in [("parent-bom", parent_bom), ("child-bom", child_bom)] {
+        boms.insert(
+            (
+                "g".to_string(),
+                artifact.to_string(),
+                "1".to_string(),
+                "pom".to_string(),
+                None,
+            ),
+            pom,
+        );
+    }
+    let resolver = ParentChainBomResolver { parents, boms };
+
+    let project = Project::from_pom(child, resolver).unwrap();
+    assert_eq!(project.dependencies[0].version.as_deref(), Some("2"));
 }
 
 #[test]
@@ -2594,6 +2770,42 @@ fn observe_project_repositories_skipped_when_empty() {
     };
     let _project = Project::from_pom(Pom::parse(pom_xml).unwrap(), &resolver).unwrap();
     assert_eq!(resolver.calls.get(), 0);
+}
+
+#[test]
+fn project_prerequisites_maven_interpolates_dependency_versions() {
+    struct NoOp;
+    impl ParentResolver for NoOp {
+        fn resolve_parent(&self, _parent: &Parent) -> Result<Option<Pom>, PomError> {
+            Ok(None)
+        }
+    }
+
+    let pom_xml = r#"<project>
+        <modelVersion>4.0.0</modelVersion>
+        <groupId>com.example</groupId>
+        <artifactId>plugin</artifactId>
+        <version>1.0.0</version>
+        <prerequisites>
+            <maven>3.0</maven>
+        </prerequisites>
+        <dependencies>
+            <dependency>
+                <groupId>org.apache.maven</groupId>
+                <artifactId>maven-plugin-api</artifactId>
+                <version>${project.prerequisites.maven}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.maven</groupId>
+                <artifactId>maven-core</artifactId>
+                <version>${pom.prerequisites.maven}</version>
+            </dependency>
+        </dependencies>
+    </project>"#;
+
+    let project = Project::from_pom(Pom::parse(pom_xml).unwrap(), &NoOp).unwrap();
+    assert_eq!(project.dependencies[0].version.as_deref(), Some("3.0"));
+    assert_eq!(project.dependencies[1].version.as_deref(), Some("3.0"));
 }
 
 #[test]

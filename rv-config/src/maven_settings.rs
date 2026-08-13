@@ -522,7 +522,7 @@ impl SettingsXml {
         let servers = self.servers.map(|s| {
             s.server
                 .into_iter()
-                .map(|s| {
+                .filter_map(|s| {
                     let mut token = None;
                     if let Some(config) = s.configuration
                         && let Some(headers) = config.http_headers
@@ -532,6 +532,21 @@ impl SettingsXml {
                                 token = parse_bearer_token(&prop.value);
                             }
                         }
+                    }
+
+                    // A `<server>` carrying none of the credential fields rv
+                    // models says nothing about HTTP auth for its id — holding
+                    // only `<privateKey>`/`<passphrase>`/`<filePermissions>` is
+                    // standard for scp deploys. Converting it anyway would turn
+                    // an empty `AuthConfig` into an "incomplete auth entry"
+                    // error and poison every repository using that id.
+                    if s.username.is_none() && s.password.is_none() && token.is_none() {
+                        tracing::warn!(
+                            entry_id = %s.id,
+                            "ignoring settings.xml <server> with no username, password or \
+                             Authorization header; it carries only fields rv does not model"
+                        );
+                        return None;
                     }
 
                     let password = s
@@ -564,12 +579,12 @@ impl SettingsXml {
                     // `parse_bearer_token`.
                     let token = token.map(Secret::new);
 
-                    AuthConfig {
+                    Some(AuthConfig {
                         id: Some(s.id),
                         username: s.username,
                         password,
                         token,
-                    }
+                    })
                 })
                 .collect()
         });
@@ -752,6 +767,8 @@ mod tests {
           <servers>
             <server>
               <id>corp</id>
+              <username>corp-user</username>
+              <password>corp-password</password>
               <configuration>
                 <httpHeaders/>
               </configuration>
@@ -927,6 +944,36 @@ mod tests {
             proxies[0].non_proxy_hosts,
             vec!["localhost".to_string(), "*.example.com".to_string()]
         );
+    }
+
+    /// A `<server>` holding only fields rv does not model (the scp deploy
+    /// trio) must be dropped, not converted into an empty `AuthConfig`. An
+    /// empty entry would id-match its repository and abort resolution with
+    /// "incomplete settings.xml auth entry" even though the user never
+    /// configured HTTP credentials for it.
+    #[test]
+    fn drops_servers_carrying_no_modeled_credential() {
+        let xml = r"
+        <settings>
+          <servers>
+            <server>
+              <id>scp-deploy</id>
+              <privateKey>/home/user/.ssh/id_rsa</privateKey>
+              <passphrase>secret</passphrase>
+              <filePermissions>664</filePermissions>
+            </server>
+            <server>
+              <id>corp</id>
+              <username>user</username>
+              <password>pass</password>
+            </server>
+          </servers>
+        </settings>
+        ";
+        let settings = MavenSettings::parse(xml).unwrap();
+        let servers = settings.servers.as_ref().unwrap();
+        assert_eq!(servers.len(), 1, "the scp-only server must be dropped");
+        assert_eq!(servers[0].id.as_deref(), Some("corp"));
     }
 
     #[test]

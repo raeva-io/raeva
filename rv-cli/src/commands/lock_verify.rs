@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
 use std::str::FromStr;
@@ -9,11 +9,13 @@ use clap::{Args, Subcommand};
 use futures::stream::{self, StreamExt};
 
 use rv_config::{
-    Checksum, Config, LOCKFILE_SCHEMA_VERSION, LockPackage, Lockfile, normalize_checksum_algorithm,
+    Checksum, Config, LOCKFILE_SCHEMA_VERSION, LockCoordinate, LockPackage, Lockfile,
+    normalize_checksum_algorithm,
 };
 use rv_repo::{ArtifactRequest, RepoClient, Repository, normalize_repo_url, sha1_hex_file};
 use rv_store::{ArtifactKey, BlobId, Store};
 
+use crate::commands::module_selector::ModuleSelector;
 use crate::commands::{path_to_forward_slashes, read_lockfile};
 use crate::error::{CliError, Result};
 use crate::output::{
@@ -41,6 +43,9 @@ pub struct LockVerifyArgs {
     /// Re-download missing or corrupted blobs
     #[arg(long)]
     pub download: bool,
+
+    #[command(flatten)]
+    pub(crate) module: ModuleSelector,
 }
 
 pub async fn run(args: &LockArgs, project_root: &Path) -> Result<()> {
@@ -74,9 +79,13 @@ fn lock_info(project_root: &Path) -> Result<()> {
     let mut unique_coords: HashSet<String> = HashSet::new();
 
     for platform in &lock.platforms {
-        total_packages += platform.packages.len();
-        for pkg in &platform.packages {
-            unique_coords.insert(pkg.format_coord());
+        total_packages += platform
+            .modules
+            .iter()
+            .map(|module| module.packages.len())
+            .sum::<usize>();
+        for artifact in &platform.artifacts {
+            unique_coords.insert(artifact.coordinate.format_coord());
         }
     }
 
@@ -87,7 +96,9 @@ fn lock_info(project_root: &Path) -> Result<()> {
             .map(|p| {
                 serde_json::json!({
                     "platform": p.platform.to_string(),
-                    "packages": p.packages.len(),
+                    "packages": p.modules.iter().map(|module| module.packages.len()).sum::<usize>(),
+                    "modules": p.modules.len(),
+                    "external_artifacts": p.artifacts.len(),
                 })
             })
             .collect();
@@ -131,7 +142,17 @@ fn lock_info(project_root: &Path) -> Result<()> {
         table.add_row(["Platform breakdown", ""]);
         for platform in &lock.platforms {
             let key = format!("  {}", platform.platform);
-            let value = format!("{} packages", platform.packages.len());
+            let packages = platform
+                .modules
+                .iter()
+                .map(|module| module.packages.len())
+                .sum::<usize>();
+            let value = format!(
+                "{} packages, {} modules, {} external artifacts",
+                packages,
+                platform.modules.len(),
+                platform.artifacts.len()
+            );
             table.add_row([&key, &value]);
         }
     }
@@ -171,11 +192,13 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
     // the WEAK_HASH_FALLBACK warning), so a lockfile produced against a
     // SHA-1-only repository legitimately carries SHA-1 pins. Verify must
     // accept the same set or it falsely rejects those lockfiles.
-    let (prepared, no_checksum) = prepare_targets(&lock)?;
+    let prepared = prepare_targets(&lock, &args.module)?;
+    let workspace_skipped = prepared.workspace_skipped;
+    let no_checksum = prepared.no_checksum;
 
-    let results: Vec<Result<(LockPackage, ArtifactKey, ExpectedPin, VerifyStatus)>> =
-        stream::iter(prepared.into_iter())
-            .map(|(package, key, expected)| {
+    let results: Vec<Result<(PreparedTarget, VerifyStatus)>> =
+        stream::iter(prepared.targets.into_iter())
+            .map(|target| {
                 // Share the single Arc opened above instead of
                 // building a fresh `Arc<Store>` wrapping yet another
                 // inner clone.
@@ -184,17 +207,17 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
                     // For SHA-1 pins the on-disk lookup needs the
                     // async index API; resolve the BlobId here, then let
                     // the blocking task focus on the hash pass.
-                    let resolved_blob = match &expected {
+                    let resolved_blob = match &target.expected {
                         ExpectedPin::Sha256(id) => Some(id.clone()),
-                        ExpectedPin::Sha1(_) => store.lookup_artifact(&key).await?,
+                        ExpectedPin::Sha1(_) => store.lookup_artifact(&target.key).await?,
                     };
-                    let expected_for_task = expected.clone();
+                    let expected_for_task = target.expected.clone();
                     let status = tokio::task::spawn_blocking(move || {
                         verify_pin(&store, resolved_blob.as_ref(), &expected_for_task)
                     })
                     .await
                     .map_err(|e| CliError::Message(format!("verify task panicked: {e}")))??;
-                    Ok((package, key, expected, status))
+                    Ok((target, status))
                 }
             })
             .buffer_unordered(parallelism)
@@ -205,127 +228,96 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
     let mut missing = Vec::new();
     let mut corrupt = Vec::new();
     for entry in results {
-        let (package, key, expected, status) = entry?;
+        let (target, status) = entry?;
         match status {
             VerifyStatus::Ok => {
                 verified = verified.saturating_add(1);
             }
             VerifyStatus::Missing => missing.push(VerifyTarget {
-                package,
-                key,
-                expected,
+                target,
                 actual: None,
             }),
             VerifyStatus::Corrupt { actual } => corrupt.push(VerifyTarget {
-                package,
-                key,
-                expected,
+                target,
                 actual: Some(actual),
             }),
         }
     }
 
     let mut downloaded = 0usize;
+    let mut untrusted_origin: Vec<VerifyTarget> = Vec::new();
+    let mut pin_mismatch: Vec<VerifyTarget> = Vec::new();
     if args.download && (!missing.is_empty() || !corrupt.is_empty()) {
-        let progress = std::sync::Arc::new(ProgressReporter::new());
-        let client = RepoClient::new(config).await?.with_progress(progress);
-
         let mut targets = Vec::new();
         targets.append(&mut missing);
         targets.append(&mut corrupt);
-        let download_count = targets.len();
 
-        let spinner = Spinner::start("lock verify: downloading artifacts");
         // Pre-resolve the repository for each target before the fan-out so
         // the parallel task body only needs &self captures (Config is not
         // Clone, and pinning it inside an Arc would require threading it
         // through everything).
-        let dispatch: Vec<(VerifyTarget, Repository)> = targets
-            .into_iter()
-            .map(|target| {
-                let repo = repository_for_package(config, &target.package);
-                (target, repo)
-            })
-            .collect();
-        let client = Arc::new(client);
-        // Keep using the single Arc<Store> from verify_inner.
-        let store_arc = Arc::clone(&store);
-        // Fan downloads out the same way verification did: each fetch is
-        // independent and bottlenecked on the network, so a sequential
-        // await chain would leave bandwidth on the floor.
         //
-        // Route through the atomic `fetch_artifact_to_store_and_index`
-        // so the blob persist and the artifact-key → blob index commit
-        // happen under one held `StoreLock`. A two-step
-        // `fetch_artifact_to_store` → `Store::add_artifact` would reopen
-        // the window that `put_stream_and_index` is designed to close:
-        // a concurrent `prune_blobs` could observe the freshly-persisted
-        // blob with no row pointing at it and delete it before the index
-        // write landed.
-        //
-        // No explicit pre-fetch `remove_file` call is needed either: it
-        // would carry a TOCTOU between `exists_async` + `is_file` and
-        // `remove_file`, and `put_stream_and_index` already replaces the
-        // on-disk blob atomically.
-        let download_results: Vec<Result<()>> = stream::iter(dispatch.into_iter())
-            .map(|(target, repo)| {
-                let client = Arc::clone(&client);
-                let store = Arc::clone(&store_arc);
-                async move {
-                    let request = artifact_request(&target.package);
-                    let blob = client
-                        .fetch_artifact_to_store_and_index(&repo, &request, &store, &target.key)
-                        .await?;
-                    // Confirm the downloaded blob matches the lockfile
-                    // pin under whichever algorithm the lockfile recorded.
-                    // For SHA-256 the BlobId already *is* the digest. For
-                    // SHA-1 we re-hash the on-disk blob (the store is
-                    // SHA-256 keyed, so there is no shortcut).
-                    match &target.expected {
-                        ExpectedPin::Sha256(expected) => {
-                            if &blob != expected {
-                                return Err(CliError::LockfileMismatch {
-                                    details: format!("checksum mismatch for {}", target.key),
-                                });
-                            }
-                        }
-                        ExpectedPin::Sha1(expected) => {
-                            let path = store.get_path(&blob);
-                            let expected = expected.clone();
-                            let key_display = target.key.to_string();
-                            tokio::task::spawn_blocking(move || -> Result<()> {
-                                let actual = sha1_hex_file(&path)?;
-                                if actual != expected {
-                                    return Err(CliError::LockfileMismatch {
-                                        details: format!(
-                                            "checksum mismatch for {key_display}: \
-                                             expected sha1 {expected}, got {actual}"
-                                        ),
-                                    });
-                                }
-                                Ok(())
-                            })
-                            .await
-                            .map_err(|e| {
-                                CliError::Message(format!("sha1 verify task panicked: {e}"))
-                            })??;
-                        }
-                    }
-                    Ok(())
-                }
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
-        for result in download_results {
-            result?;
+        // Resolution is also the trust gate, and it runs ahead of every
+        // other step — before the HTTP client is even built: an artifact
+        // whose recorded origin is not declared in `rv.toml` never gets
+        // contacted at all, it becomes a finding. That is the same refusal
+        // `rv sync` raises as `RepoError::UntrustedRepoUrl`, downgraded from
+        // a hard error to a per-artifact finding so the rest of the batch is
+        // still repaired.
+        let mut dispatch: Vec<(VerifyTarget, Repository)> = Vec::new();
+        for target in targets {
+            match repository_for_package(config, &target.target.package) {
+                Some(repo) => dispatch.push((target, repo)),
+                None => untrusted_origin.push(target),
+            }
         }
-        spinner.finish(success("done"));
-        verified += download_count;
-        downloaded = download_count;
+
+        if !dispatch.is_empty() {
+            let progress = std::sync::Arc::new(ProgressReporter::new());
+            let client = RepoClient::new(config).await?.with_progress(progress);
+
+            let spinner = Spinner::start("lock verify: downloading artifacts");
+            let client = Arc::new(client);
+            // Keep using the single Arc<Store> from verify_inner.
+            let store_arc = Arc::clone(&store);
+            // Fan downloads out the same way verification did: each fetch is
+            // independent and bottlenecked on the network, so a sequential
+            // await chain would leave bandwidth on the floor.
+            let download_results: Vec<Result<(VerifyTarget, DownloadOutcome)>> =
+                stream::iter(dispatch.into_iter())
+                    .map(|(target, repo)| {
+                        let client = Arc::clone(&client);
+                        let store = Arc::clone(&store_arc);
+                        async move {
+                            let outcome =
+                                download_and_verify(&client, &store, &repo, &target.target).await?;
+                            Ok((target, outcome))
+                        }
+                    })
+                    .buffer_unordered(parallelism)
+                    .collect()
+                    .await;
+            for result in download_results {
+                let (target, outcome) = result?;
+                match outcome {
+                    DownloadOutcome::Repaired => downloaded = downloaded.saturating_add(1),
+                    DownloadOutcome::PinMismatch { actual } => pin_mismatch.push(VerifyTarget {
+                        target: target.target,
+                        actual: Some(actual),
+                    }),
+                }
+            }
+            spinner.finish(success("done"));
+            verified += downloaded;
+        }
     }
 
-    if missing.is_empty() && corrupt.is_empty() && no_checksum.is_empty() {
+    if missing.is_empty()
+        && corrupt.is_empty()
+        && no_checksum.is_empty()
+        && untrusted_origin.is_empty()
+        && pin_mismatch.is_empty()
+    {
         if is_json_mode() {
             json_result(
                 true,
@@ -334,7 +326,11 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
                     "missing": 0,
                     "corrupt": 0,
                     "no_checksum": 0,
+                    "untrusted_origin": 0,
+                    "pin_mismatch": 0,
                     "downloaded": downloaded,
+                    "workspace_skipped": workspace_skipped.len(),
+                    "workspace_entries": workspace_json(&workspace_skipped),
                 }),
             );
         } else if downloaded > 0 {
@@ -342,10 +338,17 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
         } else if !quiet_enabled() {
             eprintln!("{}", success("lockfile verified"));
         }
+        report_workspace_skips(&workspace_skipped);
         return Ok(());
     }
 
-    let summary = failure_summary(missing.len(), corrupt.len(), no_checksum.len());
+    let summary = failure_summary(&FailureCounts {
+        missing: missing.len(),
+        corrupt: corrupt.len(),
+        no_checksum: no_checksum.len(),
+        untrusted_origin: untrusted_origin.len(),
+        pin_mismatch: pin_mismatch.len(),
+    });
     if is_json_mode() {
         // Emit a structured failure envelope (matching the success-path
         // shape) so JSON consumers see the same `data.{verified,missing,
@@ -359,7 +362,16 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
                 "missing": missing.len(),
                 "corrupt": corrupt.len(),
                 "no_checksum": no_checksum.len(),
+                "untrusted_origin": untrusted_origin.len(),
+                "pin_mismatch": pin_mismatch.len(),
                 "downloaded": downloaded,
+                "workspace_skipped": workspace_skipped.len(),
+                "workspace_entries": workspace_json(&workspace_skipped),
+                "missing_artifacts": verify_targets_json(&missing),
+                "corrupt_artifacts": verify_targets_json(&corrupt),
+                "no_checksum_artifacts": unpinned_targets_json(&no_checksum),
+                "untrusted_origin_artifacts": untrusted_origin_json(&untrusted_origin),
+                "pin_mismatch_artifacts": verify_targets_json(&pin_mismatch),
                 "exit_code": crate::error::ExitCodes::LOCKFILE_MISMATCH,
                 "error": summary,
             }),
@@ -372,69 +384,204 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
     if !quiet_enabled() {
         eprintln!("{}", heading("Lock verification failed"));
         for target in &missing {
-            eprintln!("  {}", warning(format!("missing {0}", target.key)));
+            eprintln!(
+                "  {}",
+                warning(format!(
+                    "missing {} ({})",
+                    target.target.key,
+                    module_attribution(&target.target.modules)
+                ))
+            );
         }
         for target in &corrupt {
             if let Some(actual) = &target.actual {
                 eprintln!(
                     "  {}",
-                    warning(format!("corrupt {0} (found {1})", target.key, actual))
+                    warning(format!(
+                        "corrupt {} (found {}; {})",
+                        target.target.key,
+                        actual,
+                        module_attribution(&target.target.modules)
+                    ))
                 );
             } else {
-                eprintln!("  {}", warning(format!("corrupt {0}", target.key)));
+                eprintln!(
+                    "  {}",
+                    warning(format!(
+                        "corrupt {} ({})",
+                        target.target.key,
+                        module_attribution(&target.target.modules)
+                    ))
+                );
             }
         }
-        for key in &no_checksum {
-            eprintln!("  {}", warning(format!("no checksum recorded for {key}")));
+        for target in &no_checksum {
+            eprintln!(
+                "  {}",
+                warning(format!(
+                    "no checksum recorded for {} ({})",
+                    target.key,
+                    module_attribution(&target.modules)
+                ))
+            );
+        }
+        for target in &untrusted_origin {
+            eprintln!(
+                "  {}",
+                warning(format!(
+                    "untrusted origin {} recorded for {}; not downloaded \
+                     (declare it under [[repositories]] in rv.toml; {})",
+                    target.target.package.repo_url,
+                    target.target.key,
+                    module_attribution(&target.target.modules)
+                ))
+            );
+        }
+        for target in &pin_mismatch {
+            eprintln!(
+                "  {}",
+                warning(format!(
+                    "downloaded bytes for {} do not match the recorded checksum{}; \
+                     discarded, store left unchanged ({})",
+                    target.target.key,
+                    target
+                        .actual
+                        .as_ref()
+                        .map(|actual| format!(" (got {actual})"))
+                        .unwrap_or_default(),
+                    module_attribution(&target.target.modules)
+                ))
+            );
         }
     }
+    report_workspace_skips(&workspace_skipped);
     Err(CliError::LockfileMismatch { details: summary })
 }
 
-/// Human/JSON summary line for a failed verify. The `no checksum` clause is
+#[derive(Debug, Default)]
+struct FailureCounts {
+    missing: usize,
+    corrupt: usize,
+    no_checksum: usize,
+    untrusted_origin: usize,
+    pin_mismatch: usize,
+}
+
+/// Human/JSON summary line for a failed verify. The trailing clauses are
 /// only appended when present so the established "X missing, Y corrupt"
 /// message stays stable for the common cases.
-fn failure_summary(missing: usize, corrupt: usize, no_checksum: usize) -> String {
-    let mut summary = format!("{missing} missing, {corrupt} corrupt");
-    if no_checksum > 0 {
-        summary.push_str(&format!(", {no_checksum} with no checksum recorded"));
+fn failure_summary(counts: &FailureCounts) -> String {
+    let mut summary = format!("{} missing, {} corrupt", counts.missing, counts.corrupt);
+    if counts.no_checksum > 0 {
+        summary.push_str(&format!(
+            ", {} with no checksum recorded",
+            counts.no_checksum
+        ));
+    }
+    if counts.untrusted_origin > 0 {
+        summary.push_str(&format!(
+            ", {} from an untrusted origin",
+            counts.untrusted_origin
+        ));
+    }
+    if counts.pin_mismatch > 0 {
+        summary.push_str(&format!(
+            ", {} whose download did not match the recorded checksum",
+            counts.pin_mismatch
+        ));
     }
     summary
 }
 
 /// Pre-compute the per-package verification inputs for the parallel stage.
 ///
-/// Returns `(prepared, no_checksum)`: packages with a parseable pin ready to
-/// verify, and the keys of packages that record no checksum at all (reported
-/// as per-package findings rather than aborting the batch). Packages with a
-/// `system_path` and pom-packaged packages are skipped, mirroring the
-/// predicate `rv_repo::sync::ensure_artifacts` applies: neither is ever
-/// downloaded into the store by sync, so on a fresh machine they are
-/// legitimately absent and must not be reported as missing.
-#[allow(clippy::type_complexity)]
-fn prepare_targets(
-    lock: &Lockfile,
-) -> Result<(
-    Vec<(LockPackage, ArtifactKey, ExpectedPin)>,
-    Vec<ArtifactKey>,
-)> {
-    let mut prepared = Vec::new();
-    let mut no_checksum = Vec::new();
+/// Inputs come from the canonical schema-4 artifact table. Module graphs only
+/// restrict that union and attach reachability diagnostics; workspace and
+/// system nodes never become store lookups.
+fn prepare_targets(lock: &Lockfile, selector: &ModuleSelector) -> Result<PreparedTargets> {
+    let mut artifacts = BTreeMap::<LockCoordinate, ArtifactReachability>::new();
+    let mut workspace_skipped = BTreeSet::new();
+
     for platform in &lock.platforms {
-        for package in &platform.packages {
-            if package.system_path.is_some() || package.packaging == "pom" {
-                continue;
+        let selection = selector.select(platform)?;
+        let mut reachable = BTreeMap::<LockCoordinate, BTreeSet<String>>::new();
+        for module in selection.modules() {
+            for package in &module.packages {
+                if let Some(workspace_module) = package.workspace_module.as_deref() {
+                    workspace_skipped.insert(WorkspaceSkip {
+                        module: module.path.clone(),
+                        workspace_module: workspace_module.to_string(),
+                        coordinate: package.coordinate.format_coord(),
+                    });
+                    continue;
+                }
+                if package.system_path.is_some() {
+                    continue;
+                }
+                reachable
+                    .entry(package.coordinate.clone())
+                    .or_default()
+                    .insert(module.path.clone());
             }
-            let key = artifact_key(package);
-            let Some(checksum) = package.checksum.as_ref() else {
-                no_checksum.push(key);
+        }
+
+        for artifact in &platform.artifacts {
+            let Some(modules) = reachable.get(&artifact.coordinate) else {
                 continue;
             };
-            let expected = expected_pin(&key, checksum)?;
-            prepared.push((package.clone(), key, expected));
+            // `pom` packaging is verified like any other row. Only an explicit
+            // `<type>pom</type>` dependency reaches the artifact table;
+            // imported BOMs and parent POMs are support material with no row,
+            // so they stay out of the verification set on their own.
+            let package = artifact.as_package();
+            match artifacts.entry(artifact.coordinate.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(ArtifactReachability {
+                        package,
+                        modules: modules.clone(),
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    if existing.package.checksum != package.checksum
+                        || existing.package.snapshot_timestamp != package.snapshot_timestamp
+                    {
+                        return Err(CliError::LockfileMismatch {
+                            details: format!(
+                                "conflicting integrity records for {} across locked platforms",
+                                artifact.coordinate.format_coord()
+                            ),
+                        });
+                    }
+                    existing.modules.extend(modules.iter().cloned());
+                }
+            }
         }
     }
-    Ok((prepared, no_checksum))
+
+    let mut targets = Vec::new();
+    let mut no_checksum = Vec::new();
+    for artifact in artifacts.into_values() {
+        let key = artifact_key(&artifact.package);
+        let modules = artifact.modules.into_iter().collect();
+        let Some(checksum) = artifact.package.checksum.as_ref() else {
+            no_checksum.push(UnpinnedTarget { key, modules });
+            continue;
+        };
+        let expected = expected_pin(&key, checksum)?;
+        targets.push(PreparedTarget {
+            package: artifact.package,
+            key,
+            expected,
+            modules,
+        });
+    }
+
+    Ok(PreparedTargets {
+        targets,
+        no_checksum,
+        workspace_skipped: workspace_skipped.into_iter().collect(),
+    })
 }
 
 fn artifact_request(package: &LockPackage) -> ArtifactRequest {
@@ -457,14 +604,226 @@ fn artifact_key(package: &LockPackage) -> ArtifactKey {
     )
 }
 
-fn repository_for_package(config: &Config, package: &LockPackage) -> Repository {
+/// Resolve a lockfile `repo_url` against the configured `[[repositories]]`
+/// and `[[mirrors]]`, returning `None` for an origin the current `rv.toml`
+/// does not declare.
+///
+/// Same policy as `rv_repo::sync`'s own `repository_for_package`, which
+/// refuses an unknown origin with `RepoError::UntrustedRepoUrl`: the
+/// lockfile is not a trust root, so a tampered `rv.lock` must not be able to
+/// redirect a download at an attacker-controlled repository. This used to
+/// synthesize `Repository::new(None, wanted, ..)` for the no-match case,
+/// which trusted the lockfile URL outright — the exact redirect `rv sync`
+/// refuses.
+///
+/// The rv-repo resolver is private to `rv_repo::sync`; if it is exported,
+/// call it here instead of restating the policy. (Its `trusted_repositories`
+/// argument carries origins rediscovered by the current resolution pass,
+/// which verify never runs, so verify's set is config + mirrors only.)
+fn repository_for_package(config: &Config, package: &LockPackage) -> Option<Repository> {
     let wanted = normalize_repo_url(&package.repo_url);
     for repo in config.repositories() {
         if normalize_repo_url(&repo.url) == wanted {
-            return Repository::from(repo);
+            return Some(Repository::from(repo));
         }
     }
-    Repository::new(None, wanted, true, true)
+    for mirror in config.mirrors() {
+        if normalize_repo_url(&mirror.url) == wanted {
+            return Some(Repository::new(
+                mirror.id.clone(),
+                mirror.url.clone(),
+                true,
+                true,
+            ));
+        }
+    }
+    None
+}
+
+/// Fetch one artifact and check the downloaded bytes against the lockfile pin
+/// *before* anything in the store points at them.
+///
+/// [`RepoClient::fetch_artifact_to_store`] lands the bytes in the
+/// content-addressed store but writes no index row, so until the pin check
+/// passes the blob is unrooted: the artifact key still resolves to exactly
+/// what it resolved to before (the original blob, or nothing). Only a blob
+/// that matches the pin is indexed. This used to call the atomic
+/// `fetch_artifact_to_store_and_index`, which repointed the coordinate at the
+/// fetched bytes *before* the comparison, so a failed pin check still left
+/// the shared store redirected at whatever the origin served.
+///
+/// The two-step persist-then-index does reopen the GC window that
+/// `Store::put_stream_and_index` closes: a concurrent `prune_blobs` can reap
+/// the still-unrooted blob before `add_artifact` runs. That loss is
+/// fail-safe — `add_artifact` refuses to index a blob whose file is gone,
+/// and verify reports the artifact as unrepaired — whereas indexing first is
+/// fail-open. An index that can never point at unverified bytes is worth the
+/// rarer race.
+///
+/// Mismatched bytes are dropped in the only sense that is safe for a
+/// content-addressed store: no row ever references them, so they are
+/// unreachable through the artifact index and are reclaimed by the store's
+/// blob GC. Unlinking the CAS file here would be wrong — the store dedups,
+/// so that same digest may already be rooted by another coordinate.
+async fn download_and_verify(
+    client: &RepoClient,
+    store: &Store,
+    repo: &Repository,
+    target: &PreparedTarget,
+) -> Result<DownloadOutcome> {
+    let request = artifact_request(&target.package);
+    let blob = client
+        .fetch_artifact_to_store(repo, &request, store)
+        .await?;
+
+    // Compare against the lockfile pin under whichever algorithm the
+    // lockfile recorded. For SHA-256 the BlobId already *is* the digest.
+    // For SHA-1 we re-hash the persisted blob (the store is SHA-256 keyed,
+    // so there is no shortcut).
+    match &target.expected {
+        ExpectedPin::Sha256(expected) => {
+            if &blob != expected {
+                return Ok(DownloadOutcome::PinMismatch {
+                    actual: blob.as_str().to_string(),
+                });
+            }
+        }
+        ExpectedPin::Sha1(expected) => {
+            let path = store.get_path(&blob);
+            let expected = expected.clone();
+            let actual = tokio::task::spawn_blocking(move || sha1_hex_file(&path))
+                .await
+                .map_err(|e| CliError::Message(format!("sha1 verify task panicked: {e}")))??;
+            if actual != expected {
+                return Ok(DownloadOutcome::PinMismatch { actual });
+            }
+        }
+    }
+
+    store.add_artifact(&target.key, &blob).await?;
+    Ok(DownloadOutcome::Repaired)
+}
+
+#[derive(Debug)]
+enum DownloadOutcome {
+    /// Bytes matched the pin and the coordinate now points at them.
+    Repaired,
+    /// Bytes did not match the pin; nothing was indexed.
+    PinMismatch { actual: String },
+}
+
+#[derive(Debug)]
+struct PreparedTargets {
+    targets: Vec<PreparedTarget>,
+    no_checksum: Vec<UnpinnedTarget>,
+    workspace_skipped: Vec<WorkspaceSkip>,
+}
+
+#[derive(Debug)]
+struct ArtifactReachability {
+    package: LockPackage,
+    modules: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct PreparedTarget {
+    package: LockPackage,
+    key: ArtifactKey,
+    expected: ExpectedPin,
+    modules: Vec<String>,
+}
+
+#[derive(Debug)]
+struct UnpinnedTarget {
+    key: ArtifactKey,
+    modules: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct WorkspaceSkip {
+    module: String,
+    workspace_module: String,
+    coordinate: String,
+}
+
+fn module_attribution(modules: &[String]) -> String {
+    format!("reachable from {}", modules.join(", "))
+}
+
+fn report_workspace_skips(skipped: &[WorkspaceSkip]) {
+    if skipped.is_empty() || quiet_enabled() || is_json_mode() {
+        return;
+    }
+    eprintln!(
+        "  skipped {} workspace {} by design",
+        skipped.len(),
+        if skipped.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        }
+    );
+    for entry in skipped {
+        eprintln!(
+            "    {} -> {} ({})",
+            entry.module, entry.workspace_module, entry.coordinate
+        );
+    }
+}
+
+fn workspace_json(skipped: &[WorkspaceSkip]) -> Vec<serde_json::Value> {
+    skipped
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "module": entry.module,
+                "workspace_module": entry.workspace_module,
+                "coordinate": entry.coordinate,
+                "reason": "workspace module; skipped by design",
+            })
+        })
+        .collect()
+}
+
+fn verify_targets_json(targets: &[VerifyTarget]) -> Vec<serde_json::Value> {
+    targets
+        .iter()
+        .map(|target| {
+            serde_json::json!({
+                "coordinate": target.target.key.to_string(),
+                "affected_modules": target.target.modules,
+                "actual": target.actual,
+            })
+        })
+        .collect()
+}
+
+/// Untrusted-origin findings carry the offending `repo_url` so the operator
+/// can tell whether the lockfile records a repository they dropped from
+/// `rv.toml` or one they have never seen.
+fn untrusted_origin_json(targets: &[VerifyTarget]) -> Vec<serde_json::Value> {
+    targets
+        .iter()
+        .map(|target| {
+            serde_json::json!({
+                "coordinate": target.target.key.to_string(),
+                "repo_url": target.target.package.repo_url,
+                "affected_modules": target.target.modules,
+            })
+        })
+        .collect()
+}
+
+fn unpinned_targets_json(targets: &[UnpinnedTarget]) -> Vec<serde_json::Value> {
+    targets
+        .iter()
+        .map(|target| {
+            serde_json::json!({
+                "coordinate": target.key.to_string(),
+                "affected_modules": target.modules,
+            })
+        })
+        .collect()
 }
 
 /// Parsed lockfile pin for a single package.
@@ -559,9 +918,7 @@ fn verify_pin(
 
 #[derive(Debug)]
 struct VerifyTarget {
-    package: LockPackage,
-    key: ArtifactKey,
-    expected: ExpectedPin,
+    target: PreparedTarget,
     actual: Option<String>,
 }
 
@@ -671,12 +1028,15 @@ mod tests {
     fn lock_with_packages(packages: Vec<LockPackage>) -> Lockfile {
         let platform = rv_config::Platform::new("linux", "x86_64").unwrap();
         let mut lock = Lockfile::new();
-        lock.platforms = vec![rv_config::LockPlatform {
+        lock.platforms = vec![rv_config::LockPlatform::single_module(
             platform,
+            "",
+            "pom.xml",
+            rv_config::LockGav::new("com.example", "demo", "1"),
+            "jar",
             packages,
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            vec![],
+        )];
         lock
     }
 
@@ -717,38 +1077,166 @@ mod tests {
             ),
             lock_package("no-pin-2", "jar", None, None),
         ]);
-        let (prepared, no_checksum) = prepare_targets(&lock).expect("prepare");
-        assert_eq!(prepared.len(), 1, "the pinned package must still verify");
-        assert_eq!(prepared[0].0.artifact_id, "pinned");
-        assert_eq!(no_checksum.len(), 2, "both checksum-less packages reported");
+        let prepared = prepare_targets(&lock, &ModuleSelector::default()).expect("prepare targets");
+        assert_eq!(
+            prepared.targets.len(),
+            1,
+            "the pinned package must still verify"
+        );
+        assert_eq!(prepared.targets[0].package.artifact_id, "pinned");
+        assert_eq!(
+            prepared.no_checksum.len(),
+            2,
+            "both checksum-less packages reported"
+        );
     }
 
-    /// Pom-packaged and system-path packages are skipped, mirroring
-    /// `rv_repo::sync::ensure_artifacts`: sync never stores them, so verify
-    /// must not report them missing on a fresh machine.
+    /// An explicit `<type>pom</type>` dependency owns an artifact-table row and
+    /// is pinned like any other artifact, so it must be verified rather than
+    /// skipped: a deleted or corrupted explicit POM otherwise survives verify
+    /// and only surfaces when `rv export-m2` trips over it. System-path
+    /// packages are still skipped; they are never stored.
     #[test]
-    fn prepare_targets_skips_pom_and_system_path_packages() {
+    fn prepare_targets_verifies_pom_packaging_and_skips_system_path_packages() {
         let lock = lock_with_packages(vec![
-            lock_package("bom", "pom", Some(Checksum::new("sha256", SHA256_A)), None),
+            lock_package(
+                "pom-dep",
+                "pom",
+                Some(Checksum::new("sha256", SHA256_A)),
+                None,
+            ),
             lock_package("pom-no-pin", "pom", None, None),
             lock_package("local", "jar", None, Some("/opt/local.jar")),
             lock_package("real", "jar", Some(Checksum::new("sha256", SHA256_A)), None),
         ]);
-        let (prepared, no_checksum) = prepare_targets(&lock).expect("prepare");
-        assert_eq!(prepared.len(), 1);
-        assert_eq!(prepared[0].0.artifact_id, "real");
+        let prepared = prepare_targets(&lock, &ModuleSelector::default()).expect("prepare targets");
+        let verified: Vec<&str> = prepared
+            .targets
+            .iter()
+            .map(|target| target.package.artifact_id.as_str())
+            .collect();
+        assert_eq!(verified, vec!["pom-dep", "real"]);
+        let unpinned: Vec<String> = prepared
+            .no_checksum
+            .iter()
+            .map(|target| target.key.to_string())
+            .collect();
+        assert_eq!(
+            unpinned.len(),
+            1,
+            "the unpinned POM row is a finding, the system-path package is not: {unpinned:?}"
+        );
+        assert!(unpinned[0].contains("pom-no-pin"));
+    }
+
+    /// A corrupted explicit-POM blob must be flagged. Verification runs off the
+    /// same `prepare_targets` -> `verify_pin` pair as the real command, so this
+    /// also pins that a POM row survives target preparation.
+    #[tokio::test]
+    async fn verify_flags_corrupt_explicit_pom_blob() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::open(dir.path()).expect("open store");
+        let pom_bytes = b"<project><modelVersion>4.0.0</modelVersion></project>";
+        let blob_id = store.put_bytes(pom_bytes).await.expect("put pom");
+
+        let lock = lock_with_packages(vec![lock_package(
+            "pom-dep",
+            "pom",
+            Some(Checksum::new("sha256", blob_id.as_str())),
+            None,
+        )]);
+        let prepared = prepare_targets(&lock, &ModuleSelector::default()).expect("prepare targets");
+        assert_eq!(prepared.targets.len(), 1, "the POM row must be verified");
+        let target = &prepared.targets[0];
+        assert_eq!(target.key.packaging, "pom");
+
+        let status = verify_pin(&store, Some(&blob_id), &target.expected).expect("verify intact");
+        assert!(matches!(status, VerifyStatus::Ok));
+
+        // CAS blobs are published read-only; re-grant write before tampering.
+        let path = store.get_path(&blob_id);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).expect("stat blob").permissions();
+            perms.set_mode(0o644);
+            std::fs::set_permissions(&path, perms).expect("chmod blob");
+        }
+        std::fs::write(&path, b"<project>tampered</project>").expect("corrupt pom");
+
+        let status = verify_pin(&store, Some(&blob_id), &target.expected).expect("verify corrupt");
         assert!(
-            no_checksum.is_empty(),
-            "skipped packages must not surface as checksum-less findings"
+            matches!(status, VerifyStatus::Corrupt { .. }),
+            "a corrupted explicit POM must be reported, got {status:?}"
         );
     }
 
+    fn config_with_repo(url: &str) -> (TempDir, Config) {
+        let temp = TempDir::new().expect("temp dir");
+        let paths = rv_config::ResolvedPaths::discover().expect("paths");
+        let repo = rv_config::RepoConfig {
+            id: Some("configured".to_string()),
+            url: url.to_string(),
+            releases: Some(true),
+            snapshots: Some(false),
+            snapshots_update_policy: Some(rv_config::UpdatePolicy::Daily),
+        };
+        let config = Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![repo]);
+        (temp, config)
+    }
+
+    /// The lockfile is not a trust root. An origin the current `rv.toml`
+    /// does not declare must not resolve to a `Repository` at all, so the
+    /// download stage cannot be redirected at it — the same refusal
+    /// `rv_repo::sync` raises as `RepoError::UntrustedRepoUrl`.
     #[test]
-    fn failure_summary_appends_no_checksum_clause_only_when_present() {
-        assert_eq!(failure_summary(2, 1, 0), "2 missing, 1 corrupt");
+    fn repository_for_package_refuses_origin_outside_the_trust_roots() {
+        let (_temp, config) = config_with_repo("https://repo.example/m2/");
+        let mut package = lock_package("demo", "jar", None, None);
+        package.repo_url = "https://attacker.example/m2/".to_string();
+        assert!(
+            repository_for_package(&config, &package).is_none(),
+            "an unconfigured lockfile origin must be refused, not synthesized"
+        );
+    }
+
+    /// Happy path, including the trailing-slash normalization that
+    /// `normalize_repo_url` applies on both sides.
+    #[test]
+    fn repository_for_package_accepts_configured_origin() {
+        let (_temp, config) = config_with_repo("https://repo.example/m2/");
+        let mut package = lock_package("demo", "jar", None, None);
+        package.repo_url = "https://repo.example/m2".to_string();
+        let repo = repository_for_package(&config, &package).expect("configured origin resolves");
+        assert_eq!(repo.id.as_deref(), Some("configured"));
+    }
+
+    #[test]
+    fn failure_summary_appends_optional_clauses_only_when_present() {
         assert_eq!(
-            failure_summary(0, 0, 3),
+            failure_summary(&FailureCounts {
+                missing: 2,
+                corrupt: 1,
+                ..FailureCounts::default()
+            }),
+            "2 missing, 1 corrupt"
+        );
+        assert_eq!(
+            failure_summary(&FailureCounts {
+                no_checksum: 3,
+                ..FailureCounts::default()
+            }),
             "0 missing, 0 corrupt, 3 with no checksum recorded"
+        );
+        assert_eq!(
+            failure_summary(&FailureCounts {
+                missing: 1,
+                untrusted_origin: 2,
+                pin_mismatch: 1,
+                ..FailureCounts::default()
+            }),
+            "1 missing, 0 corrupt, 2 from an untrusted origin, \
+             1 whose download did not match the recorded checksum"
         );
     }
 

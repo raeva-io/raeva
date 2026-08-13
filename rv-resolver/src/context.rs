@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
-use rv_config::{Config, Platform};
+use rv_config::{BlobId, Config, Platform};
 use rv_maven_model::Project;
 use rv_repo::{Metadata, RepoClient, Repository};
 use rv_store::Store;
@@ -39,6 +39,19 @@ impl MetadataKey {
 /// that collide on them.
 pub type MissingParentKey = (Arc<str>, Arc<str>, Arc<str>);
 
+/// A parsed project plus the identity of the POM bytes it was parsed from.
+///
+/// The digest travels *inside* the cache entry rather than beside it: a cache
+/// hit must be able to tell the caller which bytes produced this model, and a
+/// caller that could not learn that would have to fall back to the store's
+/// last-writer-wins coordinate index to pin the POM — the exact substitution
+/// the pin exists to prevent.
+#[derive(Clone, Debug)]
+pub struct CachedProject {
+    pub project: Project,
+    pub pom_blob: BlobId,
+}
+
 /// Shared LRU caches hoisted above the per-platform loop so warm entries
 /// survive across platform passes in a single resolution run.
 pub struct ResolveState {
@@ -54,7 +67,7 @@ pub struct ResolveState {
     /// across concurrent per-platform passes; without the platform in the key
     /// whichever pass resolved a coordinate first would win and silently
     /// contaminate every other platform's lockfile section.
-    projects: RwLock<LruCache<(Coord, Platform), Project>>,
+    projects: RwLock<LruCache<(Coord, Platform), CachedProject>>,
     /// `std::sync::Mutex` because every op is a single LRU `get`/`put` with
     /// no awaits, which lets the sync `ParentResolver` trait probe without
     /// bridging to async.
@@ -149,7 +162,7 @@ impl ResolveContext {
         guard.put(key, Arc::new(metadata));
     }
 
-    pub fn cached_project(&self, coord: &Coord) -> Option<Project> {
+    pub fn cached_project(&self, coord: &Coord) -> Option<CachedProject> {
         // `peek` (no LRU recency bump) lets reads share a read-lock, matching
         // the metadata cache's read-heavy concurrency tradeoff. The cache key
         // includes this context's target platform so concurrent per-platform
@@ -159,10 +172,10 @@ impl ResolveContext {
         guard.peek(&key).cloned()
     }
 
-    pub fn insert_project(&self, coord: Coord, project: Project) {
+    pub fn insert_project(&self, coord: Coord, project: Project, pom_blob: BlobId) {
         let key = (coord, self.platform.clone());
         let mut guard = self.state.projects.write().expect("projects lock poisoned");
-        guard.put(key, project);
+        guard.put(key, CachedProject { project, pom_blob });
     }
 
     /// Lazily evicts expired entries under a single write-lock so observation
@@ -199,7 +212,7 @@ mod tests {
     use super::{MissingParentKey, ResolveContext, ResolveState};
     use std::sync::Arc;
 
-    use rv_config::{Config, ResolvedPaths};
+    use rv_config::{BlobId, Config, ResolvedPaths};
     use rv_maven_model::{DependencyManagement, Project};
     use rv_store::Store;
     use rv_version::Coord;
@@ -236,8 +249,13 @@ mod tests {
         let ctx = make_test_ctx();
         let coord = Coord::parse("com.example:demo:1.0").unwrap();
         let project = demo_project();
-        ctx.insert_project(coord.clone(), project.clone());
-        assert_eq!(ctx.cached_project(&coord), Some(project));
+        let pom_blob = BlobId::from_bytes(b"<project/>");
+        ctx.insert_project(coord.clone(), project.clone(), pom_blob.clone());
+        let cached = ctx.cached_project(&coord).expect("cache hit");
+        assert_eq!(cached.project, project);
+        // The POM identity round-trips with the model: a cache hit is what a
+        // second backend uses to pin the coordinate's POM.
+        assert_eq!(cached.pom_blob, pom_blob);
     }
 
     /// Two contexts that SHARE one `ResolveState` but target different
@@ -260,12 +278,19 @@ mod tests {
 
         let coord = Coord::parse("com.example:demo:1.0").unwrap();
         let project = demo_project();
-        ctx_x86.insert_project(coord.clone(), project.clone());
+        ctx_x86.insert_project(
+            coord.clone(),
+            project.clone(),
+            BlobId::from_bytes(b"<project/>"),
+        );
 
         // Same platform as the writer: cache hit.
-        assert_eq!(ctx_x86.cached_project(&coord), Some(project));
+        assert_eq!(
+            ctx_x86.cached_project(&coord).map(|cached| cached.project),
+            Some(project)
+        );
         // Different platform sharing the same cache: miss, no cross-contamination.
-        assert_eq!(ctx_arm.cached_project(&coord), None);
+        assert!(ctx_arm.cached_project(&coord).is_none());
     }
 
     fn pk(group: &str, artifact: &str, version: &str) -> MissingParentKey {
@@ -373,7 +398,11 @@ mod tests {
         let capacity = super::MAX_METADATA_CACHE_SIZE;
         let overflow = 10;
         for id in 0..capacity + overflow {
-            ctx.insert_project(make_coord(id), make_project(id));
+            ctx.insert_project(
+                make_coord(id),
+                make_project(id),
+                BlobId::from_bytes(format!("<project>{id}</project>").as_bytes()),
+            );
         }
         for id in 0..overflow {
             assert!(

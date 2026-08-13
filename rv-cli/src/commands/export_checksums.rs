@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -11,7 +12,12 @@ use crate::error::{CliError, Result};
 use crate::output::{heading, is_json_mode, json_result, quiet_enabled, success};
 
 #[derive(Debug, Args)]
-#[command(about = "Export checksums in Maven 4 Trusted Checksums format to .mvn/checksums/")]
+#[command(
+    about = "Export checksums in Maven 4 Trusted Checksums format to .mvn/checksums/",
+    long_about = "Export the deduplicated external artifact union from rv.lock in Maven 4 \
+                  Trusted Checksums format to .mvn/checksums/. Reactor workspace nodes and \
+                  system-path dependencies are skipped."
+)]
 pub struct ExportChecksumsArgs {}
 
 pub fn run(_args: &ExportChecksumsArgs, project_root: &Path) -> Result<()> {
@@ -122,38 +128,49 @@ fn build_checksums_files(lock: &Lockfile) -> ChecksumFiles {
     let mut sha256_count = 0usize;
     let mut sha1_count = 0usize;
 
+    let mut packages = BTreeMap::new();
     for platform in &lock.platforms {
-        for package in &platform.packages {
+        for package in platform.external_packages() {
             if package.system_path.is_some() {
                 continue;
             }
+            packages
+                .entry((
+                    package.group_id.clone(),
+                    package.artifact_id.clone(),
+                    package.version.clone(),
+                    package.packaging.clone(),
+                    package.classifier.clone(),
+                ))
+                .or_insert(package);
+        }
+    }
 
-            let Some(checksum) = package.checksum.as_ref() else {
-                continue;
-            };
+    for package in packages.into_values() {
+        let Some(checksum) = package.checksum.as_ref() else {
+            continue;
+        };
 
-            let Some(algorithm) = normalize_checksum_algorithm(&checksum.algorithm) else {
-                // Anything outside the canonical sha256/sha1 set was
-                // already going to fail downstream verification, so drop
-                // it loudly via the lockfile schema rather than silently
-                // here.
-                continue;
-            };
+        let Some(algorithm) = normalize_checksum_algorithm(&checksum.algorithm) else {
+            // Only sha256 and sha1 verify downstream. The lockfile
+            // schema rejects any other algorithm loudly, so skipping
+            // the entry here loses nothing.
+            continue;
+        };
 
-            let repo_path = maven_repo_path(package);
-            let digest = checksum.digest.trim().to_ascii_lowercase();
-            match algorithm {
-                "sha256" => {
-                    let _ = writeln!(sha256, "{}  {}", digest, repo_path);
-                    sha256_count += 1;
-                }
-                "sha1" => {
-                    let _ = writeln!(sha1, "{}  {}", digest, repo_path);
-                    sha1_count += 1;
-                }
-                // `normalize_checksum_algorithm` only returns sha256 / sha1.
-                _ => continue,
+        let repo_path = maven_repo_path(&package);
+        let digest = checksum.digest.trim().to_ascii_lowercase();
+        match algorithm {
+            "sha256" => {
+                let _ = writeln!(sha256, "{}  {}", digest, repo_path);
+                sha256_count += 1;
             }
+            "sha1" => {
+                let _ = writeln!(sha1, "{}  {}", digest, repo_path);
+                sha1_count += 1;
+            }
+            // `normalize_checksum_algorithm` returns only sha256 or sha1.
+            _ => continue,
         }
     }
 
@@ -208,7 +225,19 @@ fn maven_repo_path_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rv_config::{Checksum, LockPackage, LockPlatform, Lockfile, Platform};
+    use rv_config::{Checksum, LockGav, LockPackage, LockPlatform, Lockfile, Platform};
+
+    fn test_platform(platform: Platform, packages: Vec<LockPackage>) -> LockPlatform {
+        LockPlatform::single_module(
+            platform,
+            "",
+            "pom.xml",
+            LockGav::new("com.example", "root", "1"),
+            "pom",
+            packages,
+            Vec::new(),
+        )
+    }
 
     fn test_package(
         group: &str,
@@ -301,9 +330,9 @@ mod tests {
     fn build_checksums_uses_snapshot_layout() {
         let platform = Platform::new("linux", "x86_64").unwrap();
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![test_package(
+            vec![test_package(
                 "com.example",
                 "demo",
                 "2.3-20240511.121314-42",
@@ -311,9 +340,7 @@ mod tests {
                 Some("sources"),
                 "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             )],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+        )];
 
         let split = build_checksums_files(&lock);
         let lines: Vec<&str> = split.sha256.lines().collect();
@@ -346,9 +373,9 @@ mod tests {
     fn build_checksums_file_format() {
         let platform = Platform::new("linux", "x86_64").unwrap();
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![
+            vec![
                 test_package(
                     "com.google.code.findbugs",
                     "jsr305",
@@ -366,9 +393,7 @@ mod tests {
                     "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
                 ),
             ],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+        )];
 
         let split = build_checksums_files(&lock);
         let lines: Vec<&str> = split.sha256.lines().collect();
@@ -388,9 +413,9 @@ mod tests {
     fn build_checksums_file_skips_system_path() {
         let platform = Platform::new("linux", "x86_64").unwrap();
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            vec![LockPackage {
                 group_id: "com.local".to_string(),
                 artifact_id: "local-lib".to_string(),
                 version: "1.0.0".to_string(),
@@ -403,9 +428,7 @@ mod tests {
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
             }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+        )];
 
         let split = build_checksums_files(&lock);
         assert!(
@@ -418,9 +441,9 @@ mod tests {
     fn build_checksums_file_skips_missing_checksum() {
         let platform = Platform::new("linux", "x86_64").unwrap();
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            vec![LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "no-checksum".to_string(),
                 version: "1.0.0".to_string(),
@@ -433,9 +456,7 @@ mod tests {
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
             }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+        )];
 
         let split = build_checksums_files(&lock);
         assert!(
@@ -472,12 +493,7 @@ mod tests {
             None,
             "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
         );
-        lock.platforms = vec![LockPlatform {
-            platform,
-            packages: vec![sha1_pkg, sha256_pkg],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+        lock.platforms = vec![test_platform(platform, vec![sha1_pkg, sha256_pkg])];
 
         let split = build_checksums_files(&lock);
         let sha256_lines: Vec<&str> = split.sha256.lines().collect();

@@ -77,6 +77,21 @@ fn redacted_url(url: &Url) -> Url {
     redacted
 }
 
+fn request_error(error: reqwest::Error, url: &Url) -> RetryError {
+    if let Some((kind, details)) = crate::client::redirect_rejection_from_reqwest(&error) {
+        return RetryError::permanent(RepoError::RedirectRejected { kind, details });
+    }
+
+    // Strip and reattach a redacted URL so the rendered error never exposes
+    // userinfo or presigned query tokens through Debug/Display.
+    let error = error.without_url().with_url(redacted_url(url));
+    if error.is_timeout() || error.is_connect() {
+        RetryError::transient(RepoError::Http(error))
+    } else {
+        RetryError::permanent(RepoError::Http(error))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchConfig {
     pub retries: usize,
@@ -263,16 +278,10 @@ pub(crate) async fn fetch_bytes(
             request = auth.apply(request);
         }
 
-        let response = request.send().await.map_err(|e| {
-            // Strip and reattach a redacted URL so the rendered error never
-            // exposes `user:pass@host` or query tokens through Debug/Display.
-            let err = e.without_url().with_url(redacted_url(url));
-            if err.is_timeout() || err.is_connect() {
-                RetryError::transient(RepoError::Http(err))
-            } else {
-                RetryError::permanent(RepoError::Http(err))
-            }
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| request_error(error, url))?;
 
         let status = response.status();
         let content_length = response.content_length();
@@ -353,6 +362,32 @@ fn classify_status_to_error(status: StatusCode, url: &Url) -> RepoError {
     }
 }
 
+/// Names what was being downloaded, and from where, for a mid-body failure.
+///
+/// An artifact body is streamed straight into the store, so a transport error
+/// partway through the response has to cross a `std::io::Error` boundary to
+/// reach `Store::put_stream*`. Coming back out as `RepoError::Store` it lost
+/// every bit of request identity: a dropped connection rendered as the bare
+/// `store error: io error: error decoding response body`, naming neither the
+/// artifact nor the repository, which is useless for deciding whether a
+/// transient sync failure is worth retrying or points at one bad mirror.
+///
+/// The URL is redacted (no query, no `user:pass@`) exactly as elsewhere.
+fn download_context(coordinate: Option<&ArtifactKey>, url: &Url) -> String {
+    match coordinate {
+        Some(coordinate) => {
+            format!(" while downloading {coordinate} from {}", redact_url(url))
+        }
+        None => format!(" while downloading {}", redact_url(url)),
+    }
+}
+
+/// Turn a mid-body transport error into an io error that still names the
+/// artifact and repository it came from.
+fn stream_chunk_error(error: reqwest::Error, context: &str) -> std::io::Error {
+    std::io::Error::other(format!("{error}{context}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_stream_to_store_verified(
     client: &Client,
@@ -371,16 +406,10 @@ pub(crate) async fn fetch_stream_to_store_verified(
             request = auth.apply(request);
         }
 
-        let response = request.send().await.map_err(|e| {
-            // Strip and reattach a redacted URL so the rendered error never
-            // exposes `user:pass@host` or query tokens through Debug/Display.
-            let err = e.without_url().with_url(redacted_url(url));
-            if err.is_timeout() || err.is_connect() {
-                RetryError::transient(RepoError::Http(err))
-            } else {
-                RetryError::permanent(RepoError::Http(err))
-            }
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| request_error(error, url))?;
 
         let status = response.status();
         let content_length = response.content_length();
@@ -407,18 +436,20 @@ pub(crate) async fn fetch_stream_to_store_verified(
         let bytes_read = std::sync::Arc::new(AtomicU64::new(0));
         let bytes_read_clone = bytes_read.clone();
 
+        let context = download_context(None, url);
+
         // Stream chunks through the store's put_stream, which writes to
         // a temp file incrementally (hashing as it goes) instead of buffering
         // the entire artifact in memory.
         let byte_stream = response.bytes_stream().map(move |chunk| match chunk {
             Ok(bytes) => {
                 if bytes_read_clone.load(Ordering::Relaxed) + bytes.len() as u64 > MAX_ARTIFACT_SIZE {
-                    return Err(std::io::Error::other("artifact too large"));
+                    return Err(std::io::Error::other(format!("artifact too large{context}")));
                 }
                 bytes_read_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 Ok(bytes)
             }
-            Err(e) => Err(std::io::Error::other(e)),
+            Err(e) => Err(stream_chunk_error(e, &context)),
         });
 
         let boxed_stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>> =
@@ -536,16 +567,10 @@ pub(crate) async fn fetch_stream_to_store_and_index(
             request = auth.apply(request);
         }
 
-        let response = request.send().await.map_err(|e| {
-            // Strip and reattach a redacted URL so the rendered error never
-            // exposes `user:pass@host` or query tokens through Debug/Display.
-            let err = e.without_url().with_url(redacted_url(url));
-            if err.is_timeout() || err.is_connect() {
-                RetryError::transient(RepoError::Http(err))
-            } else {
-                RetryError::permanent(RepoError::Http(err))
-            }
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| request_error(error, url))?;
 
         let status = response.status();
         let content_length = response.content_length();
@@ -571,17 +596,21 @@ pub(crate) async fn fetch_stream_to_store_and_index(
         let bytes_read = std::sync::Arc::new(AtomicU64::new(0));
         let bytes_read_clone = bytes_read.clone();
 
+        let context = download_context(Some(key), url);
+
         let byte_stream = response.bytes_stream().map(move |chunk| match chunk {
             Ok(bytes) => {
                 if bytes_read_clone.load(Ordering::Relaxed) + bytes.len() as u64
                     > MAX_ARTIFACT_SIZE
                 {
-                    return Err(std::io::Error::other("artifact too large"));
+                    return Err(std::io::Error::other(format!(
+                        "artifact too large{context}"
+                    )));
                 }
                 bytes_read_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 Ok(bytes)
             }
-            Err(e) => Err(std::io::Error::other(e)),
+            Err(e) => Err(stream_chunk_error(e, &context)),
         });
 
         let boxed_stream: std::pin::Pin<
@@ -687,16 +716,10 @@ pub(crate) async fn fetch_text(
             request = auth.apply(request);
         }
 
-        let response = request.send().await.map_err(|e| {
-            // Strip and reattach a redacted URL so the rendered error never
-            // exposes `user:pass@host` or query tokens through Debug/Display.
-            let err = e.without_url().with_url(redacted_url(url));
-            if err.is_timeout() || err.is_connect() {
-                RetryError::transient(RepoError::Http(err))
-            } else {
-                RetryError::permanent(RepoError::Http(err))
-            }
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| request_error(error, url))?;
 
         let status = response.status();
         let content_length = response.content_length();
@@ -1043,6 +1066,44 @@ mod tests {
             } => assert_eq!(d, Duration::from_secs(42)),
             other => panic!("expected Transient with retry_after, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn download_context_names_coordinate_and_repository() {
+        use super::download_context;
+        use rv_config::ArtifactKey;
+        use url::Url;
+
+        let url = Url::parse(
+            "https://user:pass@repo.example.com/maven2/junit/junit/4.13.2/junit-4.13.2.jar?sig=abc",
+        )
+        .unwrap();
+        let key = ArtifactKey::new("junit", "junit", "4.13.2", "jar", None);
+
+        let context = download_context(Some(&key), &url);
+        assert!(
+            context.contains("junit:junit:4.13.2:jar"),
+            "context must name the artifact coordinate: {context}"
+        );
+        assert!(
+            context.contains("repo.example.com/maven2/junit/junit/4.13.2/junit-4.13.2.jar"),
+            "context must name the repository URL: {context}"
+        );
+        assert!(
+            !context.contains("sig=abc") && !context.contains("pass"),
+            "context must reuse URL redaction: {context}"
+        );
+
+        // Without a coordinate the URL alone still identifies the download.
+        let context = download_context(None, &url);
+        assert!(
+            context.contains("junit-4.13.2.jar"),
+            "coordinate-less context must still name the URL: {context}"
+        );
+        assert!(
+            !context.contains("sig=abc") && !context.contains("pass"),
+            "context must reuse URL redaction: {context}"
+        );
     }
 
     #[test]

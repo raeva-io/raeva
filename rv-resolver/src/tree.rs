@@ -104,6 +104,7 @@ mod tests {
             scope: Scope::Compile,
             repo_url: None,
             checksum: None,
+            workspace_module: None,
             local: false,
             system_path: None,
         }

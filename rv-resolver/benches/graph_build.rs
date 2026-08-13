@@ -13,6 +13,7 @@ fn build_graph(direct_deps: usize, depth: usize) -> Graph {
         scope: Scope::Compile,
         repo_url: None,
         checksum: None,
+        workspace_module: None,
         local: false,
         system_path: None,
     };
@@ -27,6 +28,7 @@ fn build_graph(direct_deps: usize, depth: usize) -> Graph {
             scope: Scope::Compile,
             repo_url: None,
             checksum: None,
+            workspace_module: None,
             local: false,
             system_path: None,
         };
@@ -51,6 +53,7 @@ fn build_graph(direct_deps: usize, depth: usize) -> Graph {
                 scope: Scope::Compile,
                 repo_url: None,
                 checksum: None,
+                workspace_module: None,
                 local: false,
                 system_path: None,
             };
@@ -81,6 +84,7 @@ fn build_diamond_graph() -> Graph {
         scope: Scope::Compile,
         repo_url: None,
         checksum: None,
+        workspace_module: None,
         local: false,
         system_path: None,
     };
@@ -108,6 +112,7 @@ fn build_diamond_graph() -> Graph {
                 scope: Scope::Compile,
                 repo_url: None,
                 checksum: None,
+                workspace_module: None,
                 local: false,
                 system_path: None,
             };
@@ -123,6 +128,7 @@ fn build_diamond_graph() -> Graph {
             scope: Scope::Compile,
             repo_url: None,
             checksum: None,
+            workspace_module: None,
             local: false,
             system_path: None,
         };
@@ -205,6 +211,7 @@ fn bench_graph_insert_dedup(c: &mut Criterion) {
             scope: Scope::Compile,
             repo_url: None,
             checksum: None,
+            workspace_module: None,
             local: false,
             system_path: None,
         })

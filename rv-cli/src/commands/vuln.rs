@@ -5,6 +5,7 @@ use chrono::{SecondsFormat, Utc};
 use clap::{Args, ValueEnum};
 use rv_vuln::{OsvClient, ScanReport, SeverityBand, VulnScanner, Vulnerability};
 
+use crate::commands::module_selector::ModuleSelector;
 use crate::error::{CliError, Result};
 use crate::output::{Table, is_json_mode, json_result};
 
@@ -28,12 +29,16 @@ Unknown severity meets every --fail-on threshold.
 
 Examples:
   rv vuln
+  rv vuln --module app/pom.xml
+  rv vuln --module com.acme:app
   rv vuln --format json
   rv vuln --format sarif
   rv vuln --fail-on high
 "
 )]
 pub struct VulnArgs {
+    #[command(flatten)]
+    module: ModuleSelector,
     #[arg(
         long,
         value_enum,
@@ -102,8 +107,8 @@ pub async fn run(args: &VulnArgs, project_root: &Path) -> Result<()> {
     let query_timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let metadata = scan_metadata(&query_timestamp);
 
-    match scan(project_root).await {
-        Ok((report, platform)) => render_report(args, report, &platform, metadata),
+    match scan(project_root, &args.module).await {
+        Ok(scan) => render_report(args, scan, metadata),
         Err(err) => {
             let details = err.user_message();
             if is_json_mode() {
@@ -123,17 +128,25 @@ pub async fn run(args: &VulnArgs, project_root: &Path) -> Result<()> {
     }
 }
 
-async fn scan(project_root: &Path) -> Result<(ScanReport, String)> {
+struct ScanData {
+    report: ScanReport,
+    platform: String,
+    reachability: BTreeMap<String, Vec<String>>,
+}
+
+async fn scan(project_root: &Path, selector: &ModuleSelector) -> Result<ScanData> {
     let project_root = project_root.to_path_buf();
-    let (adapted, platform) = tokio::task::spawn_blocking(move || {
+    let selector = selector.clone();
+    let (adapted, platform, reachability) = tokio::task::spawn_blocking(move || {
         let config = rv_config::Config::load(&project_root)?;
         let lock = crate::commands::read_fresh_lockfile(&config)?;
         let platform = crate::commands::select_platform(&lock)?;
         let platform_name = platform.platform.to_string();
-        let adapted = crate::commands::lock_adapter::adapt_platform(platform)
-            .map_err(|err| CliError::Message(format!("failed to map rv.lock: {err}")))?;
-        let (vuln_dependencies, _, _) = adapted.into_parts();
-        Ok::<_, CliError>((vuln_dependencies, platform_name))
+        let selection = selector.select(platform)?;
+        let adapted =
+            crate::commands::lock_adapter::adapt_vulnerability_modules(selection.modules())
+                .map_err(|err| CliError::Message(format!("failed to map rv.lock: {err}")))?;
+        Ok::<_, CliError>((adapted.dependencies, platform_name, adapted.reachability))
     })
     .await
     .map_err(|err| CliError::Message(format!("vulnerability scan task panicked: {err}")))??;
@@ -148,15 +161,15 @@ async fn scan(project_root: &Path) -> Result<(ScanReport, String)> {
         }
     };
     let report = scanner.scan(&adapted).await?;
-    Ok((report, platform))
+    Ok(ScanData {
+        report,
+        platform,
+        reachability,
+    })
 }
 
-fn render_report(
-    args: &VulnArgs,
-    report: ScanReport,
-    platform: &str,
-    metadata: serde_json::Value,
-) -> Result<()> {
+fn render_report(args: &VulnArgs, scan: ScanData, metadata: serde_json::Value) -> Result<()> {
+    let report = &scan.report;
     let total_vulnerabilities: usize = report
         .vulnerabilities
         .iter()
@@ -170,18 +183,22 @@ fn render_report(
         .count();
 
     if args.format == VulnOutputFormat::Sarif {
-        println!("{}", serde_json::to_string_pretty(&sarif_report(&report))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&sarif_report(report, &scan.reachability))?
+        );
     } else if is_json_mode() {
         render_json_report(
-            &report,
-            platform,
+            report,
+            &scan.platform,
+            &scan.reachability,
             metadata,
             args.fail_on,
             matching_findings,
             total_vulnerabilities,
         );
     } else {
-        render_table(&report, matching_findings, args.fail_on)
+        render_table(report, &scan.reachability, matching_findings, args.fail_on)
     }
 
     if matching_findings > 0 {
@@ -194,11 +211,23 @@ fn render_report(
 fn render_json_report(
     report: &ScanReport,
     platform: &str,
+    reachability: &BTreeMap<String, Vec<String>>,
     metadata: serde_json::Value,
     threshold: SeverityThreshold,
     matching_findings: usize,
     total_vulnerabilities: usize,
 ) {
+    let results = report
+        .vulnerabilities
+        .iter()
+        .map(|result| {
+            serde_json::json!({
+                "purl": result.purl,
+                "affected_modules": reachability.get(&result.purl).cloned().unwrap_or_default(),
+                "vulnerabilities": result.vulnerabilities,
+            })
+        })
+        .collect::<Vec<_>>();
     json_result(
         true,
         serde_json::json!({
@@ -217,12 +246,15 @@ fn render_json_report(
                 "low": report.low_count,
                 "unknown": report.unknown_count,
             },
-            "results": report.vulnerabilities,
+            "results": results,
         }),
     );
 }
 
-fn sarif_report(report: &ScanReport) -> serde_json::Value {
+fn sarif_report(
+    report: &ScanReport,
+    reachability: &BTreeMap<String, Vec<String>>,
+) -> serde_json::Value {
     let mut vulnerabilities = BTreeMap::<&str, &Vulnerability>::new();
     for result in &report.vulnerabilities {
         for vulnerability in &result.vulnerabilities {
@@ -287,22 +319,34 @@ fn sarif_report(report: &ScanReport) -> serde_json::Value {
     let results = findings
         .into_iter()
         .map(|(vulnerability, purl)| {
+            let modules = reachability.get(purl).cloned().unwrap_or_default();
+            let locations = modules
+                .iter()
+                .map(|module| {
+                    serde_json::json!({
+                        "physicalLocation": {
+                            "artifactLocation": {
+                                "uri": module,
+                            },
+                        },
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "ruleId": vulnerability.id,
                 "ruleIndex": rule_indices[vulnerability.id.as_str()],
                 "level": sarif_level(vulnerability),
                 "message": {
-                    "text": format!("{} affects {purl}", vulnerability.id),
+                    "text": format!(
+                        "{} affects {purl} (reachable from {})",
+                        vulnerability.id,
+                        modules.join(", ")
+                    ),
                 },
-                "locations": [{
-                    "physicalLocation": {
-                        "artifactLocation": {
-                            "uri": "pom.xml",
-                        },
-                    },
-                }],
+                "locations": locations,
                 "properties": {
                     "dependencyPurl": purl,
+                    "affectedModules": modules,
                 },
             })
         })
@@ -341,7 +385,12 @@ fn sarif_level(vulnerability: &Vulnerability) -> &'static str {
     }
 }
 
-fn render_table(report: &ScanReport, matching_findings: usize, threshold: SeverityThreshold) {
+fn render_table(
+    report: &ScanReport,
+    reachability: &BTreeMap<String, Vec<String>>,
+    matching_findings: usize,
+    threshold: SeverityThreshold,
+) {
     if report.vulnerabilities.is_empty() {
         println!(
             "No vulnerabilities found in {} dependencies.",
@@ -355,6 +404,7 @@ fn render_table(report: &ScanReport, matching_findings: usize, threshold: Severi
         "Vulnerability",
         "Severity",
         "Score",
+        "Affected modules",
         "Summary",
     ]);
     for result in &report.vulnerabilities {
@@ -377,6 +427,10 @@ fn render_table(report: &ScanReport, matching_findings: usize, threshold: Severi
                 vulnerability.id.clone(),
                 severity,
                 score,
+                reachability
+                    .get(&result.purl)
+                    .map(|modules| modules.join(", "))
+                    .unwrap_or_default(),
                 vulnerability.summary.clone(),
             ]);
         }

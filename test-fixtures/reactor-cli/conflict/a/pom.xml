@@ -1,0 +1,22 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>conflict-reactor</artifactId>
+    <version>1</version>
+  </parent>
+  <artifactId>a</artifactId>
+  <repositories>
+    <repository>
+      <id>repo-a</id>
+      <url>__REPO_A__</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>org.test</groupId>
+      <artifactId>conflict</artifactId>
+      <version>1</version>
+    </dependency>
+  </dependencies>
+</project>

@@ -7,6 +7,7 @@ use rv_sbom::{Component, CycloneDxGenerator, SpdxGenerator};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+use crate::commands::module_selector::ModuleSelector;
 use crate::error::{CliError, Result};
 use crate::output::{is_json_mode, json_result};
 
@@ -23,11 +24,15 @@ Output:
 
 Examples:
   rv sbom
+  rv sbom --module app/pom.xml
+  rv sbom --module com.acme:app
   rv sbom --format spdx
   rv sbom --format cyclonedx -o bom.json
 "
 )]
 pub struct SbomArgs {
+    #[command(flatten)]
+    module: ModuleSelector,
     #[arg(
         long,
         value_enum,
@@ -64,10 +69,16 @@ pub fn run(args: &SbomArgs, project_root: &Path) -> Result<()> {
     let (lock, pom_xml) = crate::commands::read_fresh_lockfile_with_pom(&config)?;
     let platform = crate::commands::select_platform(&lock)?;
     let platform_name = platform.platform.to_string();
-    let adapted = crate::commands::lock_adapter::adapt_platform(platform)
-        .map_err(|err| CliError::Message(format!("failed to map rv.lock: {err}")))?;
-    let (_, components, root_dependencies) = adapted.into_parts();
-    let root = parse_root_component(&pom_xml, root_dependencies)?;
+    let selection = args.module.select(platform)?;
+    let fallback_root = parse_root_component(&pom_xml, Vec::new())?;
+    let adapted = crate::commands::lock_adapter::adapt_sbom_modules(
+        platform,
+        selection.modules(),
+        fallback_root,
+    )
+    .map_err(|err| CliError::Message(format!("failed to map rv.lock: {err}")))?;
+    let root = adapted.root;
+    let components = adapted.components;
     let document = match args.format {
         SbomFormat::Cyclonedx => {
             let identity = document_identity(&platform_name, &root, &components, None)?;

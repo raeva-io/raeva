@@ -1,6 +1,48 @@
 use anyhow::Error as AnyhowError;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RedirectRejectionKind {
+    OriginNotConfigured,
+    InsecureOrigin,
+    HttpsDowngrade,
+    NonGlobalTarget,
+    ProxiedTargetNotConfigured,
+    ExemptHostOriginMismatch,
+    SecondCrossOriginHop,
+    ChainLimit,
+}
+
+impl RedirectRejectionKind {
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::OriginNotConfigured => {
+                "cross-origin redirect rejected: redirect origin is not configured"
+            }
+            Self::InsecureOrigin => "cross-origin redirect rejected: redirect origin is not HTTPS",
+            Self::HttpsDowngrade => "cross-origin redirect rejected: target is not HTTPS",
+            Self::NonGlobalTarget => {
+                "cross-origin redirect rejected: target address is not globally routable"
+            }
+            Self::ProxiedTargetNotConfigured => {
+                "cross-origin redirect rejected: a proxy is configured and the target origin is not \
+                 a configured repository or mirror"
+            }
+            Self::ExemptHostOriginMismatch => {
+                "cross-origin redirect rejected: target host is configured but the target origin is not"
+            }
+            Self::SecondCrossOriginHop => "cross-origin redirect rejected: second cross-origin hop",
+            Self::ChainLimit => "redirect rejected: chain exceeds 5 hops",
+        }
+    }
+}
+
+impl std::fmt::Display for RedirectRejectionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.summary())
+    }
+}
+
 // Re-use the io context helper from rv-config.
 pub(crate) use rv_config::io_error_with_context;
 
@@ -68,6 +110,11 @@ pub enum RepoError {
         "lockfile references repository '{0}' which is not in the current rv.toml; refusing to fetch from an unconfigured origin"
     )]
     UntrustedRepoUrl(String),
+    #[error("{kind}: {details}")]
+    RedirectRejected {
+        kind: RedirectRejectionKind,
+        details: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, RepoError>;

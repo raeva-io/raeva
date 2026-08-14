@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use clap::Args;
 
-use rv_config::{AuthConfig, Config, MirrorConfig, ProxyConfig};
+use rv_config::{
+    AuthConfig, Config, CredentialStore, KeyringCredentialStore, MirrorConfig, NormalizedEndpoint,
+    ProxyConfig,
+};
 use rv_repo::{RepoClient, RepoError, Repository, same_origin_redirect_policy};
 use rv_version::Coord;
 
@@ -222,15 +225,6 @@ async fn probe_repositories(
             continue;
         };
 
-        // Resolve which credential the sync path would attach (by id only,
-        // never the secret values) so the 401 hint can distinguish "no
-        // credentials configured" from "credentials rejected".
-        let credential = credential_source(
-            config.auth(),
-            resolution.repository.id.as_deref(),
-            resolution.host_changed,
-        );
-
         let row = match client.fetch_metadata(&origin, &coord).await {
             Ok(_) => Row {
                 check: label,
@@ -239,7 +233,19 @@ async fn probe_repositories(
                 outcome: Outcome::Ok,
             },
             Err(err) => {
-                let (status, details, outcome) = classify_probe_error(err, credential.as_deref());
+                // Resolve which credential the probe attached (by source only,
+                // never the secret values) so the 401 hint can distinguish "no
+                // credentials configured" from "credentials rejected", and can
+                // name the store they actually came from. Only on failure: a
+                // passing row needs no hint, and this reads the OS credential
+                // store.
+                let credential = credential_source(
+                    config.auth(),
+                    &KeyringCredentialStore,
+                    &resolution.repository,
+                    resolution.host_changed,
+                );
+                let (status, details, outcome) = classify_probe_error(err, credential.as_ref());
                 Row {
                     check: label,
                     status,
@@ -437,27 +443,66 @@ fn is_external_repo(url: &str) -> bool {
     }
 }
 
-/// Identify which configured credential (if any) the sync path would attach
-/// to the resolved repository, by source label only; secret values are never
-/// read. Mirrors rv-repo's crate-internal `AuthStore` lookup: an id-scoped
-/// entry matching the resolved repo id wins; otherwise the default (id-less)
-/// entry applies unless the mirror substitution crossed hosts, in which case
-/// sync suppresses it.
+/// Where the credential the probe attached came from. Source only: secret
+/// values are never read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialSource {
+    /// An OS credential-store entry for the resolved endpoint. These win over
+    /// every configured entry and silently shadow them, so a stale one has to
+    /// be named explicitly.
+    Keyring(String),
+    /// A configured entry scoped to the resolved repository id.
+    ConfigId(String),
+    /// The default (id-less) configured entry.
+    ConfigDefault,
+}
+
+impl CredentialSource {
+    /// Subject of the "… were sent but rejected" sentence.
+    fn label(&self) -> String {
+        match self {
+            Self::Keyring(endpoint) => {
+                format!("the OS credential store entry for {endpoint}")
+            }
+            Self::ConfigId(id) => format!("credentials for id '{id}'"),
+            Self::ConfigDefault => "default credentials".to_string(),
+        }
+    }
+}
+
+/// Identify which credential (if any) the sync path would attach to the
+/// resolved repository, by source only; secret values are never read. Mirrors
+/// rv-repo's crate-internal `AuthStore` lookup, in its precedence order: an OS
+/// credential-store entry for the resolved endpoint wins over everything
+/// (including across a cross-host mirror substitution, since the entry is
+/// keyed by that endpoint); then an id-scoped config entry matching the
+/// resolved repo id; then the default (id-less) entry, unless the mirror
+/// substitution crossed hosts, in which case sync suppresses it.
+///
+/// Store errors (including an unavailable backend) count as "no entry", the
+/// same fallback `AuthStore` takes.
 fn credential_source(
     auth: &[AuthConfig],
-    resolved_id: Option<&str>,
+    store: &dyn CredentialStore,
+    resolved: &Repository,
     host_changed: bool,
-) -> Option<String> {
+) -> Option<CredentialSource> {
+    if let Ok(endpoint) = NormalizedEndpoint::parse(&resolved.url)
+        && matches!(store.get(&endpoint), Ok(Some(_)))
+    {
+        return Some(CredentialSource::Keyring(endpoint.as_str().to_string()));
+    }
+
     let usable = |entry: &&AuthConfig| {
         entry.token.is_some() || (entry.username.is_some() && entry.password.is_some())
     };
-    if let Some(id) = resolved_id
+    if let Some(id) = resolved.id.as_deref()
         && auth
             .iter()
             .filter(usable)
             .any(|entry| entry.id.as_deref() == Some(id))
     {
-        return Some(format!("credentials for id '{id}'"));
+        return Some(CredentialSource::ConfigId(id.to_string()));
     }
     if host_changed {
         return None;
@@ -465,7 +510,7 @@ fn credential_source(
     auth.iter()
         .filter(usable)
         .find(|entry| entry.id.is_none())
-        .map(|_| "default credentials".to_string())
+        .map(|_| CredentialSource::ConfigDefault)
 }
 
 /// Build the probe coordinate for a repository.
@@ -502,19 +547,29 @@ fn probe_group_artifact(id: Option<&str>, base_url: &str) -> (&'static str, &'st
 /// Map a failed probe to a row status, human details, and outcome class.
 ///
 /// `credential` names the credential source the sync path would have
-/// attached (id only, never the secret) so the 401/403 hint can distinguish
-/// "nothing was sent, configure credentials" from "credentials were sent
-/// and rejected".
+/// attached (source only, never the secret) so the 401/403 hint can
+/// distinguish "nothing was sent, configure credentials" from "credentials
+/// were sent and rejected", and can point at the store that actually supplied
+/// them.
 fn classify_probe_error(
     err: RepoError,
-    credential: Option<&str>,
+    credential: Option<&CredentialSource>,
 ) -> (&'static str, String, Outcome) {
     if let Some(code) = err.status_code() {
         if code == 401 || code == 403 {
             let details = match credential {
+                // A stored entry outranks rv.toml and settings.xml, so
+                // editing those files cannot fix a rejected one.
+                Some(source @ CredentialSource::Keyring(endpoint)) => format!(
+                    "{code} ({} was sent but rejected; run 'rv login {endpoint}' to replace \
+                     it — a stored entry shadows any credentials in rv.toml or \
+                     ~/.m2/settings.xml)",
+                    source.label()
+                ),
                 Some(source) => format!(
-                    "{code} ({source} were sent but rejected; check the username/password \
-                     or token in ~/.m2/settings.xml or rv.toml)"
+                    "{code} ({} were sent but rejected; check the username/password \
+                     or token in ~/.m2/settings.xml or rv.toml)",
+                    source.label()
                 ),
                 None => format!(
                     "{code} (no credentials were sent; configure credentials in \
@@ -655,7 +710,11 @@ fn mirror_probe_urls(mirror: &Repository) -> std::result::Result<(url::Url, Stri
 /// credentials are not attached: the probe's goal is reachability through
 /// the proxy, and a 407 surfaces as a failure naming the proxy.
 fn build_doctor_client(config: &Config) -> Result<reqwest::Client> {
+    // Match the sync client's proxy policy: only proxies from Maven/rv
+    // configuration apply, never HTTP(S)_PROXY environment variables, so the
+    // probe diagnoses the same network path sync will use.
     let mut builder = reqwest::Client::builder()
+        .no_proxy()
         .redirect(same_origin_redirect_policy())
         .connect_timeout(DOCTOR_CONNECT_TIMEOUT)
         .timeout(DOCTOR_REQUEST_TIMEOUT);
@@ -911,11 +970,15 @@ fn format_connection_error(err: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Outcome, Row, build_doctor_proxy_url, classify_exit_code, classify_probe_error,
-        credential_source, probe_coord, probe_group_artifact, resolve_mirror, should_bypass_proxy,
+        CredentialSource, Outcome, Row, build_doctor_proxy_url, classify_exit_code,
+        classify_probe_error, credential_source, probe_coord, probe_group_artifact, resolve_mirror,
+        should_bypass_proxy,
     };
     use crate::error::ExitCodes;
-    use rv_config::{AuthConfig, MirrorConfig};
+    use rv_config::{
+        AuthConfig, CredentialError, CredentialRecord, CredentialStore, MirrorConfig,
+        NormalizedEndpoint,
+    };
     use rv_repo::{RepoError, Repository};
 
     fn mirror_config(id: Option<&str>, url: &str, mirror_of: &[&str]) -> MirrorConfig {
@@ -1099,13 +1162,163 @@ mod tests {
 
     // --- credential source replication ---
 
+    /// Stand-in for the OS credential store: holds records for exact
+    /// normalized endpoints, or reports the backend as unavailable.
+    struct FakeCredentialStore {
+        endpoints: Vec<String>,
+        unavailable: bool,
+    }
+
+    impl FakeCredentialStore {
+        fn empty() -> Self {
+            Self {
+                endpoints: Vec::new(),
+                unavailable: false,
+            }
+        }
+
+        fn with_entry(endpoint: &str) -> Self {
+            Self {
+                endpoints: vec![endpoint.to_string()],
+                unavailable: false,
+            }
+        }
+
+        fn unavailable() -> Self {
+            Self {
+                endpoints: Vec::new(),
+                unavailable: true,
+            }
+        }
+    }
+
+    impl CredentialStore for FakeCredentialStore {
+        fn get(
+            &self,
+            endpoint: &NormalizedEndpoint,
+        ) -> std::result::Result<Option<CredentialRecord>, CredentialError> {
+            if self.unavailable {
+                return Err(CredentialError::BackendUnavailable("test".to_string()));
+            }
+            if self
+                .endpoints
+                .iter()
+                .any(|stored| stored == endpoint.as_str())
+            {
+                return Ok(Some(CredentialRecord::bearer("stored-token")?));
+            }
+            Ok(None)
+        }
+
+        fn set(
+            &self,
+            _endpoint: &NormalizedEndpoint,
+            _record: &CredentialRecord,
+        ) -> std::result::Result<(), CredentialError> {
+            unreachable!("read-only test credential store")
+        }
+
+        fn delete(
+            &self,
+            _endpoint: &NormalizedEndpoint,
+        ) -> std::result::Result<bool, CredentialError> {
+            unreachable!("read-only test credential store")
+        }
+    }
+
+    fn repository(id: Option<&str>, url: &str) -> Repository {
+        Repository::new(id.map(str::to_string), url, true, false)
+    }
+
+    /// A keyring record for the probed endpoint outranks every configured
+    /// entry, exactly as `AuthStore` resolves it. Reporting the config source
+    /// here (or "no credentials") sent users to edit files that the stored
+    /// entry shadows.
     #[test]
-    fn credential_source_prefers_id_match_and_suppresses_default_cross_host() {
-        // Entries are built through toml deserialization since the secret
-        // fields cannot be constructed directly without the secrecy crate.
-        let auth: Vec<AuthConfig> =
-            toml::from_str::<std::collections::BTreeMap<String, Vec<AuthConfig>>>(
-                r#"
+    fn credential_source_reports_the_credential_store_first() {
+        let auth = auth_entries();
+        let repo = repository(Some("corp"), "https://repo.example/maven2/");
+
+        let source = credential_source(
+            &auth,
+            &FakeCredentialStore::with_entry("https://repo.example/maven2/"),
+            &repo,
+            false,
+        )
+        .expect("keyring entry");
+        assert_eq!(
+            source,
+            CredentialSource::Keyring("https://repo.example/maven2/".to_string())
+        );
+
+        // Endpoint-keyed, so it applies even across a cross-host mirror
+        // substitution, where the configured default would be suppressed.
+        assert!(matches!(
+            credential_source(
+                &auth,
+                &FakeCredentialStore::with_entry("https://repo.example/maven2/"),
+                &repository(None, "https://repo.example/maven2/"),
+                true,
+            ),
+            Some(CredentialSource::Keyring(_))
+        ));
+
+        // The misattribution case: a repo with no configured credentials at
+        // all still had a keyring record attached by the probe.
+        assert!(matches!(
+            credential_source(
+                &[],
+                &FakeCredentialStore::with_entry("https://repo.example/maven2/"),
+                &repo,
+                false,
+            ),
+            Some(CredentialSource::Keyring(_))
+        ));
+
+        // An entry for a different endpoint must not be claimed.
+        assert_eq!(
+            credential_source(
+                &auth,
+                &FakeCredentialStore::with_entry("https://other.example/maven2/"),
+                &repo,
+                false,
+            ),
+            Some(CredentialSource::ConfigId("corp".to_string()))
+        );
+    }
+
+    /// An unavailable backend (or an endpoint the store cannot key) is not a
+    /// credential: `AuthStore` falls through to the configured entries, and so
+    /// must the report.
+    #[test]
+    fn credential_source_falls_back_when_the_store_cannot_answer() {
+        let auth = auth_entries();
+        assert_eq!(
+            credential_source(
+                &auth,
+                &FakeCredentialStore::unavailable(),
+                &repository(Some("corp"), "https://repo.example/maven2/"),
+                false,
+            ),
+            Some(CredentialSource::ConfigId("corp".to_string()))
+        );
+        // A non-http endpoint has no keyring key at all.
+        assert_eq!(
+            credential_source(
+                &auth,
+                &FakeCredentialStore::empty(),
+                &repository(Some("corp"), "file:///srv/repo/"),
+                false,
+            ),
+            Some(CredentialSource::ConfigId("corp".to_string()))
+        );
+    }
+
+    /// Entries are built through toml deserialization since the secret
+    /// fields cannot be constructed directly without the secrecy crate.
+    fn auth_entries() -> Vec<AuthConfig> {
+        toml::from_str::<std::collections::BTreeMap<String, Vec<AuthConfig>>>(
+            r#"
 [[auth]]
 id = "corp"
 token = "corp-token"
@@ -1113,28 +1326,49 @@ token = "corp-token"
 [[auth]]
 token = "default-token"
 "#,
-            )
-            .expect("parse auth")
-            .remove("auth")
-            .expect("auth entries");
+        )
+        .expect("parse auth")
+        .remove("auth")
+        .expect("auth entries")
+    }
+
+    #[test]
+    fn credential_source_prefers_id_match_and_suppresses_default_cross_host() {
+        let auth = auth_entries();
+        let store = FakeCredentialStore::empty();
+        let corp = repository(Some("corp"), "https://repo.example/maven2/");
+        let other = repository(Some("other"), "https://repo.example/maven2/");
+        let anonymous = repository(None, "https://repo.example/maven2/");
 
         // Id-scoped entry wins for the resolved id, regardless of host change.
-        let source = credential_source(&auth, Some("corp"), true).expect("id match");
-        assert!(source.contains("'corp'"), "got {source}");
+        assert_eq!(
+            credential_source(&auth, &store, &corp, true),
+            Some(CredentialSource::ConfigId("corp".to_string()))
+        );
         // No id match, same host: the default applies.
-        let source = credential_source(&auth, Some("other"), false).expect("default");
-        assert!(source.contains("default"), "got {source}");
+        assert_eq!(
+            credential_source(&auth, &store, &other, false),
+            Some(CredentialSource::ConfigDefault)
+        );
         // No id match, cross-host: sync suppresses the default, so doctor
         // must report that nothing was sent.
-        assert_eq!(credential_source(&auth, Some("other"), true), None);
-        assert_eq!(credential_source(&auth, None, true), None);
+        assert_eq!(credential_source(&auth, &store, &other, true), None);
+        assert_eq!(credential_source(&auth, &store, &anonymous, true), None);
     }
 
     #[test]
     fn credential_source_ignores_unusable_entries() {
         // An entry with an id but no usable credentials never matches.
         let auth = vec![auth_entry_no_creds(Some("corp"))];
-        assert_eq!(credential_source(&auth, Some("corp"), false), None);
+        assert_eq!(
+            credential_source(
+                &auth,
+                &FakeCredentialStore::empty(),
+                &repository(Some("corp"), "https://repo.example/maven2/"),
+                false,
+            ),
+            None
+        );
     }
 
     fn auth_entry_no_creds(id: Option<&str>) -> AuthConfig {
@@ -1209,7 +1443,8 @@ token = "default-token"
         );
 
         let err = RepoError::AuthError("401 Unauthorized for https://repo.example/".to_string());
-        let (_, details, outcome) = classify_probe_error(err, Some("credentials for id 'corp'"));
+        let (_, details, outcome) =
+            classify_probe_error(err, Some(&CredentialSource::ConfigId("corp".to_string())));
         assert_eq!(outcome, Outcome::Auth);
         assert!(
             details.contains("sent but rejected") && details.contains("'corp'"),
@@ -1218,6 +1453,38 @@ token = "default-token"
         assert!(
             !details.contains("configure credentials in"),
             "creds-sent 401 must not suggest configuring missing credentials: {details}"
+        );
+    }
+
+    /// A rejected keyring credential is not fixable by editing settings.xml or
+    /// rv.toml: the stored entry shadows both. The hint has to name the store
+    /// and send the user back through `rv login`.
+    #[test]
+    fn unauthorized_hint_points_at_the_credential_store_when_it_supplied_the_secret() {
+        let err = RepoError::AuthError("401 Unauthorized for https://repo.example/".to_string());
+        let (_, details, outcome) = classify_probe_error(
+            err,
+            Some(&CredentialSource::Keyring(
+                "https://repo.example/".to_string(),
+            )),
+        );
+        assert_eq!(outcome, Outcome::Auth);
+        assert!(
+            details.contains("OS credential store entry for https://repo.example/")
+                && details.contains("sent but rejected"),
+            "keyring 401 must name the store: {details}"
+        );
+        assert!(
+            details.contains("rv login https://repo.example/"),
+            "keyring 401 must point at rv login: {details}"
+        );
+        assert!(
+            details.contains("shadows"),
+            "keyring 401 must explain that config credentials are shadowed: {details}"
+        );
+        assert!(
+            !details.contains("no credentials were sent"),
+            "keyring credentials were sent: {details}"
         );
     }
 

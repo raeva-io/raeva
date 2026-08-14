@@ -213,6 +213,14 @@ const WARNING_CODE_CATALOGUE: &[(&str, &str)] = &[
         "settings.xml credential dropped after failed decryption",
     ),
     (
+        "KEYRING_UNAVAILABLE",
+        "the OS credential store was unavailable, so configured credentials were used",
+    ),
+    (
+        "KEYRING_ENTRY_MISSING",
+        "no OS credential entry matched the endpoint, so configured credentials were used",
+    ),
+    (
         "ENV_VALUE_IN_LOCKFILE",
         "a lockfile field contains the resolved value of a ${env.X} substitution; the secret may have leaked into a tracked artifact",
     ),

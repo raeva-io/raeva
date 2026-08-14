@@ -100,8 +100,12 @@ pub fn read_fresh_lockfile_with_pom(
     }
 
     let pom_xml = rv_config::read_project_input_string(&pom_path)?;
-    let current_hash =
-        crate::commands::sync::compute_config_hash_with_pom(config, &pom_path, &pom_xml)?;
+    let current_hash = if lock.schema_version == rv_config::LOCKFILE_SCHEMA_VERSION {
+        crate::commands::sync::validate_current_models(config, &lock)?;
+        crate::commands::sync::compute_resolution_config_hash(config)?
+    } else {
+        crate::commands::sync::compute_config_hash_with_pom(config, &pom_path, &pom_xml)?
+    };
     match lock.config_hash.as_deref() {
         Some(stored_hash) if stored_hash == current_hash => Ok((lock, pom_xml)),
         Some(_) => Err(CliError::LockfileMismatch {

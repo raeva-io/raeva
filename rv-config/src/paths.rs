@@ -64,6 +64,10 @@ impl ResolvedPaths {
     pub fn metadata_db_path(&self) -> PathBuf {
         self.store_dir.with_file_name("metadata.db")
     }
+
+    pub fn credentials_index_path(&self) -> PathBuf {
+        self.config_dir.join("credentials.json")
+    }
 }
 
 /// Interpret the raw `RAEVA_HOME` value.
@@ -145,5 +149,9 @@ mod tests {
         assert_eq!(paths.cache_dir, base.join("cache"));
         assert_eq!(paths.config_file_path(), base.join("config.toml"));
         assert_eq!(paths.metadata_db_path(), base.join("metadata.db"));
+        assert_eq!(
+            paths.credentials_index_path(),
+            base.join("credentials.json")
+        );
     }
 }

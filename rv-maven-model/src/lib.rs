@@ -5,6 +5,7 @@
 
 mod activation;
 mod dependency;
+mod effective;
 mod error;
 #[allow(clippy::field_reassign_with_default)]
 mod inheritance;
@@ -17,8 +18,12 @@ mod scope;
 
 pub use activation::{Activation, ActivationContext};
 pub use dependency::{Dependency, DependencyManagement, Exclusion};
+pub use effective::{EffectiveDescriptor, Gav};
 pub use error::PomError;
-pub use inheritance::ParentResolver;
+pub use inheritance::{
+    MAX_PARENT_CHAIN_DEPTH, ParentResolver, interpolate_parent,
+    interpolate_parent_with_user_properties,
+};
 pub use pom::{Parent, Pom, Relocation};
 pub use project::Project;
 pub use properties::{env_substitution_allowlist, set_env_substitution_allowlist};

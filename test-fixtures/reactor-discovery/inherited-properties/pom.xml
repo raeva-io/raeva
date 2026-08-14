@@ -1,0 +1,16 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>workspace-parent</artifactId>
+    <version>1</version>
+    <relativePath>parent/pom.xml</relativePath>
+  </parent>
+  <artifactId>reactor</artifactId>
+  <version>${revision}</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>parent</module>
+    <module>child</module>
+  </modules>
+</project>

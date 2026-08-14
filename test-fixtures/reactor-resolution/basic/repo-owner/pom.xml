@@ -1,0 +1,19 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>repo-owner</artifactId>
+  <version>1</version>
+  <repositories>
+    <repository>
+      <id>workspace-declared</id>
+      <url>__REPO_URL__</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>org.vendor</groupId>
+      <artifactId>only-here</artifactId>
+      <version>1</version>
+    </dependency>
+  </dependencies>
+</project>

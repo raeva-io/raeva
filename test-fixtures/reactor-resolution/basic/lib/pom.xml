@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>1</version>
+    <relativePath />
+  </parent>
+  <artifactId>lib</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>org.external</groupId>
+      <artifactId>leaf</artifactId>
+      <version>1</version>
+    </dependency>
+  </dependencies>
+</project>

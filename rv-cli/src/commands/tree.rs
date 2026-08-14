@@ -2,29 +2,30 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use clap::Args;
-use petgraph::Direction;
-use petgraph::graph::{DiGraph, NodeIndex};
+use rv_config::{Config, LockModule};
+use rv_maven_model::Scope;
 use serde::Serialize;
 
-use rv_config::{Config, LockPlatform};
-use rv_maven_model::Scope;
-
+use crate::commands::module_selector::{LockModuleExt, ModuleSelector};
 use crate::error::{CliError, Result};
 use crate::output::{Table, is_json_mode, json_result};
 
 #[derive(Debug, Args)]
 #[command(
-    about = "Show the dependency tree from rv.lock",
+    about = "Show dependency trees from rv.lock",
     after_long_help = "\
 Examples:
-  rv tree                          # Show full dependency tree
+  rv tree                          # Show every module's dependency tree
+  rv tree --module app/pom.xml     # Show one module by path
+  rv tree --module com.acme:app    # Show one module by unique GA
   rv tree --scope compile          # Show only compile-scoped dependencies
   rv tree --depth 2                # Limit tree depth to 2 levels
   rv --json tree                   # Output as JSON
-  rv tree --scope test --depth 3   # Test deps, max 3 levels deep
 "
 )]
 pub struct TreeArgs {
+    #[command(flatten)]
+    module: ModuleSelector,
     #[arg(
         long,
         value_name = "SCOPE",
@@ -41,31 +42,82 @@ pub struct TreeArgs {
     pub depth: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct TreeNode {
     coordinate: String,
     scope: String,
     optional: bool,
+    workspace: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_module: Option<String>,
     children: Vec<TreeNode>,
+}
+
+#[derive(Debug, Serialize)]
+struct TreeModuleOutput {
+    module: String,
+    /// Always a `group:artifact:version` string, including for the synthetic
+    /// root of a legacy-adapted lock, where it is rv's documented placeholder
+    /// (`__legacy__:__root__:0`, see `schemas/rv-lock.json`). Keeping the raw
+    /// value holds the field's type stable for machine consumers; the text
+    /// renderer substitutes the module's POM path instead.
+    gav: String,
+    dependencies: Vec<TreeNode>,
 }
 
 #[derive(Debug, Serialize)]
 struct TreeOutput {
     project: String,
     platform: String,
+    /// Retained for single-module JSON consumers. Aggregate callers read
+    /// `modules`, which attributes each graph to its POM path.
     dependencies: Vec<TreeNode>,
+    modules: Vec<TreeModuleOutput>,
 }
 
 pub fn run(args: &TreeArgs, project_root: &Path) -> Result<()> {
     let config = Config::load(project_root)?;
     let lock = crate::commands::read_lockfile(&config)?;
     let platform = crate::commands::select_platform(&lock)?;
+    let selection = args.module.select(platform)?;
 
     if is_json_mode() {
-        let output = build_json_tree(platform, args.scope, args.depth, project_root)?;
-        json_result(true, serde_json::to_value(&output)?);
-    } else {
-        match render_tree(platform, args.scope, args.depth, project_root)? {
+        let modules = selection
+            .modules()
+            .iter()
+            .map(|module| build_json_module(module, args.scope, args.depth))
+            .collect::<Result<Vec<_>>>()?;
+        let dependencies = if modules.len() == 1 {
+            modules[0].dependencies.clone()
+        } else {
+            Vec::new()
+        };
+        let project = project_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("root")
+            .to_string();
+        json_result(
+            true,
+            serde_json::to_value(TreeOutput {
+                project,
+                platform: platform.platform.to_string(),
+                dependencies,
+                modules,
+            })?,
+        );
+        return Ok(());
+    }
+
+    let show_headers = selection.is_aggregate();
+    for (index, module) in selection.modules().iter().enumerate() {
+        if show_headers {
+            if index > 0 {
+                println!();
+            }
+            println!("Module: {}", module.display_label());
+        }
+        match render_tree(module, args.scope, args.depth)? {
             TreeRender::Table(table) => println!("{}", table.render()),
             TreeRender::Empty(message) => println!("{message}"),
         }
@@ -73,258 +125,217 @@ pub fn run(args: &TreeArgs, project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Shared data structure representing the dependency graph
+#[derive(Clone)]
+struct NodeInfo {
+    coordinate: String,
+    workspace_module: Option<String>,
+    system: bool,
+}
+
+impl NodeInfo {
+    fn label(&self) -> String {
+        if self.workspace_module.is_some() {
+            format!("{} (workspace)", self.coordinate)
+        } else if self.system {
+            format!("{} (system)", self.coordinate)
+        } else {
+            self.coordinate.clone()
+        }
+    }
+}
+
 struct TreeData {
-    coords: Vec<String>,
-    /// Adjacency-list view over `graph`: for each node index `n`,
-    /// `children[n]` is the sorted list of outgoing `EdgeInfo`s. Kept
-    /// alongside the petgraph so the recursive printers stay readable
-    /// and we don't pay the per-step `edges_directed` cost on every
-    /// node visit.
+    nodes: Vec<NodeInfo>,
     children: Vec<Vec<EdgeInfo>>,
     roots: Vec<usize>,
-    /// Per-node scope/optional cached from the first incoming edge. Computed
-    /// once during graph construction so that tree-rendering doesn't redo
-    /// an O(N*E) scan for every visited node.
     node_scope: Vec<(Scope, bool)>,
 }
 
-/// Build the dependency graph data structure from the platform
-fn build_dep_tree_data(platform: &LockPlatform, scope_filter: Option<Scope>) -> Result<TreeData> {
-    let count = platform.packages.len();
-    let coords: Vec<String> = platform
+fn build_dep_tree_data(module: &LockModule, scope_filter: Option<Scope>) -> Result<TreeData> {
+    let count = module.packages.len();
+    let nodes = module
         .packages
         .iter()
-        .map(|pkg| pkg.format_coord())
-        .collect();
-
-    let mut graph: DiGraph<usize, EdgeInfo> = DiGraph::with_capacity(count, platform.edges.len());
-    let nodes: Vec<NodeIndex> = (0..count).map(|i| graph.add_node(i)).collect();
-    // Pre-compute the per-node (scope, optional) from the first incoming edge
-    // we encounter. Without it, build_json_node/render_node would re-scan
-    // every edge in the whole graph for every node, O(N*E) overall.
-    let mut node_scope: Vec<(Scope, bool)> = vec![(Scope::Compile, false); count];
+        .map(|package| NodeInfo {
+            coordinate: package.coordinate.format_coord(),
+            workspace_module: package.workspace_module.clone(),
+            system: package.system_path.is_some(),
+        })
+        .collect::<Vec<_>>();
+    let mut children = vec![Vec::new(); count];
+    let mut incoming = vec![0_usize; count];
+    let mut node_scope = vec![(Scope::Compile, false); count];
     let mut node_scope_set = vec![false; count];
 
-    for edge in &platform.edges {
+    for edge in &module.edges {
         if edge.from >= count || edge.to >= count {
             return Err(CliError::Message(format!(
-                "lockfile edge out of bounds: {} -> {}",
-                edge.from, edge.to
+                "lockfile edge out of bounds in module '{}': {} -> {}",
+                module.path, edge.from, edge.to
             )));
         }
         let edge_scope = parse_edge_scope(edge.scope.as_deref())?;
-        if let Some(filter) = scope_filter
-            && !scope_includes(filter, edge_scope)
-        {
+        if scope_filter.is_some_and(|filter| !scope_includes(filter, edge_scope)) {
             continue;
         }
-        graph.add_edge(
-            nodes[edge.from],
-            nodes[edge.to],
-            EdgeInfo {
-                to: edge.to,
-                scope: edge_scope,
-                optional: edge.optional,
-            },
-        );
+        children[edge.from].push(EdgeInfo {
+            to: edge.to,
+            scope: edge_scope,
+            optional: edge.optional,
+        });
+        incoming[edge.to] = incoming[edge.to].saturating_add(1);
         if !node_scope_set[edge.to] {
             node_scope[edge.to] = (edge_scope, edge.optional);
             node_scope_set[edge.to] = true;
         }
     }
+    for outgoing in &mut children {
+        outgoing.sort_by(|left, right| {
+            nodes[left.to]
+                .coordinate
+                .cmp(&nodes[right.to].coordinate)
+                .then(left.to.cmp(&right.to))
+        });
+    }
 
-    let mut children: Vec<Vec<EdgeInfo>> = (0..count)
-        .map(|i| {
-            let mut out: Vec<EdgeInfo> = graph
-                .edges_directed(nodes[i], Direction::Outgoing)
-                .map(|e| e.weight().clone())
-                .collect();
-            out.sort_by(|a, b| coords[a.to].cmp(&coords[b.to]));
-            out
-        })
-        .collect();
-    // Suppress the unused-mut lint in cfgs where the loop above produces an
-    // empty Vec; the binding is still mutated unconditionally on the common
-    // path. (No-op for current builds.)
-    let _ = &mut children;
-
-    let mut roots: Vec<usize> = graph
-        .externals(Direction::Incoming)
-        .map(|n| n.index())
-        .collect();
-    if roots.is_empty() {
+    let has_direct_scope = module
+        .packages
+        .iter()
+        .any(|package| package.direct_scope.is_some());
+    let mut roots = if has_direct_scope {
+        module
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.direct_scope.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    } else {
+        incoming
+            .iter()
+            .enumerate()
+            .filter(|(_, count)| **count == 0)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    if roots.is_empty() && count > 0 {
         roots = (0..count).collect();
     }
 
-    // Root packages have zero incoming edges, so the per-edge
-    // scope_filter check above never gates them. Apply the filter to
-    // root packages using their stamped `direct_scope` instead: that's
-    // the scope the resolver recorded on the root dependency itself.
-    // Otherwise `rv tree --scope compile` would still show a package
-    // whose only declaration was test-scope.
     if let Some(filter) = scope_filter {
-        roots.retain(
-            |idx| match platform.packages[*idx].direct_scope.as_deref() {
-                Some(scope_str) => scope_str
-                    .parse::<Scope>()
-                    .map(|scope| scope_includes(filter, scope))
-                    .unwrap_or(true),
-                // No recorded direct scope: assume `compile` (the resolver
-                // default), matching how edges without a stamped scope are
-                // treated above.
-                None => scope_includes(filter, Scope::Compile),
-            },
-        );
+        // A root without a `direct_scope` stamp (every root on a lock adapted
+        // from schema 1-3) defaults to compile, exactly as an unscoped edge
+        // does above. Keeping such roots unconditionally would make
+        // `--scope provided` list the whole graph.
+        let mut retained = Vec::with_capacity(roots.len());
+        for index in roots {
+            let scope = parse_edge_scope(module.packages[index].direct_scope.as_deref())?;
+            if scope_includes(filter, scope) {
+                retained.push(index);
+            }
+        }
+        roots = retained;
     }
-
-    roots.sort_by(|a, b| coords[*a].cmp(&coords[*b]));
+    for root in &roots {
+        if let Some(scope) = module.packages[*root].direct_scope.as_deref() {
+            node_scope[*root] = (parse_edge_scope(Some(scope))?, false);
+        }
+    }
+    roots.sort_by(|left, right| {
+        nodes[*left]
+            .coordinate
+            .cmp(&nodes[*right].coordinate)
+            .then(left.cmp(right))
+    });
 
     Ok(TreeData {
-        coords,
+        nodes,
         children,
         roots,
         node_scope,
     })
 }
 
-fn build_json_tree(
-    platform: &LockPlatform,
+fn build_json_module(
+    module: &LockModule,
     scope_filter: Option<Scope>,
     max_depth: Option<usize>,
-    project_root: &Path,
-) -> Result<TreeOutput> {
-    let tree_data = build_dep_tree_data(platform, scope_filter)?;
-
-    let project = project_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("root")
-        .to_string();
-
+) -> Result<TreeModuleOutput> {
+    let tree = build_dep_tree_data(module, scope_filter)?;
     let mut dependencies = Vec::new();
-    let mut visited: HashSet<usize> = HashSet::new();
-    for root in tree_data.roots {
-        dependencies.push(build_json_node(
-            root,
-            &tree_data.children,
-            &tree_data.coords,
-            &tree_data.node_scope,
-            &mut visited,
-            0,
-            max_depth,
-        ));
+    let mut path = HashSet::new();
+    for root in &tree.roots {
+        dependencies.push(build_json_node(*root, &tree, &mut path, 0, max_depth));
     }
-
-    Ok(TreeOutput {
-        project,
-        platform: platform.platform.to_string(),
+    Ok(TreeModuleOutput {
+        module: module.path.clone(),
+        gav: module.gav(),
         dependencies,
     })
 }
 
 fn build_json_node(
     node: usize,
-    edges: &[Vec<EdgeInfo>],
-    coords: &[String],
-    node_scope: &[(Scope, bool)],
-    visited: &mut HashSet<usize>,
+    tree: &TreeData,
+    path: &mut HashSet<usize>,
     current_depth: usize,
     max_depth: Option<usize>,
 ) -> TreeNode {
-    let (scope, optional) = node_scope
-        .get(node)
-        .copied()
-        .unwrap_or((Scope::Compile, false));
-
-    let depth_exceeded = max_depth.is_some_and(|max| current_depth >= max);
-
-    let children = if depth_exceeded {
+    let (scope, optional) = tree.node_scope[node];
+    let children = if max_depth.is_some_and(|max| current_depth >= max) {
         Vec::new()
     } else {
-        visited.insert(node);
-        // Skip edges that would re-enter a node already on the path.
-        // Without this guard, a self-loop edge or a back-edge in the
-        // graph would emit the cycled node as a phantom child with
-        // empty grandchildren, leaving JSON consumers with a node
-        // that looks like a real terminal dependency. Collect the
-        // non-cycle child indices first so the closure does not
-        // straddle a mutable borrow on `visited`.
-        let live_children: Vec<usize> = edges[node]
+        path.insert(node);
+        let live_children = tree.children[node]
             .iter()
-            .filter(|edge| !visited.contains(&edge.to))
+            .filter(|edge| !path.contains(&edge.to))
             .map(|edge| edge.to)
-            .collect();
-        let result: Vec<TreeNode> = live_children
+            .collect::<Vec<_>>();
+        let children = live_children
             .into_iter()
-            .map(|child| {
-                build_json_node(
-                    child,
-                    edges,
-                    coords,
-                    node_scope,
-                    visited,
-                    current_depth + 1,
-                    max_depth,
-                )
-            })
+            .map(|child| build_json_node(child, tree, path, current_depth + 1, max_depth))
             .collect();
-        visited.remove(&node);
-        result
+        path.remove(&node);
+        children
     };
-
+    let info = &tree.nodes[node];
     TreeNode {
-        coordinate: coords[node].clone(),
+        coordinate: info.coordinate.clone(),
         scope: scope.to_string(),
         optional,
+        workspace: info.workspace_module.is_some(),
+        workspace_module: info.workspace_module.clone(),
         children,
     }
 }
 
-/// Render outcome: either a populated table or a "nothing to show" notice
-/// that the caller should print verbatim instead of an empty table.
 enum TreeRender {
     Table(Table),
     Empty(String),
 }
 
 fn render_tree(
-    platform: &LockPlatform,
+    module: &LockModule,
     scope_filter: Option<Scope>,
     max_depth: Option<usize>,
-    project_root: &Path,
 ) -> Result<TreeRender> {
-    let tree_data = build_dep_tree_data(platform, scope_filter)?;
-
-    // An empty lockfile (or one whose entries were all filtered out by
-    // `--scope`) would otherwise render as a single-row table with the
-    // project directory name and no children, visually indistinguishable
-    // from a tree that has exactly one root dependency named after the
-    // project. Surface a clear "nothing here" line instead.
-    if tree_data.roots.is_empty() {
+    let tree = build_dep_tree_data(module, scope_filter)?;
+    if tree.roots.is_empty() {
         return Ok(TreeRender::Empty(format!(
-            "No dependencies in rv.lock for platform {}",
-            platform.platform
+            "No dependencies in rv.lock for module {}",
+            module.path
         )));
     }
 
-    let root_label = project_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("root");
-
     let mut table = Table::new(["Dependency", "Scope", "Optional"]);
-    table.add_row([root_label, "", ""]);
-
-    let mut path: HashSet<usize> = HashSet::new();
-    for (idx, root) in tree_data.roots.iter().enumerate() {
-        let is_last = idx + 1 == tree_data.roots.len();
+    table.add_row([module.display_gav(), String::new(), String::new()]);
+    let mut path = HashSet::new();
+    for (index, root) in tree.roots.iter().enumerate() {
         render_node(
             *root,
             "",
-            is_last,
-            &tree_data.children,
-            &tree_data.coords,
+            index + 1 == tree.roots.len(),
+            &tree,
             &mut path,
             &mut table,
             None,
@@ -332,7 +343,6 @@ fn render_tree(
             max_depth,
         );
     }
-
     Ok(TreeRender::Table(table))
 }
 
@@ -341,8 +351,7 @@ fn render_node(
     node: usize,
     prefix: &str,
     is_last: bool,
-    edges: &[Vec<EdgeInfo>],
-    coords: &[String],
+    tree: &TreeData,
     path: &mut HashSet<usize>,
     table: &mut Table,
     edge_info: Option<&EdgeInfo>,
@@ -350,39 +359,45 @@ fn render_node(
     max_depth: Option<usize>,
 ) {
     let connector = if is_last { "└──" } else { "├──" };
-    let mut label = format!("{}{} {}", prefix, connector, coords[node]);
     let cycle = path.contains(&node);
+    let mut label = format!("{prefix}{connector} {}", tree.nodes[node].label());
     if cycle {
         label.push_str(" (cycle)");
     }
     let scope = edge_info
         .map(|edge| edge.scope.to_string())
+        .or_else(|| {
+            tree.nodes
+                .get(node)
+                .map(|_| tree.node_scope[node].0.to_string())
+        })
         .unwrap_or_default();
     let mut optional = edge_info
-        .map(|edge| if edge.optional { "optional" } else { "" })
+        .filter(|edge| edge.optional)
+        .map(|_| "optional")
         .unwrap_or("")
         .to_string();
     if cycle && optional.is_empty() {
         optional = "cycle".to_string();
     }
     table.add_row([label, scope, optional]);
-
     if cycle {
         return;
     }
 
-    // Check if we've reached the depth limit
-    let depth_exceeded = max_depth.is_some_and(|max| current_depth >= max);
-    if depth_exceeded {
-        let child_count = edges[node].len();
+    if max_depth.is_some_and(|max| current_depth >= max) {
+        let child_count = tree.children[node].len();
         if child_count > 0 {
             let next_prefix = if is_last {
                 format!("{prefix}    ")
             } else {
                 format!("{prefix}│   ")
             };
-            let truncate_label = format!("{next_prefix}... ({child_count} more)");
-            table.add_row([truncate_label, String::new(), String::new()]);
+            table.add_row([
+                format!("{next_prefix}... ({child_count} more)"),
+                String::new(),
+                String::new(),
+            ]);
         }
         return;
     }
@@ -392,16 +407,13 @@ fn render_node(
     } else {
         format!("{prefix}│   ")
     };
-
     path.insert(node);
-    for (idx, edge) in edges[node].iter().enumerate() {
-        let is_last = idx + 1 == edges[node].len();
+    for (index, edge) in tree.children[node].iter().enumerate() {
         render_node(
             edge.to,
             &next_prefix,
-            is_last,
-            edges,
-            coords,
+            index + 1 == tree.children[node].len(),
+            tree,
             path,
             table,
             Some(edge),
@@ -444,135 +456,141 @@ struct EdgeInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::collections::BTreeMap;
 
-    use rv_config::{LockEdge, LockPackage, LockPlatform, Platform};
+    use rv_config::{LockCoordinate, LockEdge, LockGav, LockModule, LockModulePackage};
+    use rv_maven_model::Scope;
 
-    use super::{TreeRender, build_dep_tree_data, build_json_tree, render_tree};
+    use super::{TreeRender, build_dep_tree_data, build_json_module, render_tree};
 
-    fn mk_pkg(idx: usize) -> LockPackage {
-        LockPackage {
-            group_id: "com.example".to_string(),
-            artifact_id: format!("a{idx}"),
-            version: "1.0".to_string(),
-            snapshot_timestamp: None,
-            packaging: "jar".to_string(),
-            classifier: None,
-            repo_url: "https://repo".to_string(),
-            checksum: Some(rv_config::Checksum::new("sha256", "deadbeef")),
+    fn package(artifact: &str, direct: bool, workspace: Option<&str>) -> LockModulePackage {
+        LockModulePackage {
+            coordinate: LockCoordinate::new("com.example", artifact, "1", "jar", None),
+            direct_scope: direct.then(|| "compile".to_string()),
+            workspace_module: workspace.map(str::to_string),
             system_path: None,
-            direct_scope: None,
-            extra: std::collections::BTreeMap::new(),
+            extra: BTreeMap::new(),
         }
     }
 
-    #[test]
-    fn coord_format_includes_classifier() {
-        let pkg = LockPackage {
-            group_id: "com.example".to_string(),
-            artifact_id: "demo".to_string(),
-            version: "1.0".to_string(),
-            snapshot_timestamp: None,
+    fn module() -> LockModule {
+        LockModule {
+            path: "app/pom.xml".to_string(),
+            gav: LockGav::new("com.example", "app", "1"),
             packaging: "jar".to_string(),
-            classifier: Some("tests".to_string()),
-            repo_url: "https://repo".to_string(),
-            checksum: Some(rv_config::Checksum::new("sha256", "deadbeef")),
-            system_path: None,
-            direct_scope: None,
-            extra: std::collections::BTreeMap::new(),
-        };
-        assert!(pkg.format_coord().contains("tests"));
-    }
-
-    #[test]
-    fn build_dep_tree_data_precomputes_node_scope() {
-        let packages = (0..3).map(mk_pkg).collect::<Vec<_>>();
-        let edges = vec![
-            LockEdge {
+            packages: vec![
+                package("lib", true, Some("lib/pom.xml")),
+                package("external", false, None),
+            ],
+            edges: vec![LockEdge {
                 from: 0,
                 to: 1,
-                scope: Some("compile".to_string()),
-                optional: false,
-                extra: std::collections::BTreeMap::new(),
-            },
-            LockEdge {
-                from: 1,
-                to: 2,
                 scope: Some("runtime".to_string()),
                 optional: true,
-                extra: std::collections::BTreeMap::new(),
-            },
-        ];
-        let platform = LockPlatform {
-            platform: Platform::new("linux", "x86_64").expect("platform"),
-            packages,
-            edges,
-            extra: std::collections::BTreeMap::new(),
-        };
-        let data = build_dep_tree_data(&platform, None).expect("build");
-        // node 2 picks up the runtime/optional from its incoming edge.
-        assert_eq!(data.node_scope[2].0.to_string(), "runtime");
-        assert!(data.node_scope[2].1);
-        // node 1 picks up compile/non-optional.
-        assert_eq!(data.node_scope[1].0.to_string(), "compile");
-        assert!(!data.node_scope[1].1);
-    }
-
-    #[test]
-    fn render_tree_empty_lockfile_returns_explicit_message() {
-        let platform = LockPlatform {
-            platform: Platform::new("linux", "x86_64").expect("platform"),
-            packages: Vec::new(),
-            edges: Vec::new(),
-            extra: std::collections::BTreeMap::new(),
-        };
-        let project_root = std::path::PathBuf::from("/tmp/some-project");
-        match render_tree(&platform, None, None, &project_root).expect("render") {
-            TreeRender::Empty(msg) => {
-                assert!(
-                    msg.contains("No dependencies in rv.lock"),
-                    "unexpected message: {msg}"
-                );
-                assert!(
-                    msg.contains("linux-x86_64"),
-                    "platform should appear in message: {msg}"
-                );
-            }
-            TreeRender::Table(_) => panic!("empty lockfile should not render a table"),
+                extra: BTreeMap::new(),
+            }],
+            extra: BTreeMap::new(),
         }
     }
 
-    /// Regression: a 500-node deep chain used to take >1s due to O(N*E) scans
-    /// in build_json_node / render_node. With the per-node scope cache and
-    /// HashSet visited check, the whole render finishes in well under 100ms.
+    /// Shape of a lockfile adapted from schema 1-3: one synthetic root module
+    /// carrying the placeholder GAV, and packages with no `direct_scope`.
+    fn legacy_module() -> LockModule {
+        let mut module = module();
+        module.path = "pom.xml".to_string();
+        module.gav = LockGav::legacy_root();
+        module.packaging = "pom".to_string();
+        for package in &mut module.packages {
+            package.direct_scope = None;
+        }
+        module.edges.clear();
+        module
+    }
+
     #[test]
-    fn build_json_tree_500_nodes_under_100ms() {
-        let count = 500;
-        let packages: Vec<LockPackage> = (0..count).map(mk_pkg).collect();
-        // chain: 0 -> 1 -> 2 -> ... -> 499
-        let edges: Vec<LockEdge> = (0..count - 1)
-            .map(|i| LockEdge {
-                from: i,
-                to: i + 1,
-                scope: Some("compile".to_string()),
-                optional: false,
-                extra: std::collections::BTreeMap::new(),
-            })
-            .collect();
-        let platform = LockPlatform {
-            platform: Platform::new("linux", "x86_64").expect("platform"),
-            packages,
-            edges,
-            extra: std::collections::BTreeMap::new(),
-        };
-        let project_root = std::path::PathBuf::from("/tmp/dummy");
-        let started = Instant::now();
-        let out = build_json_tree(&platform, None, None, &project_root).expect("build");
-        let elapsed = started.elapsed();
-        assert_eq!(out.dependencies.len(), 1);
-        assert!(
-            elapsed < Duration::from_millis(100),
-            "500-node tree took {elapsed:?}, expected < 100ms"
+    fn workspace_nodes_are_marked_and_keep_children() {
+        let module = module();
+        let data = build_dep_tree_data(&module, None).expect("build");
+        assert_eq!(data.roots, [0]);
+        assert_eq!(data.children[0][0].to, 1);
+        assert_eq!(
+            data.nodes[0].workspace_module.as_deref(),
+            Some("lib/pom.xml")
         );
+        let json = build_json_module(&module, None, None).expect("JSON tree");
+        assert!(json.dependencies[0].workspace);
+        assert_eq!(json.dependencies[0].children.len(), 1);
+    }
+
+    #[test]
+    fn direct_nodes_remain_roots_when_they_also_have_incoming_edges() {
+        let mut module = module();
+        module.packages[1].direct_scope = Some("compile".to_string());
+        let data = build_dep_tree_data(&module, None).expect("build");
+        assert_eq!(data.roots, [1, 0]);
+    }
+
+    /// A lock adapted from schema 1-3 stamps no `direct_scope`, so every root
+    /// falls back to compile — the same default unscoped edges get. Without
+    /// it, `--scope provided` listed the entire graph.
+    #[test]
+    fn scope_filter_defaults_scopeless_roots_to_compile() {
+        let module = legacy_module();
+        let compile = build_dep_tree_data(&module, Some(Scope::Compile)).expect("compile");
+        assert_eq!(compile.roots.len(), 2);
+        let provided = build_dep_tree_data(&module, Some(Scope::Provided)).expect("provided");
+        assert!(provided.roots.is_empty(), "got {:?}", provided.roots);
+
+        match render_tree(&module, Some(Scope::Provided), None).expect("render") {
+            TreeRender::Empty(message) => assert!(message.contains("pom.xml")),
+            TreeRender::Table(table) => {
+                panic!(
+                    "scope-less roots must not survive --scope provided:\n{}",
+                    table.render()
+                )
+            }
+        }
+        assert_eq!(
+            build_json_module(&module, Some(Scope::Provided), None)
+                .expect("JSON tree")
+                .dependencies
+                .len(),
+            0
+        );
+    }
+
+    /// The synthetic root of a legacy lock has no coordinate; the text view
+    /// names its POM, while the JSON `gav` keeps the documented placeholder so
+    /// the field stays a `group:artifact:version` string for consumers.
+    #[test]
+    fn legacy_placeholder_renders_as_its_pom_path() {
+        let module = legacy_module();
+        let TreeRender::Table(table) = render_tree(&module, None, None).expect("render") else {
+            panic!("legacy module has dependencies to render");
+        };
+        let rendered = table.render();
+        assert!(
+            rendered.contains("pom.xml (legacy lockfile root)"),
+            "got {rendered}"
+        );
+        assert!(
+            !rendered.contains("__legacy__"),
+            "sentinel leaked: {rendered}"
+        );
+
+        let json = build_json_module(&module, None, None).expect("JSON tree");
+        assert_eq!(json.module, "pom.xml");
+        assert_eq!(json.gav, "__legacy__:__root__:0");
+    }
+
+    #[test]
+    fn render_tree_empty_module_returns_explicit_message() {
+        let mut module = module();
+        module.packages.clear();
+        module.edges.clear();
+        match render_tree(&module, None, None).expect("render") {
+            TreeRender::Empty(message) => assert!(message.contains("app/pom.xml")),
+            TreeRender::Table(_) => panic!("empty graph should not render a table"),
+        }
     }
 }

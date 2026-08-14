@@ -42,6 +42,35 @@ enum LockPin {
     Sha1(String),
 }
 
+/// What a disagreement between the store's coordinate index and a SHA-256 pin
+/// means for the key being checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexDisagreement {
+    /// The index is expected to name the pinned blob. Anything else is an
+    /// integrity error: for a main artifact the lockfile is the contract, and
+    /// "repairing" it by re-fetching would paper over a real substitution.
+    Fatal,
+    /// The index may legitimately name other bytes. Companion POMs are keyed
+    /// `(g, a, v, pom)` with no project in the key, so any other project
+    /// syncing against the same store repoints them last-writer-wins. The
+    /// pinned blob is still the right answer; adopt it from the content store,
+    /// or re-fetch and verify.
+    Adopt,
+}
+
+/// Companion-POM pins carried by the lockfile's artifact rows, keyed by
+/// `(group, artifact, resolved version)` — one `.pom` per GAV, shared by every
+/// packaging and classifier of that coordinate.
+type PomPins = HashMap<(String, String, String), BlobId>;
+
+fn pom_pin_key(package: &LockPackage) -> (String, String, String) {
+    (
+        package.group_id.clone(),
+        package.artifact_id.clone(),
+        package.version.clone(),
+    )
+}
+
 impl LockPin {
     fn from_checksum(checksum: &Checksum, coord: &str) -> Result<Self> {
         // `Lockfile::read` already rewrites the algorithm to a canonical
@@ -130,14 +159,19 @@ pub async fn ensure_artifacts(
     lock: &Lockfile,
     config: &Config,
     platforms: &[Platform],
+    trusted_repositories: &[Repository],
 ) -> Result<Vec<DownloadResult>> {
     let filtered = filter_lock(lock, platforms)?;
-    let all_packages: Vec<&LockPackage> = filtered
+    // Every artifact-table row is a pinned dependency, `pom` packaging
+    // included: an ordinary `<type>pom</type>` dependency is a real resolved
+    // node and gets a row, while imported BOMs and parent POMs never do. Rows
+    // are what repair covers, so filtering `pom` out here would leave an
+    // explicit POM dependency unrepaired until `rv export-m2` tripped over it.
+    let all_packages: Vec<LockPackage> = filtered
         .platforms
         .iter()
-        .flat_map(|platform| platform.packages.iter())
+        .flat_map(|platform| platform.external_packages())
         .filter(|package| package.system_path.is_none())
-        .filter(|package| package.packaging != "pom")
         .collect();
 
     if all_packages.is_empty() {
@@ -146,7 +180,7 @@ pub async fn ensure_artifacts(
 
     let mut seen = HashSet::new();
     let mut packages = Vec::new();
-    for pkg in all_packages {
+    for pkg in &all_packages {
         let key = (
             &pkg.group_id,
             &pkg.artifact_id,
@@ -159,27 +193,59 @@ pub async fn ensure_artifacts(
         }
     }
 
+    // The companion-POM pins the lockfile carries. Two rows pinning one GAV to
+    // different bytes are rejected before this point — by `rv sync` for a
+    // freshly resolved lock and by `Lockfile::read` for one off disk — so
+    // collapsing the rows into one map per GAV cannot lose a distinct pin.
+    let mut pom_pins = PomPins::new();
+    for platform in &filtered.platforms {
+        for artifact in &platform.artifacts {
+            let Some(digest) = artifact.pom_sha256.as_deref() else {
+                continue;
+            };
+            let blob = BlobId::from_str(digest).map_err(|err| {
+                RepoError::InvalidMetadata(format!(
+                    "pom_sha256 for {}: {err}",
+                    artifact.coordinate.format_coord()
+                ))
+            })?;
+            pom_pins.insert(pom_pin_key(&artifact.as_package()), blob);
+        }
+    }
+
     let concurrency = config.network.concurrency.max(1);
-    let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
-    download_artifacts_parallel(&packages, config, store, client, concurrency, dedup).await
+    let inputs = SyncInputs {
+        config,
+        store,
+        client,
+        trusted_repositories,
+        pom_pins: &pom_pins,
+    };
+    download_artifacts_parallel(&packages, &inputs, concurrency).await
+}
+
+/// The read-only inputs every package in one `ensure_artifacts` call shares.
+struct SyncInputs<'a> {
+    config: &'a Config,
+    store: &'a Store,
+    client: &'a RepoClient,
+    trusted_repositories: &'a [Repository],
+    pom_pins: &'a PomPins,
 }
 
 async fn download_artifacts_parallel(
     packages: &[&LockPackage],
-    config: &Config,
-    store: &Store,
-    client: &RepoClient,
+    inputs: &SyncInputs<'_>,
     concurrency: usize,
-    dedup: FetchDedupMap,
 ) -> Result<Vec<DownloadResult>> {
     let concurrency = concurrency.max(1);
+    let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
 
     let results = stream::iter(packages.iter().copied())
         .map(|pkg| {
-            let client = client.clone();
             let dedup = dedup.clone();
             async move {
-                let result = ensure_package_artifacts(config, store, &client, pkg, &dedup).await;
+                let result = ensure_package_artifacts(inputs, pkg, &dedup).await;
                 DownloadResult {
                     package: package_label(pkg),
                     result,
@@ -252,17 +318,21 @@ fn package_label(package: &LockPackage) -> String {
 }
 
 async fn ensure_package_artifacts(
-    config: &Config,
-    store: &Store,
-    client: &RepoClient,
+    inputs: &SyncInputs<'_>,
     package: &LockPackage,
     dedup: &FetchDedupMap,
 ) -> Result<()> {
     if package.system_path.is_some() {
         return Ok(());
     }
+    let SyncInputs {
+        config,
+        store,
+        client,
+        trusted_repositories,
+        pom_pins,
+    } = *inputs;
 
-    let repo = repository_for_package(config, package)?;
     let request = ArtifactRequest::new(&package.group_id, &package.artifact_id, &package.version)
         .with_packaging(package.packaging.clone());
     let request = if let Some(classifier) = &package.classifier {
@@ -285,8 +355,10 @@ async fn ensure_package_artifacts(
 
     let coord = key.to_string();
     let pin = LockPin::from_checksum(checksum, &coord)?;
+    let mut origin = PackageOrigin::new(config, package, trusted_repositories);
 
-    if needs_download(store, &key, &pin, &coord).await? {
+    if needs_download(store, &key, &pin, &coord, IndexDisagreement::Fatal).await? {
+        let repo = origin.repository()?;
         // Route fetch + index through `fetch_artifact_to_store_and_index`
         // so the persist and the index commit share one `StoreLock`. The
         // legacy two-step `fetch_artifact_to_store` then `Store::add_artifact`
@@ -299,7 +371,7 @@ async fn ensure_package_artifacts(
         // the sidecar but the lockfile pin is the user's contract and must
         // always hold. Re-hashing here also catches the SHA-1 pin case that
         // the sidecar path may not have covered.
-        let blob = fetch_with_dedup(client, &repo, &request, store, &key, dedup).await?;
+        let blob = fetch_with_dedup(client, repo, &request, store, &key, dedup).await?;
         // Off-runtime SHA-256/SHA-1 verify: the synchronous on-disk hash
         // would otherwise pin a tokio worker for the duration of a large JAR.
         verify_blob_against_pin_offload(store, &blob, &pin, &coord).await?;
@@ -317,26 +389,98 @@ async fn ensure_package_artifacts(
         "pom",
         None,
     );
-    let pom_blob = if package.packaging == "pom" {
-        // A pom-typed package (BOM import, pom dependency) was already
-        // persisted under its own key by the main fetch above.
+    let pom_blob = if let Some(expected) = pom_pins.get(&pom_pin_key(package)) {
+        // The lockfile names the exact POM bytes resolution parsed. The store's
+        // coordinate index is not authoritative for them — any other project
+        // sharing the store repoints `(g, a, v, pom)` last-writer-wins — so
+        // verify against the pin and, if the store no longer holds those
+        // bytes, re-fetch and verify what comes back rather than accepting
+        // whatever the index currently names.
+        let pom_pin = LockPin::Sha256(expected.clone());
+        let pom_coord = pom_key.to_string();
+        if needs_download(
+            store,
+            &pom_key,
+            &pom_pin,
+            &pom_coord,
+            IndexDisagreement::Adopt,
+        )
+        .await?
+        {
+            let repo = origin.repository()?;
+            let blob =
+                fetch_with_dedup(client, repo, &request.pom(), store, &pom_key, dedup).await?;
+            // A POM that no longer hashes to the pin is upstream drift, not a
+            // repairable local miss: continuing would index bytes this
+            // lockfile was never resolved against.
+            verify_blob_against_pin_offload(store, &blob, &pom_pin, &pom_coord).await?;
+        }
+        Some(expected.clone())
+    } else if package.packaging == "pom" {
+        // An explicit `<type>pom</type>` dependency is its own POM: the main
+        // fetch above already persisted it under `pom_key`.
         store.lookup_artifact(&pom_key).await?
-    } else if needs_download_unpinned(store, &pom_key).await? {
+    } else if !needs_download_unpinned(store, &pom_key).await? {
+        store.lookup_artifact(&pom_key).await?
+    } else {
+        // A timestamped snapshot row without a pin is NOT satisfied by the
+        // store's base `-SNAPSHOT` POM row: that row is keyed without a
+        // project and repointed last-writer-wins, so aliasing it here would
+        // index some other build's POM under this build's key and poison the
+        // parent-chain walk and export. Only a pinned row can adopt bytes by
+        // identity (the branch above does, straight from the content store);
+        // everything else fetches the real timestamped POM and verifies it.
+        let repo = origin.repository()?;
         // Companion POMs ride through the same atomic put+index path as the
         // main artifact. The repo's `.sha256`/`.sha1` sidecar still gates
         // trust (refusing unverified blobs when `require_checksums=true`);
-        // lockfile-level POM pinning is a separate piece in the schema.
+        // an unpinned row is one written before POM pinning, or by a lockfile
+        // that recorded no digest for this coordinate.
         let pom_req = request.pom();
-        Some(fetch_with_dedup(client, &repo, &pom_req, store, &pom_key, dedup).await?)
-    } else {
-        store.lookup_artifact(&pom_key).await?
+        Some(fetch_with_dedup(client, repo, &pom_req, store, &pom_key, dedup).await?)
     };
 
     if let Some(pom_blob) = pom_blob {
-        ensure_parent_chain(client, &repo, store, &pom_blob, dedup).await?;
+        ensure_parent_chain(client, &mut origin, store, &pom_blob, dedup).await?;
     }
 
     Ok(())
+}
+
+struct PackageOrigin<'a> {
+    repository: Option<Repository>,
+    config: &'a Config,
+    package: &'a LockPackage,
+    trusted_repositories: &'a [Repository],
+}
+
+impl<'a> PackageOrigin<'a> {
+    fn new(
+        config: &'a Config,
+        package: &'a LockPackage,
+        trusted_repositories: &'a [Repository],
+    ) -> Self {
+        Self {
+            repository: None,
+            config,
+            package,
+            trusted_repositories,
+        }
+    }
+
+    fn repository(&mut self) -> Result<&Repository> {
+        if self.repository.is_none() {
+            self.repository = Some(repository_for_package(
+                self.config,
+                self.package,
+                self.trusted_repositories,
+            )?);
+        }
+        Ok(self
+            .repository
+            .as_ref()
+            .expect("repository was initialized before borrowing"))
+    }
 }
 
 /// Maximum `<parent>` ancestry depth followed during sync. Guards against
@@ -357,7 +501,7 @@ const MAX_PARENT_CHAIN: usize = 64;
 /// ancestors are fetched once via the per-sync dedup map.
 async fn ensure_parent_chain(
     client: &RepoClient,
-    repo: &Repository,
+    origin: &mut PackageOrigin<'_>,
     store: &Store,
     child_pom_blob: &BlobId,
     dedup: &FetchDedupMap,
@@ -383,6 +527,7 @@ async fn ensure_parent_chain(
             return Ok(());
         }
         let parent_blob = if needs_download_unpinned(store, &parent_key).await? {
+            let repo = origin.repository()?;
             let req =
                 ArtifactRequest::new(group_id.as_str(), artifact_id.as_str(), version.as_str())
                     .with_packaging("pom");
@@ -438,6 +583,7 @@ async fn needs_download(
     key: &ArtifactKey,
     pin: &LockPin,
     coord: &str,
+    on_index_disagreement: IndexDisagreement,
 ) -> Result<bool> {
     let expected_blob_id = pin.expected_blob_id().cloned();
 
@@ -445,16 +591,21 @@ async fn needs_download(
         && store.exists_async(&existing).await
     {
         // For sha256 pins, an index disagreement means the index points at
-        // a different blob than the lockfile demands. That is an integrity
-        // error, not something to "repair" by re-fetching.
+        // a different blob than the lockfile demands. Whether that is an
+        // integrity error or an ordinary repoint depends on who owns the key;
+        // see `IndexDisagreement`. Under `Adopt` the pinned blob is looked up
+        // by content below instead.
         if let Some(expected) = expected_blob_id.as_ref()
             && existing != *expected
         {
-            return Err(RepoError::ChecksumMismatch {
-                path: coord.to_string(),
-                expected: expected.to_string(),
-                actual: existing.to_string(),
-            });
+            if on_index_disagreement == IndexDisagreement::Fatal {
+                return Err(RepoError::ChecksumMismatch {
+                    path: coord.to_string(),
+                    expected: expected.to_string(),
+                    actual: existing.to_string(),
+                });
+            }
+            return adopt_pinned_blob(store, key, expected, pin, coord).await;
         }
 
         // Re-hash the on-disk blob against the lockfile pin. SHA-256 over a
@@ -476,40 +627,52 @@ async fn needs_download(
         }
     }
 
-    // Fallback: the index has no row for this key but a matching SHA-256
-    // blob already exists in the CAS. Adopt it after verification.
-    //
-    // KNOWN LIMITATION: `exists_async` -> `verify_pin_*` -> `add_artifact` is
-    // three steps with no `StoreLock` held across them. A concurrent
-    // `Store::prune_blobs` sweep can remove the blob between any pair of
-    // steps and leave a dangling index row. The cross-crate atomic helper
-    // that would close this race lives in rv-store and is out of scope for
-    // this branch; until then we log on the observable post-condition
-    // (blob gone after add_artifact) and rely on the next sync's
-    // lockfile-pin re-hash in `needs_download` to repair the row.
-    if let Some(expected) = expected_blob_id.as_ref()
-        && store.exists_async(expected).await
-    {
-        let verify = verify_pin_repairing_corruption(store, expected, pin, coord).await?;
-        match verify {
-            BlobCheck::Intact => {
-                store.add_artifact(key, expected).await?;
-                if !store.exists_async(expected).await {
-                    tracing::warn!(
-                        sec_code = "ADOPT_RACE",
-                        coord = %coord,
-                        blob = %expected,
-                        "blob disappeared between exists check and add_artifact (concurrent GC); index row will be repaired on next sync"
-                    );
-                    return Ok(true);
-                }
-                return Ok(false);
-            }
-            BlobCheck::PinMismatch => return Ok(true),
-        }
+    // Fallback: the index has no row for this key (or, under `Adopt`, names
+    // other bytes) but the pinned blob is in the CAS. Adopt it.
+    if let Some(expected) = expected_blob_id.as_ref() {
+        return adopt_pinned_blob(store, key, expected, pin, coord).await;
     }
 
     Ok(true)
+}
+
+/// Point `key` at the pinned blob when the content store already holds it,
+/// returning whether a download is still needed.
+///
+/// KNOWN LIMITATION: `exists_async` -> `verify_pin_*` -> `add_artifact` is
+/// three steps with no `StoreLock` held across them. A concurrent
+/// `Store::prune_blobs` sweep can remove the blob between any pair of steps
+/// and leave a dangling index row. The cross-crate atomic helper that would
+/// close this race lives in rv-store and is out of scope for this branch;
+/// until then we log on the observable post-condition (blob gone after
+/// `add_artifact`) and rely on the next sync's lockfile-pin re-hash in
+/// `needs_download` to repair the row.
+async fn adopt_pinned_blob(
+    store: &Store,
+    key: &ArtifactKey,
+    expected: &BlobId,
+    pin: &LockPin,
+    coord: &str,
+) -> Result<bool> {
+    if !store.exists_async(expected).await {
+        return Ok(true);
+    }
+    match verify_pin_repairing_corruption(store, expected, pin, coord).await? {
+        BlobCheck::Intact => {
+            store.add_artifact(key, expected).await?;
+            if !store.exists_async(expected).await {
+                tracing::warn!(
+                    sec_code = "ADOPT_RACE",
+                    coord = %coord,
+                    blob = %expected,
+                    "blob disappeared between exists check and add_artifact (concurrent GC); index row will be repaired on next sync"
+                );
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        BlobCheck::PinMismatch => Ok(true),
+    }
 }
 
 /// Outcome of an off-runtime pin verification step.
@@ -618,11 +781,42 @@ async fn needs_download_unpinned(store: &Store, key: &ArtifactKey) -> Result<boo
 /// Resolve a lockfile `repo_url` against configured `[repositories]`. Refuse
 /// any URL not declared in `rv.toml`: the lockfile is not a trust root, so
 /// a tampered `rv.lock` must not redirect a sync to an attacker origin.
-fn repository_for_package(config: &Config, package: &LockPackage) -> Result<Repository> {
+///
+/// This is the canonical trust policy for a lockfile origin; callers that only
+/// need to decide whether a recorded `repo_url` is still trusted (`rv lock
+/// --verify`) should call it rather than restate it. Such callers pass an empty
+/// `trusted_repositories`: that slice carries the origins the *current*
+/// resolution authorized, which a verification pass does not have.
+pub fn repository_for_package(
+    config: &Config,
+    package: &LockPackage,
+    trusted_repositories: &[Repository],
+) -> Result<Repository> {
     let wanted = normalize_repo_url(&package.repo_url);
     for repo in config.repositories() {
         if normalize_repo_url(&repo.url) == wanted {
             return Ok(Repository::from(repo));
+        }
+    }
+    // Resolution records the mirror-substituted URL, so a mirror's own URL is
+    // a legitimate lockfile origin. The repository carries the MIRROR's id,
+    // never the origin repository's, and `AuthStore`'s mirror policy re-applies
+    // the cross-host credential suppression that resolution made — mirror
+    // selection cannot recompute it from a substituted URL, which matches its
+    // own entry and short-circuits as a self-reference.
+    for mirror in config.mirrors() {
+        if normalize_repo_url(&mirror.url) == wanted {
+            return Ok(Repository::new(
+                mirror.id.clone(),
+                mirror.url.clone(),
+                true,
+                true,
+            ));
+        }
+    }
+    for repo in trusted_repositories {
+        if normalize_repo_url(&repo.url) == wanted {
+            return Ok(repo.clone());
         }
     }
     tracing::warn!(
@@ -727,7 +921,7 @@ mod tests {
         let pin = LockPin::Sha256(good_id.clone());
         let coord = key.to_string();
 
-        let needs = needs_download(&store, &key, &pin, &coord)
+        let needs = needs_download(&store, &key, &pin, &coord, IndexDisagreement::Fatal)
             .await
             .expect("needs_download");
         assert!(
@@ -753,9 +947,15 @@ mod tests {
         store.add_artifact(&key, &id).await.unwrap();
 
         let pin = LockPin::Sha256(id.clone());
-        let needs = needs_download(&store, &key, &pin, &key.to_string())
-            .await
-            .unwrap();
+        let needs = needs_download(
+            &store,
+            &key,
+            &pin,
+            &key.to_string(),
+            IndexDisagreement::Fatal,
+        )
+        .await
+        .unwrap();
         assert!(
             !needs,
             "intact blob should be reported as no-download-needed"
@@ -816,7 +1016,9 @@ mod tests {
         let coord = key.to_string();
         let pin = LockPin::from_checksum(&bogus, &coord).unwrap();
 
-        let needs = needs_download(&store, &key, &pin, &coord).await.unwrap();
+        let needs = needs_download(&store, &key, &pin, &coord, IndexDisagreement::Fatal)
+            .await
+            .unwrap();
         assert!(
             needs,
             "a stale pin must trigger a re-fetch for the offending coordinate"
@@ -898,7 +1100,9 @@ mod tests {
                     let pin = pin.clone();
                     let coord = key.to_string();
                     handles.push(tokio::spawn(async move {
-                        needs_download(&store, &key, &pin, &coord).await.unwrap()
+                        needs_download(&store, &key, &pin, &coord, IndexDisagreement::Fatal)
+                            .await
+                            .unwrap()
                     }));
                 }
                 for h in handles {
@@ -967,7 +1171,7 @@ mod tests {
             extra: Default::default(),
         };
 
-        let err = repository_for_package(&config, &package)
+        let err = repository_for_package(&config, &package, &[])
             .expect_err("unknown lockfile repo must be rejected");
         match err {
             RepoError::UntrustedRepoUrl(url) => {
@@ -1013,8 +1217,43 @@ mod tests {
             extra: Default::default(),
         };
 
-        let repo = repository_for_package(&config, &package).expect("configured repo must resolve");
+        let repo =
+            repository_for_package(&config, &package, &[]).expect("configured repo must resolve");
         assert_eq!(repo.id.as_deref(), Some("central"));
+    }
+
+    #[test]
+    fn repository_for_package_accepts_origin_trusted_by_current_resolution() {
+        use rv_config::ResolvedPaths;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ResolvedPaths::discover().expect("paths");
+        let config =
+            rv_config::Config::for_testing_with_repos(temp.path().to_path_buf(), paths, Vec::new());
+        let package = LockPackage {
+            group_id: "com.example".to_string(),
+            artifact_id: "demo".to_string(),
+            version: "1.0-SNAPSHOT".to_string(),
+            snapshot_timestamp: None,
+            packaging: "jar".to_string(),
+            classifier: None,
+            repo_url: "https://repository.example/snapshots/".to_string(),
+            checksum: Some(Checksum::new("sha256", "f".repeat(64))),
+            system_path: None,
+            direct_scope: None,
+            extra: Default::default(),
+        };
+        let trusted = Repository::new(
+            Some("snapshots".to_string()),
+            "https://repository.example/snapshots",
+            false,
+            true,
+        );
+
+        let repo = repository_for_package(&config, &package, &[trusted])
+            .expect("current resolution should authorize its effective repository");
+        assert_eq!(repo.id.as_deref(), Some("snapshots"));
+        assert!(repo.snapshots_enabled);
     }
 
     /// `Checksum.algorithm = "sha-256"` (dash form) parses through
@@ -1086,7 +1325,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_artifacts_rejects_package_without_checksum() {
         use rv_config::{
-            LOCKFILE_SCHEMA_VERSION, LockPlatform, Platform, ResolvedPaths, UpdatePolicy,
+            LOCKFILE_SCHEMA_VERSION, LockGav, LockPlatform, Platform, ResolvedPaths, UpdatePolicy,
         };
 
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1125,18 +1364,22 @@ mod tests {
         let lock = Lockfile {
             schema_version: LOCKFILE_SCHEMA_VERSION,
             config_hash: None,
-            platforms: vec![LockPlatform {
-                platform: Platform::current().expect("platform"),
-                packages: vec![package],
-                edges: Vec::new(),
-                extra: Default::default(),
-            }],
+            resolution: None,
+            platforms: vec![LockPlatform::single_module(
+                Platform::current().expect("platform"),
+                "",
+                "pom.xml",
+                LockGav::new("com.example", "root", "1"),
+                "pom",
+                vec![package],
+                Vec::new(),
+            )],
             metadata: Default::default(),
             extra: Default::default(),
         };
         let platforms = vec![Platform::current().expect("platform")];
 
-        let results = ensure_artifacts(&client, &store, &lock, &config, &platforms)
+        let results = ensure_artifacts(&client, &store, &lock, &config, &platforms, &[])
             .await
             .expect("ensure_artifacts returns a per-package result vec, not a hard Err");
         // Exactly one package; its per-package result must be a MissingChecksum.
@@ -1145,5 +1388,467 @@ mod tests {
             Err(RepoError::MissingChecksum(_)) => {}
             other => panic!("expected MissingChecksum, got {other:?}"),
         }
+    }
+
+    /// Fast path: the lockfile pins the timestamped POM to bytes the store
+    /// already holds (here under the base `-SNAPSHOT` row), so the row is
+    /// adopted by identity with no network and no authorization of the
+    /// recorded origin.
+    #[tokio::test]
+    async fn cached_artifact_does_not_require_its_origin_in_current_config() {
+        use rv_config::{ResolvedPaths, UpdatePolicy};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ResolvedPaths::discover().expect("paths");
+        let central = rv_config::RepoConfig {
+            id: Some("central".to_string()),
+            url: "https://repo1.maven.org/maven2/".to_string(),
+            releases: Some(true),
+            snapshots: Some(false),
+            snapshots_update_policy: Some(UpdatePolicy::Daily),
+        };
+        let config = rv_config::Config::for_testing_with_repos(
+            temp.path().to_path_buf(),
+            paths,
+            vec![central],
+        );
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let client = RepoClient::new(&config).await.expect("client");
+
+        let timestamped = "1.0-20260720.123253-28";
+        let key = ArtifactKey::new("com.example", "demo", timestamped, "jar", None);
+        let blob = store.put_bytes(b"cached artifact").await.expect("put jar");
+        store.add_artifact(&key, &blob).await.expect("index jar");
+        let base_pom_key = ArtifactKey::new("com.example", "demo", "1.0-SNAPSHOT", "pom", None);
+        let pom_blob = store
+            .put_bytes(
+                b"<project><modelVersion>4.0.0</modelVersion>\
+                  <groupId>com.example</groupId><artifactId>demo</artifactId>\
+                  <version>1.0-SNAPSHOT</version></project>",
+            )
+            .await
+            .expect("put pom");
+        store
+            .add_artifact(&base_pom_key, &pom_blob)
+            .await
+            .expect("index pom");
+
+        let package = LockPackage {
+            group_id: "com.example".to_string(),
+            artifact_id: "demo".to_string(),
+            version: timestamped.to_string(),
+            snapshot_timestamp: Some("20260720.123253".to_string()),
+            packaging: "jar".to_string(),
+            classifier: None,
+            repo_url: "https://pom-declared.example/repository/".to_string(),
+            checksum: Some(Checksum::new("sha256", blob.to_string())),
+            system_path: None,
+            direct_scope: None,
+            extra: Default::default(),
+        };
+        let pom_pins = PomPins::from([(
+            (
+                "com.example".to_string(),
+                "demo".to_string(),
+                timestamped.to_string(),
+            ),
+            pom_blob.clone(),
+        )]);
+        let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
+
+        ensure_package_artifacts(
+            &SyncInputs {
+                config: &config,
+                store: &store,
+                client: &client,
+                trusted_repositories: &[],
+                pom_pins: &pom_pins,
+            },
+            &package,
+            &dedup,
+        )
+        .await
+        .expect("cached bytes need no origin authorization or network fetch");
+
+        let timestamped_pom_key = ArtifactKey::new("com.example", "demo", timestamped, "pom", None);
+        assert_eq!(
+            store
+                .lookup_artifact(&timestamped_pom_key)
+                .await
+                .expect("lookup timestamped POM"),
+            Some(pom_blob),
+            "the pinned POM bytes should be indexed for timestamped export"
+        );
+    }
+
+    /// Build a config whose only repository is unreachable, so any network
+    /// fetch fails loudly instead of quietly succeeding. Snapshots are enabled
+    /// so the snapshot scenarios reach the fetch rather than stopping at the
+    /// repository policy check.
+    async fn offline_only_config(root: &std::path::Path) -> (rv_config::Config, RepoClient) {
+        use rv_config::{ResolvedPaths, UpdatePolicy};
+
+        let paths = ResolvedPaths::discover().expect("paths");
+        let repo = rv_config::RepoConfig {
+            id: Some("fixture".to_string()),
+            url: "https://unreachable.invalid/maven2/".to_string(),
+            releases: Some(true),
+            snapshots: Some(true),
+            snapshots_update_policy: Some(UpdatePolicy::Daily),
+        };
+        let config =
+            rv_config::Config::for_testing_with_repos(root.to_path_buf(), paths, vec![repo]);
+        let client = RepoClient::new(&config).await.expect("client");
+        (config, client)
+    }
+
+    fn pinned_package(jar: &BlobId) -> LockPackage {
+        LockPackage {
+            group_id: "com.example".to_string(),
+            artifact_id: "demo".to_string(),
+            version: "1.0".to_string(),
+            snapshot_timestamp: None,
+            packaging: "jar".to_string(),
+            classifier: None,
+            repo_url: "https://unreachable.invalid/maven2/".to_string(),
+            checksum: Some(Checksum::new("sha256", jar.to_string())),
+            system_path: None,
+            direct_scope: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// The store's `(g, a, v, pom)` index row is last-writer-wins across every
+    /// project sharing the store, so between the resolve that recorded the pin
+    /// and this download pass another project can repoint it. The download
+    /// pass must follow the pin, not the index: it re-points the row at the
+    /// pinned blob, which is still in the content store, without going to the
+    /// network (the only configured repository here does not resolve).
+    #[tokio::test]
+    async fn repointed_pom_index_row_is_restored_from_the_pin() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let (config, client) = offline_only_config(temp.path()).await;
+
+        let jar = store.put_bytes(b"demo jar").await.expect("put jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "demo", "1.0", "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+
+        let pom_key = ArtifactKey::new("com.example", "demo", "1.0", "pom", None);
+        let resolved_pom = store
+            .put_bytes(b"<project>resolution parsed this</project>")
+            .await
+            .expect("put resolved pom");
+        // Another project syncing against the same store repoints the row.
+        let other_pom = store
+            .put_bytes(b"<project>another project indexed this</project>")
+            .await
+            .expect("put other pom");
+        store
+            .add_artifact(&pom_key, &other_pom)
+            .await
+            .expect("repoint index");
+
+        let pom_pins = PomPins::from([(
+            (
+                "com.example".to_string(),
+                "demo".to_string(),
+                "1.0".to_string(),
+            ),
+            resolved_pom.clone(),
+        )]);
+        let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
+        ensure_package_artifacts(
+            &SyncInputs {
+                config: &config,
+                store: &store,
+                client: &client,
+                trusted_repositories: &[],
+                pom_pins: &pom_pins,
+            },
+            &pinned_package(&jar),
+            &dedup,
+        )
+        .await
+        .expect("the pinned blob is in the store, so no fetch is needed");
+
+        assert_eq!(
+            store.lookup_artifact(&pom_key).await.expect("lookup"),
+            Some(resolved_pom),
+            "the index row must be restored to the bytes the lockfile pins"
+        );
+    }
+
+    /// Negative control for the check above: an unpinned row keeps the old
+    /// behaviour and leaves whatever the index names in place.
+    #[tokio::test]
+    async fn unpinned_pom_row_still_follows_the_index() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let (config, client) = offline_only_config(temp.path()).await;
+
+        let jar = store.put_bytes(b"demo jar").await.expect("put jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "demo", "1.0", "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+        let pom_key = ArtifactKey::new("com.example", "demo", "1.0", "pom", None);
+        let other_pom = store
+            .put_bytes(b"<project>another project indexed this</project>")
+            .await
+            .expect("put other pom");
+        store
+            .add_artifact(&pom_key, &other_pom)
+            .await
+            .expect("index pom");
+
+        let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
+        ensure_package_artifacts(
+            &SyncInputs {
+                config: &config,
+                store: &store,
+                client: &client,
+                trusted_repositories: &[],
+                pom_pins: &PomPins::new(),
+            },
+            &pinned_package(&jar),
+            &dedup,
+        )
+        .await
+        .expect("an unpinned companion POM present in the index needs no fetch");
+
+        assert_eq!(
+            store.lookup_artifact(&pom_key).await.expect("lookup"),
+            Some(other_pom)
+        );
+    }
+
+    /// When the pinned bytes are gone from the content store, the pin still
+    /// governs: the pass re-fetches rather than adopting whatever the index
+    /// names. With no reachable repository that surfaces as a fetch failure,
+    /// which is the honest outcome — silently exporting the other project's
+    /// POM is what the pin exists to prevent.
+    #[tokio::test]
+    async fn missing_pinned_pom_bytes_force_a_refetch_instead_of_the_index_row() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let (config, client) = offline_only_config(temp.path()).await;
+
+        let jar = store.put_bytes(b"demo jar").await.expect("put jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "demo", "1.0", "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+        let pom_key = ArtifactKey::new("com.example", "demo", "1.0", "pom", None);
+        let other_pom = store
+            .put_bytes(b"<project>another project indexed this</project>")
+            .await
+            .expect("put other pom");
+        store
+            .add_artifact(&pom_key, &other_pom)
+            .await
+            .expect("index pom");
+
+        // A digest the store has never held.
+        let pom_pins = PomPins::from([(
+            (
+                "com.example".to_string(),
+                "demo".to_string(),
+                "1.0".to_string(),
+            ),
+            BlobId::from_bytes(b"<project>resolution parsed this</project>"),
+        )]);
+        let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
+        let error = ensure_package_artifacts(
+            &SyncInputs {
+                config: &config,
+                store: &store,
+                client: &client,
+                trusted_repositories: &[],
+                pom_pins: &pom_pins,
+            },
+            &pinned_package(&jar),
+            &dedup,
+        )
+        .await
+        .expect_err("the pin must not fall back to the index row");
+        assert!(
+            !matches!(error, RepoError::UntrustedRepoUrl(_)),
+            "the failure must come from the fetch, not from repository trust: {error:?}"
+        );
+
+        assert_eq!(
+            store.lookup_artifact(&pom_key).await.expect("lookup"),
+            Some(other_pom),
+            "a failed refetch must not leave the pin's coordinate pointing anywhere new"
+        );
+    }
+
+    fn timestamped_snapshot_package(jar: &BlobId, version: &str) -> LockPackage {
+        LockPackage {
+            group_id: "com.example".to_string(),
+            artifact_id: "demo".to_string(),
+            version: version.to_string(),
+            snapshot_timestamp: Some("20260720.123253".to_string()),
+            packaging: "jar".to_string(),
+            classifier: None,
+            repo_url: "https://unreachable.invalid/maven2/".to_string(),
+            checksum: Some(Checksum::new("sha256", jar.to_string())),
+            system_path: None,
+            direct_scope: None,
+            extra: Default::default(),
+        }
+    }
+
+    /// The base `-SNAPSHOT` POM row is keyed without a project and repointed
+    /// last-writer-wins, so a sibling project syncing a newer build renames the
+    /// bytes it holds. A pinned timestamped row must ignore it entirely and use
+    /// the bytes its own resolution parsed, which the content store still has.
+    #[tokio::test]
+    async fn repointed_base_snapshot_row_is_not_aliased_to_a_pinned_pom() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let (config, client) = offline_only_config(temp.path()).await;
+
+        let timestamped = "1.0-20260720.123253-3";
+        let jar = store.put_bytes(b"build -3 jar").await.expect("put jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "demo", timestamped, "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+
+        // The bytes this project resolved against, still in the content store.
+        let resolved_pom = store
+            .put_bytes(b"<project><modelVersion>4.0.0</modelVersion></project>")
+            .await
+            .expect("put build -3 pom");
+        // Project B synced build -7 and repointed the shared base row.
+        let base_pom_key = ArtifactKey::new("com.example", "demo", "1.0-SNAPSHOT", "pom", None);
+        let other_pom = store
+            .put_bytes(b"<project><modelVersion>4.0.0</modelVersion><!-- build -7 --></project>")
+            .await
+            .expect("put build -7 pom");
+        store
+            .add_artifact(&base_pom_key, &other_pom)
+            .await
+            .expect("repoint base row");
+
+        let pom_pins = PomPins::from([(
+            (
+                "com.example".to_string(),
+                "demo".to_string(),
+                timestamped.to_string(),
+            ),
+            resolved_pom.clone(),
+        )]);
+        let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
+        ensure_package_artifacts(
+            &SyncInputs {
+                config: &config,
+                store: &store,
+                client: &client,
+                trusted_repositories: &[],
+                pom_pins: &pom_pins,
+            },
+            &timestamped_snapshot_package(&jar, timestamped),
+            &dedup,
+        )
+        .await
+        .expect("the pinned POM bytes are in the store, so no fetch is needed");
+
+        let timestamped_pom_key = ArtifactKey::new("com.example", "demo", timestamped, "pom", None);
+        assert_eq!(
+            store
+                .lookup_artifact(&timestamped_pom_key)
+                .await
+                .expect("lookup"),
+            Some(resolved_pom),
+            "the timestamped key must name this build's POM, not the repointed base row"
+        );
+        assert_eq!(
+            store.lookup_artifact(&base_pom_key).await.expect("lookup"),
+            Some(other_pom),
+            "adopting the pin must not disturb the shared base row"
+        );
+    }
+
+    /// An unpinned timestamped row carries no identity to check the base row
+    /// against, so it must fetch the real timestamped POM rather than alias
+    /// whatever the mutable base row currently names. With no reachable
+    /// repository that surfaces as a fetch failure, which is the honest
+    /// outcome.
+    #[tokio::test]
+    async fn unpinned_timestamped_pom_fetches_instead_of_aliasing_the_base_row() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let (config, client) = offline_only_config(temp.path()).await;
+
+        let timestamped = "1.0-20260720.123253-3";
+        let jar = store.put_bytes(b"build -3 jar").await.expect("put jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "demo", timestamped, "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+        let base_pom_key = ArtifactKey::new("com.example", "demo", "1.0-SNAPSHOT", "pom", None);
+        let other_pom = store
+            .put_bytes(b"<project><modelVersion>4.0.0</modelVersion><!-- build -7 --></project>")
+            .await
+            .expect("put build -7 pom");
+        store
+            .add_artifact(&base_pom_key, &other_pom)
+            .await
+            .expect("index base row");
+
+        let dedup: FetchDedupMap = Arc::new(Mutex::new(HashMap::new()));
+        let error = ensure_package_artifacts(
+            &SyncInputs {
+                config: &config,
+                store: &store,
+                client: &client,
+                trusted_repositories: &[],
+                pom_pins: &PomPins::new(),
+            },
+            &timestamped_snapshot_package(&jar, timestamped),
+            &dedup,
+        )
+        .await
+        .expect_err("an unverifiable base row must not stand in for the timestamped POM");
+        assert!(
+            !matches!(error, RepoError::UntrustedRepoUrl(_)),
+            "the failure must come from the fetch, not from repository trust: {error:?}"
+        );
+
+        let timestamped_pom_key = ArtifactKey::new("com.example", "demo", timestamped, "pom", None);
+        assert_eq!(
+            store
+                .lookup_artifact(&timestamped_pom_key)
+                .await
+                .expect("lookup"),
+            None,
+            "the timestamped key must not be aliased to the base row's blob"
+        );
     }
 }

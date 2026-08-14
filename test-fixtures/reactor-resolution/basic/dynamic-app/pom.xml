@@ -1,0 +1,16 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>reactor</artifactId>
+    <version>1</version>
+  </parent>
+  <artifactId>dynamic-app</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>dynamic-lib</artifactId>
+      <version>LATEST</version>
+    </dependency>
+  </dependencies>
+</project>

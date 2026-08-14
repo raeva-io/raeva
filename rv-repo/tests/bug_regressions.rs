@@ -382,9 +382,13 @@ async fn ensure_artifacts_dedupes_concurrent_fetches_of_shared_coordinate() {
     let repo_url = config.repositories().first().expect("repo").url.clone();
 
     let platform = rv_config::Platform::current().expect("current platform");
-    let lock_platform = rv_config::LockPlatform {
-        platform: platform.clone(),
-        packages: vec![
+    let lock_platform = rv_config::LockPlatform::single_module(
+        platform.clone(),
+        "",
+        "pom.xml",
+        rv_config::LockGav::new("com.example", "root", "1"),
+        "pom",
+        vec![
             rv_config::LockPackage {
                 group_id: "com.example".into(),
                 artifact_id: "demo".into(),
@@ -412,15 +416,15 @@ async fn ensure_artifacts_dedupes_concurrent_fetches_of_shared_coordinate() {
                 extra: Default::default(),
             },
         ],
-        edges: Vec::new(),
-        extra: Default::default(),
-    };
+        Vec::new(),
+    );
     let mut lock = rv_config::Lockfile::new();
     lock.platforms.push(lock_platform);
 
-    let results = rv_repo::sync::ensure_artifacts(&client, &store, &lock, &config, &[platform])
-        .await
-        .expect("ensure_artifacts");
+    let results =
+        rv_repo::sync::ensure_artifacts(&client, &store, &lock, &config, &[platform], &[])
+            .await
+            .expect("ensure_artifacts");
     for r in &results {
         assert!(r.result.is_ok(), "{}: {:?}", r.package, r.result);
     }
@@ -446,5 +450,136 @@ async fn ensure_artifacts_dedupes_concurrent_fetches_of_shared_coordinate() {
             .unwrap_or(&0),
         1,
         "sources jar should be fetched once"
+    );
+}
+
+/// Regression: an ordinary `<type>pom</type>` dependency owns an
+/// artifact-table row and is pinned like any other artifact, so `sync` must
+/// repair it. `ensure_artifacts` used to drop every `pom`-packaged row before
+/// the fan-out, which let a deleted explicit POM survive sync untouched and
+/// only surface later as an `rv export-m2` failure.
+#[tokio::test]
+async fn ensure_artifacts_repairs_deleted_explicit_pom_dependency() {
+    use sha2::{Digest, Sha256};
+
+    ensure_crypto_provider();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store_dir = temp.path().join("store");
+    let store = Store::open(&store_dir).expect("open store");
+
+    // No `<parent>`, so the ancestry walk ends at this POM.
+    let pom_body: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+        <groupId>com.example</groupId><artifactId>pom-dep</artifactId>\
+        <version>1.0.0</version><packaging>pom</packaging></project>";
+    let pom_sha256 = hex::encode(Sha256::digest(pom_body));
+
+    let hits: PathHits = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let pom_sha_for_handler = pom_sha256.clone();
+    let addr = spawn_recording_stub(
+        move |request_line| {
+            let path = request_line.split_whitespace().nth(1).unwrap_or("");
+            let body: Option<Vec<u8>> = if path.ends_with("pom-dep-1.0.0.pom.sha256") {
+                Some(pom_sha_for_handler.as_bytes().to_vec())
+            } else if path.ends_with("pom-dep-1.0.0.pom") {
+                Some(pom_body.to_vec())
+            } else {
+                None
+            };
+            match body {
+                Some(b) => {
+                    let mut resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        b.len()
+                    )
+                    .into_bytes();
+                    resp.extend_from_slice(&b);
+                    resp
+                }
+                None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            }
+        },
+        hits.clone(),
+    )
+    .await;
+
+    let config = build_config(&temp, format!("http://{addr}/"));
+    let client = RepoClient::new(&config).await.expect("client");
+    let repo_url = config.repositories().first().expect("repo").url.clone();
+
+    let platform = rv_config::Platform::current().expect("current platform");
+    let lock_platform = rv_config::LockPlatform::single_module(
+        platform.clone(),
+        "",
+        "pom.xml",
+        rv_config::LockGav::new("com.example", "root", "1"),
+        "pom",
+        vec![rv_config::LockPackage {
+            group_id: "com.example".into(),
+            artifact_id: "pom-dep".into(),
+            version: "1.0.0".into(),
+            snapshot_timestamp: None,
+            packaging: "pom".into(),
+            classifier: None,
+            repo_url,
+            checksum: Some(rv_config::Checksum::new("sha256", pom_sha256.clone())),
+            system_path: None,
+            direct_scope: None,
+            extra: Default::default(),
+        }],
+        Vec::new(),
+    );
+    let mut lock = rv_config::Lockfile::new();
+    lock.platforms.push(lock_platform);
+
+    let run = || async {
+        let results = rv_repo::sync::ensure_artifacts(
+            &client,
+            &store,
+            &lock,
+            &config,
+            std::slice::from_ref(&platform),
+            &[],
+        )
+        .await
+        .expect("ensure_artifacts");
+        assert_eq!(results.len(), 1, "the pom row must be synced, not filtered");
+        for r in &results {
+            assert!(r.result.is_ok(), "{}: {:?}", r.package, r.result);
+        }
+    };
+
+    run().await;
+
+    let key = rv_config::ArtifactKey::new("com.example", "pom-dep", "1.0.0", "pom", None);
+    let blob = store
+        .lookup_artifact(&key)
+        .await
+        .expect("lookup")
+        .expect("explicit POM must be indexed after the first sync");
+    let blob_path = store.get_path(&blob);
+    assert!(blob_path.is_file());
+
+    // Simulate the blob being deleted out from under the index.
+    std::fs::remove_file(&blob_path).expect("delete pom blob");
+    assert!(!blob_path.is_file());
+
+    run().await;
+
+    assert!(
+        blob_path.is_file(),
+        "sync must refetch an explicit POM dependency whose blob went missing"
+    );
+    assert_eq!(
+        std::fs::read(&blob_path).expect("read restored pom"),
+        pom_body,
+        "the restored blob must be the pinned POM bytes"
+    );
+    let map = hits.lock().expect("hits");
+    assert_eq!(
+        *map.get("/com/example/pom-dep/1.0.0/pom-dep-1.0.0.pom")
+            .unwrap_or(&0),
+        2,
+        "one fetch for the initial sync, one for the repair; full path map: {map:?}"
     );
 }

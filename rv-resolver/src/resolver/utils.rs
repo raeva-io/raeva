@@ -57,11 +57,11 @@ pub(super) async fn fetch_artifact_from_repos(
 
     for repo in repos {
         match client
-            .fetch_artifact_to_store_and_index(repo, artifact_req, store, key)
+            .fetch_artifact_to_store_and_index_with_repository(repo, artifact_req, store, key)
             .await
         {
-            Ok(blob) => {
-                return Ok((blob.to_string(), repo.url.clone()));
+            Ok((blob, serving_repository)) => {
+                return Ok((blob.to_string(), serving_repository));
             }
             Err(err) => {
                 searched.push(RepoSearchStatus::from_error(repo.url.as_str(), &err));
@@ -119,17 +119,15 @@ pub(super) fn build_lock_data(graph: &Graph) -> Result<(Vec<LockPackage>, Vec<Lo
         visited
     };
 
-    // Collect and sort nodes (excluding root, local, and pom-only nodes)
+    // Imported BOMs never enter the solver graph, but an ordinary dependency
+    // with `<type>pom</type>` is still a real classpath entry in Maven's
+    // resolved dependency set and must remain in the lock.
     let mut nodes: Vec<_> = graph
         .node_indices()
         .filter(|idx| *idx != graph.root() && reachable.contains(idx))
         .filter_map(|idx| {
             graph.node(idx).and_then(|node| {
                 if node.local {
-                    return None;
-                }
-                // Skip BOM dependencies with pom packaging - they're metadata-only, no artifact
-                if node.coord.packaging.as_deref() == Some("pom") {
                     return None;
                 }
                 Some((idx, node))
@@ -186,25 +184,26 @@ pub(super) fn build_lock_data(graph: &Graph) -> Result<(Vec<LockPackage>, Vec<Lo
     let mut packages = Vec::with_capacity(nodes.len());
     for (idx, node) in nodes.iter() {
         // System-scoped dependencies use local paths, no remote fetch.
-        let (repo_url, checksum, system_path) = if node.scope == Scope::System {
-            (String::new(), None, node.system_path.clone())
-        } else {
-            let repo_url =
-                node.repo_url
-                    .as_ref()
-                    .ok_or_else(|| ResolveError::ArtifactNotFound {
-                        coord: node.coord.to_string(),
-                        searched: Vec::new(),
-                    })?;
-            let checksum =
-                node.checksum
-                    .as_ref()
-                    .ok_or_else(|| ResolveError::ArtifactNotFound {
-                        coord: node.coord.to_string(),
-                        searched: Vec::new(),
-                    })?;
-            (repo_url.to_string(), Some(checksum.clone()), None)
-        };
+        let (repo_url, checksum, system_path) =
+            if node.scope == Scope::System || node.workspace_module.is_some() {
+                (String::new(), None, node.system_path.clone())
+            } else {
+                let repo_url =
+                    node.repo_url
+                        .as_ref()
+                        .ok_or_else(|| ResolveError::ArtifactNotFound {
+                            coord: node.coord.to_string(),
+                            searched: Vec::new(),
+                        })?;
+                let checksum =
+                    node.checksum
+                        .as_ref()
+                        .ok_or_else(|| ResolveError::ArtifactNotFound {
+                            coord: node.coord.to_string(),
+                            searched: Vec::new(),
+                        })?;
+                (repo_url.to_string(), Some(checksum.clone()), None)
+            };
 
         let direct_scope = direct_deps.get(idx).map(|scope| scope.to_string());
         let snapshot_timestamp = snapshot_timestamp_from_version(node.coord.version.as_str());
@@ -365,6 +364,7 @@ mod tests {
                 algorithm: "sha256".to_string(),
                 digest: "a".repeat(64),
             }),
+            workspace_module: None,
             local: false,
             system_path: None,
         }
@@ -437,6 +437,23 @@ mod tests {
             is_sorted,
             "edges must be sorted by (from, to, scope): {edges1:?}"
         );
+    }
+
+    #[test]
+    fn build_lock_data_keeps_explicit_pom_dependencies() {
+        let mut graph = Graph::new(make_node("com.example", "root", "1.0"));
+        let mut pom_dependency = make_node("com.example", "model", "1.0");
+        pom_dependency.coord.packaging = Some("pom".to_string());
+        pom_dependency.repo_url = None;
+        pom_dependency.checksum = None;
+        pom_dependency.workspace_module = Some("model/pom.xml".to_string());
+        let dependency = graph.insert_node(pom_dependency);
+        graph.add_edge(graph.root(), dependency, compile_edge());
+
+        let (packages, _) = build_lock_data(&graph).expect("lock data");
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].packaging, "pom");
+        assert_eq!(packages[0].direct_scope.as_deref(), Some("compile"));
     }
 
     fn release_repo(id: &str, url: &str) -> Repository {

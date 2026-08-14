@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
-use rv_config::{Checksum, LockEdge, LockPackage, LockPlatform, Lockfile, Platform};
+use rv_config::{Checksum, LockEdge, LockGav, LockPackage, LockPlatform, Lockfile, Platform};
 
 /// Build a realistic lockfile with `n` packages and dependency edges.
 fn build_lockfile(n: usize) -> Lockfile {
@@ -53,12 +53,16 @@ fn build_lockfile(n: usize) -> Lockfile {
     Lockfile {
         schema_version: 3,
         config_hash: Some("abc123def456".to_string()),
-        platforms: vec![LockPlatform {
+        resolution: None,
+        platforms: vec![LockPlatform::single_module(
             platform,
+            "",
+            "pom.xml",
+            LockGav::new("org.example", "benchmark", "1"),
+            "jar",
             packages,
             edges,
-            extra: BTreeMap::new(),
-        }],
+        )],
         metadata: BTreeMap::new(),
         extra: BTreeMap::new(),
     }

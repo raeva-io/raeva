@@ -27,6 +27,13 @@ impl RemotePomFetcher for RepoBackendFetcher {
         Some(&self.backend.ctx)
     }
 
+    fn fetch_local_pom_by_coord(
+        &self,
+        coord: &Coord,
+    ) -> std::result::Result<Option<Pom>, PomError> {
+        Ok(self.backend.workspace_pom_for_coord(coord))
+    }
+
     fn fetch_pom_by_coord(&self, coord: &Coord) -> std::result::Result<Option<Pom>, PomError> {
         match self.backend.fetch_pom_bytes_blocking(coord) {
             Ok(bytes) => {

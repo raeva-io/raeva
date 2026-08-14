@@ -205,6 +205,14 @@ pub struct DistributionManagement {
     pub relocation: Option<Relocation>,
 }
 
+/// Build-tool prerequisite declared by a POM.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Prerequisites {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maven: Option<String>,
+}
+
 /// A raw parsed POM (pom.xml) before inheritance or property resolution.
 ///
 /// Use `Project::from_pom()` to compute the effective model with parent inheritance,
@@ -222,6 +230,8 @@ pub struct Pom {
     pub packaging: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Parent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prerequisites: Option<Prerequisites>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -277,7 +287,7 @@ where
     Option::<Wrapper>::deserialize(deserializer).map(|w| w.map(|w| w.items).unwrap_or_default())
 }
 
-fn deserialize_modules<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+pub(crate) fn deserialize_modules<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

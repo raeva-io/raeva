@@ -235,8 +235,30 @@ struct MavenSettingsData {
     repositories: Vec<RepoConfig>,
     mirrors: Vec<MirrorConfig>,
     auth: Vec<AuthConfig>,
+    auth_layers: AuthConfigLayers,
     proxies: Vec<ProxyConfig>,
     active_profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfigLayers {
+    project: Vec<AuthConfig>,
+    user: Vec<AuthConfig>,
+    settings: Vec<AuthConfig>,
+}
+
+impl AuthConfigLayers {
+    pub fn project(&self) -> &[AuthConfig] {
+        &self.project
+    }
+
+    pub fn user(&self) -> &[AuthConfig] {
+        &self.user
+    }
+
+    pub fn settings(&self) -> &[AuthConfig] {
+        &self.settings
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -631,13 +653,18 @@ impl Config {
             }
             mirrors.extend(settings.mirrors.unwrap_or_default());
 
-            let mut auth = settings.servers.unwrap_or_default();
-            if let Some(ref user_auth) = self.inputs.user_auth {
-                merge_auth(&mut auth, user_auth);
-            }
-            if let Some(ref project_auth) = self.inputs.project_auth {
-                merge_auth(&mut auth, project_auth);
-            }
+            let auth_layers = AuthConfigLayers {
+                project: self.inputs.project_auth.clone().unwrap_or_default(),
+                user: self.inputs.user_auth.clone().unwrap_or_default(),
+                settings: settings.servers.unwrap_or_default(),
+            };
+            let auth: Vec<AuthConfig> = auth_layers
+                .project
+                .iter()
+                .chain(&auth_layers.user)
+                .chain(&auth_layers.settings)
+                .cloned()
+                .collect();
 
             // Order proxies by precedence (project > user > settings), for the
             // same first-match reason as mirrors above.
@@ -663,6 +690,7 @@ impl Config {
                 repositories,
                 mirrors,
                 auth,
+                auth_layers,
                 proxies,
                 active_profiles,
             }
@@ -679,6 +707,10 @@ impl Config {
 
     pub fn auth(&self) -> &[AuthConfig] {
         &self.maven_data().auth
+    }
+
+    pub fn auth_layers(&self) -> &AuthConfigLayers {
+        &self.maven_data().auth_layers
     }
 
     pub fn proxies(&self) -> &[ProxyConfig] {
@@ -736,6 +768,7 @@ impl Config {
             repositories,
             mirrors: Vec::new(),
             auth: Vec::new(),
+            auth_layers: AuthConfigLayers::default(),
             proxies: Vec::new(),
             active_profiles: Vec::new(),
         });
@@ -803,26 +836,6 @@ fn merge_repositories(repositories: &mut Vec<RepoConfig>, underlay: &[RepoConfig
             continue;
         }
         repositories.push(repo.clone());
-    }
-}
-
-fn merge_auth(auth: &mut Vec<AuthConfig>, overlay: &[AuthConfig]) {
-    for entry in overlay {
-        if let Some(id) = entry.id.as_deref()
-            && let Some(existing) = auth.iter_mut().find(|item| item.id.as_deref() == Some(id))
-        {
-            if let Some(ref username) = entry.username {
-                existing.username = Some(username.clone());
-            }
-            if let Some(ref password) = entry.password {
-                existing.password = Some(password.clone());
-            }
-            if let Some(ref token) = entry.token {
-                existing.token = Some(token.clone());
-            }
-            continue;
-        }
-        auth.push(entry.clone());
     }
 }
 

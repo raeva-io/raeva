@@ -8,7 +8,7 @@ use std::path::Path;
 
 use common::{rv_command, temp_project};
 use jsonschema::{Retrieve, Uri, Validator};
-use rv_config::{Checksum, LockPackage, Lockfile};
+use rv_config::{Checksum, LockPackage, LockPlatform, Lockfile};
 use serde_json::Value;
 
 const CYCLONEDX_SCHEMA: &str = include_str!("fixtures/schemas/cyclonedx/bom-1.5.schema.json");
@@ -16,6 +16,7 @@ const CYCLONEDX_JSF_SCHEMA: &str = include_str!("fixtures/schemas/cyclonedx/jsf-
 const CYCLONEDX_SPDX_SCHEMA: &str = include_str!("fixtures/schemas/cyclonedx/spdx.schema.json");
 const SPDX_SCHEMA: &str = include_str!("fixtures/schemas/spdx/spdx-2.3.schema.json");
 const SARIF_SCHEMA: &str = include_str!("fixtures/schemas/sarif/sarif-2.1.0.schema.json");
+const RV_LOCK_SCHEMA: &str = include_str!("../../schemas/rv-lock.json");
 
 struct BundledSchemas {
     schemas: HashMap<String, Value>,
@@ -62,6 +63,16 @@ fn schema_validators_reject_broken_documents() {
     let mut sarif = documents.sarif;
     sarif.as_object_mut().unwrap().remove("runs");
     assert!(!validator(SARIF_SCHEMA).is_valid(&sarif));
+}
+
+#[test]
+fn generated_lock_matches_schema_v4() {
+    let (project, home) = temp_project();
+    write_fresh_lock(project.path(), home.path());
+    let raw = fs::read_to_string(project.path().join("rv.lock")).expect("read generated rv.lock");
+    let document: toml::Value = toml::from_str(&raw).expect("parse generated rv.lock");
+    let document = serde_json::to_value(document).expect("convert lock to JSON value");
+    assert_valid(&validator(RV_LOCK_SCHEMA), &document);
 }
 
 fn generated_documents() -> Documents {
@@ -123,11 +134,15 @@ fn write_fresh_lock(project_root: &Path, home: &Path) {
 
     let lock_path = project_root.join("rv.lock");
     let mut lock = Lockfile::read(&lock_path).expect("read generated lock");
-    lock.platforms
-        .first_mut()
-        .expect("generated platform")
-        .packages
-        .push(LockPackage {
+    let platform = lock.platforms.first_mut().expect("generated platform");
+    let module = platform.modules.first().expect("generated module");
+    let mut converted = LockPlatform::single_module(
+        platform.platform.clone(),
+        platform.model_hash.clone(),
+        &module.path,
+        module.gav.clone(),
+        &module.packaging,
+        vec![LockPackage {
             group_id: "org.example".to_string(),
             artifact_id: "demo-lib".to_string(),
             version: "2.0.0".to_string(),
@@ -142,7 +157,13 @@ fn write_fresh_lock(project_root: &Path, home: &Path) {
             system_path: None,
             direct_scope: Some("compile".to_string()),
             extra: BTreeMap::new(),
-        });
+        }],
+        Vec::new(),
+    );
+    platform.modules[0]
+        .packages
+        .append(&mut converted.modules[0].packages);
+    platform.artifacts.append(&mut converted.artifacts);
     lock.write_atomic(&lock_path).expect("write fixture lock");
 }
 

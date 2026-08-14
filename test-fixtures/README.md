@@ -12,6 +12,7 @@ test-fixtures/
 ├── dependency-types/        # Projects with various dependency scopes
 ├── bom-usage/               # Projects using Bill of Materials (BOMs)
 ├── profile-based/           # Projects with profile-based dependencies
+├── reactor-discovery/       # Synthetic nested and profile-based reactor trees, plus error cases
 ├── spring-ecosystem/        # Spring Framework, Spring Security, Spring Data projects
 ├── apache-projects/         # Apache Maven, HttpClient, Commons projects
 ├── popular-libs/            # Slf4j, Logback, Hibernate, JUnit5, Mockito
@@ -443,6 +444,7 @@ Categories included:
 - dependency-types
 - bom-usage
 - profile-based
+- reactor-discovery
 - spring-ecosystem
 - apache-projects
 - popular-libs

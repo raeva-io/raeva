@@ -1,5 +1,6 @@
 use crate::activation::Activation;
 use crate::dependency::{Dependency, DependencyManagement, deserialize_dependencies};
+use crate::pom::deserialize_modules;
 use crate::properties::PropertyMap;
 use crate::repository::{Repository, deserialize_repositories};
 
@@ -24,6 +25,12 @@ pub struct Profile {
         deserialize_with = "deserialize_repositories"
     )]
     pub repositories: Vec<Repository>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_modules"
+    )]
+    pub modules: Vec<String>,
     #[serde(default, skip_serializing_if = "PropertyMap::is_empty")]
     pub properties: PropertyMap,
     /// Which POM in the inheritance lineage declared this profile: 0 is the
@@ -84,6 +91,10 @@ mod tests {
           <properties>
             <flag>on</flag>
           </properties>
+          <modules>
+            <module>module-a</module>
+            <module>nested/module-b</module>
+          </modules>
           <repositories>
             <repository>
               <id>central</id>
@@ -104,6 +115,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(profile.repositories.len(), 1);
+        assert_eq!(profile.modules, ["module-a", "nested/module-b"]);
         assert_eq!(
             profile.properties.get("flag").map(String::as_str),
             Some("on")

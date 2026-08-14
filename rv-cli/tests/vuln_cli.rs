@@ -9,7 +9,24 @@ use std::path::Path;
 use std::thread;
 
 use common::{rv_command, temp_project};
-use rv_config::{Checksum, LockPackage, Lockfile};
+use rv_config::{Checksum, LockPackage, LockPlatform, Lockfile};
+
+fn push_package(platform: &mut LockPlatform, package: LockPackage) {
+    let module = platform.modules.first().expect("generated module");
+    let mut converted = LockPlatform::single_module(
+        platform.platform.clone(),
+        platform.model_hash.clone(),
+        &module.path,
+        module.gav.clone(),
+        &module.packaging,
+        vec![package],
+        Vec::new(),
+    );
+    platform.modules[0]
+        .packages
+        .append(&mut converted.modules[0].packages);
+    platform.artifacts.append(&mut converted.artifacts);
+}
 
 fn write_pom(project_root: &Path, version: &str) {
     fs::write(
@@ -43,33 +60,34 @@ fn write_fresh_lock(project_root: &Path, home: &Path) {
     let lock_path = project_root.join("rv.lock");
     let mut lock = Lockfile::read(&lock_path).expect("read generated lock");
     let platform = lock.platforms.first_mut().expect("generated platform");
-    platform.packages.push(LockPackage {
-        group_id: "org.example".to_string(),
-        artifact_id: "demo-lib".to_string(),
-        version: "2.0.0".to_string(),
-        snapshot_timestamp: None,
-        packaging: "test-jar".to_string(),
-        classifier: Some("tests".to_string()),
-        repo_url: "https://repo.example/maven2".to_string(),
-        checksum: Some(Checksum::new(
-            "sha256",
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )),
-        system_path: None,
-        direct_scope: Some("test".to_string()),
-        extra: BTreeMap::new(),
-    });
+    push_package(
+        platform,
+        LockPackage {
+            group_id: "org.example".to_string(),
+            artifact_id: "demo-lib".to_string(),
+            version: "2.0.0".to_string(),
+            snapshot_timestamp: None,
+            packaging: "test-jar".to_string(),
+            classifier: Some("tests".to_string()),
+            repo_url: "https://repo.example/maven2".to_string(),
+            checksum: Some(Checksum::new(
+                "sha256",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )),
+            system_path: None,
+            direct_scope: Some("test".to_string()),
+            extra: BTreeMap::new(),
+        },
+    );
     lock.write_atomic(&lock_path).expect("write fixture lock");
 }
 
 fn add_locked_dependency(project_root: &Path, artifact_id: &str) {
     let lock_path = project_root.join("rv.lock");
     let mut lock = Lockfile::read(&lock_path).expect("read fixture lock");
-    lock.platforms
-        .first_mut()
-        .expect("fixture platform")
-        .packages
-        .push(LockPackage {
+    push_package(
+        lock.platforms.first_mut().expect("fixture platform"),
+        LockPackage {
             group_id: "org.example".to_string(),
             artifact_id: artifact_id.to_string(),
             version: "1.0.0".to_string(),
@@ -81,7 +99,8 @@ fn add_locked_dependency(project_root: &Path, artifact_id: &str) {
             system_path: None,
             direct_scope: Some("compile".to_string()),
             extra: BTreeMap::new(),
-        });
+        },
+    );
     lock.write_atomic(&lock_path).expect("write fixture lock");
 }
 

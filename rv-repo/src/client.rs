@@ -1,10 +1,15 @@
-use std::sync::{Arc, LazyLock};
+use std::collections::{HashMap, HashSet};
+use std::error::Error as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use regex::Regex;
 use reqwest::Client;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tracing::{debug, warn};
+use url::Url;
 
 use rv_config::{BlobId, Config};
 
@@ -13,10 +18,10 @@ use rv_version::Coord;
 use crate::artifact::ArtifactRequest;
 use crate::auth::AuthStore;
 use crate::cache::{CacheTable, MetadataCache};
-use crate::error::{RepoError, Result};
+use crate::error::{RedirectRejectionKind, RepoError, Result};
 use crate::fetch::{
     Checksum, ChecksumAlgorithm, FetchConfig, FetchProgress, fetch_bytes,
-    fetch_stream_to_store_verified, fetch_text, parse_checksum, verify_checksum,
+    fetch_stream_to_store_verified, fetch_text, parse_checksum, redact_url, verify_checksum,
 };
 use crate::metadata::Metadata;
 use crate::mirror::MirrorSelector;
@@ -26,7 +31,18 @@ use rv_store::Store;
 
 #[derive(Clone)]
 pub struct RepoClient {
+    /// Requests to a configured repository or mirror host. This is the only
+    /// client that may follow a cross-origin redirect, and every screen it
+    /// applies — policy and resolver alike — reads the frozen
+    /// [`ConfiguredHosts`] set. It never consults runtime trust. See
+    /// [`RepoClient::http_client_for`].
     client: Client,
+    /// Requests to every other host, including repositories trusted at runtime
+    /// by [`RepoClient::trust_repositories`]. Its resolver reads the live
+    /// [`TrustedHosts`] set so a grant taken mid-resolve is honoured without a
+    /// rebuild, and its redirect policy is same-origin only, so that live set
+    /// can never widen what a redirect may reach.
+    runtime_client: Client,
     auth: AuthStore,
     mirrors: MirrorSelector,
     fetch: FetchConfig,
@@ -34,7 +50,96 @@ pub struct RepoClient {
     cache: MetadataCache,
     offline: bool,
     require_checksums: bool,
+    mirror_failures: Arc<MirrorFailureTracker>,
+    /// Hosts named by `rv.toml` (repositories, mirrors and proxies), frozen at
+    /// construction. Decides which of the two clients above serves a request.
+    configured_hosts: ConfiguredHosts,
+    /// Hosts the runtime client may dial even when they resolve off the public
+    /// internet: the configured ones above plus whatever
+    /// [`RepoClient::trust_repositories`] adds. See [`TrustedHosts`].
+    trusted_hosts: TrustedHosts,
 }
+
+const MIRROR_FAILURE_SUMMARY_THRESHOLD: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MirrorFailureKey {
+    mirror: String,
+    kind: RedirectRejectionKind,
+}
+
+#[derive(Debug, Default)]
+struct MirrorFailureTracker {
+    counts: Mutex<HashMap<MirrorFailureKey, usize>>,
+}
+
+impl MirrorFailureTracker {
+    fn record(&self, mirror: &Repository, error: &RepoError) {
+        let RepoError::RedirectRejected { kind, .. } = error else {
+            return;
+        };
+        let mirror_url = Url::parse(&mirror.url)
+            .map(|url| redact_url(&url))
+            .unwrap_or_else(|_| "<invalid mirror URL>".to_string());
+        let mirror_name = mirror
+            .id
+            .as_deref()
+            .map_or_else(|| mirror_url.clone(), |id| format!("{id} ({mirror_url})"));
+        let mut counts = self.counts.lock().unwrap_or_else(|err| err.into_inner());
+        *counts
+            .entry(MirrorFailureKey {
+                mirror: mirror_name,
+                kind: *kind,
+            })
+            .or_default() += 1;
+    }
+
+    fn report(&self) {
+        let mut counts = self.counts.lock().unwrap_or_else(|err| err.into_inner());
+        let mut summaries: Vec<_> = std::mem::take(&mut *counts).into_iter().collect();
+        summaries.sort_by(|(left, _), (right, _)| {
+            left.mirror
+                .cmp(&right.mirror)
+                .then(left.kind.summary().cmp(right.kind.summary()))
+        });
+        for (failure, count) in summaries {
+            if count < MIRROR_FAILURE_SUMMARY_THRESHOLD {
+                continue;
+            }
+            warn!(
+                mirror = %failure.mirror,
+                failures = count,
+                reason = failure.kind.summary(),
+                "mirror {} failed {} fetches ({}); results came from origin repositories",
+                failure.mirror,
+                count,
+                failure.kind.summary(),
+            );
+        }
+    }
+}
+
+impl Drop for RepoClient {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.mirror_failures) == 1 {
+            self.mirror_failures.report();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RedirectPolicyError {
+    kind: RedirectRejectionKind,
+    details: String,
+}
+
+impl std::fmt::Display for RedirectPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind, self.details)
+    }
+}
+
+impl std::error::Error for RedirectPolicyError {}
 
 #[derive(Debug, Clone)]
 pub struct SnapshotResolution {
@@ -54,31 +159,59 @@ impl RepoClient {
             retries: config.network.retries,
             timeout: Duration::from_secs(config.network.timeout),
         };
-        let mut builder = Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .pool_max_idle_per_host(10)
-            // Keep long-lived idle connections healthy and reclaim them
-            // before the typical 60s NAT/idle-timeout would. Pairs with
-            // pool_idle_timeout to bound the keep-alive window.
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_idle_timeout(Duration::from_secs(75))
+        let guard = redirect_guard(config)?;
+        // Seeded with the configured hosts, then grown by `trust_repositories`.
+        // A separate set, not a second handle on the guard's: the guard's must
+        // stay frozen.
+        let trusted_hosts = guard.exempt_hosts.to_runtime_set();
+
+        // Shared by both clients. `no_proxy` ignores HTTP_PROXY/HTTPS_PROXY and
+        // friends: an implicit environment proxy resolves hostnames itself, so
+        // it silently bypasses `GlobalOnlyResolver` while
+        // `RedirectGuard::proxy_active` still reads false and the policy relaxes
+        // accordingly. Proxies come from the user's own configuration, which is
+        // the path both guards are told about. Must precede `proxy` calls: it
+        // clears the accumulated list.
+        let base_builder = || {
+            Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .pool_max_idle_per_host(10)
+                // Keep long-lived idle connections healthy and reclaim them
+                // before the typical 60s NAT/idle-timeout would. Pairs with
+                // pool_idle_timeout to bound the keep-alive window.
+                .tcp_keepalive(Duration::from_secs(30))
+                .pool_idle_timeout(Duration::from_secs(75))
+                .no_proxy()
+                .user_agent(USER_AGENT)
+        };
+        let mut configured_builder = base_builder()
+            .redirect(trusted_redirect_policy(guard.clone()))
+            .dns_resolver(Arc::new(GlobalOnlyResolver {
+                exempt_hosts: guard.exempt_hosts.clone(),
+            }));
+        let mut runtime_builder = base_builder()
+            // Same-origin only, so nothing this client dials can be redirected
+            // anywhere its live exemption set has not already been asked about.
             .redirect(same_origin_redirect_policy())
-            .user_agent(USER_AGENT);
+            .dns_resolver(Arc::new(GlobalOnlyResolver {
+                exempt_hosts: trusted_hosts.clone(),
+            }));
 
         for proxy_config in config.proxies() {
             // Proxy auth (Basic and Bearer alike) is wired into the Proxy
             // object inside build_proxy so it rides the CONNECT for HTTPS
             // upstreams and is never leaked into the TLS tunnel.
             let proxy = build_proxy(proxy_config)?;
-            builder = builder.proxy(proxy);
+            configured_builder = configured_builder.proxy(proxy.clone());
+            runtime_builder = runtime_builder.proxy(proxy);
         }
 
-        let client = builder.build()?;
         let cache_path = config.paths.metadata_db_path();
         let cache = MetadataCache::new(&cache_path)?;
 
         Ok(Self {
-            client,
+            client: configured_builder.build()?,
+            runtime_client: runtime_builder.build()?,
             auth: AuthStore::from_config(config)?,
             mirrors: MirrorSelector::from_config(config),
             fetch,
@@ -86,7 +219,71 @@ impl RepoClient {
             cache,
             offline: false,
             require_checksums: true,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: guard.exempt_hosts,
+            trusted_hosts,
         })
+    }
+
+    /// Pick the client that serves `url`.
+    ///
+    /// A host named in `rv.toml` gets the redirect-capable client; everything
+    /// else — a repository the root POM declared, one the user's transitive
+    /// policy approved, any endpoint trusted after construction — gets the
+    /// same-origin-only client whose resolver reads the live trust set.
+    ///
+    /// Splitting the two is what keeps runtime trust out of the redirect
+    /// decision entirely: a set that grows mid-resolve is read by exactly one
+    /// resolver, and that resolver belongs to a client which cannot leave the
+    /// origin it was pointed at. It costs no reach, because a cross-origin
+    /// redirect has always required the *issuer* to be a configured origin
+    /// (see [`RedirectGuard::evaluate`]), which a runtime-trusted repository
+    /// is not: an object-storage-backed registry that answers `302` with a
+    /// presigned storage URL had to be named in `rv.toml` — together with the
+    /// storage origin — before this split, and still does.
+    fn http_client_for(&self, url: &Url) -> &Client {
+        match url.host_str() {
+            Some(host) if self.configured_hosts.contains(host) => &self.client,
+            _ => &self.runtime_client,
+        }
+    }
+
+    /// Extend the address-screen exemption to repositories that became trusted
+    /// after this client was built: the root POM's own `<repositories>` (the
+    /// root POM belongs to the user) and transitive ones the user's policy
+    /// approved. Both are deliberate trust decisions taken by the resolver;
+    /// this mirrors them into the DNS screen so an on-prem registry the user
+    /// named in their POM rather than in `rv.toml` stays reachable on an
+    /// RFC1918 address.
+    ///
+    /// The exemption covers DIRECT connections only and carries no redirect
+    /// authority: it is read by one resolver, and that resolver belongs to the
+    /// same-origin-only client, so a hostile POM cannot parlay a grant into a
+    /// probe of the private network — nor can a grant landing mid-request
+    /// retroactively excuse a redirect the policy let through on the
+    /// expectation that the resolver would screen it. See
+    /// [`RepoClient::http_client_for`] and [`RedirectGuard`].
+    pub fn trust_repositories<'a>(&self, repos: impl IntoIterator<Item = &'a Repository>) {
+        for repo in repos {
+            // An unparsable or non-HTTP endpoint never reaches the resolver,
+            // so there is nothing to exempt; the fetch path reports it. Same
+            // filter as `redirect_guard`.
+            let Ok(url) = Url::parse(&repo.url) else {
+                continue;
+            };
+            if origin_key(&url).is_none() {
+                continue;
+            }
+            if let Some(host) = url.host_str() {
+                self.trusted_hosts.insert(host);
+            }
+        }
+    }
+
+    /// Whether `host` is currently exempt from the address screen, i.e. may
+    /// resolve off the public internet on a direct connection.
+    pub fn trusts_host(&self, host: &str) -> bool {
+        self.trusted_hosts.contains(host)
     }
 
     pub fn with_progress(mut self, progress: Arc<dyn FetchProgress>) -> Self {
@@ -113,6 +310,15 @@ impl RepoClient {
 
     pub fn set_progress(&mut self, progress: Option<Arc<dyn FetchProgress>>) {
         self.progress = progress;
+    }
+
+    /// Return the configured endpoint a fetch tries first after mirror
+    /// substitution.
+    ///
+    /// Callers use this to keep cached-artifact provenance aligned with the
+    /// current routing configuration even when no HTTP request happens.
+    pub fn effective_repository_url(&self, repo: &Repository) -> String {
+        self.mirrors.resolve_with_host_change(repo).0.url
     }
 
     pub async fn fetch_metadata(&self, repo: &Repository, coord: &Coord) -> Result<Metadata> {
@@ -185,13 +391,17 @@ impl RepoClient {
             Ok(bytes) => bytes,
             Err(err) if fallback.is_some() && should_fallback_to_origin(&err) => {
                 let origin = fallback.expect("fallback present");
-                warn!(
+                debug!(
                     mirror_url = %primary.url,
                     origin_url = %origin.url,
                     error = %err,
                     "metadata fetch failed against mirror; retrying against origin"
                 );
-                self.fetch_with_checksums(&origin, &path, false).await?
+                let result = self.fetch_with_checksums(&origin, &path, false).await;
+                if result.is_ok() {
+                    self.mirror_failures.record(&primary, &err);
+                }
+                result?
             }
             Err(err) => return Err(err),
         };
@@ -268,21 +478,26 @@ impl RepoClient {
             Ok(metadata) => metadata,
             Err(err) if fallback.is_some() && should_fallback_to_origin(&err) => {
                 let origin = fallback.expect("fallback present");
-                warn!(
+                debug!(
                     mirror_url = %primary.url,
                     origin_url = %origin.url,
                     error = %err,
                     "snapshot metadata fetch failed against mirror; retrying against origin"
                 );
-                self.fetch_snapshot_metadata(
-                    &origin,
-                    &cache_scope,
-                    coord.group_id.as_str(),
-                    coord.artifact_id.as_str(),
-                    &version,
-                    false,
-                )
-                .await?
+                let result = self
+                    .fetch_snapshot_metadata(
+                        &origin,
+                        &cache_scope,
+                        coord.group_id.as_str(),
+                        coord.artifact_id.as_str(),
+                        &version,
+                        false,
+                    )
+                    .await;
+                if result.is_ok() {
+                    self.mirror_failures.record(&primary, &err);
+                }
+                result?
             }
             Err(err) => return Err(err),
         };
@@ -365,13 +580,17 @@ impl RepoClient {
             Ok(bytes) => bytes,
             Err(err) if fallback.is_some() && should_fallback_to_origin(&err) => {
                 let origin = fallback.expect("fallback present");
-                warn!(
+                debug!(
                     mirror_url = %primary.url,
                     origin_url = %origin.url,
                     error = %err,
                     "POM fetch failed against mirror; retrying against origin"
                 );
-                self.fetch_with_checksums(&origin, &path, false).await?
+                let result = self.fetch_with_checksums(&origin, &path, false).await;
+                if result.is_ok() {
+                    self.mirror_failures.record(&primary, &err);
+                }
+                result?
             }
             Err(err) => return Err(err),
         };
@@ -420,14 +639,19 @@ impl RepoClient {
             Ok(blob) => Ok(blob),
             Err(err) if fallback.is_some() && should_fallback_to_origin(&err) => {
                 let origin = fallback.expect("fallback present");
-                warn!(
+                debug!(
                     mirror_url = %primary.url,
                     origin_url = %origin.url,
                     error = %err,
                     "artifact fetch failed against mirror; retrying against origin"
                 );
-                self.fetch_artifact_to_store_attempt(&origin, &path, false, store)
-                    .await
+                let result = self
+                    .fetch_artifact_to_store_attempt(&origin, &path, false, store)
+                    .await;
+                if result.is_ok() {
+                    self.mirror_failures.record(&primary, &err);
+                }
+                result
             }
             Err(err) => Err(err),
         }
@@ -455,12 +679,12 @@ impl RepoClient {
         }
 
         let url = repo.url_for_path(path)?;
-        let auth = self.auth.for_repository_with_policy(repo, host_changed);
+        let auth = self.auth.for_repository_with_policy(repo, host_changed)?;
 
         let blob = fetch_stream_to_store_verified(
-            &self.client,
+            self.http_client_for(&url),
             &url,
-            auth,
+            auth.as_ref(),
             &self.fetch,
             self.progress.as_deref(),
             store,
@@ -500,6 +724,25 @@ impl RepoClient {
         store: &Store,
         key: &rv_config::ArtifactKey,
     ) -> Result<BlobId> {
+        self.fetch_artifact_to_store_and_index_with_repository(repo, req, store, key)
+            .await
+            .map(|(blob, _)| blob)
+    }
+
+    /// Fetch and index an artifact, returning the configured repository or
+    /// mirror URL that actually served it.
+    ///
+    /// Redirect targets are transport details, so this never returns them. A
+    /// presigned object-storage URL must never become durable lockfile
+    /// provenance. When a mirror fails and the origin retry succeeds, this
+    /// returns the origin URL.
+    pub async fn fetch_artifact_to_store_and_index_with_repository(
+        &self,
+        repo: &Repository,
+        req: &ArtifactRequest,
+        store: &Store,
+        key: &rv_config::ArtifactKey,
+    ) -> Result<(BlobId, String)> {
         req.validate().map_err(RepoError::InvalidCoord)?;
         debug!(
             group = %req.group_id,
@@ -532,17 +775,22 @@ impl RepoClient {
             .fetch_artifact_to_store_and_index_attempt(&primary, &path, host_changed, store, key)
             .await
         {
-            Ok(blob) => Ok(blob),
+            Ok(blob) => Ok((blob, primary.url)),
             Err(err) if fallback.is_some() && should_fallback_to_origin(&err) => {
                 let origin = fallback.expect("fallback present");
-                warn!(
+                debug!(
                     mirror_url = %primary.url,
                     origin_url = %origin.url,
                     error = %err,
                     "atomic artifact fetch failed against mirror; retrying against origin"
                 );
-                self.fetch_artifact_to_store_and_index_attempt(&origin, &path, false, store, key)
-                    .await
+                let result = self
+                    .fetch_artifact_to_store_and_index_attempt(&origin, &path, false, store, key)
+                    .await;
+                if result.is_ok() {
+                    self.mirror_failures.record(&primary, &err);
+                }
+                result.map(|blob| (blob, origin.url))
             }
             Err(err) => Err(err),
         }
@@ -563,12 +811,12 @@ impl RepoClient {
         }
 
         let url = repo.url_for_path(path)?;
-        let auth = self.auth.for_repository_with_policy(repo, host_changed);
+        let auth = self.auth.for_repository_with_policy(repo, host_changed)?;
 
         let blob = crate::fetch::fetch_stream_to_store_and_index(
-            &self.client,
+            self.http_client_for(&url),
             &url,
-            auth,
+            auth.as_ref(),
             &self.fetch,
             self.progress.as_deref(),
             store,
@@ -871,8 +1119,15 @@ impl RepoClient {
         for &algorithm in algorithms {
             let checksum_path = format!("{path}.{}", algorithm.as_ref());
             let checksum_url = repo.url_for_path(&checksum_path)?;
-            let auth = self.auth.for_repository_with_policy(repo, host_changed);
-            match fetch_text(&self.client, &checksum_url, auth, &self.fetch).await {
+            let auth = self.auth.for_repository_with_policy(repo, host_changed)?;
+            match fetch_text(
+                self.http_client_for(&checksum_url),
+                &checksum_url,
+                auth.as_ref(),
+                &self.fetch,
+            )
+            .await
+            {
                 Ok(text) => match parse_checksum(&text, algorithm) {
                     Ok(checksum) => {
                         if algorithm == ChecksumAlgorithm::Sha1 {
@@ -947,12 +1202,12 @@ impl RepoClient {
             return Err(RepoError::OfflineNotCached(path.to_string()));
         }
         let url = repo.url_for_path(path)?;
-        let auth = self.auth.for_repository_with_policy(repo, host_changed);
+        let auth = self.auth.for_repository_with_policy(repo, host_changed)?;
 
         fetch_bytes(
-            &self.client,
+            self.http_client_for(&url),
             &url,
-            auth,
+            auth.as_ref(),
             &self.fetch,
             self.progress.as_deref(),
         )
@@ -982,7 +1237,10 @@ pub(crate) fn should_fallback_to_origin(err: &RepoError) -> bool {
     err.is_transient()
         || matches!(
             err,
-            RepoError::UnexpectedResponse(_) | RepoError::Http(_) | RepoError::InvalidMetadata(_)
+            RepoError::UnexpectedResponse(_)
+                | RepoError::Http(_)
+                | RepoError::InvalidMetadata(_)
+                | RepoError::RedirectRejected { .. }
         )
 }
 
@@ -991,21 +1249,600 @@ pub(crate) fn should_fallback_to_origin(err: &RepoError) -> bool {
 /// to `raeva/<crate-version>` keeps the value stable and self-describing.
 pub(crate) const USER_AGENT: &str = concat!("raeva/", env!("CARGO_PKG_VERSION"));
 
-/// Redirect policy that refuses cross-origin redirects and caps the chain at
-/// 5 hops. reqwest's default (`Policy::limited(10)`) follows redirects across
-/// any origin, which would let a hostile mirror bounce us to `http://attacker/`,
-/// bypassing both `Repository::url_for_path`'s origin check and TLS.
-pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        let previous_origin = attempt.previous().last().map(|prev| prev.origin());
-        if previous_origin != Some(attempt.url().origin()) {
-            attempt.error("cross-origin redirect rejected")
-        } else if attempt.previous().len() >= 5 {
-            attempt.error("too many redirects")
-        } else {
-            attempt.follow()
+fn origin_key(url: &Url) -> Option<String> {
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
+}
+
+/// A set of hostnames allowed to sit on a non-global address, in whichever of
+/// the two shapes the reader needs.
+///
+/// The distinction is the whole point of the split, so it is a type and not a
+/// convention: [`ConfiguredHosts`] cannot change after the client is built,
+/// [`TrustedHosts`] can. Anything screening a redirect reads the first kind.
+trait ExemptHosts: Send + Sync + 'static {
+    fn contains(&self, host: &str) -> bool;
+}
+
+/// Hostnames `rv.toml` named — repository, mirror and proxy endpoints — fixed
+/// when the client is built.
+///
+/// Read by [`RedirectGuard`] and by the redirect-capable client's
+/// [`GlobalOnlyResolver`], which is why it is immutable: those two read it at
+/// different moments (policy evaluation, then connect), and a set that could
+/// grow in between would let a trust grant taken by an unrelated concurrent
+/// task retroactively excuse a redirect the policy only permitted because the
+/// resolver was going to screen it.
+#[derive(Debug, Default, Clone)]
+struct ConfiguredHosts(Arc<HashSet<String>>);
+
+impl ConfiguredHosts {
+    /// Normalising on the way in is what keeps a configured `[fd00::1]` and a
+    /// DNS name `fd00::1` from becoming two spellings of one host.
+    fn new(hosts: impl IntoIterator<Item = String>) -> Self {
+        Self(Arc::new(
+            hosts
+                .into_iter()
+                .map(|host| normalized_host(&host))
+                .collect(),
+        ))
+    }
+
+    fn contains(&self, host: &str) -> bool {
+        self.0.contains(&normalized_host(host))
+    }
+
+    /// A fresh mutable set seeded with these hosts, for the runtime client.
+    /// Deliberately a copy rather than a shared handle: growing it must not
+    /// reach anything that screens redirects.
+    fn to_runtime_set(&self) -> TrustedHosts {
+        TrustedHosts(Arc::new(RwLock::new((*self.0).clone())))
+    }
+}
+
+impl ExemptHosts for ConfiguredHosts {
+    fn contains(&self, host: &str) -> bool {
+        ConfiguredHosts::contains(self, host)
+    }
+}
+
+/// Hostnames the runtime client may dial off the public internet: the
+/// configured ones plus every repository trusted after construction.
+///
+/// Mutable because trust is not fully known when the client is built. The root
+/// POM's `<repositories>`, and any transitive repository the user's policy
+/// approves, are granted trust part-way through a resolve; a set frozen at
+/// construction left every request to such a repository failing the address
+/// screen the moment its name resolved onto RFC1918 — which is the normal shape
+/// of an on-prem registry declared in the project's own POM.
+///
+/// Exactly one thing reads it: the DNS resolver of the client that follows
+/// same-origin redirects only ([`RepoClient::http_client_for`]). Growing it
+/// therefore widens nothing but the address screen on connections `rv` was
+/// already told to make, and no redirect decision anywhere depends on when it
+/// grew.
+#[derive(Debug, Default, Clone)]
+struct TrustedHosts(Arc<RwLock<HashSet<String>>>);
+
+impl TrustedHosts {
+    /// Add one host. Idempotent, and normalising on the way in is what keeps a
+    /// configured `[fd00::1]` and a runtime `fd00::1` from becoming two
+    /// spellings of one host.
+    fn insert(&self, host: &str) {
+        self.0
+            .write()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(normalized_host(host));
+    }
+
+    fn contains(&self, host: &str) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|err| err.into_inner())
+            .contains(&normalized_host(host))
+    }
+}
+
+impl ExemptHosts for TrustedHosts {
+    fn contains(&self, host: &str) -> bool {
+        TrustedHosts::contains(self, host)
+    }
+}
+
+/// Everything the SSRF guards derive from the user's configuration, in the
+/// three shapes they consume it.
+///
+/// `origins` (scheme + host + port) is the authority a redirect can be granted:
+/// it gates both which origin may issue a cross-origin redirect and which
+/// non-global or proxied target may be followed. It is fixed at construction
+/// from `rv.toml` alone. Repositories trusted later at runtime deliberately do
+/// *not* join it: trusting the root POM's registry means fetching from the URL
+/// it names, not licensing a hostile mirror to bounce `rv` at any port on that
+/// private host.
+///
+/// `exempt_hosts` is bare hostnames, because a resolver only ever sees a name,
+/// never a port. It is consumed by the redirect-capable client's
+/// [`GlobalOnlyResolver`] and, for the one rejection below that depends on
+/// knowing the resolver will stand down, by [`RedirectGuard::screen_target`].
+/// It is deliberately *wider* than `origins`: it also carries configured proxy
+/// hosts, so a corporate proxy at `proxy.corp` on an RFC1918 address stays
+/// connectable. A merely exempt host must never turn into a redirect target the
+/// user did not name, which is why the policy consults `origins` and never this
+/// set for authorisation.
+///
+/// `proxy_active` records whether any proxy from the user's configuration is
+/// attached to the client. Any configured proxy sets it, even one whose
+/// `non_proxy_hosts` would send this particular request direct: the policy
+/// cannot know at redirect time which route the next request would take, and
+/// over-restricting a redirect is the safe direction.
+///
+/// All three are fixed at construction, and that is load-bearing: the policy
+/// and the resolver read `exempt_hosts` at different moments, so a redirect
+/// target that was not exempt at policy-evaluation time must be DNS-screened at
+/// connect time, regardless of concurrent trust grants. Runtime trust lives in
+/// a separate [`TrustedHosts`] set belonging to a separate, same-origin-only
+/// client, so no grant can land in that window.
+#[derive(Debug, Default, Clone)]
+struct RedirectGuard {
+    origins: HashSet<String>,
+    exempt_hosts: ConfiguredHosts,
+    proxy_active: bool,
+}
+
+/// Collect the repository, mirror and proxy endpoints the guards screen against.
+fn redirect_guard(config: &Config) -> Result<RedirectGuard> {
+    let mut guard = RedirectGuard::default();
+    let mut exempt_hosts = HashSet::new();
+    for configured_url in config
+        .repositories()
+        .iter()
+        .map(|repository| repository.url.as_str())
+        .chain(config.mirrors().iter().map(|mirror| mirror.url.as_str()))
+    {
+        let url = Url::parse(configured_url)?;
+        if let Some(origin) = origin_key(&url) {
+            guard.origins.insert(origin);
+            if let Some(host) = url.host_str() {
+                exempt_hosts.insert(host.to_string());
+            }
+        }
+    }
+    for proxy in config.proxies() {
+        guard.proxy_active = true;
+        exempt_hosts.insert(proxy.host.clone());
+    }
+    guard.exempt_hosts = ConfiguredHosts::new(exempt_hosts);
+    Ok(guard)
+}
+
+/// Normalise a configured host for comparison against a DNS name. Bracketed
+/// IPv6 literals never reach a resolver, but stripping the brackets keeps the
+/// set free of two spellings of one host.
+fn normalized_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// Longest redirect chain followed before the request is abandoned.
+const MAX_REDIRECT_HOPS: usize = 5;
+
+/// Follow same-origin redirects plus one explicitly trusted cross-origin hop.
+///
+/// The issuer of the cross-origin redirect must be a repository or mirror
+/// origin present when the client was built. Both sides of that hop must use
+/// HTTPS, and any later redirect must stay on the new origin. The chain is
+/// capped at [`MAX_REDIRECT_HOPS`] redirects.
+///
+/// The cross-origin target must also be a public-internet address, established
+/// by one of three screens depending on what `rv` can know at redirect time:
+///
+/// * An IP literal carries its address, so it is screened here.
+/// * A hostname normally carries none, so it is screened by
+///   [`GlobalOnlyResolver`] at connect time, which is also what closes the
+///   check-then-use window a policy-side resolution would open.
+/// * A hostname is screened *here* instead whenever the resolver could not do
+///   it: when a proxy is active the name is resolved by the proxy and never
+///   reaches the resolver, and when the host sits in the resolver's exempt set
+///   the resolver waves it through by design.
+///
+/// Non-global targets are allowed only when the target origin — scheme, host
+/// *and port* — is itself a configured repository or mirror, so pointing `rv`
+/// at an on-prem registry stays a decision the user makes in `rv.toml`. Host-level
+/// trust is not enough: configuring `https://nexus.corp` must not license a
+/// redirect to `https://nexus.corp:8443`, which is a different service on the
+/// same private machine.
+///
+/// The proxy case is the strictest, because a proxy dissolves the distinction
+/// between public and private that every other screen rests on: `rv` hands the
+/// proxy a name and the proxy resolves and connects on its behalf, so
+/// `https://admin.internal/` becomes an internal connection made by a host that
+/// can reach it. A proxied cross-origin redirect to a hostname is therefore
+/// followed only to a configured origin. Users behind a proxy whose repository
+/// redirects to a CDN must name that CDN origin in their configuration.
+///
+/// reqwest's default policy follows redirects to any origin, which would let a
+/// hostile mirror bounce a fetch to `http://attacker/` and bypass both
+/// `Repository::url_for_path`'s origin check and TLS, or aim it at
+/// `https://169.254.169.254/` and turn `rv` into an SSRF probe for the private
+/// network it runs on.
+fn trusted_redirect_policy(guard: RedirectGuard) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let decision = guard.evaluate(attempt.previous(), attempt.url());
+        match decision {
+            Ok(()) => attempt.follow(),
+            Err(rejection) => attempt.error(rejection),
         }
     })
+}
+
+impl RedirectGuard {
+    /// Decide a single redirect hop. Split out of the policy closure so each
+    /// branch is unit-testable without staging a server per case.
+    fn evaluate(
+        &self,
+        previous: &[Url],
+        target: &Url,
+    ) -> std::result::Result<(), RedirectPolicyError> {
+        if previous.len() >= MAX_REDIRECT_HOPS {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::ChainLimit,
+                details: format!(
+                    "redirect chain reached {MAX_REDIRECT_HOPS} hops before {}",
+                    redact_url(target)
+                ),
+            });
+        }
+
+        let Some(issuer) = previous.last() else {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::OriginNotConfigured,
+                details: format!(
+                    "redirect to {} has no issuing request origin",
+                    redact_url(target)
+                ),
+            });
+        };
+        if issuer.origin() == target.origin() {
+            return Ok(());
+        }
+
+        let prior_cross_origin_hops = previous
+            .windows(2)
+            .filter(|pair| pair[0].origin() != pair[1].origin())
+            .count();
+        if prior_cross_origin_hops > 0 {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::SecondCrossOriginHop,
+                details: format!(
+                    "redirect chain already crossed origin once; refusing {} -> {}",
+                    issuer.origin().ascii_serialization(),
+                    redact_url(target)
+                ),
+            });
+        }
+
+        let issuer_origin = issuer.origin().ascii_serialization();
+        if !self.origins.contains(&issuer_origin) {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::OriginNotConfigured,
+                details: format!(
+                    "redirect issuer {issuer_origin} is not a configured repository or mirror"
+                ),
+            });
+        }
+        if issuer.scheme() != "https" {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::InsecureOrigin,
+                details: format!(
+                    "plain-http configured origin {issuer_origin} may redirect only within its own origin"
+                ),
+            });
+        }
+        if target.scheme() != "https" {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::HttpsDowngrade,
+                details: format!(
+                    "redirect from {issuer_origin} to {} would downgrade transport",
+                    redact_url(target)
+                ),
+            });
+        }
+
+        self.screen_target(target, &issuer_origin)
+    }
+
+    /// Screen the address the cross-origin target names, or the authority that
+    /// will resolve it on `rv`'s behalf.
+    fn screen_target(
+        &self,
+        target: &Url,
+        issuer_origin: &str,
+    ) -> std::result::Result<(), RedirectPolicyError> {
+        let Some(host) = target.host() else {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::NonGlobalTarget,
+                details: format!("redirect target {} has no host", redact_url(target)),
+            });
+        };
+        let domain = match host {
+            url::Host::Domain(domain) => domain,
+            url::Host::Ipv4(_) | url::Host::Ipv6(_) => {
+                return match non_global_literal_target(target, &self.origins) {
+                    Some(details) => Err(RedirectPolicyError {
+                        kind: RedirectRejectionKind::NonGlobalTarget,
+                        details,
+                    }),
+                    None => Ok(()),
+                };
+            }
+        };
+
+        if self
+            .origins
+            .contains(&target.origin().ascii_serialization())
+        {
+            return Ok(());
+        }
+        if self.proxy_active {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::ProxiedTargetNotConfigured,
+                details: format!(
+                    "a proxy would resolve and connect to {} on rv's behalf, so {issuer_origin} \
+                     may redirect only to a configured repository or mirror origin",
+                    redact_url(target)
+                ),
+            });
+        }
+        // This client's resolver waves an exempt host through, so this is the
+        // only screen left standing between a hostile mirror and an
+        // unconfigured port on that private host. The set is frozen, so what is
+        // decided here is what the resolver will see: a redirect target that was
+        // not exempt at policy-evaluation time must be DNS-screened at connect
+        // time, regardless of concurrent trust grants.
+        if self.exempt_hosts.contains(domain) {
+            return Err(RedirectPolicyError {
+                kind: RedirectRejectionKind::ExemptHostOriginMismatch,
+                details: format!(
+                    "{domain} is exempt from the address screen because it is configured, but \
+                     {} is not a configured origin",
+                    redact_url(target)
+                ),
+            });
+        }
+        // Nothing exempts this name, so the resolver screens its addresses when
+        // the connection is made.
+        Ok(())
+    }
+}
+
+/// Reject a cross-origin target whose host is an IP literal outside the public
+/// internet. Hostname targets carry no address at this point and are screened
+/// by [`GlobalOnlyResolver`] instead.
+fn non_global_literal_target(target: &Url, trusted_origins: &HashSet<String>) -> Option<String> {
+    let addr = match target.host()? {
+        url::Host::Ipv4(addr) => IpAddr::V4(addr),
+        url::Host::Ipv6(addr) => IpAddr::V6(addr),
+        url::Host::Domain(_) => return None,
+    };
+    if is_globally_routable(addr)
+        || trusted_origins.contains(&target.origin().ascii_serialization())
+    {
+        return None;
+    }
+    Some(format!(
+        "redirect target {} resolves to non-global address {addr}",
+        redact_url(target)
+    ))
+}
+
+/// DNS resolver that refuses any name resolving outside the public internet.
+///
+/// Screening here rather than in the redirect policy is what closes the
+/// check-then-use window: hyper connects to exactly the addresses returned
+/// below, so a name cannot answer with a public address for the check and a
+/// private one for the connection. IP literals never reach a resolver, which is
+/// why [`non_global_literal_target`] screens those separately.
+///
+/// A request routed through a configured proxy resolves at the proxy, so only
+/// the proxy host passes through here. That is why the proxy host itself is
+/// exempt (it is trusted by configuration and routinely private) and why
+/// [`RedirectGuard::screen_target`] takes over the target screening whenever a
+/// proxy is active.
+struct GlobalOnlyResolver<E: ExemptHosts> {
+    /// Hosts allowed to sit on a non-global address because the user named
+    /// them, whether in `rv.toml` or in the project's own POM: an on-prem
+    /// registry at `nexus.corp.internal` or a proxy at `proxy.corp` is a
+    /// deliberate choice, not an SSRF target.
+    ///
+    /// Which kind of set this is decides what the client owning this resolver
+    /// may do. [`ConfiguredHosts`] is frozen and pairs with the redirect policy
+    /// on the redirect-capable client: a target that policy passed on the
+    /// expectation of being screened here still is, because nothing can join
+    /// the set in between. [`TrustedHosts`] grows mid-resolve and pairs with
+    /// the same-origin-only client, which follows nothing the policy had to
+    /// pass judgement on.
+    ///
+    /// Exemption is host-level and therefore port-blind, so it cannot stand in
+    /// for authorisation. A redirect to a merely-exempt host is rejected by the
+    /// policy before any connection is attempted; what reaches here is a direct
+    /// request to a trusted endpoint, a hop the policy already matched
+    /// against a full configured origin, or a connection to a proxy.
+    exempt_hosts: E,
+}
+
+impl<E: ExemptHosts> Resolve for GlobalOnlyResolver<E> {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_ascii_lowercase();
+        // Read per resolution, not per client: the runtime set grows while a
+        // resolve runs.
+        let exempt = self.exempt_hosts.contains(&host);
+        Box::pin(async move {
+            let resolved: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0_u16))
+                .await
+                .map_err(ResolveError::from)?
+                .collect();
+            let screened = screen_resolved_addrs(&host, exempt, resolved)?;
+            Ok(Box::new(screened.into_iter()) as Addrs)
+        })
+    }
+}
+
+type ResolveError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Reject the whole answer when any address in it is non-global, rather than
+/// filtering: a hostile authoritative server can return a public and a private
+/// address together and let connection ordering pick the private one.
+fn screen_resolved_addrs(
+    host: &str,
+    exempt: bool,
+    addrs: Vec<SocketAddr>,
+) -> std::result::Result<Vec<SocketAddr>, RedirectPolicyError> {
+    if exempt {
+        return Ok(addrs);
+    }
+    match addrs.iter().find(|addr| !is_globally_routable(addr.ip())) {
+        Some(blocked) => Err(RedirectPolicyError {
+            kind: RedirectRejectionKind::NonGlobalTarget,
+            details: format!("{host} resolves to non-global address {}", blocked.ip()),
+        }),
+        None => Ok(addrs),
+    }
+}
+
+/// Whether an address is a plausible public-internet destination.
+///
+/// `IpAddr::is_global` is still unstable, so the non-global ranges are spelled
+/// out here, following std's nightly implementation (`core::net::Ipv4Addr::
+/// is_global` / `Ipv6Addr::is_global`) and the IANA special-purpose address
+/// registries it is derived from. Three deliberate departures from std, all
+/// erring towards rejection:
+///
+/// * std preserves the globally-reachable carve-outs inside otherwise-reserved
+///   blocks: 192.0.0.9/32 (PCP anycast) and 192.0.0.10/32 (NAT64 discovery) in
+///   192.0.0.0/24, and the PCP/TURN/AMT/AS112 addresses in 2001::/23. Each whole
+///   block is excluded here instead. No Maven repository is served from one, and
+///   one predicate per block is easier to audit than a predicate plus its holes.
+/// * std treats 6to4 (2002::/16) and Teredo (2001::/32, inside 2001::/23) as
+///   reachable. Both encode an arbitrary IPv4 address in the destination, which
+///   is precisely the laundering step this screen exists to stop, so both are
+///   excluded.
+/// * std does not cover the 6to4 relay anycast prefix (192.88.99.0/24, whose
+///   IANA entry became non-global when RFC 7526 deprecated it) or the dummy
+///   prefix (100:0:0:1::/64, RFC 9780). Neither can carry a real destination,
+///   and the first relays into the 6to4 addressing excluded above.
+///
+/// IPv4 addresses embedded in IPv6 are unwrapped first so `[::ffff:10.0.0.1]`
+/// cannot smuggle an RFC1918 target past the check.
+fn is_globally_routable(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => is_globally_routable_v4(addr),
+        IpAddr::V6(addr) => is_globally_routable_v6(addr),
+    }
+}
+
+fn is_globally_routable_v4(addr: Ipv4Addr) -> bool {
+    let [first, second, third, _] = addr.octets();
+    !(addr.is_loopback()
+        || addr.is_private()
+        || addr.is_link_local()
+        || addr.is_broadcast()
+        || addr.is_multicast()
+        // 192.0.2.0/24, 198.51.100.0/24 and 203.0.113.0/24.
+        || addr.is_documentation()
+        // "This network" (0.0.0.0/8), which subsumes the unspecified address.
+        || first == 0
+        // IETF protocol assignments (192.0.0.0/24), carve-outs included.
+        || (first == 192 && second == 0 && third == 0)
+        // Deprecated 6to4 relay anycast (192.88.99.0/24).
+        || (first == 192 && second == 88 && third == 99)
+        // Shared address space (100.64.0.0/10), benchmarking (198.18.0.0/15)
+        // and reserved (240.0.0.0/4) have no stable std predicate.
+        || (first == 100 && (64..128).contains(&second))
+        || (first == 198 && second & 0xfe == 18)
+        || first >= 240)
+}
+
+fn is_globally_routable_v6(addr: Ipv6Addr) -> bool {
+    if addr.is_loopback() || addr.is_unspecified() || addr.is_multicast() {
+        return false;
+    }
+    if let Some(mapped) = embedded_ipv4(addr) {
+        return is_globally_routable_v4(mapped);
+    }
+    let segments = addr.segments();
+    let [first, second, third, fourth, ..] = segments;
+    !(
+        // Unique-local (fc00::/7) and link-local (fe80::/10).
+        first & 0xfe00 == 0xfc00
+        || first & 0xffc0 == 0xfe80
+        // Site-local (fec0::/10). Deprecated by RFC 3879 but still routed on
+        // legacy networks, and never a public destination.
+        || first & 0xffc0 == 0xfec0
+        // Discard-only (100::/64).
+        || (first == 0x0100 && second == 0 && third == 0 && fourth == 0)
+        // Dummy prefix (100:0:0:1::/64), reserved by RFC 9780 as a placeholder
+        // that is never routed.
+        || (first == 0x0100 && second == 0 && third == 0 && fourth == 1)
+        // IETF protocol assignments (2001::/23): Teredo, benchmarking,
+        // ORCHIDv2 and friends, excluded as one block (see above).
+        || (first == 0x2001 && second < 0x0200)
+        // Documentation (2001:db8::/32 and 3fff::/20).
+        || (first == 0x2001 && second == 0x0db8)
+        || (first == 0x3fff && second <= 0x0fff)
+        // 6to4 (2002::/16).
+        || first == 0x2002
+        // Local-use IPv4/IPv6 translation (64:ff9b:1::/48). The well-known
+        // NAT64 prefix 64:ff9b::/96 is globally reachable and handled by
+        // `embedded_ipv4` instead.
+        || (first == 0x0064 && second == 0xff9b && third == 0x0001)
+        // Segment Routing (SRv6) SIDs (5f00::/16).
+        || first == 0x5f00
+    )
+}
+
+/// Unwrap the IPv4-mapped (`::ffff:a.b.c.d`), deprecated IPv4-compatible
+/// (`::a.b.c.d`) and well-known NAT64 (`64:ff9b::a.b.c.d`) forms. Callers must
+/// have ruled out `::` and `::1` first, since both also match the compatible
+/// prefix.
+///
+/// NAT64 is unwrapped rather than rejected outright: on a DNS64 network every
+/// public destination arrives in this shape, so excluding the prefix would
+/// break IPv6-only clients, while screening the address it carries is what
+/// keeps `64:ff9b::10.0.0.1` out.
+fn embedded_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
+    let embedded = matches!(
+        addr.segments(),
+        [0, 0, 0, 0, 0, 0 | 0xffff, ..] | [0x0064, 0xff9b, 0, 0, 0, 0, ..]
+    );
+    if !embedded {
+        return None;
+    }
+    let octets = addr.octets();
+    Some(Ipv4Addr::new(
+        octets[12], octets[13], octets[14], octets[15],
+    ))
+}
+
+/// Strict same-origin policy retained for callers that do not have a resolved
+/// repository configuration. Production `RepoClient` instances use
+/// [`trusted_redirect_policy`] with the configured repository and mirror
+/// origins.
+pub fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
+    trusted_redirect_policy(RedirectGuard::default())
+}
+
+pub(crate) fn redirect_rejection_from_reqwest(
+    error: &reqwest::Error,
+) -> Option<(RedirectRejectionKind, String)> {
+    let mut source = error.source();
+    while let Some(current) = source {
+        if let Some(policy_error) = current.downcast_ref::<RedirectPolicyError>() {
+            return Some((policy_error.kind, policy_error.details.clone()));
+        }
+        source = current.source();
+    }
+    None
 }
 
 /// Periodically prunes expired cache rows. Runs every Nth blocking
@@ -1085,11 +1922,24 @@ mod tests {
     use crate::auth::AuthStore;
     use crate::cache::MetadataCache;
     use crate::mirror::MirrorSelector;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     use secrecy::Secret;
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::thread;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn plain_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(same_origin_redirect_policy())
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("client")
+    }
 
     /// Build a minimal in-process `RepoClient`, skipping `Config` so tests can
     /// isolate fetch/checksum/mirror logic. The returned `TempDir` must outlive
@@ -1099,12 +1949,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
         let client = RepoClient {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(same_origin_redirect_policy())
-                .user_agent(USER_AGENT)
-                .build()
-                .expect("client"),
+            client: plain_test_client(),
+            runtime_client: plain_test_client(),
             auth: AuthStore::default(),
             mirrors: MirrorSelector::default(),
             fetch: FetchConfig::default(),
@@ -1112,6 +1958,34 @@ mod tests {
             cache,
             offline: false,
             require_checksums: true,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: ConfiguredHosts::default(),
+            trusted_hosts: TrustedHosts::default(),
+        };
+        (client, tmp)
+    }
+
+    fn test_client_with_mirrors(
+        mirrors: Vec<rv_config::MirrorConfig>,
+    ) -> (RepoClient, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
+        let client = RepoClient {
+            client: plain_test_client(),
+            runtime_client: plain_test_client(),
+            auth: AuthStore::default(),
+            mirrors: MirrorSelector::from_mirrors(mirrors),
+            fetch: FetchConfig {
+                retries: 0,
+                timeout: Duration::from_secs(5),
+            },
+            progress: None,
+            cache,
+            offline: false,
+            require_checksums: true,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: ConfiguredHosts::default(),
+            trusted_hosts: TrustedHosts::default(),
         };
         (client, tmp)
     }
@@ -1163,6 +2037,1353 @@ mod tests {
             }
         });
         (addr, connections)
+    }
+
+    // Self-signed localhost certificate used only by the in-process redirect
+    // stubs. The reqwest clients below opt into accepting it.
+    const TEST_CERT_DER: &str = "308201993082013fa00302010202142edbe5ec174441664b0b0f3b828a97fe31e81747300a06082a8648ce3d04030230143112301006035504030c096c6f63616c686f7374301e170d3236303732343233343131335a170d3336303732313233343131335a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d03010703420004325fb4c3e179b836c763009e555ff7709191f1fec299a00a5cfb7a34d99fe02e9c346670096f9bd5c4a8b3d2acf3b1894646cb99f04584a20f3492fd8e99cc4ba36f306d301d0603551d0e04160414730484bd1929ef7f056e4256368807a07197a43c301f0603551d23041830168014730484bd1929ef7f056e4256368807a07197a43c300f0603551d130101ff040530030101ff301a0603551d110413301182096c6f63616c686f737487047f000001300a06082a8648ce3d040302034800304502210099131112ae00cf55f0d34b1283ced2c520d4d9c029dfe2ccafc327456953de66022029cbd4d385d2d1d11fd11550073ccfaf8a1c6d2e6febe89f9439c928b33c78fe";
+    const TEST_KEY_DER: &str = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104200e9f9cb30589ef41f37a668cc1928b38f76ca3c443feb73aef12380ccac2f9a9a14403420004325fb4c3e179b836c763009e555ff7709191f1fec299a00a5cfb7a34d99fe02e9c346670096f9bd5c4a8b3d2acf3b1894646cb99f04584a20f3492fd8e99cc4b";
+
+    struct HttpsStub {
+        addr: std::net::SocketAddr,
+        request: Arc<Mutex<Option<String>>>,
+    }
+
+    fn spawn_https_stub(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> HttpsStub {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = CertificateDer::from(hex::decode(TEST_CERT_DER).expect("test certificate"));
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            hex::decode(TEST_KEY_DER).expect("test private key"),
+        ));
+        let tls = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("test TLS config"),
+        );
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind HTTPS stub");
+        let addr = listener.local_addr().expect("HTTPS stub address");
+        let request = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&request);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept HTTPS stub");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let connection =
+                rustls::ServerConnection::new(tls).expect("create TLS server connection");
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("read HTTPS request");
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+                if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let raw_request = String::from_utf8_lossy(&bytes).into_owned();
+            *captured.lock().expect("capture HTTPS request") = Some(raw_request.clone());
+            stream
+                .write_all(&handler(&raw_request))
+                .expect("write HTTPS response");
+            stream.flush().expect("flush HTTPS response");
+        });
+        HttpsStub { addr, request }
+    }
+
+    fn redirect_response(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn ok_response(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// A guard for a configuration that named exactly these origins. Mirrors
+    /// `redirect_guard`: naming an origin also exempts its host from the
+    /// address screen.
+    fn origins_guard(origins: HashSet<String>) -> RedirectGuard {
+        let exempt_hosts: Vec<String> = origins
+            .iter()
+            .filter_map(|origin| Url::parse(origin).ok())
+            .filter_map(|origin| origin.host_str().map(str::to_string))
+            .collect();
+        RedirectGuard {
+            origins,
+            exempt_hosts: ConfiguredHosts::new(exempt_hosts),
+            proxy_active: false,
+        }
+    }
+
+    fn redirect_test_client(trusted_origins: HashSet<String>) -> reqwest::Client {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .redirect(trusted_redirect_policy(origins_guard(trusted_origins)))
+            .build()
+            .expect("redirect test client")
+    }
+
+    fn url(raw: &str) -> Url {
+        Url::parse(raw).expect("test URL")
+    }
+
+    fn origin_set<const N: usize>(raw: [&str; N]) -> HashSet<String> {
+        raw.iter()
+            .map(|value| url(value).origin().ascii_serialization())
+            .collect()
+    }
+
+    /// A runtime (growable) exemption set, as `trust_repositories` builds one.
+    fn host_set<const N: usize>(raw: [&str; N]) -> TrustedHosts {
+        let hosts = TrustedHosts::default();
+        for host in raw {
+            hosts.insert(host);
+        }
+        hosts
+    }
+
+    /// A configured (frozen) exemption set, as `redirect_guard` builds one.
+    fn frozen_hosts<const N: usize>(raw: [&str; N]) -> ConfiguredHosts {
+        ConfiguredHosts::new(raw.iter().map(|host| host.to_string()))
+    }
+
+    async fn fetch_redirect_test(client: &reqwest::Client, url: &Url) -> Result<Bytes> {
+        fetch_bytes(
+            client,
+            url,
+            None,
+            &FetchConfig {
+                retries: 0,
+                timeout: Duration::from_secs(5),
+            },
+            None,
+        )
+        .await
+    }
+
+    /// The stubs live on loopback, which the address guard rejects unless the
+    /// target origin is configured too — so this configures both, the shape a
+    /// user gets from an on-prem registry pair.
+    #[tokio::test]
+    async fn trusted_https_cross_origin_redirect_strips_sensitive_headers() {
+        let target = spawn_https_stub(|_| ok_response(b"artifact bytes"));
+        let target_url = format!("https://127.0.0.1:{}/artifact", target.addr.port());
+        let source_location = target_url.clone();
+        let source = spawn_https_stub(move |_| redirect_response(&source_location));
+        let source_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+        let trusted = HashSet::from([
+            source_url.origin().ascii_serialization(),
+            Url::parse(&target_url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        ]);
+        let client = redirect_test_client(trusted);
+
+        let response = client
+            .get(source_url)
+            .bearer_auth("registry-secret")
+            .header(reqwest::header::COOKIE, "session=private")
+            .send()
+            .await
+            .expect("trusted HTTPS redirect should succeed");
+        assert_eq!(
+            response.bytes().await.expect("response bytes"),
+            Bytes::from_static(b"artifact bytes")
+        );
+
+        let source_request = source
+            .request
+            .lock()
+            .expect("source request")
+            .clone()
+            .expect("source contacted");
+        let target_request = target
+            .request
+            .lock()
+            .expect("target request")
+            .clone()
+            .expect("target contacted");
+        assert!(
+            source_request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer registry-secret"),
+            "configured source must receive its Authorization header"
+        );
+        let target_request = target_request.to_ascii_lowercase();
+        assert!(
+            !target_request.contains("authorization:"),
+            "redirect target must not receive Authorization"
+        );
+        assert!(
+            !target_request.contains("cookie:"),
+            "redirect target must not receive Cookie"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_origin_rejects_loopback_target() {
+        let target = spawn_https_stub(|_| ok_response(b"must not arrive"));
+        let target_url = format!("https://127.0.0.1:{}/artifact", target.addr.port());
+        let source = spawn_https_stub(move |_| redirect_response(&target_url));
+        let source_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+        let trusted = HashSet::from([source_url.origin().ascii_serialization()]);
+        let client = redirect_test_client(trusted);
+
+        let error = fetch_redirect_test(&client, &source_url)
+            .await
+            .expect_err("loopback redirect target must be rejected");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::NonGlobalTarget,
+                    ..
+                }
+            ),
+            "expected explicit non-global rejection, got {error:?}"
+        );
+        assert!(
+            target.request.lock().expect("target request").is_none(),
+            "loopback target must not be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_origin_rejects_non_global_literal_targets() {
+        for target_url in [
+            "https://127.0.0.1/artifact",
+            "https://10.0.0.1/artifact",
+            "https://172.16.0.1/artifact",
+            "https://192.168.1.10/artifact",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/artifact",
+            "https://[::ffff:10.0.0.1]/artifact",
+            "https://[fd00::1]/artifact",
+        ] {
+            let source = spawn_https_stub(move |_| redirect_response(target_url));
+            let source_url =
+                Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+            let trusted = HashSet::from([source_url.origin().ascii_serialization()]);
+            let client = redirect_test_client(trusted);
+
+            let error = fetch_redirect_test(&client, &source_url)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{target_url} must be rejected"));
+            assert!(
+                matches!(
+                    error,
+                    RepoError::RedirectRejected {
+                        kind: RedirectRejectionKind::NonGlobalTarget,
+                        ..
+                    }
+                ),
+                "expected non-global rejection for {target_url}, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trusted_origin_rejects_https_to_http_downgrade() {
+        let (target_addr, target_hits) =
+            spawn_stub_seq(vec![Box::new(|_| ok_response(b"no"))]).await;
+        let target_url = format!("http://{target_addr}/artifact");
+        let source = spawn_https_stub(move |_| redirect_response(&target_url));
+        let source_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+        let trusted = HashSet::from([source_url.origin().ascii_serialization()]);
+        let client = redirect_test_client(trusted);
+
+        let error = fetch_redirect_test(&client, &source_url)
+            .await
+            .expect_err("HTTPS downgrade must be rejected");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::HttpsDowngrade,
+                    ..
+                }
+            ),
+            "expected explicit HTTPS downgrade rejection, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("target is not HTTPS"),
+            "rendered error must name the downgrade: {error}"
+        );
+        assert_eq!(
+            target_hits.load(Ordering::SeqCst),
+            0,
+            "downgrade target must not be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_rejects_second_cross_origin_hop() {
+        let final_target = spawn_https_stub(|_| ok_response(b"must not arrive"));
+        let final_url = format!("https://127.0.0.1:{}/artifact", final_target.addr.port());
+        let middle = spawn_https_stub(move |_| redirect_response(&final_url));
+        let middle_url = format!("https://127.0.0.1:{}/middle", middle.addr.port());
+        let middle_origin = middle_url.clone();
+        let first = spawn_https_stub(move |_| redirect_response(&middle_url));
+        let first_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", first.addr.port())).unwrap();
+        // The middle origin is configured so the first hop clears the address
+        // guard and the second hop is what fails.
+        let trusted = HashSet::from([
+            first_url.origin().ascii_serialization(),
+            Url::parse(&middle_origin)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        ]);
+        let client = redirect_test_client(trusted);
+
+        let error = fetch_redirect_test(&client, &first_url)
+            .await
+            .expect_err("second cross-origin hop must be rejected");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::SecondCrossOriginHop,
+                    ..
+                }
+            ),
+            "expected explicit second-hop rejection, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains("second cross-origin hop"),
+            "rendered error must name the second hop: {error}"
+        );
+        assert!(
+            middle.request.lock().expect("middle request").is_some(),
+            "first cross-origin target should be contacted"
+        );
+        assert!(
+            final_target
+                .request
+                .lock()
+                .expect("final request")
+                .is_none(),
+            "second cross-origin target must not be contacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_names_unconfigured_issuing_origin() {
+        let target = spawn_https_stub(|_| ok_response(b"must not arrive"));
+        let target_url = format!("https://127.0.0.1:{}/artifact", target.addr.port());
+        let source = spawn_https_stub(move |_| redirect_response(&target_url));
+        let source_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+        let source_origin = source_url.origin().ascii_serialization();
+        let client = redirect_test_client(HashSet::new());
+
+        let error = fetch_redirect_test(&client, &source_url)
+            .await
+            .expect_err("unconfigured redirect issuer must be rejected");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::OriginNotConfigured,
+                    ..
+                }
+            ),
+            "expected explicit unconfigured-origin rejection, got {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&source_origin),
+            "rendered error must name untrusted origin {source_origin}: {error}"
+        );
+        assert!(
+            target.request.lock().expect("target request").is_none(),
+            "target of an untrusted redirect must not be contacted"
+        );
+    }
+
+    /// Minimal CONNECT-capable stub proxy. Records the request line of every
+    /// connection it accepts, so a test can assert exactly which authorities
+    /// the client asked it to reach, and tunnels CONNECT through to the real
+    /// (loopback) address so a permitted hop can still complete.
+    async fn spawn_stub_proxy() -> (std::net::SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind proxy");
+        let addr = listener.local_addr().expect("proxy address");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut downstream, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorder = Arc::clone(&recorder);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 4096];
+                    let mut head = Vec::new();
+                    loop {
+                        let Ok(read) = downstream.read(&mut buffer).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        head.extend_from_slice(&buffer[..read]);
+                        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&head).into_owned();
+                    let request_line = request.lines().next().unwrap_or_default().to_string();
+                    recorder
+                        .lock()
+                        .expect("proxy log")
+                        .push(request_line.clone());
+
+                    let authority = request_line
+                        .strip_prefix("CONNECT ")
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(str::to_string);
+                    let Some(authority) = authority else {
+                        // Absolute-form GET: answer directly, no upstream.
+                        let _ = downstream.write_all(&ok_response(b"proxied")).await;
+                        return;
+                    };
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(&authority).await else {
+                        let _ = downstream
+                            .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                            .await;
+                        return;
+                    };
+                    if downstream
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .await
+                        .is_ok()
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+                    }
+                });
+            }
+        });
+        (addr, seen)
+    }
+
+    fn proxied_test_client(
+        proxy_url: &str,
+        guard: RedirectGuard,
+        resolver_exempt: ConfiguredHosts,
+    ) -> reqwest::Client {
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(proxy_url).expect("stub proxy"))
+            .dns_resolver(Arc::new(GlobalOnlyResolver {
+                exempt_hosts: resolver_exempt,
+            }))
+            .redirect(trusted_redirect_policy(guard))
+            .build()
+            .expect("proxied test client")
+    }
+
+    /// The proxy-bypass blocker. A proxied request never resolves its target
+    /// locally, so [`GlobalOnlyResolver`] cannot screen it: without the
+    /// proxy-aware branch in the policy, `Location: https://admin.internal/`
+    /// becomes a `CONNECT admin.internal:443` that the corporate proxy happily
+    /// completes on rv's behalf. The proxy log is the assertion: the internal
+    /// name must never be handed to it.
+    #[tokio::test]
+    async fn proxied_redirect_to_internal_hostname_never_reaches_the_proxy() {
+        let (proxy_addr, proxy_log) = spawn_stub_proxy().await;
+        let source = spawn_https_stub(|_| redirect_response("https://admin.internal/secret"));
+        let source_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+        let guard = RedirectGuard {
+            origins: HashSet::from([source_url.origin().ascii_serialization()]),
+            exempt_hosts: ConfiguredHosts::default(),
+            proxy_active: true,
+        };
+        let client = proxied_test_client(
+            &format!("http://{proxy_addr}"),
+            guard,
+            frozen_hosts(["127.0.0.1"]),
+        );
+
+        let error = fetch_redirect_test(&client, &source_url)
+            .await
+            .expect_err("internal-hostname redirect must be rejected");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::ProxiedTargetNotConfigured,
+                    ..
+                }
+            ),
+            "expected a proxied-target rejection, got {error:?}"
+        );
+
+        let log = proxy_log.lock().expect("proxy log").clone();
+        assert_eq!(
+            log,
+            vec![format!("CONNECT 127.0.0.1:{} HTTP/1.1", source.addr.port())],
+            "the proxy must see the configured source and nothing else"
+        );
+        assert!(
+            !log.iter().any(|line| line.contains("admin.internal")),
+            "the internal name must never be handed to the proxy: {log:?}"
+        );
+    }
+
+    /// The other half of the proxy story: a configured target origin is still
+    /// followed through the proxy, so the guard does not simply break proxied
+    /// redirects.
+    #[tokio::test]
+    async fn proxied_redirect_to_configured_origin_is_followed() {
+        let (proxy_addr, proxy_log) = spawn_stub_proxy().await;
+        let target = spawn_https_stub(|_| ok_response(b"artifact bytes"));
+        let target_url = format!("https://127.0.0.1:{}/artifact", target.addr.port());
+        let redirect_to = target_url.clone();
+        let source = spawn_https_stub(move |_| redirect_response(&redirect_to));
+        let source_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+        let guard = RedirectGuard {
+            origins: HashSet::from([
+                source_url.origin().ascii_serialization(),
+                Url::parse(&target_url)
+                    .unwrap()
+                    .origin()
+                    .ascii_serialization(),
+            ]),
+            exempt_hosts: ConfiguredHosts::default(),
+            proxy_active: true,
+        };
+        let client = proxied_test_client(
+            &format!("http://{proxy_addr}"),
+            guard,
+            frozen_hosts(["127.0.0.1"]),
+        );
+
+        let bytes = fetch_redirect_test(&client, &source_url)
+            .await
+            .expect("configured target must still be reachable through the proxy");
+        assert_eq!(bytes, Bytes::from_static(b"artifact bytes"));
+        let log = proxy_log.lock().expect("proxy log").clone();
+        assert!(
+            log.iter()
+                .any(|line| line.contains(&format!("CONNECT 127.0.0.1:{}", target.addr.port()))),
+            "the permitted hop must reach the proxy: {log:?}"
+        );
+    }
+
+    /// A corporate proxy named by hostname that resolves onto RFC1918 must be
+    /// dialable: its host is exempt from the address screen. That exemption is
+    /// scoped to the resolver, so the redirect target arriving from behind it
+    /// is screened exactly as before.
+    #[tokio::test]
+    async fn private_hostname_proxy_connects_while_target_stays_screened() {
+        let (proxy_addr, proxy_log) = spawn_stub_proxy().await;
+        let source = spawn_https_stub(|_| redirect_response("https://admin.internal/secret"));
+        let source_url =
+            Url::parse(&format!("https://127.0.0.1:{}/start", source.addr.port())).unwrap();
+        let guard = RedirectGuard {
+            origins: HashSet::from([source_url.origin().ascii_serialization()]),
+            // `localhost` stands in for `proxy.corp`: a proxy named by hostname
+            // that resolves to an address the screen would otherwise reject.
+            exempt_hosts: frozen_hosts(["localhost", "127.0.0.1"]),
+            proxy_active: true,
+        };
+        let proxy_url = format!("http://localhost:{}", proxy_addr.port());
+        let client = proxied_test_client(&proxy_url, guard.clone(), guard.exempt_hosts.clone());
+
+        let error = fetch_redirect_test(&client, &source_url)
+            .await
+            .expect_err("internal-hostname redirect must be rejected");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::ProxiedTargetNotConfigured,
+                    ..
+                }
+            ),
+            "expected a proxied-target rejection, got {error:?}"
+        );
+        let log = proxy_log.lock().expect("proxy log").clone();
+        assert_eq!(
+            log,
+            vec![format!("CONNECT 127.0.0.1:{} HTTP/1.1", source.addr.port())],
+            "the private-address proxy must have been reachable, and only for the source"
+        );
+
+        // Drop the proxy host from the resolver exemption and the same client
+        // cannot even reach its proxy, which is what finding 4 was about.
+        let unexempt = proxied_test_client(&proxy_url, guard, ConfiguredHosts::default());
+        let error = fetch_redirect_test(&unexempt, &source_url)
+            .await
+            .expect_err("an unexempt private proxy host must not resolve");
+        assert!(
+            error.to_string().contains("localhost"),
+            "rejection must name the host it refused to resolve: {error}"
+        );
+        assert_eq!(
+            proxy_log.lock().expect("proxy log").len(),
+            1,
+            "no further connection may reach the proxy"
+        );
+    }
+
+    /// The DNS exemption is host-level, so authorisation must not be.
+    /// Configuring `https://nexus.corp` (port 443) exempts the *name* from the
+    /// address screen; letting that exemption carry a redirect to
+    /// `https://nexus.corp:8443` would hand a hostile mirror a port scanner
+    /// pointed at a private host the user only meant to fetch artifacts from.
+    #[test]
+    fn redirect_to_exempt_host_requires_the_configured_origin() {
+        let guard = RedirectGuard {
+            origins: origin_set(["https://mirror.example", "https://nexus.corp"]),
+            exempt_hosts: frozen_hosts(["mirror.example", "nexus.corp"]),
+            proxy_active: false,
+        };
+        let previous = [url("https://mirror.example/demo-1.0.jar")];
+
+        let rejection = guard
+            .evaluate(&previous, &url("https://nexus.corp:8443/demo-1.0.jar"))
+            .expect_err("a different port is a different service");
+        assert_eq!(
+            rejection.kind,
+            RedirectRejectionKind::ExemptHostOriginMismatch
+        );
+        assert!(
+            rejection.details.contains("nexus.corp:8443"),
+            "rejection must name the origin it refused: {}",
+            rejection.details
+        );
+
+        guard
+            .evaluate(&previous, &url("https://nexus.corp/demo-1.0.jar"))
+            .expect("the configured origin is still followed");
+        // An unexempt name carries no address here and no exemption later, so
+        // the policy defers to the resolver rather than second-guessing it.
+        guard
+            .evaluate(&previous, &url("https://cdn.example/demo-1.0.jar"))
+            .expect("unexempt hostname is screened by the resolver");
+    }
+
+    /// With a proxy in play the proxy resolves hostnames, so
+    /// [`GlobalOnlyResolver`] never sees the target and a hostname hop is
+    /// followed only to an origin the user configured.
+    #[test]
+    fn proxied_redirect_requires_a_configured_target_origin() {
+        let guard = RedirectGuard {
+            origins: origin_set(["https://mirror.example", "https://cdn.example"]),
+            exempt_hosts: frozen_hosts(["mirror.example", "cdn.example", "proxy.corp"]),
+            proxy_active: true,
+        };
+        let previous = [url("https://mirror.example/demo-1.0.jar")];
+
+        for target in [
+            "https://admin.internal/",
+            "https://cdn.example:8443/demo-1.0.jar",
+            "https://elsewhere.example/demo-1.0.jar",
+            // Finding 4's exemption must not become authority: the proxy host
+            // is connectable, not a legitimate redirect target.
+            "https://proxy.corp/demo-1.0.jar",
+        ] {
+            let Err(rejection) = guard.evaluate(&previous, &url(target)) else {
+                panic!("{target} must not be followed through a proxy");
+            };
+            assert_eq!(
+                rejection.kind,
+                RedirectRejectionKind::ProxiedTargetNotConfigured,
+                "unexpected rejection for {target}: {rejection}"
+            );
+        }
+
+        guard
+            .evaluate(&previous, &url("https://cdn.example/demo-1.0.jar"))
+            .expect("a configured origin is still reachable through the proxy");
+        // IP literals still carry their address, so the literal screen decides.
+        guard
+            .evaluate(&previous, &url("https://93.184.216.34/demo-1.0.jar"))
+            .expect("global literal target stays followable");
+        let rejection = guard
+            .evaluate(&previous, &url("https://169.254.169.254/latest/meta-data"))
+            .expect_err("non-global literal stays rejected under a proxy");
+        assert_eq!(rejection.kind, RedirectRejectionKind::NonGlobalTarget);
+    }
+
+    /// A proxy host is exempt from the address screen so it can be dialled, and
+    /// nothing more: with no proxy active the same host is still refused as a
+    /// redirect target because no configured origin matches it.
+    #[test]
+    fn exempt_proxy_host_is_not_a_redirect_target() {
+        let guard = RedirectGuard {
+            origins: origin_set(["https://mirror.example"]),
+            exempt_hosts: frozen_hosts(["mirror.example", "proxy.corp"]),
+            proxy_active: false,
+        };
+        let previous = [url("https://mirror.example/demo-1.0.jar")];
+
+        let rejection = guard
+            .evaluate(&previous, &url("https://proxy.corp/demo-1.0.jar"))
+            .expect_err("proxy host must not be a redirect target");
+        assert_eq!(
+            rejection.kind,
+            RedirectRejectionKind::ExemptHostOriginMismatch
+        );
+    }
+
+    /// Repository and mirror URLs must land in both sets, and a configuration
+    /// with no proxy must leave the policy in its unproxied mode.
+    #[test]
+    fn redirect_guard_reads_repository_endpoints() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths = rv_config::ResolvedPaths::discover().expect("paths");
+        let config = rv_config::Config::for_testing_with_repos(
+            temp.path().to_path_buf(),
+            paths,
+            vec![rv_config::RepoConfig {
+                id: Some("internal".to_string()),
+                url: "https://nexus.corp:8443/repository/maven/".to_string(),
+                releases: Some(true),
+                snapshots: Some(false),
+                snapshots_update_policy: None,
+            }],
+        );
+
+        let guard = redirect_guard(&config).expect("guard");
+        assert!(guard.origins.contains("https://nexus.corp:8443"));
+        assert!(guard.exempt_hosts.contains("nexus.corp"));
+        assert!(
+            !guard.proxy_active,
+            "no configured proxy must leave the proxy screen off"
+        );
+    }
+
+    /// Every IPv4 special-purpose block this screen excludes, at both edges,
+    /// paired with the routable addresses immediately outside it. The
+    /// neighbours are the point: an off-by-one in a mask silently either opens
+    /// a private range or blackholes a public one.
+    #[test]
+    fn ipv4_special_purpose_blocks_are_excluded() {
+        let cases: &[(&str, &str, [&str; 2], &[&str])] = &[
+            (
+                "0.0.0.0/8",
+                "this network",
+                ["0.0.0.0", "0.255.255.255"],
+                &["1.0.0.0"],
+            ),
+            (
+                "10.0.0.0/8",
+                "private",
+                ["10.0.0.0", "10.255.255.255"],
+                &["9.255.255.255", "11.0.0.0"],
+            ),
+            (
+                "100.64.0.0/10",
+                "shared address space",
+                ["100.64.0.0", "100.127.255.255"],
+                &["100.63.255.255", "100.128.0.0"],
+            ),
+            (
+                "127.0.0.0/8",
+                "loopback",
+                ["127.0.0.0", "127.255.255.255"],
+                &["126.255.255.255", "128.0.0.1"],
+            ),
+            (
+                "169.254.0.0/16",
+                "link local",
+                ["169.254.0.0", "169.254.169.254"],
+                &["169.253.255.255", "169.255.0.0"],
+            ),
+            (
+                "172.16.0.0/12",
+                "private",
+                ["172.16.0.0", "172.31.255.255"],
+                &["172.15.255.255", "172.32.0.0"],
+            ),
+            (
+                "192.0.0.0/24",
+                "IETF protocol assignments",
+                ["192.0.0.0", "192.0.0.255"],
+                // The two globally-reachable /32s inside the block are
+                // excluded with it, deliberately.
+                &["191.255.255.255", "192.0.1.0"],
+            ),
+            (
+                "192.0.2.0/24",
+                "documentation TEST-NET-1",
+                ["192.0.2.0", "192.0.2.255"],
+                &["192.0.1.255", "192.0.3.0"],
+            ),
+            (
+                "192.88.99.0/24",
+                "deprecated 6to4 relay anycast",
+                ["192.88.99.0", "192.88.99.255"],
+                &["192.88.98.255", "192.88.100.0"],
+            ),
+            (
+                "192.168.0.0/16",
+                "private",
+                ["192.168.0.0", "192.168.255.255"],
+                &["192.167.255.255", "192.169.0.0"],
+            ),
+            (
+                "198.18.0.0/15",
+                "benchmarking",
+                ["198.18.0.0", "198.19.255.255"],
+                &["198.17.255.255", "198.20.0.0"],
+            ),
+            (
+                "198.51.100.0/24",
+                "documentation TEST-NET-2",
+                ["198.51.100.0", "198.51.100.255"],
+                &["198.51.99.255", "198.51.101.0"],
+            ),
+            (
+                "203.0.113.0/24",
+                "documentation TEST-NET-3",
+                ["203.0.113.0", "203.0.113.255"],
+                &["203.0.112.255", "203.0.114.0"],
+            ),
+            (
+                "224.0.0.0/4",
+                "multicast",
+                ["224.0.0.0", "239.255.255.255"],
+                &["223.255.255.255"],
+            ),
+            (
+                "240.0.0.0/4",
+                "reserved, including the broadcast address",
+                ["240.0.0.0", "255.255.255.255"],
+                // Nothing routable borders this block: 239.255.255.255 below it
+                // is multicast, and above it is the end of the address space.
+                &[],
+            ),
+        ];
+
+        for (block, description, excluded, neighbours) in cases {
+            for address in excluded {
+                let addr: IpAddr = address.parse().expect("address");
+                assert!(
+                    !is_globally_routable(addr),
+                    "{address} is in {block} ({description}) and must be non-global"
+                );
+            }
+            for neighbour in *neighbours {
+                let addr: IpAddr = neighbour.parse().expect("address");
+                assert!(
+                    is_globally_routable(addr),
+                    "{neighbour} sits outside {block} ({description}) and must stay global"
+                );
+            }
+        }
+
+        for public in ["1.1.1.1", "8.8.8.8", "93.184.216.34", "223.255.255.255"] {
+            let addr: IpAddr = public.parse().expect("address");
+            assert!(is_globally_routable(addr), "{public} should be global");
+        }
+    }
+
+    /// The IPv6 half of the same table, plus the embedded-IPv4 forms that would
+    /// otherwise launder an RFC1918 destination through a v6 literal.
+    #[test]
+    fn ipv6_special_purpose_blocks_are_excluded() {
+        let cases: &[(&str, &str, &[&str], &[&str])] = &[
+            ("::/128", "unspecified", &["::"], &[]),
+            ("::1/128", "loopback", &["::1"], &[]),
+            (
+                "100::/64",
+                "discard only",
+                &["100::", "100::ffff:ffff:ffff:ffff"],
+                // The block immediately above is the dummy prefix, also
+                // excluded, so the nearest routable neighbour is one /64 further
+                // out.
+                &["100:0:0:2::1", "101::1"],
+            ),
+            (
+                "100:0:0:1::/64",
+                "dummy prefix",
+                &["100:0:0:1::", "100:0:0:1:ffff:ffff:ffff:ffff"],
+                // Below it sits the discard-only prefix, also excluded.
+                &["100:0:0:2::1"],
+            ),
+            (
+                "64:ff9b:1::/48",
+                "local-use IPv4/IPv6 translation",
+                &["64:ff9b:1::", "64:ff9b:1:ffff:ffff:ffff:ffff:ffff"],
+                &["64:ff9b:2::1"],
+            ),
+            (
+                "2001::/23",
+                "IETF protocol assignments (Teredo, benchmarking, ORCHIDv2)",
+                &[
+                    "2001::",
+                    "2001:1::1",
+                    "2001:2::1",
+                    "2001:20::1",
+                    "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+                &["2000::1", "2001:200::1"],
+            ),
+            (
+                "2001:db8::/32",
+                "documentation",
+                &["2001:db8::", "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &["2001:db7::1", "2001:db9::1"],
+            ),
+            (
+                "2002::/16",
+                "6to4, which embeds an arbitrary IPv4 destination",
+                &[
+                    "2002::",
+                    "2002:a00:1::1",
+                    "2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+                &["2003::1"],
+            ),
+            (
+                "3fff::/20",
+                "documentation",
+                &["3fff::", "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &["3ffe::1", "3fff:1000::1"],
+            ),
+            (
+                "5f00::/16",
+                "segment routing SIDs",
+                &["5f00::", "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &["5eff:ffff::1", "5f01::1"],
+            ),
+            (
+                "fc00::/7",
+                "unique local",
+                &[
+                    "fc00::1",
+                    "fd00::1",
+                    "fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+                ],
+                &["fbff:ffff::1"],
+            ),
+            (
+                "fe80::/10",
+                "link local",
+                &["fe80::1", "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &[],
+            ),
+            (
+                "fec0::/10",
+                "deprecated site local",
+                &["fec0::1", "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"],
+                &[],
+            ),
+            ("ff00::/8", "multicast", &["ff02::1", "ff05::1:3"], &[]),
+        ];
+
+        for (block, description, excluded, neighbours) in cases {
+            for address in *excluded {
+                let addr: IpAddr = address.parse().expect("address");
+                assert!(
+                    !is_globally_routable(addr),
+                    "{address} is in {block} ({description}) and must be non-global"
+                );
+            }
+            for neighbour in *neighbours {
+                let addr: IpAddr = neighbour.parse().expect("address");
+                assert!(
+                    is_globally_routable(addr),
+                    "{neighbour} sits outside {block} ({description}) and must stay global"
+                );
+            }
+        }
+
+        for embedded in [
+            "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:0.0.0.1",
+            // Deprecated IPv4-compatible form of 10.0.0.1.
+            "::10.0.0.1",
+            // Well-known NAT64 prefix carrying a private destination.
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::169.254.169.254",
+        ] {
+            let addr: IpAddr = embedded.parse().expect("address");
+            assert!(
+                !is_globally_routable(addr),
+                "{embedded} embeds a non-global IPv4 address and must be rejected"
+            );
+        }
+
+        for public in [
+            "2606:4700:4700::1111",
+            "2a00:1450:4001:80e::200e",
+            // A DNS64 network answers with these for every public destination,
+            // so the well-known NAT64 prefix must stay usable.
+            "64:ff9b::8.8.8.8",
+            "::ffff:8.8.8.8",
+        ] {
+            let addr: IpAddr = public.parse().expect("address");
+            assert!(is_globally_routable(addr), "{public} should be global");
+        }
+    }
+
+    #[test]
+    fn dns_screen_accepts_public_answer() {
+        let addrs = vec![
+            "8.8.8.8:443".parse().expect("socket address"),
+            "[2606:4700:4700::1111]:443"
+                .parse()
+                .expect("socket address"),
+        ];
+        let screened =
+            screen_resolved_addrs("cdn.example.com", false, addrs.clone()).expect("public answer");
+        assert_eq!(screened, addrs);
+    }
+
+    /// A rebinding answer that mixes a public and a private address must be
+    /// rejected wholesale: the connector uses the addresses returned here, so
+    /// keeping the public one would still leave the private one reachable.
+    #[test]
+    fn dns_screen_rejects_mixed_answer() {
+        let addrs = vec![
+            "8.8.8.8:443".parse().expect("socket address"),
+            "169.254.169.254:443".parse().expect("socket address"),
+        ];
+        let error = screen_resolved_addrs("rebind.example.com", false, addrs)
+            .expect_err("mixed answer must be rejected");
+        assert_eq!(error.kind, RedirectRejectionKind::NonGlobalTarget);
+        assert!(
+            error.details.contains("169.254.169.254"),
+            "rejection must name the offending address: {}",
+            error.details
+        );
+    }
+
+    #[test]
+    fn dns_screen_exempts_configured_host() {
+        let addrs = vec!["10.1.2.3:8443".parse().expect("socket address")];
+        let screened = screen_resolved_addrs("nexus.corp.internal", true, addrs.clone())
+            .expect("configured host may be private");
+        assert_eq!(screened, addrs);
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_loopback_name_unless_configured() {
+        let resolver = GlobalOnlyResolver {
+            exempt_hosts: TrustedHosts::default(),
+        };
+        let error = resolver
+            .resolve("localhost".parse().expect("name"))
+            .await
+            .err()
+            .expect("localhost must not resolve for an unconfigured host");
+        assert!(
+            error.to_string().contains("not globally routable"),
+            "resolver rejection must explain itself: {error}"
+        );
+
+        let resolver = GlobalOnlyResolver {
+            exempt_hosts: host_set(["localhost"]),
+        };
+        let addrs = resolver
+            .resolve("localhost".parse().expect("name"))
+            .await
+            .expect("configured host resolves");
+        assert!(
+            addrs.count() > 0,
+            "configured loopback host must still resolve"
+        );
+    }
+
+    /// A `RepoClient` wired the way [`RepoClient::new`] wires one: a
+    /// redirect-capable client screening against the frozen configured set, and
+    /// a same-origin-only client screening against the live runtime set that
+    /// `trust_repositories` grows. Requests pick between them exactly as
+    /// production does, through `http_client_for`.
+    fn screened_test_client(guard: RedirectGuard) -> (RepoClient, tempfile::TempDir) {
+        let (mut client, tmp) = test_client();
+        let trusted_hosts = guard.exempt_hosts.to_runtime_set();
+        client.client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .redirect(trusted_redirect_policy(guard.clone()))
+            .dns_resolver(Arc::new(GlobalOnlyResolver {
+                exempt_hosts: guard.exempt_hosts.clone(),
+            }))
+            .build()
+            .expect("screened test client");
+        client.runtime_client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .redirect(same_origin_redirect_policy())
+            .dns_resolver(Arc::new(GlobalOnlyResolver {
+                exempt_hosts: trusted_hosts.clone(),
+            }))
+            .build()
+            .expect("runtime test client");
+        client.fetch = FetchConfig {
+            retries: 0,
+            timeout: Duration::from_secs(5),
+        };
+        client.configured_hosts = guard.exempt_hosts;
+        client.trusted_hosts = trusted_hosts;
+        (client, tmp)
+    }
+
+    /// `localhost` stands in for `nexus.corp.internal`: a *name* that resolves
+    /// onto an address the screen rejects. Only a name exercises the resolver
+    /// at all — an IP literal never reaches one, which is why the mock servers
+    /// elsewhere in this file cannot see this class of failure.
+    fn loopback_name_url(port: u16, path: &str) -> Url {
+        url(&format!("https://localhost:{port}{path}"))
+    }
+
+    /// The routing rule the split rests on: only a host `rv.toml` named is
+    /// served by the redirect-capable client, and no trust grant can move a
+    /// host onto it afterwards.
+    #[test]
+    fn only_configured_hosts_reach_the_redirect_capable_client() {
+        let (client, _tmp) =
+            screened_test_client(origins_guard(origin_set(["https://mirror.example"])));
+
+        assert!(
+            std::ptr::eq(
+                client.http_client_for(&url("https://mirror.example/demo-1.0.jar")),
+                &client.client
+            ),
+            "a configured host is served by the redirect-capable client"
+        );
+        let runtime_url = url("https://nexus.corp.internal/demo-1.0.jar");
+        for stage in ["before the grant", "after the grant"] {
+            assert!(
+                std::ptr::eq(client.http_client_for(&runtime_url), &client.runtime_client),
+                "an unconfigured host must stay on the same-origin-only client {stage}"
+            );
+            client.trust_repositories(&[Repository::new(
+                None,
+                "https://nexus.corp.internal/repo/".to_string(),
+                true,
+                false,
+            )]);
+        }
+        assert!(client.trusts_host("nexus.corp.internal"));
+    }
+
+    /// A hostname nothing has trusted still fails the address screen when it
+    /// resolves onto a private network, and fails before any connection.
+    #[tokio::test]
+    async fn untrusted_private_hostname_fails_the_address_screen() {
+        let repo = spawn_https_stub(|_| ok_response(b"must not arrive"));
+        let (client, _tmp) = screened_test_client(origins_guard(HashSet::new()));
+
+        let repo_url = loopback_name_url(repo.addr.port(), "/demo-1.0.jar");
+        let error = fetch_redirect_test(client.http_client_for(&repo_url), &repo_url)
+            .await
+            .expect_err("an untrusted private hostname must not be dialled");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::NonGlobalTarget,
+                    ..
+                }
+            ),
+            "expected a non-global rejection, got {error:?}"
+        );
+        assert!(
+            repo.request.lock().expect("repo request").is_none(),
+            "the screened host must not be contacted"
+        );
+    }
+
+    /// The regression: a repository the root POM declares becomes trusted
+    /// part-way through a resolve, and the client that is already running the
+    /// resolve has to honour that without being rebuilt. Freezing the exempt
+    /// set at construction left every such fetch failing the address screen —
+    /// the normal shape of an on-prem registry named only in the project's POM.
+    #[tokio::test]
+    async fn runtime_trusted_repository_host_fetches_without_a_client_rebuild() {
+        let repo = spawn_https_stub(|_| ok_response(b"artifact bytes"));
+        let repo_url = loopback_name_url(repo.addr.port(), "/demo-1.0.jar");
+        let (client, _tmp) = screened_test_client(origins_guard(HashSet::new()));
+
+        // Routing sends an unconfigured host to the same-origin-only client.
+        assert!(
+            std::ptr::eq(client.http_client_for(&repo_url), &client.runtime_client),
+            "an unconfigured repository host must not be served by the redirect-capable client"
+        );
+        let error = fetch_redirect_test(client.http_client_for(&repo_url), &repo_url)
+            .await
+            .expect_err("the host is not trusted yet");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::NonGlobalTarget,
+                    ..
+                }
+            ),
+            "expected a non-global rejection before the grant, got {error:?}"
+        );
+
+        // What `RepoBackend::extend_repos_trusted` does when the root POM
+        // declares a repository the configuration never named.
+        client.trust_repositories(&[Repository::new(
+            Some("internal".to_string()),
+            loopback_name_url(repo.addr.port(), "/repo/").to_string(),
+            true,
+            false,
+        )]);
+        assert!(client.trusts_host("LOCALHOST"), "the grant is case-blind");
+
+        let bytes = fetch_redirect_test(client.http_client_for(&repo_url), &repo_url)
+            .await
+            .expect("a trusted repository host must resolve and fetch");
+        assert_eq!(bytes, Bytes::from_static(b"artifact bytes"));
+    }
+
+    /// Runtime trust buys a direct connection and nothing else: a hostile
+    /// mirror bouncing `rv` at another port of a private host the root POM
+    /// happened to name is the SSRF this whole screen exists to stop.
+    ///
+    /// The redirect-capable client's resolver never sees the grant, so the
+    /// target is screened on its addresses and the connection dies there.
+    #[tokio::test]
+    async fn runtime_trusted_host_is_still_not_a_redirect_target() {
+        let target = spawn_https_stub(|_| ok_response(b"must not arrive"));
+        let target_url = loopback_name_url(target.addr.port(), "/secret").to_string();
+        let source = spawn_https_stub(move |_| redirect_response(&target_url));
+        let source_url = url(&format!("https://127.0.0.1:{}/start", source.addr.port()));
+        // Only the source is configured in `rv.toml`; the target host is
+        // trusted at runtime, the way a root-POM repository is.
+        let configured = HashSet::from([source_url.origin().ascii_serialization()]);
+        let (client, _tmp) = screened_test_client(origins_guard(configured));
+        client.trust_repositories(&[Repository::new(
+            None,
+            loopback_name_url(target.addr.port(), "/repo/").to_string(),
+            true,
+            false,
+        )]);
+
+        let error = fetch_redirect_test(client.http_client_for(&source_url), &source_url)
+            .await
+            .expect_err("a runtime-trusted host is not a redirect target");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::NonGlobalTarget,
+                    ..
+                }
+            ),
+            "expected a non-global rejection, got {error:?}"
+        );
+        assert!(
+            target.request.lock().expect("target request").is_none(),
+            "the redirect target must not be contacted"
+        );
+    }
+
+    /// The interleaving the port-blind exemption made possible: a hostile
+    /// configured mirror redirects to a host nothing trusts yet, the policy
+    /// permits the hop *because* the resolver is expected to screen it, and a
+    /// concurrent reactor task then trusts a direct repository on that same
+    /// host. A redirect target that was not exempt at policy-evaluation time
+    /// must be DNS-screened at connect time, regardless of concurrent trust
+    /// grants — otherwise the grant retroactively licenses the hop, at any
+    /// port, on a private machine the user only meant to fetch artifacts from.
+    ///
+    /// Driven in order rather than raced: the three steps are the ones the two
+    /// tasks interleave, and the assertion is that step 3 cannot change what
+    /// step 4 decides.
+    #[tokio::test]
+    async fn trust_granted_after_policy_evaluation_leaves_the_target_screened() {
+        let target = spawn_https_stub(|_| ok_response(b"must not arrive"));
+        let target_url = loopback_name_url(target.addr.port(), "/secret");
+        let redirect_to = target_url.to_string();
+        let source = spawn_https_stub(move |_| redirect_response(&redirect_to));
+        let source_url = url(&format!("https://127.0.0.1:{}/start", source.addr.port()));
+        let guard = origins_guard(HashSet::from([source_url.origin().ascii_serialization()]));
+        let (client, _tmp) = screened_test_client(guard.clone());
+
+        // (1) and (2): the hop is evaluated while nothing trusts the target
+        // host, and permitted on the expectation that the resolver screens the
+        // addresses the name answers with.
+        guard
+            .evaluate(std::slice::from_ref(&source_url), &target_url)
+            .expect("an unexempt hostname target is left to the resolver");
+
+        // (3) a concurrent task grants the host direct-connection trust, the
+        // way a root-POM repository on the same machine would.
+        client.trust_repositories(&[Repository::new(
+            None,
+            loopback_name_url(target.addr.port(), "/repo/").to_string(),
+            true,
+            false,
+        )]);
+        assert!(
+            client.trusts_host("localhost"),
+            "the grant must have landed"
+        );
+
+        // (4) the redirect-capable client screens the target anyway: its
+        // resolver reads the frozen configured set, which runtime trust cannot
+        // reach. `configured_hosts` is the same handle that client's resolver
+        // holds, so this is the state the connection would see.
+        assert!(
+            !client.configured_hosts.contains("localhost"),
+            "runtime trust must never reach the configured set"
+        );
+        let resolver = GlobalOnlyResolver {
+            exempt_hosts: client.configured_hosts.clone(),
+        };
+        let error = resolver
+            .resolve("localhost".parse().expect("name"))
+            .await
+            .err()
+            .expect("the permitted redirect target must still be screened");
+        assert!(
+            error.to_string().contains("non-global address"),
+            "resolver rejection must explain itself: {error}"
+        );
+
+        // And end to end, with the grant already in place before the request
+        // runs: the hop is followed no further than the address screen.
+        let error = fetch_redirect_test(client.http_client_for(&source_url), &source_url)
+            .await
+            .expect_err("a grant taken mid-flight must not unscreen the target");
+        assert!(
+            matches!(
+                error,
+                RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::NonGlobalTarget,
+                    ..
+                }
+            ),
+            "expected a non-global rejection, got {error:?}"
+        );
+        assert!(
+            target.request.lock().expect("target request").is_none(),
+            "the redirect target must not be contacted"
+        );
     }
 
     /// A redirect that switches origin (e.g. attacker mirror sends
@@ -1352,11 +3573,198 @@ mod tests {
             .redirect(same_origin_redirect_policy())
             .build()
             .expect("client");
-        let result = client.get(format!("http://{addr}/loop")).send().await;
+        let url = Url::parse(&format!("http://{addr}/loop")).expect("loop URL");
+        let result = fetch_redirect_test(&client, &url).await;
         assert!(
-            result.is_err(),
-            "redirect chain over the cap must surface as an error"
+            matches!(
+                result,
+                Err(RepoError::RedirectRejected {
+                    kind: RedirectRejectionKind::ChainLimit,
+                    ..
+                })
+            ),
+            "redirect chain over the cap must name the chain limit, got {result:?}"
         );
+    }
+
+    #[test]
+    fn repeated_mirror_redirect_failures_emit_one_summary_warning() {
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct VecWriter(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for VecWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("warning output")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for VecWriter {
+            type Writer = VecWriter;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let tracker = MirrorFailureTracker::default();
+        let mirror = Repository::new(
+            Some("object-store-mirror".to_string()),
+            "https://registry.example/maven/".to_string(),
+            true,
+            false,
+        );
+        let error = RepoError::RedirectRejected {
+            kind: RedirectRejectionKind::HttpsDowngrade,
+            details: "test redirect".to_string(),
+        };
+        for _ in 0..MIRROR_FAILURE_SUMMARY_THRESHOLD {
+            tracker.record(&mirror, &error);
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(VecWriter(Arc::clone(&output)))
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || tracker.report());
+
+        let rendered = String::from_utf8(output.lock().expect("warning output").clone())
+            .expect("UTF-8 warning");
+        assert!(
+            rendered.contains(
+                "mirror object-store-mirror (https://registry.example/maven/) failed 3 fetches"
+            ),
+            "summary must name the mirror and failure count: {rendered}"
+        );
+        assert!(
+            rendered.contains("cross-origin redirect rejected: target is not HTTPS"),
+            "summary must name the rejection class: {rendered}"
+        );
+        assert!(
+            rendered.contains("results came from origin repositories"),
+            "summary must disclose origin fallback: {rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("results came from origin repositories")
+                .count(),
+            1,
+            "repeated failures must collapse into one summary: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_fetch_reports_successful_mirror_as_provenance() {
+        use rv_config::{ArtifactKey, MirrorConfig};
+        use rv_store::Store;
+        use sha2::{Digest, Sha256};
+
+        let body = b"mirror artifact";
+        let digest = hex::encode(Sha256::digest(body));
+        let checksum: StubHandler = Box::new(move |request| {
+            assert!(request.contains(".sha256"), "first request is checksum");
+            ok_response(digest.as_bytes())
+        });
+        let artifact: StubHandler = Box::new(move |request| {
+            assert!(!request.contains(".sha"), "second request is artifact");
+            ok_response(body)
+        });
+        let (mirror_addr, mirror_hits) = spawn_stub_seq(vec![checksum, artifact]).await;
+        let mirror_url = format!("http://{mirror_addr}/");
+        let (client, _cache) = test_client_with_mirrors(vec![MirrorConfig {
+            id: Some("serving-mirror".to_string()),
+            url: mirror_url.clone(),
+            mirror_of: vec!["central".to_string()],
+        }]);
+        let origin = Repository::new(
+            Some("central".to_string()),
+            "http://127.0.0.1:9/".to_string(),
+            true,
+            false,
+        );
+        let request = ArtifactRequest::new("com.example", "demo", "1.0.0");
+        let key = ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let store = Store::open(store_dir.path()).expect("store");
+
+        let (_, serving_repository) = client
+            .fetch_artifact_to_store_and_index_with_repository(&origin, &request, &store, &key)
+            .await
+            .expect("mirror artifact fetch");
+        assert_eq!(serving_repository, mirror_url);
+        assert_eq!(mirror_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn effective_repository_url_applies_mirror_without_network_fetch() {
+        let mirror_url = "https://registry.example/maven/";
+        let (client, _cache) = test_client_with_mirrors(vec![rv_config::MirrorConfig {
+            id: Some("registry".to_string()),
+            url: mirror_url.to_string(),
+            mirror_of: vec!["central".to_string()],
+        }]);
+        let origin = Repository::new(
+            Some("central".to_string()),
+            "https://repo1.maven.org/maven2/",
+            true,
+            false,
+        );
+
+        assert_eq!(client.effective_repository_url(&origin), mirror_url);
+    }
+
+    #[tokio::test]
+    async fn artifact_fetch_reports_origin_after_mirror_fallback() {
+        use rv_config::{ArtifactKey, MirrorConfig};
+        use rv_store::Store;
+        use sha2::{Digest, Sha256};
+
+        let unavailable: StubHandler = Box::new(|_| {
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        });
+        let unavailable_again: StubHandler = Box::new(|_| {
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        });
+        let (mirror_addr, mirror_hits) = spawn_stub_seq(vec![unavailable, unavailable_again]).await;
+
+        let body = b"origin artifact";
+        let digest = hex::encode(Sha256::digest(body));
+        let checksum: StubHandler = Box::new(move |_| ok_response(digest.as_bytes()));
+        let artifact: StubHandler = Box::new(move |_| ok_response(body));
+        let (origin_addr, origin_hits) = spawn_stub_seq(vec![checksum, artifact]).await;
+        let origin_url = format!("http://{origin_addr}/");
+        let (client, _cache) = test_client_with_mirrors(vec![MirrorConfig {
+            id: Some("broken-mirror".to_string()),
+            url: format!("http://{mirror_addr}/"),
+            mirror_of: vec!["central".to_string()],
+        }]);
+        let origin = Repository::new(Some("central".to_string()), origin_url.clone(), true, false);
+        let request = ArtifactRequest::new("com.example", "demo", "1.0.0");
+        let key = ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let store = Store::open(store_dir.path()).expect("store");
+
+        let (_, serving_repository) = client
+            .fetch_artifact_to_store_and_index_with_repository(&origin, &request, &store, &key)
+            .await
+            .expect("origin fallback artifact fetch");
+        assert_eq!(serving_repository, origin_url);
+        assert_eq!(mirror_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
     }
 
     /// THE launch-blocker fix: a repo (like Maven Central) that serves only a
@@ -1697,12 +4105,8 @@ mod tests {
         // _tmp stays bound for the rest of the test; dropping it would
         // delete the SQLite cache file MetadataCache still holds open.
         let client = RepoClient {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(same_origin_redirect_policy())
-                .user_agent(USER_AGENT)
-                .build()
-                .expect("client"),
+            client: plain_test_client(),
+            runtime_client: plain_test_client(),
             auth,
             mirrors,
             fetch: FetchConfig::default(),
@@ -1710,6 +4114,9 @@ mod tests {
             cache,
             offline: false,
             require_checksums: false,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: ConfiguredHosts::default(),
+            trusted_hosts: TrustedHosts::default(),
         };
 
         // Original repo is "https://repo.example/" (different host from the
@@ -1857,12 +4264,8 @@ mod tests {
         let _tmp = tempfile::tempdir().expect("tempdir");
         let cache = MetadataCache::new(&_tmp.path().join("metadata.db")).expect("cache");
         let client = RepoClient {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(same_origin_redirect_policy())
-                .user_agent(USER_AGENT)
-                .build()
-                .expect("client"),
+            client: plain_test_client(),
+            runtime_client: plain_test_client(),
             auth,
             mirrors,
             fetch: FetchConfig::default(),
@@ -1870,6 +4273,9 @@ mod tests {
             cache,
             offline: false,
             require_checksums: true,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: ConfiguredHosts::default(),
+            trusted_hosts: TrustedHosts::default(),
         };
 
         // Original repo lives on a different host (repo.example) than the
@@ -2029,12 +4435,8 @@ mod tests {
         // _tmp stays bound for the rest of the test; dropping it would
         // delete the SQLite cache file MetadataCache still holds open.
         let client = RepoClient {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(same_origin_redirect_policy())
-                .user_agent(USER_AGENT)
-                .build()
-                .expect("client"),
+            client: plain_test_client(),
+            runtime_client: plain_test_client(),
             auth: AuthStore::default(),
             mirrors,
             // Speed the retry loop up so the test doesn't wait on backoff.
@@ -2046,6 +4448,9 @@ mod tests {
             cache,
             offline: false,
             require_checksums: true,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: ConfiguredHosts::default(),
+            trusted_hosts: TrustedHosts::default(),
         };
 
         let origin = Repository::new(
@@ -2160,12 +4565,8 @@ mod tests {
         // _tmp stays bound for the rest of the test; dropping it would
         // delete the SQLite cache file MetadataCache still holds open.
         let client = RepoClient {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(same_origin_redirect_policy())
-                .user_agent(USER_AGENT)
-                .build()
-                .expect("client"),
+            client: plain_test_client(),
+            runtime_client: plain_test_client(),
             auth: AuthStore::default(),
             mirrors,
             fetch: FetchConfig {
@@ -2176,6 +4577,9 @@ mod tests {
             cache,
             offline: false,
             require_checksums: true,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: ConfiguredHosts::default(),
+            trusted_hosts: TrustedHosts::default(),
         };
 
         let origin = Repository::new(
@@ -2424,12 +4828,8 @@ mod tests {
         let _tmp = tempfile::tempdir().expect("tempdir");
         let cache = MetadataCache::new(&_tmp.path().join("metadata.db")).expect("cache");
         let client = RepoClient {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(same_origin_redirect_policy())
-                .user_agent(USER_AGENT)
-                .build()
-                .expect("client"),
+            client: plain_test_client(),
+            runtime_client: plain_test_client(),
             auth: AuthStore::default(),
             mirrors,
             fetch: FetchConfig {
@@ -2440,6 +4840,9 @@ mod tests {
             cache,
             offline: false,
             require_checksums: true,
+            mirror_failures: Arc::new(MirrorFailureTracker::default()),
+            configured_hosts: ConfiguredHosts::default(),
+            trusted_hosts: TrustedHosts::default(),
         };
 
         let origin = Repository::new(

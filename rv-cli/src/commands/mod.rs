@@ -1,8 +1,10 @@
+pub mod auth;
 pub mod doctor;
 pub mod export_checksums;
 pub mod export_m2;
 pub(crate) mod lock_adapter;
 pub mod lock_verify;
+pub(crate) mod module_selector;
 pub mod sbom;
 pub mod sync;
 pub mod tree;
@@ -10,6 +12,7 @@ pub mod util;
 pub mod vuln;
 pub mod why;
 
+pub use auth::{AuthArgs, LoginArgs, LogoutArgs};
 pub use doctor::DoctorArgs;
 pub use export_checksums::ExportChecksumsArgs;
 pub use export_m2::ExportM2Args;

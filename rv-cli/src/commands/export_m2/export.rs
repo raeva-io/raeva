@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 use rv_config::{Checksum, LockPackage, Lockfile};
 use rv_store::{ArtifactKey, BlobId, Store};
 
+use super::aggregate_external_packages;
 use super::error::{ExportError, Result};
 use super::link::{LinkStrategy, link_with_fallback};
 use super::metadata::{
@@ -51,16 +52,200 @@ pub(crate) struct ExportStats {
     pub linked_count: usize,
 }
 
+/// Ceiling on the number of *unique* support POMs (parent ancestries and
+/// imported BOMs) a single export may walk.
+///
+/// Nothing in the lock bounds this closure. Parents and import BOMs are not
+/// lockfile packages (pom-only nodes are dropped from the lock), and the walk
+/// discovers them by parsing POM bytes out of the content store, so the lock
+/// has no count the budget could be sized from. The cap is therefore a fixed
+/// guard against a pathological POM graph, set an order of magnitude above the
+/// largest real reactors. Exceeding it is an error, never a truncated closure:
+/// a short export produces a `~/.m2` that fails `mvn -o` later with nothing
+/// pointing back at the export that caused it.
+const MAX_SUPPORT_POM_NODES: usize = 10_000;
+
+/// Environment override for [`MAX_SUPPORT_POM_NODES`], named in the error so a
+/// build that genuinely needs a bigger closure has a way forward.
+const MAX_SUPPORT_POM_NODES_ENV: &str = "RAEVA_EXPORT_M2_MAX_SUPPORT_POMS";
+
+/// Recovery instruction for [`ExportError::MissingSupportPom`]. A frozen sync
+/// only checks the lockfile against the resolved graph; it is a plain `rv sync`
+/// that re-fetches and re-persists the support-POM closure, so the hint has to
+/// say which one.
+const MISSING_SUPPORT_POM_HINT: &str =
+    "Run `rv sync` (without --frozen) to repopulate the content store, then retry the export";
+
+/// Recovery instruction for [`ExportError::MissingPinnedPom`]. The pinned bytes
+/// are gone from the content store (pruned, or never written on this machine),
+/// and only a fresh resolve can put the recorded digest back or record a new
+/// one, so the hint names the same command for the same reason.
+const MISSING_PINNED_POM_HINT: &str =
+    "Run `rv sync` (without --frozen) to repopulate the content store, then retry the export";
+
+fn max_support_pom_nodes_from_env() -> usize {
+    parse_max_support_pom_nodes(std::env::var(MAX_SUPPORT_POM_NODES_ENV).ok().as_deref())
+}
+
+/// Parse the override. Anything unusable (non-numeric, zero) falls back to the
+/// default rather than shrinking the budget, so a typo in the environment can
+/// never be the reason an export stops early.
+fn parse_max_support_pom_nodes(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return MAX_SUPPORT_POM_NODES;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(limit) if limit > 0 => limit,
+        _ => {
+            warn!(
+                variable = MAX_SUPPORT_POM_NODES_ENV,
+                value = %raw,
+                default = MAX_SUPPORT_POM_NODES,
+                "ignoring unparseable support-POM node limit; using the default"
+            );
+            MAX_SUPPORT_POM_NODES
+        }
+    }
+}
+
+/// What `rv sync` recorded for one support POM (parent or imported BOM).
+#[derive(Clone, Debug)]
+pub(crate) struct SupportPomPin {
+    /// Id of the repository that served the POM. Empty when that repository
+    /// carries no id: the POM is still exported, it just gets no
+    /// `_remote.repositories` marker, since inventing `central` would claim it
+    /// came from a repository it did not.
+    pub(crate) repo_id: String,
+    /// SHA-256 of the bytes to export. `None` on a lockfile written before the
+    /// digest was recorded; the POM is then looked up through the store's
+    /// coordinate index, unpinned, as it was before.
+    pub(crate) sha256: Option<BlobId>,
+}
+
+/// Which pass of the queueing phase produced a unit. Two passes can name the
+/// same Maven file from two independently recorded pins, so the source is what
+/// the conflict error points the user at.
+#[derive(Clone, Copy)]
+enum UnitSource {
+    /// A lockfile `artifacts[]` row: pinned by that row's checksum.
+    Package,
+    /// The companion POM of a lockfile row: pinned by the row's `pom_sha256`,
+    /// or resolved through the store's coordinate index when there is no pin.
+    CompanionPom,
+    /// A node of the support-POM closure: pinned by the provenance `rv sync`
+    /// recorded for that coordinate, or resolved through the coordinate index
+    /// when the closure only inferred it from POM text.
+    SupportPom,
+}
+
+impl UnitSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Package => "the lockfile package row",
+            Self::CompanionPom => "its lockfile row's companion POM",
+            Self::SupportPom => "the recorded support-POM closure",
+        }
+    }
+}
+
 /// One file to materialize into the Maven local repository. The `package` is
 /// a stand-in used only for path/layout decisions (snapshot directory
 /// handling); parent POMs carry a synthetic one keyed off their own
 /// coordinate. `repo_id` is the repository id recorded in
-/// `_remote.repositories` next to the file.
+/// `_remote.repositories` next to the file; empty means the file gets no
+/// marker (see `repo_id_recorded`).
 struct ExportUnit {
     key: ArtifactKey,
     package: LockPackage,
     blob: BlobId,
+    /// Queueing pass this unit came from, used only to name the two sides of a
+    /// [`ExportError::ConflictingExportSources`].
+    source: UnitSource,
     repo_id: String,
+    /// True when `repo_id` came from the support-POM provenance `rv sync`
+    /// recorded for this exact coordinate, rather than being derived from the
+    /// `repo_url` of whichever package referenced it. Decides the winner when
+    /// the same POM is queued as both support metadata and a lockfile package;
+    /// a recorded but empty id wins too, because "the serving repository has no
+    /// id" is knowledge, and the guess it displaces is not.
+    repo_id_recorded: bool,
+}
+
+/// The work one export accumulates before fanning out: the coordinate dedupe
+/// set shared by every support-POM walk, the running unique-support-node
+/// budget, and the deduplicated list of files to materialize.
+#[derive(Default)]
+struct ExportQueue {
+    /// Dedupe set keyed off the package coordinate triple.
+    ///
+    /// It collapses the per-classifier POM re-exports: every (jar,
+    /// jar:sources, jar:javadoc) classifier for the same g:a:v shares a single
+    /// POM, so without deduping we would queue and ship the same POM bytes
+    /// three times. It is also the dedupe key for the support-POM walk, so a
+    /// parent shared by many children is visited once.
+    enqueued_poms: HashSet<(String, String, String)>,
+    units: Vec<ExportUnit>,
+    /// Positions in `units` by artifact key, so a coordinate reached both as
+    /// support metadata and as an explicit lockfile package collapses into one.
+    by_key: HashMap<ArtifactKey, usize>,
+    /// Unique support-POM nodes walked so far, against [`MAX_SUPPORT_POM_NODES`].
+    support_nodes: usize,
+}
+
+impl ExportQueue {
+    /// Whether a unit is already queued for `key`, i.e. whether [`Self::push`]
+    /// would compare a pin against queued bytes rather than queue a new file.
+    /// A caller that only wants the comparison — one holding a pin for a
+    /// coordinate another pass already resolved — checks this first, so it
+    /// never queues bytes nothing has confirmed are in the store.
+    fn holds(&self, key: &ArtifactKey) -> bool {
+        self.by_key.contains_key(key)
+    }
+
+    /// Queue one file, collapsing a coordinate that is both support metadata
+    /// and an explicit lockfile package into a single unit.
+    ///
+    /// `safe_artifact_path` derives the destination purely from the
+    /// `ArtifactKey` (the directory uses `version`'s base-snapshot form), so two
+    /// units sharing a key name the same file. Letting both through would write
+    /// that file twice from `buffer_unordered`, double it in the stats, and
+    /// leave its `_remote.repositories` marker to whichever unit finished last.
+    /// On collision the recorded support-POM repository id wins: it names the
+    /// repository the POM actually came from, rather than one inferred from a
+    /// referencing package's `repo_url`.
+    ///
+    /// Collapsing is only legitimate when both units name the same bytes. One
+    /// coordinate can be pinned by three independent recordings — an
+    /// `artifacts[]` row's checksum, that row's `pom_sha256`, and the
+    /// support-POM provenance — and every pair of them describes the same
+    /// Maven path. Keeping whichever arrived first would export bytes the
+    /// other pin attests are wrong, silently: the substitution
+    /// [`ExportError::ConflictingPinnedPom`] and
+    /// [`ExportError::ConflictingPomPackagedPin`] exist to refuse, reached
+    /// across two sources instead of within one. So a disagreement fails the
+    /// export here, in the queueing pass, before anything is written.
+    fn push(&mut self, unit: ExportUnit) -> Result<()> {
+        let Some(&existing) = self.by_key.get(&unit.key) else {
+            self.by_key.insert(unit.key.clone(), self.units.len());
+            self.units.push(unit);
+            return Ok(());
+        };
+        let previous = &mut self.units[existing];
+        if previous.blob != unit.blob {
+            return Err(ExportError::ConflictingExportSources {
+                coordinate: unit.key.to_string(),
+                first_source: previous.source.label(),
+                first: previous.blob.to_string(),
+                second_source: unit.source.label(),
+                second: unit.blob.to_string(),
+            });
+        }
+        if unit.repo_id_recorded && !previous.repo_id_recorded {
+            previous.repo_id = unit.repo_id;
+            previous.repo_id_recorded = true;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct Exporter<'a> {
@@ -70,11 +255,20 @@ pub(crate) struct Exporter<'a> {
     /// to fill in the `_remote.repositories` markers Maven Resolver expects.
     /// Unknown URLs fall back to `central`.
     repo_ids: HashMap<String, String>,
-    /// Maps a support POM's `"g:a:v"` to the id of the repository that served
-    /// it during resolution. Takes precedence over `repo_ids` for parent/BOM
-    /// POMs, which may come from a different repo than the child that
-    /// referenced them.
-    support_repo_ids: HashMap<String, String>,
+    /// Maps a support POM's `"g:a:v"` to what `rv sync` recorded for it.
+    ///
+    /// Every remotely fetched support POM is a key here. Key presence is what
+    /// makes a coordinate's absence from the store fatal, so an id-less
+    /// repository's POMs are covered by that check too.
+    support_poms: HashMap<String, SupportPomPin>,
+    /// Maps an artifact's `(group, artifact, resolved version)` to the SHA-256
+    /// of the companion POM `rv sync` recorded for it, from the lockfile's
+    /// artifact rows. Absent for a coordinate whose lockfile row carries no
+    /// digest, which is how locks written before the field behave.
+    pom_digests: HashMap<(String, String, String), BlobId>,
+    /// Ceiling on unique support-POM nodes for one export. Resolved once at
+    /// construction so every pass of a run shares one stable budget.
+    max_support_pom_nodes: usize,
 }
 
 impl<'a> Exporter<'a> {
@@ -83,8 +277,19 @@ impl<'a> Exporter<'a> {
             options,
             store,
             repo_ids: HashMap::new(),
-            support_repo_ids: HashMap::new(),
+            support_poms: HashMap::new(),
+            pom_digests: HashMap::new(),
+            max_support_pom_nodes: max_support_pom_nodes_from_env(),
         }
+    }
+
+    /// Override the support-POM node budget. Tests use this to exercise the
+    /// limit without materializing ten thousand POMs; production reads it from
+    /// the environment in `new`.
+    #[cfg(test)]
+    fn with_max_support_pom_nodes(mut self, limit: usize) -> Self {
+        self.max_support_pom_nodes = limit;
+        self
     }
 
     /// Supply the normalized-URL -> repository-id map used to label
@@ -96,11 +301,21 @@ impl<'a> Exporter<'a> {
         self
     }
 
-    /// Supply the support-POM `"g:a:v" -> repo-id` provenance map recorded by
+    /// Supply the support-POM `"g:a:v" -> pin` provenance map recorded by
     /// `rv sync`, so a parent/BOM that resolved from a different repository
-    /// than its child is labelled with its own source repo id.
-    pub(crate) fn with_support_repo_ids(mut self, ids: HashMap<String, String>) -> Self {
-        self.support_repo_ids = ids;
+    /// than its child is labelled with its own source repo id and exported
+    /// from the bytes that repository served.
+    pub(crate) fn with_support_poms(mut self, poms: HashMap<String, SupportPomPin>) -> Self {
+        self.support_poms = poms;
+        self
+    }
+
+    /// Supply the companion-POM digests the lockfile's artifact rows pin.
+    pub(crate) fn with_pom_digests(
+        mut self,
+        digests: HashMap<(String, String, String), BlobId>,
+    ) -> Self {
+        self.pom_digests = digests;
         self
     }
 
@@ -121,8 +336,20 @@ impl<'a> Exporter<'a> {
         lock: &Lockfile,
         root_pom: Option<&Path>,
     ) -> Result<ExportStats> {
+        let project_poms: Vec<PathBuf> = root_pom.map(Path::to_path_buf).into_iter().collect();
+        self.export_lock_with_project_poms(lock, &project_poms)
+            .await
+    }
+
+    /// Export the aggregate external union plus the support-POM closure
+    /// referenced by every active reactor module POM.
+    pub(crate) async fn export_lock_with_project_poms(
+        &self,
+        lock: &Lockfile,
+        project_poms: &[PathBuf],
+    ) -> Result<ExportStats> {
         let mut stats = ExportStats::default();
-        let mut system_scoped: Vec<String> = Vec::new();
+        let system_scoped = system_scoped_coordinates(lock);
         let mut meta = MetadataAccumulator::default();
 
         // First pass: do all the per-package work that requires sequential
@@ -132,30 +359,22 @@ impl<'a> Exporter<'a> {
         // fanned out to multiple writers, so we batch them here. Each
         // `ExportUnit` (defined at module scope so `enqueue_pom_closure` can
         // build them too) is one file we will materialize.
-        let mut units: Vec<ExportUnit> = Vec::new();
-        // Dedupe sets keyed off the package coordinate triple.
-        //
-        // `enqueued_poms` collapses the per-classifier POM re-exports: every
-        // (jar, jar:sources, jar:javadoc) classifier for the same g:a:v shares
-        // a single POM, so without deduping we would queue and ship the same
-        // POM bytes three times. It is also the dedupe key for the parent-POM
-        // walk so a parent shared by many children is only exported once.
-        //
+        // `ExportQueue` owns the coordinate dedupe set, the support-POM node
+        // budget, and the deduplicated unit list.
+        let mut queue = ExportQueue::default();
         // `accumulated` guards `accumulate_metadata` against being called more
         // than once for the same (g, a, v, packaging, classifier) tuple,
         // which is otherwise repeated once per platform: quadratic-ish work
         // for nothing.
-        let mut enqueued_poms: HashSet<(String, String, String)> = HashSet::new();
         let mut accumulated: HashSet<(String, String, String, String, Option<String>)> =
             HashSet::new();
 
         // Support POMs are overwhelmingly on Central; an unmapped repo_url
         // falls back to the `central` marker id. Prefer the project's primary
         // repo when it has one.
-        let root_repo_url = lock
-            .platforms
+        let external_packages = aggregate_external_packages(lock);
+        let root_repo_url = external_packages
             .first()
-            .and_then(|p| p.packages.first())
             .map(|pkg| pkg.repo_url.clone())
             .unwrap_or_default();
 
@@ -170,13 +389,15 @@ impl<'a> Exporter<'a> {
         // (then letting `enqueue_support_closure` recurse into each POM's own
         // parents and imports) materializes the whole transitive closure. The
         // sources/javadocs passes re-seed idempotently.
-        if !self.support_repo_ids.is_empty() {
-            let seed_refs: Vec<(String, String, String)> = self
-                .support_repo_ids
-                .keys()
-                .filter_map(|coord| parse_gav(coord))
-                .collect();
-            self.enqueue_support_closure(seed_refs, &root_repo_url, &mut enqueued_poms, &mut units)
+        if !self.support_poms.is_empty() {
+            // Sort the seeds: `support_poms` is a `HashMap`, and the walk
+            // order decides which node trips the closure limit. An export that
+            // fails on one run has to fail on every run.
+            let mut coords: Vec<&str> = self.support_poms.keys().map(String::as_str).collect();
+            coords.sort_unstable();
+            let seed_refs: Vec<(String, String, String)> =
+                coords.into_iter().filter_map(parse_gav).collect();
+            self.enqueue_support_closure(seed_refs, &root_repo_url, &mut queue)
                 .await?;
         }
 
@@ -186,129 +407,156 @@ impl<'a> Exporter<'a> {
         // or importing spring-boot-dependencies). Walk that closure too. Only
         // the primary export passes a root pom; the sources/javadocs passes
         // reuse the same dedupe set and skip it.
-        if let Some(root_pom) = root_pom {
-            let refs = read_support_refs(root_pom).unwrap_or_default();
-            self.enqueue_support_closure(refs, &root_repo_url, &mut enqueued_poms, &mut units)
+        for project_pom in project_poms {
+            let refs = read_support_refs(project_pom).unwrap_or_default();
+            self.enqueue_support_closure(refs, &root_repo_url, &mut queue)
                 .await?;
         }
 
-        for platform in &lock.platforms {
-            for package in &platform.packages {
-                if package.system_path.is_some() {
-                    system_scoped.push(format!(
-                        "{}:{}:{}",
-                        package.group_id, package.artifact_id, package.version
-                    ));
-                    continue;
-                }
+        for package in &external_packages {
+            let key = ArtifactKey::new(
+                package.group_id.clone(),
+                package.artifact_id.clone(),
+                package.version.clone(),
+                package.packaging.clone(),
+                package.classifier.clone(),
+            );
 
-                let key = ArtifactKey::new(
+            let blob = self.blob_id_for_package(&key, package).await?;
+            let repo_id = self.repo_id_for(&package.repo_url);
+
+            if package.packaging != "pom" {
+                let pom_coord = (
                     package.group_id.clone(),
                     package.artifact_id.clone(),
                     package.version.clone(),
-                    package.packaging.clone(),
-                    package.classifier.clone(),
                 );
-
-                let blob = self.blob_id_for_package(&key, package).await?;
-                let repo_id = self.repo_id_for(&package.repo_url);
-
-                if package.packaging != "pom" {
-                    let pom_coord = (
-                        package.group_id.clone(),
-                        package.artifact_id.clone(),
-                        package.version.clone(),
-                    );
-                    // Sibling classifier already queued the POM for this
-                    // g:a:v; skip the duplicate so we don't pay for hashing
-                    // and writing the same POM bytes again.
-                    if !enqueued_poms.contains(&pom_coord) {
-                        // Some Maven artifacts ship without a companion POM
-                        // (relocations, sources-only jars). Don't fail the
-                        // whole export over a missing POM: warn and ship the
-                        // primary artifact alone, matching Maven's behaviour.
-                        let pom_key = ArtifactKey::new(
-                            package.group_id.clone(),
-                            package.artifact_id.clone(),
-                            package.version.clone(),
-                            "pom",
-                            None,
-                        );
-                        match self.store.lookup_artifact_locked(&pom_key).await? {
-                            Some(pom_blob) => {
-                                enqueued_poms.insert(pom_coord);
-                                let pom_pkg = pom_package_from(package);
-                                // Walk this POM's support closure (its
-                                // `<parent>` ancestry and import-scoped BOMs)
-                                // so `mvn -o` does not fail with
-                                // "Non-resolvable parent/import POM". Each
-                                // support POM found in the store is queued.
-                                let refs = read_support_refs(&self.store.get_path(&pom_blob))
-                                    .unwrap_or_default();
-                                self.enqueue_support_closure(
-                                    refs,
-                                    &package.repo_url,
-                                    &mut enqueued_poms,
-                                    &mut units,
-                                )
+                let pom_key = ArtifactKey::new(
+                    package.group_id.clone(),
+                    package.artifact_id.clone(),
+                    package.version.clone(),
+                    "pom",
+                    None,
+                );
+                // A sibling classifier may have queued this g:a:v POM
+                // already; re-queuing it hashes and writes the same
+                // bytes twice. So may the support-POM closure, which runs
+                // first — and skipping outright on that account would skip
+                // the only comparison between the two independent
+                // recordings of this one Maven path, the closure's
+                // provenance pin and this row's `pom_sha256`. Submit the
+                // pin instead, so `ExportQueue::push` stays the single
+                // place that collapses an agreement and refuses a
+                // disagreement, exactly as it does for a `packaging =
+                // "pom"` row. Only a recorded pin is submitted: the
+                // store's coordinate index attests nothing about what this
+                // lockfile resolved, so falling back to it here could
+                // manufacture a conflict out of another project's sync.
+                if queue.holds(&pom_key) {
+                    if let Some(pinned) = self.pom_digests.get(&pom_coord) {
+                        queue.push(ExportUnit {
+                            key: pom_key,
+                            package: pom_package_from(package),
+                            blob: pinned.clone(),
+                            source: UnitSource::CompanionPom,
+                            repo_id: repo_id.clone(),
+                            repo_id_recorded: false,
+                        })?;
+                    }
+                } else if !queue.enqueued_poms.contains(&pom_coord) {
+                    // Some Maven artifacts ship without a companion POM,
+                    // for example relocations and sources-only jars.
+                    // Maven tolerates that, so a missing POM warns and
+                    // exports the primary artifact alone instead of
+                    // failing the whole export.
+                    match self.companion_pom_blob(&pom_key, &pom_coord).await? {
+                        Some(pom_blob) => {
+                            queue.enqueued_poms.insert(pom_coord);
+                            let pom_pkg = pom_package_from(package);
+                            // `mvn -o` fails with "Non-resolvable
+                            // parent/import POM" unless this POM's
+                            // `<parent>` ancestry and import-scoped BOMs
+                            // are exported alongside it.
+                            let refs = read_support_refs(&self.store.get_path(&pom_blob))
+                                .unwrap_or_default();
+                            self.enqueue_support_closure(refs, &package.repo_url, &mut queue)
                                 .await?;
-                                units.push(ExportUnit {
-                                    key: pom_key,
-                                    package: pom_pkg,
-                                    blob: pom_blob,
-                                    repo_id: repo_id.clone(),
-                                });
-                            }
-                            None => {
-                                warn!(
-                                    group_id = %package.group_id,
-                                    artifact_id = %package.artifact_id,
-                                    version = %package.version,
-                                    "no POM in store for non-POM artifact; exporting payload only"
-                                );
-                            }
+                            queue.push(ExportUnit {
+                                key: pom_key,
+                                package: pom_pkg,
+                                blob: pom_blob,
+                                source: UnitSource::CompanionPom,
+                                repo_id: repo_id.clone(),
+                                repo_id_recorded: false,
+                            })?;
+                        }
+                        None => {
+                            warn!(
+                                group_id = %package.group_id,
+                                artifact_id = %package.artifact_id,
+                                version = %package.version,
+                                "no POM in store for non-POM artifact; exporting payload only"
+                            );
                         }
                     }
-                } else {
-                    // A lockfile package that is itself a POM still needs its
-                    // parent ancestry materialized for offline builds.
-                    let pom_coord = (
-                        package.group_id.clone(),
-                        package.artifact_id.clone(),
-                        package.version.clone(),
-                    );
-                    enqueued_poms.insert(pom_coord);
-                    let refs = read_support_refs(&self.store.get_path(&blob)).unwrap_or_default();
-                    self.enqueue_support_closure(
-                        refs,
-                        &package.repo_url,
-                        &mut enqueued_poms,
-                        &mut units,
-                    )
-                    .await?;
                 }
-
-                // Queue the lockfile package's own file last so its parent
-                // ancestry (queued above) sits ahead of it. Ordering is
-                // cosmetic for the export but keeps related files adjacent in
-                // the unit list.
-                units.push(ExportUnit {
-                    key,
-                    package: package.clone(),
-                    blob,
-                    repo_id,
-                });
-
-                let accum_key = (
+            } else {
+                // A lockfile package that is itself a POM still needs its
+                // parent ancestry materialized for offline builds.
+                let pom_coord = (
                     package.group_id.clone(),
                     package.artifact_id.clone(),
                     package.version.clone(),
-                    package.packaging.clone(),
-                    package.classifier.clone(),
                 );
-                if accumulated.insert(accum_key) {
-                    self.accumulate_metadata(package, &mut meta);
+                // This package IS the `.pom` at that path, so the row's own
+                // payload pin and its companion-POM pin have to name the same
+                // blob. They are written by two independent observations
+                // during resolution, and `rv sync` and `Lockfile::read` both
+                // reject a disagreement; failing here as well means no export
+                // can silently write the payload while the lockfile claims the
+                // other digest is what was resolved. A classified `.pom` is a
+                // separate file from the coordinate's companion POM and keeps
+                // its own bytes.
+                if package.classifier.as_deref().unwrap_or_default().is_empty()
+                    && let Some(pinned) = self.pom_digests.get(&pom_coord)
+                    && *pinned != blob
+                {
+                    return Err(ExportError::ConflictingPomPackagedPin {
+                        coordinate: format!("{}:{}:{}", pom_coord.0, pom_coord.1, pom_coord.2),
+                        artifact: blob.to_string(),
+                        pom: pinned.to_string(),
+                    });
                 }
+                // The insert may report the coordinate as already queued: this
+                // POM can also be support metadata for another package. That
+                // is fine, `queue.push` below collapses the two into one unit.
+                queue.enqueued_poms.insert(pom_coord);
+                let refs = read_support_refs(&self.store.get_path(&blob)).unwrap_or_default();
+                self.enqueue_support_closure(refs, &package.repo_url, &mut queue)
+                    .await?;
+            }
+
+            // Export order is cosmetic. Queueing the package after its
+            // ancestry only keeps related files adjacent in the unit list;
+            // duplicates are collapsed by key rather than by arrival order.
+            queue.push(ExportUnit {
+                key,
+                package: package.clone(),
+                blob,
+                source: UnitSource::Package,
+                repo_id,
+                repo_id_recorded: false,
+            })?;
+
+            let accum_key = (
+                package.group_id.clone(),
+                package.artifact_id.clone(),
+                package.version.clone(),
+                package.packaging.clone(),
+                package.classifier.clone(),
+            );
+            if accumulated.insert(accum_key) {
+                self.accumulate_metadata(package, &mut meta);
             }
         }
 
@@ -333,7 +581,7 @@ impl<'a> Exporter<'a> {
         // plus the materialized path + repo id so the caller can both update
         // stats and accumulate the `_remote.repositories` markers.
         type UnitResult = (ExportOutcome, PathBuf, String);
-        let outcomes: Vec<Result<UnitResult>> = stream::iter(units.into_iter())
+        let outcomes: Vec<Result<UnitResult>> = stream::iter(queue.units.into_iter())
             .map(|item| async move {
                 let (outcome, dest) = self
                     .export_artifact_async(&item.key, &item.package, &item.blob)
@@ -351,8 +599,14 @@ impl<'a> Exporter<'a> {
             // Record the marker for every materialized file. Maven needs the
             // `_remote.repositories` entry whether we wrote the file just now
             // or skipped an already-identical copy.
+            //
+            // An empty id is the one exception: it is a support POM whose
+            // recorded provenance names a repository without an id, and a
+            // marker line has nowhere to put "unknown". The file is still
+            // exported; only its marker is left out.
             if let (Some(dir), Some(filename)) =
                 (dest.parent(), dest.file_name().and_then(|n| n.to_str()))
+                && !repo_id.is_empty()
             {
                 markers.record(dir, filename, &repo_id);
             }
@@ -383,6 +637,11 @@ impl<'a> Exporter<'a> {
             // pre-baked message. The human-readable summary lives in the
             // log message itself; the raw list rides in the structured
             // `coords` field rather than a comma-joined string.
+            //
+            // Warn after the export rather than before it: the export still
+            // succeeds, and the point of the message is that the `mvn -o`
+            // build these files were written for will look for something this
+            // `~/.m2` cannot hold.
             warn!(
                 count = system_scoped.len(),
                 coords = ?system_scoped,
@@ -502,33 +761,55 @@ impl<'a> Exporter<'a> {
     /// persists this closure during resolution (see
     /// `RepoBackend::persist_support_pom`).
     ///
-    /// Best-effort: a support POM missing from the store is skipped with a
-    /// warning rather than failing the export. An import whose version is a
-    /// property defined only in a parent (not the importing POM) is likewise
-    /// skipped with a warning (see `read_support_refs`); that case almost
-    /// always arrives via a `<parent>` chain, which IS walked.
+    /// A recorded coordinate whose provenance carries a digest is resolved from
+    /// the content-addressed store, not from the coordinate index, and pinned
+    /// bytes that are gone fail the export with
+    /// [`ExportError::MissingPinnedPom`].
+    ///
+    /// A support POM the recorded provenance names but the store does not hold
+    /// fails the export with [`ExportError::MissingSupportPom`]: `rv sync` said
+    /// it fetched that POM, so its absence is a known-incomplete offline
+    /// repository, not a POM Maven will not ask for. Coordinates only inferred
+    /// from POM text stay best-effort and are skipped with a warning, as is an
+    /// import whose version is a property defined only in a parent (not the
+    /// importing POM; see `read_support_refs`) — that case almost always
+    /// arrives via a `<parent>` chain, which IS walked.
+    ///
+    /// A closure larger than [`MAX_SUPPORT_POM_NODES`] unique POMs also fails
+    /// the export outright, for the same reason: the alternative is a `~/.m2`
+    /// that reports success and is missing parents.
+    ///
+    /// Both failures are raised here, during queueing, so nothing has been
+    /// written to `~/.m2` when the export aborts.
     async fn enqueue_support_closure(
         &self,
         initial_refs: Vec<(String, String, String)>,
         repo_url: &str,
-        enqueued: &mut HashSet<(String, String, String)>,
-        units: &mut Vec<ExportUnit>,
+        queue: &mut ExportQueue,
     ) -> Result<()> {
         // Parents form a chain but import BOMs form a tree (a POM can import
         // several BOMs, each with its own parents/imports), so walk a worklist
-        // of coordinates. The dedupe set breaks cycles/sharing; the node cap is
-        // a belt-and-braces guard against malformed input.
-        const MAX_NODES: usize = 512;
-        let mut worklist = initial_refs;
-        let mut processed = 0usize;
-        while let Some((group_id, artifact_id, version)) = worklist.pop() {
-            processed += 1;
-            if processed > MAX_NODES {
-                return Ok(());
-            }
+        // of coordinates. Breadth-first from the caller's seed order, which is
+        // itself deterministic, so the traversal is reproducible run to run.
+        //
+        // The dedupe set breaks cycles and sharing, and it gates the budget:
+        // only a coordinate we have not seen before counts against
+        // `max_support_pom_nodes`, so a parent named by two hundred children
+        // is one node rather than two hundred.
+        let mut worklist: VecDeque<(String, String, String)> = initial_refs.into();
+        while let Some((group_id, artifact_id, version)) = worklist.pop_front() {
             let coord = (group_id.clone(), artifact_id.clone(), version.clone());
-            if !enqueued.insert(coord) {
+            if !queue.enqueued_poms.insert(coord) {
                 continue;
+            }
+            queue.support_nodes += 1;
+            if queue.support_nodes > self.max_support_pom_nodes {
+                // Never return early with a partial closure: the resulting
+                // `~/.m2` would look successful and then fail `mvn -o`.
+                return Err(ExportError::SupportClosureTooLarge {
+                    limit: self.max_support_pom_nodes,
+                    variable: MAX_SUPPORT_POM_NODES_ENV,
+                });
             }
             let key = ArtifactKey::new(
                 group_id.clone(),
@@ -537,7 +818,26 @@ impl<'a> Exporter<'a> {
                 "pom",
                 None,
             );
-            match self.store.lookup_artifact_locked(&key).await? {
+            let coord_key = format!("{group_id}:{artifact_id}:{version}");
+            let recorded = self.support_poms.get(&coord_key);
+            // A recorded digest addresses the blob directly. The store's
+            // coordinate index is last-writer-wins, so a later sync of another
+            // project sharing the store can point `(g, a, v, pom)` at other
+            // bytes; following it would export a POM this lockfile was never
+            // resolved against. Pinned bytes that are gone are fatal, for the
+            // same reason a recorded coordinate missing from the store is.
+            let support_blob = match recorded.and_then(|pin| pin.sha256.as_ref()) {
+                Some(pinned) if self.store.exists_async(pinned).await => Some(pinned.clone()),
+                Some(pinned) => {
+                    return Err(ExportError::MissingPinnedPom {
+                        coordinate: coord_key,
+                        digest: pinned.to_string(),
+                        hint: MISSING_PINNED_POM_HINT,
+                    });
+                }
+                None => self.store.lookup_artifact_locked(&key).await?,
+            };
+            match support_blob {
                 Some(support_blob) => {
                     // Recurse into this support POM's own parents/imports.
                     if let Some(more) = read_support_refs(&self.store.get_path(&support_blob)) {
@@ -545,22 +845,47 @@ impl<'a> Exporter<'a> {
                     }
                     // Prefer this support POM's own recorded source-repo id
                     // (it may differ from the child's repo) over the guessed
-                    // caller `repo_url`.
-                    let coord_key = format!("{group_id}:{artifact_id}:{version}");
-                    let repo_id = self
-                        .support_repo_ids
-                        .get(&coord_key)
-                        .cloned()
+                    // caller `repo_url`. An empty recorded id is provenance
+                    // for a repository that carries no id: it still beats the
+                    // guess, and it carries through to the marker pass as
+                    // "write no `_remote.repositories` entry", since there is
+                    // no id to name and inventing `central` would claim the POM
+                    // came from a repository it did not.
+                    let repo_id_recorded = recorded.is_some();
+                    let repo_id = recorded
+                        .map(|pin| pin.repo_id.clone())
                         .unwrap_or_else(|| self.repo_id_for(repo_url));
                     let pkg = synthetic_pom_package(&group_id, &artifact_id, &version, repo_url);
-                    units.push(ExportUnit {
+                    queue.push(ExportUnit {
                         key,
                         package: pkg,
                         blob: support_blob,
+                        source: UnitSource::SupportPom,
                         repo_id,
-                    });
+                        repo_id_recorded,
+                    })?;
                 }
                 None => {
+                    // Two different kinds of miss share this branch. A
+                    // coordinate carried by the recorded provenance is one
+                    // `rv sync` says it fetched: its absence means the
+                    // content-store write was lost, and exporting anyway
+                    // produces a `~/.m2` that reports success and then fails
+                    // `mvn -o` on a non-resolvable parent/import POM. That is
+                    // the same incomplete-repository condition the node budget
+                    // treats as fatal, so treat it the same way — and do it
+                    // here, in the queueing pass, before any file is
+                    // materialized. A coordinate merely *inferred* from POM
+                    // text stays best-effort: `read_support_refs` can name
+                    // POMs that were never fetched because no active profile
+                    // needed them, and failing on those would break exports
+                    // that build fine offline.
+                    if recorded.is_some() {
+                        return Err(ExportError::MissingSupportPom {
+                            coordinate: coord_key,
+                            hint: MISSING_SUPPORT_POM_HINT,
+                        });
+                    }
                     warn!(
                         group_id = %group_id,
                         artifact_id = %artifact_id,
@@ -571,6 +896,39 @@ impl<'a> Exporter<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve the companion POM to export for one artifact coordinate.
+    ///
+    /// When the lockfile pins a digest, the blob is addressed by that digest
+    /// and the store's coordinate index is not consulted at all: the index is
+    /// last-writer-wins, so a later sync of a different project sharing the
+    /// store can have repointed `(g, a, v, pom)` at other bytes, and following
+    /// it would export a POM this lockfile was never resolved against. A pin
+    /// whose bytes are gone is fatal — the alternative is exporting the
+    /// replacement, silently.
+    ///
+    /// Without a pin (a lockfile written before the digest existed, or a
+    /// coordinate whose POM the store did not hold at sync time) the lookup
+    /// falls back to the index, unpinned, exactly as it behaved before.
+    async fn companion_pom_blob(
+        &self,
+        pom_key: &ArtifactKey,
+        pom_coord: &(String, String, String),
+    ) -> Result<Option<BlobId>> {
+        let Some(pinned) = self.pom_digests.get(pom_coord) else {
+            // Use the locked variant so a concurrent GC sweep cannot delete
+            // the blob between the index hit and the downstream open.
+            return Ok(self.store.lookup_artifact_locked(pom_key).await?);
+        };
+        if self.store.exists_async(pinned).await {
+            return Ok(Some(pinned.clone()));
+        }
+        Err(ExportError::MissingPinnedPom {
+            coordinate: format!("{}:{}:{}", pom_coord.0, pom_coord.1, pom_coord.2),
+            digest: pinned.to_string(),
+            hint: MISSING_PINNED_POM_HINT,
+        })
     }
 
     async fn blob_id_for_package(
@@ -618,6 +976,38 @@ impl<'a> Exporter<'a> {
     fn safe_artifact_path(&self, key: &ArtifactKey, package: &LockPackage) -> Result<PathBuf> {
         safe_artifact_path(&self.options, key, package)
     }
+}
+
+/// Collect the `"g:a:v"` of every system-scoped dependency the lock records,
+/// deduplicated and ordered so one lock always warns about the same list.
+///
+/// A `systemPath` dependency resolves from an absolute path on the building
+/// machine, so `rv sync` puts no bytes in the content store for it and writes
+/// it no `artifacts[]` row (`Lockfile::read` rejects a lock that gives one
+/// both). The per-module package graphs are therefore the only place the lock
+/// records these coordinates at all, and the only place export can see them:
+/// the aggregate view it otherwise works from is built from artifact rows, and
+/// `LockArtifact::as_package` has no system path to carry.
+///
+/// This covers legacy locks too — the schema adapter routes their flat package
+/// list through the same module packages, `system_path` included.
+fn system_scoped_coordinates(lock: &Lockfile) -> Vec<String> {
+    let mut coords = BTreeSet::new();
+    for platform in &lock.platforms {
+        for module in &platform.modules {
+            for package in &module.packages {
+                if package.system_path.is_some() {
+                    coords.insert(format!(
+                        "{}:{}:{}",
+                        package.coordinate.group,
+                        package.coordinate.artifact,
+                        package.coordinate.version
+                    ));
+                }
+            }
+        }
+    }
+    coords.into_iter().collect()
 }
 
 /// Blocking sister of `write_metadata`: writes every accumulated
@@ -1573,13 +1963,48 @@ fn set_artifact_perms(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::super::error::ExportError;
     use super::super::link::LinkStrategy;
-    use super::{ExportOptions, Exporter, lexical_normalize};
-    use rv_config::{Checksum, LockPackage, LockPlatform, Lockfile, Platform};
+    use super::{ExportOptions, Exporter, SupportPomPin, lexical_normalize};
+    use rv_config::{BlobId, Checksum, LockGav, LockPackage, LockPlatform, Lockfile, Platform};
     use rv_store::{ArtifactKey, Store};
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    /// Support-POM provenance with no recorded digest: what a lockfile written
+    /// before the digest existed carries, and the path that still resolves the
+    /// POM through the store's coordinate index.
+    fn unpinned_support(repo_id: &str) -> SupportPomPin {
+        SupportPomPin {
+            repo_id: repo_id.to_string(),
+            sha256: None,
+        }
+    }
+
+    /// Support-POM provenance pinning `bytes`, as a lockfile written by a
+    /// current `rv sync` carries it.
+    fn pinned_support(repo_id: &str, bytes: &[u8]) -> SupportPomPin {
+        SupportPomPin {
+            repo_id: repo_id.to_string(),
+            sha256: Some(BlobId::from_bytes(bytes)),
+        }
+    }
+
+    fn test_platform(platform: Platform, package: LockPackage) -> LockPlatform {
+        test_platform_packages(platform, vec![package])
+    }
+
+    fn test_platform_packages(platform: Platform, packages: Vec<LockPackage>) -> LockPlatform {
+        LockPlatform::single_module(
+            platform,
+            "",
+            "pom.xml",
+            LockGav::new("com.example", "root", "1"),
+            "pom",
+            packages,
+            Vec::new(),
+        )
+    }
 
     /// Regression: a path that lexically contains `..` segments
     /// must be collapsed before the containment check runs, otherwise
@@ -1659,9 +2084,9 @@ mod tests {
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "shared".to_string(),
                 version: "1.0.0".to_string(),
@@ -1677,10 +2102,8 @@ mod tests {
                 system_path: None,
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
-            }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let options = ExportOptions {
@@ -1718,9 +2141,9 @@ mod tests {
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "shared".to_string(),
                 version: "1.0.0".to_string(),
@@ -1732,10 +2155,8 @@ mod tests {
                 system_path: None,
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
-            }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let options = ExportOptions {
@@ -1799,9 +2220,9 @@ mod tests {
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -1813,10 +2234,8 @@ mod tests {
                 system_path: None,
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
-            }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let options = ExportOptions {
@@ -1876,9 +2295,9 @@ mod tests {
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -1890,10 +2309,8 @@ mod tests {
                 system_path: None,
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
-            }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let options = ExportOptions {
@@ -2094,9 +2511,9 @@ mod tests {
             .unwrap();
 
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
-            platform: Platform::new("linux", "x86_64").unwrap(),
-            packages: vec![LockPackage {
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").unwrap(),
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "child".to_string(),
                 version: "1.0".to_string(),
@@ -2108,10 +2525,8 @@ mod tests {
                 system_path: None,
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
-            }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().unwrap();
         let m2 = m2_dir.path().join("repository");
@@ -2128,12 +2543,12 @@ mod tests {
         let mut support = HashMap::new();
         support.insert(
             "com.example:theparent:2.0".to_string(),
-            "repo-b".to_string(),
+            unpinned_support("repo-b"),
         );
 
         let exporter = Exporter::new(options, &store)
             .with_repo_ids(repo_ids)
-            .with_support_repo_ids(support);
+            .with_support_poms(support);
         exporter.export_lock(&lock, None).await.expect("export");
 
         let parent_marker = m2.join("com/example/theparent/2.0/_remote.repositories");
@@ -2177,9 +2592,9 @@ mod tests {
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "foo".to_string(),
                 version: timestamped.to_string(),
@@ -2191,10 +2606,8 @@ mod tests {
                 system_path: None,
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
-            }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -2286,9 +2699,9 @@ mod tests {
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "2.0.0".to_string(),
@@ -2300,10 +2713,8 @@ mod tests {
                 system_path: None,
                 direct_scope: None,
                 extra: std::collections::BTreeMap::new(),
-            }],
-            edges: vec![],
-            extra: std::collections::BTreeMap::new(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -2542,9 +2953,9 @@ digest = "{}"
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -2556,10 +2967,8 @@ digest = "{}"
                 system_path: None,
                 direct_scope: None,
                 extra: Default::default(),
-            }],
-            edges: vec![],
-            extra: Default::default(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -2639,9 +3048,9 @@ digest = "{}"
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -2653,10 +3062,8 @@ digest = "{}"
                 system_path: None,
                 direct_scope: None,
                 extra: Default::default(),
-            }],
-            edges: vec![],
-            extra: Default::default(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -2702,9 +3109,9 @@ its format can be changed without prior notice."
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -2716,10 +3123,8 @@ its format can be changed without prior notice."
                 system_path: None,
                 direct_scope: None,
                 extra: Default::default(),
-            }],
-            edges: vec![],
-            extra: Default::default(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -2764,9 +3169,9 @@ its format can be changed without prior notice."
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -2778,10 +3183,8 @@ its format can be changed without prior notice."
                 system_path: None,
                 direct_scope: None,
                 extra: Default::default(),
-            }],
-            edges: vec![],
-            extra: Default::default(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -2867,9 +3270,9 @@ its format can be changed without prior notice."
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -2881,10 +3284,8 @@ its format can be changed without prior notice."
                 system_path: None,
                 direct_scope: None,
                 extra: Default::default(),
-            }],
-            edges: vec![],
-            extra: Default::default(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -3003,9 +3404,9 @@ its format can be changed without prior notice."
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "mid".to_string(),
                 version: "1.0".to_string(),
@@ -3017,19 +3418,20 @@ its format can be changed without prior notice."
                 system_path: None,
                 direct_scope: None,
                 extra: Default::default(),
-            }],
-            edges: vec![],
-            extra: Default::default(),
-        }];
+            },
+        )];
 
         // Provenance `rv sync` records for the support POMs it fetched during
         // resolution (parent + import BOM), keyed on bare `g:a:v`.
         let mut support = HashMap::new();
         support.insert(
             "com.example:mid-parent:1.0".to_string(),
-            "central".to_string(),
+            unpinned_support("central"),
         );
-        support.insert("com.example:the-bom:2.0".to_string(), "central".to_string());
+        support.insert(
+            "com.example:the-bom:2.0".to_string(),
+            unpinned_support("central"),
+        );
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -3039,7 +3441,7 @@ its format can be changed without prior notice."
             link_strategy: LinkStrategy::Copy,
             m2_path: m2.clone(),
         };
-        let exporter = Exporter::new(options, &store).with_support_repo_ids(support);
+        let exporter = Exporter::new(options, &store).with_support_poms(support);
         exporter.export_lock(&lock, None).await.expect("export");
 
         // The import BOM must be materialized even though its version was a
@@ -3109,9 +3511,9 @@ its format can be changed without prior notice."
 
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let mut lock = Lockfile::new();
-        lock.platforms = vec![LockPlatform {
+        lock.platforms = vec![test_platform(
             platform,
-            packages: vec![LockPackage {
+            LockPackage {
                 group_id: "com.example".to_string(),
                 artifact_id: "demo".to_string(),
                 version: "1.0.0".to_string(),
@@ -3123,10 +3525,8 @@ its format can be changed without prior notice."
                 system_path: None,
                 direct_scope: None,
                 extra: Default::default(),
-            }],
-            edges: vec![],
-            extra: Default::default(),
-        }];
+            },
+        )];
 
         let m2_dir = tempdir().expect("m2 dir");
         let m2 = m2_dir.path().join("repository");
@@ -3150,6 +3550,1527 @@ its format can be changed without prior notice."
             .join("1.0.0")
             .join("demo-1.0.0.jar");
         assert!(jar.exists());
+    }
+
+    #[test]
+    fn support_pom_node_limit_override_ignores_unusable_values() {
+        assert_eq!(
+            super::parse_max_support_pom_nodes(None),
+            super::MAX_SUPPORT_POM_NODES
+        );
+        assert_eq!(super::parse_max_support_pom_nodes(Some(" 64 ")), 64);
+        // A zero or unparseable override must not shrink the closure.
+        assert_eq!(
+            super::parse_max_support_pom_nodes(Some("0")),
+            super::MAX_SUPPORT_POM_NODES
+        );
+        assert_eq!(
+            super::parse_max_support_pom_nodes(Some("lots")),
+            super::MAX_SUPPORT_POM_NODES
+        );
+    }
+
+    /// Render import-scoped `<dependency>` entries for `com.example:bomN:1.0`.
+    fn import_block(indices: impl Iterator<Item = usize>) -> String {
+        indices
+            .map(|i| {
+                format!(
+                    "<dependency><groupId>com.example</groupId><artifactId>bom{i}</artifactId>\
+<version>1.0</version><type>pom</type><scope>import</scope></dependency>"
+                )
+            })
+            .collect()
+    }
+
+    /// Store `com.example:bomN:1.0` POMs, each importing the BOMs named by
+    /// `imports_for`, so a closure walk can be given an arbitrary shape.
+    async fn store_boms(
+        store: &Store,
+        count: usize,
+        imports_for: impl Fn(usize) -> String,
+    ) -> Vec<Vec<u8>> {
+        let mut bodies = Vec::new();
+        for i in 0..count {
+            let body = format!(
+                "<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>bom{i}</artifactId><version>1.0</version>\
+<packaging>pom</packaging>\
+<dependencyManagement><dependencies>{}</dependencies></dependencyManagement></project>",
+                imports_for(i)
+            );
+            let id = store.put_bytes(body.as_bytes()).await.expect("bom pom");
+            store
+                .add_artifact(
+                    &ArtifactKey::new("com.example", format!("bom{i}"), "1.0", "pom", None),
+                    &id,
+                )
+                .await
+                .expect("index bom pom");
+            bodies.push(body.into_bytes());
+        }
+        bodies
+    }
+
+    /// Store `com.example:app:1.0` (jar + POM) where the POM imports every BOM
+    /// in `0..bom_count`, and return the matching single-package lockfile.
+    async fn app_lock_importing_boms(store: &Store, bom_count: usize) -> Lockfile {
+        let jar_id = store.put_bytes(b"app-jar").await.expect("jar");
+        let app_pom = format!(
+            "<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version>\
+<dependencyManagement><dependencies>{}</dependencies></dependencyManagement></project>",
+            import_block(0..bom_count)
+        );
+        let app_pom_id = store.put_bytes(app_pom.as_bytes()).await.expect("app pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "jar", None),
+                &jar_id,
+            )
+            .await
+            .expect("index jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "pom", None),
+                &app_pom_id,
+            )
+            .await
+            .expect("index app pom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "app".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "jar".to_string(),
+                classifier: None,
+                repo_url: "https://repo1.maven.org/maven2/".to_string(),
+                checksum: Some(Checksum::new("sha256", jar_id.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+        lock
+    }
+
+    async fn export_with_limit(
+        store: &Store,
+        lock: &Lockfile,
+        m2: &std::path::Path,
+        limit: usize,
+    ) -> super::Result<super::ExportStats> {
+        let options = ExportOptions {
+            dry_run: false,
+            overwrite: false,
+            link_strategy: LinkStrategy::Copy,
+            m2_path: m2.to_path_buf(),
+        };
+        Exporter::new(options, store)
+            .with_max_support_pom_nodes(limit)
+            .export_lock(lock, None)
+            .await
+    }
+
+    /// A breadth-heavy support closure that exceeds the unique-node limit must
+    /// fail with an actionable error instead of returning success on a
+    /// truncated closure. A short export writes a `~/.m2` that looks complete
+    /// and then breaks `mvn -o` on a parent or BOM that never got written,
+    /// with nothing pointing back at the export that dropped it.
+    #[tokio::test]
+    async fn support_closure_over_node_limit_errors_instead_of_truncating() {
+        const BOMS: usize = 12;
+        const LIMIT: usize = 8;
+
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        store_boms(&store, BOMS, |_| String::new()).await;
+        let lock = app_lock_importing_boms(&store, BOMS).await;
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let err = export_with_limit(&store, &lock, &m2, LIMIT)
+            .await
+            .expect_err("an over-limit closure must not report success");
+
+        assert!(
+            matches!(err, ExportError::SupportClosureTooLarge { .. }),
+            "expected SupportClosureTooLarge, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&LIMIT.to_string()) && msg.contains(super::MAX_SUPPORT_POM_NODES_ENV),
+            "error must name the limit and how to raise it, got: {msg}"
+        );
+
+        // The failure happens while queueing, before anything is materialized,
+        // so no half-populated repository is left behind.
+        assert!(
+            !m2.join("com/example/app/1.0/app-1.0.jar").exists(),
+            "a failed export must not leave artifacts behind"
+        );
+    }
+
+    /// A support POM the lockfile's recorded provenance names but the store
+    /// does not hold is the same incomplete-repository condition as an
+    /// over-limit closure: `rv sync` reported it fetched that parent/BOM, so
+    /// its absence means the content-store write was lost. Exiting 0 here ships
+    /// a `~/.m2` that fails `mvn -o` with a non-resolvable parent/import POM,
+    /// so it must be a typed error raised before anything is materialized.
+    #[tokio::test]
+    async fn missing_recorded_support_pom_errors_before_writing() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        // No BOMs stored and none imported: the only support-POM coordinate in
+        // play is the one the provenance names, which was never persisted.
+        let lock = app_lock_importing_boms(&store, 0).await;
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let options = ExportOptions {
+            dry_run: false,
+            overwrite: false,
+            link_strategy: LinkStrategy::Copy,
+            m2_path: m2.clone(),
+        };
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:lost-parent:4.0".to_string(),
+            unpinned_support("central"),
+        );
+
+        let err = Exporter::new(options, &store)
+            .with_support_poms(support)
+            .export_lock(&lock, None)
+            .await
+            .expect_err("a recorded support POM missing from the store must not report success");
+
+        match &err {
+            ExportError::MissingSupportPom { coordinate, .. } => {
+                assert_eq!(coordinate, "com.example:lost-parent:4.0");
+            }
+            other => panic!("expected MissingSupportPom, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("com.example:lost-parent:4.0") && msg.contains("rv sync"),
+            "error must name the coordinate and the repair, got: {msg}"
+        );
+        assert!(
+            msg.contains("--frozen"),
+            "the hint must steer away from a frozen sync, which does not repopulate, got: {msg}"
+        );
+
+        assert!(
+            !m2.join("com/example/app/1.0/app-1.0.jar").exists(),
+            "a failed export must not leave artifacts behind"
+        );
+        assert!(
+            !m2.exists(),
+            "nothing at all should be materialized, found {m2:?}"
+        );
+    }
+
+    /// Two sets of bytes under one `(g, a, v, pom)` coordinate: the ones this
+    /// lockfile was resolved against, and the ones a later sync of a different
+    /// project (or a sibling reactor module) wrote afterwards. The store's
+    /// coordinate index keeps only the last writer, so an index lookup answers
+    /// with the replacement.
+    ///
+    /// The recorded digest is what makes the difference: pinned, the export
+    /// ships the bytes the lockfile names; unpinned (an older lockfile), it
+    /// ships whatever the index now points at.
+    #[tokio::test]
+    async fn pinned_support_pom_beats_a_repointed_coordinate_index() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let lock = app_lock_importing_boms(&store, 0).await;
+
+        let ours = b"<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>theparent</artifactId><version>2.0</version></project>";
+        let theirs = b"<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>theparent</artifactId><version>2.0</version><packaging>pom</packaging></project>";
+        let parent_key = ArtifactKey::new("com.example", "theparent", "2.0", "pom", None);
+        for bytes in [ours.as_slice(), theirs.as_slice()] {
+            let blob = store.put_bytes(bytes).await.expect("put parent pom");
+            store
+                .add_artifact(&parent_key, &blob)
+                .await
+                .expect("index parent pom");
+        }
+
+        let exported_pom = |m2: &std::path::Path| {
+            fs::read(m2.join("com/example/theparent/2.0/theparent-2.0.pom")).expect("parent pom")
+        };
+        let export_to = |m2: PathBuf, pin: SupportPomPin| {
+            let store = &store;
+            let lock = &lock;
+            async move {
+                let mut support = HashMap::new();
+                support.insert("com.example:theparent:2.0".to_string(), pin);
+                Exporter::new(
+                    ExportOptions {
+                        dry_run: false,
+                        overwrite: false,
+                        link_strategy: LinkStrategy::Copy,
+                        m2_path: m2,
+                    },
+                    store,
+                )
+                .with_support_poms(support)
+                .export_lock(lock, None)
+                .await
+                .expect("export");
+            }
+        };
+
+        let pinned_dir = tempdir().expect("m2 dir");
+        let pinned_m2 = pinned_dir.path().join("repository");
+        export_to(pinned_m2.clone(), pinned_support("central", ours)).await;
+        assert_eq!(
+            exported_pom(&pinned_m2),
+            ours,
+            "a pinned support POM must be exported from the recorded bytes, \
+             not from whatever the coordinate index points at now"
+        );
+
+        let unpinned_dir = tempdir().expect("m2 dir");
+        let unpinned_m2 = unpinned_dir.path().join("repository");
+        export_to(unpinned_m2.clone(), unpinned_support("central")).await;
+        assert_eq!(
+            exported_pom(&unpinned_m2),
+            theirs,
+            "without a digest the export still follows the index, which is the \
+             pre-schema-4 behaviour a lockfile without the field keeps"
+        );
+    }
+
+    /// A pinned support POM whose bytes are gone (pruned, or never written on
+    /// this machine) must fail typed instead of falling back to the coordinate
+    /// index: the index answer is exactly the substituted POM the pin exists to
+    /// refuse.
+    #[tokio::test]
+    async fn missing_pinned_support_pom_errors_before_writing() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let lock = app_lock_importing_boms(&store, 0).await;
+
+        let substitute =
+            b"<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>theparent</artifactId><version>2.0</version></project>";
+        let blob = store.put_bytes(substitute).await.expect("put");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "theparent", "2.0", "pom", None),
+                &blob,
+            )
+            .await
+            .expect("index");
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:theparent:2.0".to_string(),
+            pinned_support("central", b"the bytes rv sync recorded"),
+        );
+
+        let err = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_support_poms(support)
+        .export_lock(&lock, None)
+        .await
+        .expect_err("pinned bytes missing from the store must fail the export");
+
+        match &err {
+            ExportError::MissingPinnedPom {
+                coordinate, digest, ..
+            } => {
+                assert_eq!(coordinate, "com.example:theparent:2.0");
+                assert_eq!(
+                    digest,
+                    &BlobId::from_bytes(b"the bytes rv sync recorded").to_string()
+                );
+            }
+            other => panic!("expected MissingPinnedPom, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("com.example:theparent:2.0") && msg.contains("rv sync"),
+            "error must name the coordinate and the repair, got: {msg}"
+        );
+        assert!(!m2.exists(), "nothing should be materialized, found {m2:?}");
+    }
+
+    /// The same guarantee for a companion POM, which is pinned by its artifact
+    /// row's `pom_sha256` rather than by the support-POM provenance.
+    #[tokio::test]
+    async fn pinned_companion_pom_beats_a_repointed_coordinate_index() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let jar = store.put_bytes(b"app-jar").await.expect("jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+
+        let ours = b"<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>app</artifactId><version>1.0</version></project>";
+        let theirs = b"<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>app</artifactId><version>1.0</version><name>replaced</name></project>";
+        let pom_key = ArtifactKey::new("com.example", "app", "1.0", "pom", None);
+        for bytes in [ours.as_slice(), theirs.as_slice()] {
+            let blob = store.put_bytes(bytes).await.expect("put app pom");
+            store
+                .add_artifact(&pom_key, &blob)
+                .await
+                .expect("index app pom");
+        }
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "app".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "jar".to_string(),
+                classifier: None,
+                repo_url: "https://repo1.maven.org/maven2/".to_string(),
+                checksum: Some(Checksum::new("sha256", jar.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut digests = HashMap::new();
+        digests.insert(
+            (
+                "com.example".to_string(),
+                "app".to_string(),
+                "1.0".to_string(),
+            ),
+            BlobId::from_bytes(ours),
+        );
+        Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_pom_digests(digests)
+        .export_lock(&lock, None)
+        .await
+        .expect("export");
+
+        assert_eq!(
+            fs::read(m2.join("com/example/app/1.0/app-1.0.pom")).expect("app pom"),
+            ours,
+            "the companion POM must come from the digest the artifact row pins"
+        );
+    }
+
+    /// A `packaging = "pom"` row is exported as its own primary artifact, so
+    /// its payload pin and its `pom_sha256` name one file. A lockfile carrying
+    /// two digests for it would have the export write the payload while
+    /// claiming the other digest was resolved; export must refuse instead of
+    /// picking the one it happens to read first.
+    #[tokio::test]
+    async fn pom_packaged_row_with_two_pins_fails_before_writing() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let payload = b"<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>bom</artifactId><version>1.0</version><packaging>pom</packaging></project>";
+        let blob = store.put_bytes(payload).await.expect("put bom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "bom", "1.0", "pom", None),
+                &blob,
+            )
+            .await
+            .expect("index bom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "bom".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "pom".to_string(),
+                classifier: None,
+                repo_url: "https://repo1.maven.org/maven2/".to_string(),
+                checksum: Some(Checksum::new("sha256", blob.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut digests = HashMap::new();
+        digests.insert(
+            (
+                "com.example".to_string(),
+                "bom".to_string(),
+                "1.0".to_string(),
+            ),
+            BlobId::from_bytes(b"a different pom entirely"),
+        );
+
+        let err = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_pom_digests(digests)
+        .export_lock(&lock, None)
+        .await
+        .expect_err("a pom package cannot pin two different files");
+
+        assert!(
+            matches!(&err, ExportError::ConflictingPomPackagedPin { coordinate, .. }
+                if coordinate == "com.example:bom:1.0"),
+            "expected ConflictingPomPackagedPin, got {err:?}"
+        );
+        assert!(!m2.exists(), "nothing should be materialized, found {m2:?}");
+    }
+
+    /// Negative control: one digest in both fields is the healthy shape and
+    /// exports the pom-packaged artifact normally.
+    #[tokio::test]
+    async fn pom_packaged_row_with_agreeing_pins_exports() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let payload = b"<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>bom</artifactId><version>1.0</version><packaging>pom</packaging></project>";
+        let blob = store.put_bytes(payload).await.expect("put bom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "bom", "1.0", "pom", None),
+                &blob,
+            )
+            .await
+            .expect("index bom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "bom".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "pom".to_string(),
+                classifier: None,
+                repo_url: "https://repo1.maven.org/maven2/".to_string(),
+                checksum: Some(Checksum::new("sha256", blob.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut digests = HashMap::new();
+        digests.insert(
+            (
+                "com.example".to_string(),
+                "bom".to_string(),
+                "1.0".to_string(),
+            ),
+            blob.clone(),
+        );
+
+        Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_pom_digests(digests)
+        .export_lock(&lock, None)
+        .await
+        .expect("export");
+
+        assert_eq!(
+            fs::read(m2.join("com/example/bom/1.0/bom-1.0.pom")).expect("bom pom"),
+            payload,
+            "the pom-packaged artifact must be materialized from its own bytes"
+        );
+    }
+
+    /// A companion POM pinned to bytes the store no longer holds is fatal, for
+    /// the same reason the support-POM case is: the index would answer with the
+    /// substitute, and shipping it silently is the bug.
+    #[tokio::test]
+    async fn missing_pinned_companion_pom_errors_before_writing() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let lock = app_lock_importing_boms(&store, 0).await;
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut digests = HashMap::new();
+        digests.insert(
+            (
+                "com.example".to_string(),
+                "app".to_string(),
+                "1.0".to_string(),
+            ),
+            BlobId::from_bytes(b"the app pom rv sync recorded"),
+        );
+
+        let err = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_pom_digests(digests)
+        .export_lock(&lock, None)
+        .await
+        .expect_err("pinned companion bytes missing from the store must fail the export");
+
+        assert!(
+            matches!(&err, ExportError::MissingPinnedPom { coordinate, .. }
+                if coordinate == "com.example:app:1.0"),
+            "expected MissingPinnedPom for the companion POM, got {err:?}"
+        );
+        assert!(!m2.exists(), "nothing should be materialized, found {m2:?}");
+    }
+
+    /// The corollary that keeps the new error narrow: a support-POM coordinate
+    /// only *inferred* from POM text is still best-effort. `read_support_refs`
+    /// names imports and parents that resolution may never have fetched (a
+    /// profile that was not active, say), and failing on those would break
+    /// exports whose offline build is fine.
+    #[tokio::test]
+    async fn missing_inferred_support_pom_still_warns_and_exports() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        // The app POM imports bom0, but bom0 was never stored and no
+        // provenance vouches for it.
+        let lock = app_lock_importing_boms(&store, 1).await;
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let options = ExportOptions {
+            dry_run: false,
+            overwrite: false,
+            link_strategy: LinkStrategy::Copy,
+            m2_path: m2.clone(),
+        };
+        let stats = Exporter::new(options, &store)
+            .export_lock(&lock, None)
+            .await
+            .expect("an inferred-only miss must stay best-effort");
+
+        assert_eq!(stats.exported_count, 2, "app jar + app pom, got {stats:?}");
+        assert!(m2.join("com/example/app/1.0/app-1.0.jar").exists());
+    }
+
+    /// A support POM served by a repository that declares no `<id>` is recorded
+    /// with an empty id, which has to mean two things at once: the coordinate
+    /// counts as provenance (its absence from the store fails the export, the
+    /// same as any other recorded support POM), and there is no repository id
+    /// to name, so the POM gets no `_remote.repositories` marker rather than a
+    /// fabricated `central` one.
+    #[tokio::test]
+    async fn idless_repo_support_pom_is_recorded_but_gets_no_marker() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+
+        let child_pom: &[u8] = br#"<project><modelVersion>4.0.0</modelVersion>
+            <parent><groupId>com.example</groupId><artifactId>theparent</artifactId><version>2.0</version></parent>
+            <artifactId>child</artifactId></project>"#;
+        let parent_pom: &[u8] = br#"<project><modelVersion>4.0.0</modelVersion>
+            <groupId>com.example</groupId><artifactId>theparent</artifactId><version>2.0</version><packaging>pom</packaging></project>"#;
+        let jar_id = store.put_bytes(b"child-jar").await.expect("jar");
+        let child_pom_id = store.put_bytes(child_pom).await.expect("child pom");
+        let parent_pom_id = store.put_bytes(parent_pom).await.expect("parent pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "child", "1.0", "jar", None),
+                &jar_id,
+            )
+            .await
+            .unwrap();
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "child", "1.0", "pom", None),
+                &child_pom_id,
+            )
+            .await
+            .unwrap();
+        let parent_key = ArtifactKey::new("com.example", "theparent", "2.0", "pom", None);
+        store
+            .add_artifact(&parent_key, &parent_pom_id)
+            .await
+            .unwrap();
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").unwrap(),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "child".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "jar".to_string(),
+                classifier: None,
+                repo_url: "https://repo-a.example/".to_string(),
+                checksum: Some(Checksum::new("sha256", jar_id.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: std::collections::BTreeMap::new(),
+            },
+        )];
+
+        let mut repo_ids = HashMap::new();
+        repo_ids.insert("https://repo-a.example/".to_string(), "repo-a".to_string());
+        // The parent came from an id-less repository: coordinate recorded,
+        // empty id.
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:theparent:2.0".to_string(),
+            unpinned_support(""),
+        );
+
+        let m2_dir = tempdir().unwrap();
+        let m2 = m2_dir.path().join("repository");
+        let options = ExportOptions {
+            dry_run: false,
+            overwrite: false,
+            link_strategy: LinkStrategy::Copy,
+            m2_path: m2.clone(),
+        };
+        Exporter::new(options, &store)
+            .with_repo_ids(repo_ids.clone())
+            .with_support_poms(support.clone())
+            .export_lock(&lock, None)
+            .await
+            .expect("export");
+
+        assert!(
+            m2.join("com/example/theparent/2.0/theparent-2.0.pom")
+                .exists(),
+            "the support POM itself must still be materialized"
+        );
+        assert!(
+            !m2.join("com/example/theparent/2.0/_remote.repositories")
+                .exists(),
+            "an id-less repository has no id to write into a marker"
+        );
+        let child_marker =
+            fs::read_to_string(m2.join("com/example/child/1.0/_remote.repositories"))
+                .expect("child marker");
+        assert!(
+            child_marker.contains(">repo-a="),
+            "packages with a known repo id keep their markers, got: {child_marker}"
+        );
+
+        // Same provenance, but the POM is gone from the store: the empty id
+        // must not exempt the coordinate from the completeness check.
+        store
+            .remove_artifact(&parent_key)
+            .await
+            .expect("drop the support POM");
+        let second_m2_dir = tempdir().unwrap();
+        let second_m2 = second_m2_dir.path().join("repository");
+        let err = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: second_m2.clone(),
+            },
+            &store,
+        )
+        .with_repo_ids(repo_ids)
+        .with_support_poms(support)
+        .export_lock(&lock, None)
+        .await
+        .expect_err("a recorded id-less support POM missing from the store must fail the export");
+
+        match &err {
+            ExportError::MissingSupportPom { coordinate, .. } => {
+                assert_eq!(coordinate, "com.example:theparent:2.0");
+            }
+            other => panic!("expected MissingSupportPom, got {other:?}"),
+        }
+        assert!(
+            !second_m2.exists(),
+            "the failed export must not materialize anything"
+        );
+    }
+
+    /// The budget counts unique nodes, not worklist entries.
+    ///
+    /// `bom0..bom3` cross-reference each other and all name `bom4`, so the walk
+    /// pops eight re-references before it ever reaches `bom4`: five unique
+    /// nodes out of twenty references. A budget of five must export all five.
+    /// Counting references instead runs out mid-traversal, and which node falls
+    /// off the end is decided by how often the others happened to be named.
+    #[tokio::test]
+    async fn support_closure_budget_counts_unique_nodes_not_references() {
+        // bom0..bom(SEEDED-1) are seeded from the app POM; bom(BOMS-1) is only
+        // reachable through them, so it is the last unique node reached.
+        const BOMS: usize = 5;
+        const SEEDED: usize = 4;
+
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let bodies = store_boms(&store, BOMS, |i| {
+            if i == BOMS - 1 {
+                String::new()
+            } else {
+                import_block((0..BOMS).filter(move |j| *j != i))
+            }
+        })
+        .await;
+        let lock = app_lock_importing_boms(&store, SEEDED).await;
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        export_with_limit(&store, &lock, &m2, BOMS)
+            .await
+            .expect("a closure of exactly BOMS unique nodes must fit the budget");
+        for (i, body) in bodies.iter().enumerate() {
+            let pom = m2.join(format!("com/example/bom{i}/1.0/bom{i}-1.0.pom"));
+            assert!(pom.exists(), "bom{i} must be exported at {pom:?}");
+            assert_eq!(&fs::read(&pom).expect("read bom"), body);
+        }
+
+        let tight_dir = tempdir().expect("m2 dir");
+        let err = export_with_limit(
+            &store,
+            &lock,
+            &tight_dir.path().join("repository"),
+            BOMS - 1,
+        )
+        .await
+        .expect_err("one node over budget must fail");
+        assert!(
+            matches!(err, ExportError::SupportClosureTooLarge { .. }),
+            "expected SupportClosureTooLarge, got {err:?}"
+        );
+    }
+
+    /// A POM that is both support metadata and an explicit lockfile package
+    /// must be exported exactly once. Two units for one coordinate resolve to
+    /// the same destination, so they used to race through `buffer_unordered`:
+    /// the file written twice, the stats doubled, and the
+    /// `_remote.repositories` marker decided by whichever finished last. The
+    /// surviving unit must carry the recorded support-POM repository id, not
+    /// the one derived from the lockfile `repo_url`.
+    #[tokio::test]
+    async fn dual_role_pom_exports_once_with_recorded_repo_id() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+
+        let the_bom_pom: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>the-bom</artifactId><version>2.0</version>\
+<packaging>pom</packaging></project>";
+        // The consumer imports the same BOM that the lockfile also pins
+        // directly, so the coordinate is reached twice: once by the closure
+        // walk and once by the package loop.
+        let consumer_pom: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>consumer</artifactId><version>1.0</version>\
+<dependencyManagement><dependencies>\
+<dependency><groupId>com.example</groupId><artifactId>the-bom</artifactId>\
+<version>2.0</version><type>pom</type><scope>import</scope></dependency>\
+</dependencies></dependencyManagement></project>";
+
+        let jar_id = store.put_bytes(b"consumer-jar").await.expect("jar");
+        let consumer_pom_id = store.put_bytes(consumer_pom).await.expect("consumer pom");
+        let the_bom_pom_id = store.put_bytes(the_bom_pom).await.expect("bom pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "consumer", "1.0", "jar", None),
+                &jar_id,
+            )
+            .await
+            .expect("index jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "consumer", "1.0", "pom", None),
+                &consumer_pom_id,
+            )
+            .await
+            .expect("index consumer pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "the-bom", "2.0", "pom", None),
+                &the_bom_pom_id,
+            )
+            .await
+            .expect("index bom pom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform_packages(
+            Platform::new("linux", "x86_64").expect("platform"),
+            vec![
+                LockPackage {
+                    group_id: "com.example".to_string(),
+                    artifact_id: "consumer".to_string(),
+                    version: "1.0".to_string(),
+                    snapshot_timestamp: None,
+                    packaging: "jar".to_string(),
+                    classifier: None,
+                    repo_url: "https://repo-a.example/".to_string(),
+                    checksum: Some(Checksum::new("sha256", jar_id.as_str())),
+                    system_path: None,
+                    direct_scope: None,
+                    extra: Default::default(),
+                },
+                LockPackage {
+                    group_id: "com.example".to_string(),
+                    artifact_id: "the-bom".to_string(),
+                    version: "2.0".to_string(),
+                    snapshot_timestamp: None,
+                    packaging: "pom".to_string(),
+                    classifier: None,
+                    repo_url: "https://repo-a.example/".to_string(),
+                    checksum: Some(Checksum::new("sha256", the_bom_pom_id.as_str())),
+                    system_path: None,
+                    direct_scope: None,
+                    extra: Default::default(),
+                },
+            ],
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let options = ExportOptions {
+            dry_run: false,
+            overwrite: false,
+            link_strategy: LinkStrategy::Copy,
+            m2_path: m2.clone(),
+        };
+        let mut repo_ids = HashMap::new();
+        repo_ids.insert("https://repo-a.example/".to_string(), "repo-a".to_string());
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:the-bom:2.0".to_string(),
+            unpinned_support("repo-b"),
+        );
+
+        let stats = Exporter::new(options, &store)
+            .with_repo_ids(repo_ids)
+            .with_support_poms(support)
+            .export_lock(&lock, None)
+            .await
+            .expect("export");
+
+        // consumer jar + consumer pom + the-bom pom, and the-bom exactly once:
+        // a second unit for it would either export or skip a fourth file.
+        assert_eq!(
+            (stats.exported_count, stats.skipped_count),
+            (3, 0),
+            "dual-role POM must be exported once, got {stats:?}"
+        );
+
+        let bom = m2.join("com/example/the-bom/2.0/the-bom-2.0.pom");
+        assert_eq!(fs::read(&bom).expect("read bom"), the_bom_pom);
+
+        let marker = m2.join("com/example/the-bom/2.0/_remote.repositories");
+        let body = fs::read_to_string(&marker).expect("bom marker");
+        assert!(
+            body.contains("the-bom-2.0.pom>repo-b="),
+            "recorded support-POM repo id must win over the lockfile repo_url, got: {body}"
+        );
+        assert!(
+            !body.contains("repo-a="),
+            "the losing provenance must not also be recorded, got: {body}"
+        );
+    }
+
+    /// A BOM that the lockfile pins directly *and* the support-POM provenance
+    /// records, with the two naming different bytes. Both files exist in the
+    /// store, so neither missing-blob check fires: the only thing standing
+    /// between the lockfile and a silently substituted POM is the collision
+    /// check in `ExportQueue::push`. Whichever unit is queued first would
+    /// otherwise win, and here that is the support pin — shipping bytes the
+    /// package row attests are the wrong ones.
+    #[tokio::test]
+    async fn support_pin_disagreeing_with_a_pom_package_row_fails_before_writing() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+
+        let resolved: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>the-bom</artifactId><version>2.0</version>\
+<packaging>pom</packaging></project>";
+        let substitute: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>the-bom</artifactId><version>2.0</version>\
+<packaging>pom</packaging><description>another sync</description></project>";
+        let resolved_id = store.put_bytes(resolved).await.expect("resolved bom");
+        let substitute_id = store.put_bytes(substitute).await.expect("substitute bom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "the-bom", "2.0", "pom", None),
+                &resolved_id,
+            )
+            .await
+            .expect("index bom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "the-bom".to_string(),
+                version: "2.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "pom".to_string(),
+                classifier: None,
+                repo_url: "https://repo-a.example/".to_string(),
+                checksum: Some(Checksum::new("sha256", resolved_id.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:the-bom:2.0".to_string(),
+            pinned_support("repo-b", substitute),
+        );
+
+        let err = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_support_poms(support)
+        .export_lock(&lock, None)
+        .await
+        .expect_err("two pins for one Maven path cannot both be exported");
+
+        assert!(
+            matches!(&err, ExportError::ConflictingExportSources { coordinate, .. }
+                if coordinate == "com.example:the-bom:2.0:pom"),
+            "expected ConflictingExportSources, got {err:?}"
+        );
+        let message = err.to_string();
+        for digest in [resolved_id.as_str(), substitute_id.as_str()] {
+            assert!(
+                message.contains(digest),
+                "the error must name both digests, missing {digest} in: {message}"
+            );
+        }
+        assert!(!m2.exists(), "nothing should be materialized, found {m2:?}");
+    }
+
+    /// Negative control for the collision check: the healthy shape is both
+    /// recordings naming the same bytes, which still collapses into one export
+    /// and still lets the recorded support-POM repository id win.
+    #[tokio::test]
+    async fn support_pin_agreeing_with_a_pom_package_row_exports_once() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+
+        let resolved: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>the-bom</artifactId><version>2.0</version>\
+<packaging>pom</packaging></project>";
+        let resolved_id = store.put_bytes(resolved).await.expect("resolved bom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "the-bom", "2.0", "pom", None),
+                &resolved_id,
+            )
+            .await
+            .expect("index bom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "the-bom".to_string(),
+                version: "2.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "pom".to_string(),
+                classifier: None,
+                repo_url: "https://repo-a.example/".to_string(),
+                checksum: Some(Checksum::new("sha256", resolved_id.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut repo_ids = HashMap::new();
+        repo_ids.insert("https://repo-a.example/".to_string(), "repo-a".to_string());
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:the-bom:2.0".to_string(),
+            pinned_support("repo-b", resolved),
+        );
+
+        let stats = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_repo_ids(repo_ids)
+        .with_support_poms(support)
+        .export_lock(&lock, None)
+        .await
+        .expect("agreeing pins export");
+
+        assert_eq!(
+            (stats.exported_count, stats.skipped_count),
+            (1, 0),
+            "one coordinate reached twice is still one file, got {stats:?}"
+        );
+        assert_eq!(
+            fs::read(m2.join("com/example/the-bom/2.0/the-bom-2.0.pom")).expect("bom"),
+            resolved,
+        );
+        let marker = fs::read_to_string(m2.join("com/example/the-bom/2.0/_remote.repositories"))
+            .expect("marker");
+        assert!(
+            marker.contains("the-bom-2.0.pom>repo-b="),
+            "recorded support-POM repo id must still win, got: {marker}"
+        );
+    }
+
+    /// A jar whose companion POM is also a support POM (a parent that is
+    /// itself a dependency), with the row's `pom_sha256` and the recorded
+    /// support pin naming different bytes.
+    ///
+    /// `Lockfile::read` rejects this shape, so the lock is built in memory to
+    /// reach the export layer directly. The support closure is queued first
+    /// and marks the coordinate as seen; gating the companion lookup on that
+    /// alone would drop the row's pin before `ExportQueue::push` ever compared
+    /// the two, and the export would ship the support bytes while the jar's
+    /// row attests the other digest.
+    #[tokio::test]
+    async fn support_pin_disagreeing_with_a_companion_pin_fails_before_writing() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let jar = store.put_bytes(b"app-jar").await.expect("jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+
+        let resolved: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version></project>";
+        let substitute: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version>\
+<name>another sync</name></project>";
+        let resolved_id = store.put_bytes(resolved).await.expect("resolved pom");
+        let substitute_id = store.put_bytes(substitute).await.expect("substitute pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "pom", None),
+                &resolved_id,
+            )
+            .await
+            .expect("index app pom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "app".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "jar".to_string(),
+                classifier: None,
+                repo_url: "https://repo-a.example/".to_string(),
+                checksum: Some(Checksum::new("sha256", jar.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut digests = HashMap::new();
+        digests.insert(
+            (
+                "com.example".to_string(),
+                "app".to_string(),
+                "1.0".to_string(),
+            ),
+            resolved_id.clone(),
+        );
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:app:1.0".to_string(),
+            pinned_support("repo-b", substitute),
+        );
+
+        let err = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_pom_digests(digests)
+        .with_support_poms(support)
+        .export_lock(&lock, None)
+        .await
+        .expect_err("two pins for one Maven path cannot both be exported");
+
+        assert!(
+            matches!(&err, ExportError::ConflictingExportSources { coordinate, .. }
+                if coordinate == "com.example:app:1.0:pom"),
+            "expected ConflictingExportSources, got {err:?}"
+        );
+        let message = err.to_string();
+        for digest in [resolved_id.as_str(), substitute_id.as_str()] {
+            assert!(
+                message.contains(digest),
+                "the error must name both digests, missing {digest} in: {message}"
+            );
+        }
+        assert!(!m2.exists(), "nothing should be materialized, found {m2:?}");
+    }
+
+    /// Negative control: the healthy shape is both recordings naming the same
+    /// bytes, which exports one POM next to the jar and still lets the
+    /// recorded support-POM repository id win the marker.
+    #[tokio::test]
+    async fn support_pin_agreeing_with_a_companion_pin_exports_once() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let jar = store.put_bytes(b"app-jar").await.expect("jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "jar", None),
+                &jar,
+            )
+            .await
+            .expect("index jar");
+
+        let resolved: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version></project>";
+        let resolved_id = store.put_bytes(resolved).await.expect("resolved pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "pom", None),
+                &resolved_id,
+            )
+            .await
+            .expect("index app pom");
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").expect("platform"),
+            LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "app".to_string(),
+                version: "1.0".to_string(),
+                snapshot_timestamp: None,
+                packaging: "jar".to_string(),
+                classifier: None,
+                repo_url: "https://repo-a.example/".to_string(),
+                checksum: Some(Checksum::new("sha256", jar.as_str())),
+                system_path: None,
+                direct_scope: None,
+                extra: Default::default(),
+            },
+        )];
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let mut digests = HashMap::new();
+        digests.insert(
+            (
+                "com.example".to_string(),
+                "app".to_string(),
+                "1.0".to_string(),
+            ),
+            resolved_id.clone(),
+        );
+        let mut repo_ids = HashMap::new();
+        repo_ids.insert("https://repo-a.example/".to_string(), "repo-a".to_string());
+        let mut support = HashMap::new();
+        support.insert(
+            "com.example:app:1.0".to_string(),
+            pinned_support("repo-b", resolved),
+        );
+
+        let stats = Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.clone(),
+            },
+            &store,
+        )
+        .with_pom_digests(digests)
+        .with_repo_ids(repo_ids)
+        .with_support_poms(support)
+        .export_lock(&lock, None)
+        .await
+        .expect("agreeing pins export");
+
+        assert_eq!(
+            (stats.exported_count, stats.skipped_count),
+            (2, 0),
+            "the jar and one POM, not two POMs, got {stats:?}"
+        );
+        assert_eq!(
+            fs::read(m2.join("com/example/app/1.0/app-1.0.pom")).expect("app pom"),
+            resolved,
+        );
+        let marker = fs::read_to_string(m2.join("com/example/app/1.0/_remote.repositories"))
+            .expect("marker");
+        assert!(
+            marker.contains("app-1.0.pom>repo-b="),
+            "recorded support-POM repo id must win for the POM, got: {marker}"
+        );
+        assert!(
+            marker.contains("app-1.0.jar>repo-a="),
+            "the jar keeps the id derived from its own repo_url, got: {marker}"
+        );
+    }
+
+    /// Collect the `WARN`-level events emitted on this thread for as long as
+    /// the returned guard lives, each flattened to `" field=value"` pairs
+    /// (the log message rides along as the `message` field).
+    #[derive(Default)]
+    struct WarnFields(String);
+
+    impl tracing::field::Visit for WarnFields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut fields = WarnFields::default();
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(fields.0);
+        }
+    }
+
+    /// A per-test warning sink. `set_default` is thread-local, so parallel
+    /// tests cannot see each other's events, and a `#[tokio::test]` runs its
+    /// future on the thread that installed the subscriber.
+    fn capture_warnings() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(WarnCapture(std::sync::Arc::clone(&sink)));
+        (sink, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// One ordinary jar dependency, optionally joined by a system-scoped one.
+    /// Indexes the jar and its POM so the export has something to materialize.
+    async fn system_scope_fixture(store: &Store, with_system: bool) -> Lockfile {
+        let jar_id = store.put_bytes(b"app-jar").await.expect("jar");
+        let pom: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version></project>";
+        let pom_id = store.put_bytes(pom).await.expect("pom");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "jar", None),
+                &jar_id,
+            )
+            .await
+            .expect("index jar");
+        store
+            .add_artifact(
+                &ArtifactKey::new("com.example", "app", "1.0", "pom", None),
+                &pom_id,
+            )
+            .await
+            .expect("index pom");
+
+        let mut packages = vec![LockPackage {
+            group_id: "com.example".to_string(),
+            artifact_id: "app".to_string(),
+            version: "1.0".to_string(),
+            snapshot_timestamp: None,
+            packaging: "jar".to_string(),
+            classifier: None,
+            repo_url: "https://repo1.maven.org/maven2/".to_string(),
+            checksum: Some(Checksum::new("sha256", jar_id.as_str())),
+            system_path: None,
+            direct_scope: None,
+            extra: Default::default(),
+        }];
+        if with_system {
+            packages.push(LockPackage {
+                group_id: "com.example".to_string(),
+                artifact_id: "tools".to_string(),
+                version: "9.9".to_string(),
+                snapshot_timestamp: None,
+                packaging: "jar".to_string(),
+                classifier: None,
+                repo_url: String::new(),
+                checksum: None,
+                system_path: Some("/opt/jdk/lib/tools.jar".to_string()),
+                direct_scope: Some("system".to_string()),
+                extra: Default::default(),
+            });
+        }
+
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform_packages(
+            Platform::new("linux", "x86_64").expect("platform"),
+            packages,
+        )];
+        lock
+    }
+
+    async fn export_to(store: &Store, lock: &Lockfile, m2: &std::path::Path) {
+        Exporter::new(
+            ExportOptions {
+                dry_run: false,
+                overwrite: false,
+                link_strategy: LinkStrategy::Copy,
+                m2_path: m2.to_path_buf(),
+            },
+            store,
+        )
+        .export_lock(lock, None)
+        .await
+        .expect("export");
+    }
+
+    /// A `systemPath` dependency cannot be exported: it has no bytes in the
+    /// content store and no artifact row to reach them by. The export must
+    /// still say so, naming the coordinate, or the `mvn -o` failure that
+    /// follows has nothing pointing back at what this `~/.m2` is missing. The
+    /// coordinates live only in the per-module package graphs, which is why
+    /// the aggregate view the export otherwise works from cannot see them.
+    #[tokio::test]
+    async fn system_scoped_dependency_warns_and_still_exports() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let lock = system_scope_fixture(&store, true).await;
+
+        assert!(
+            lock.platforms[0]
+                .artifacts
+                .iter()
+                .all(|artifact| artifact.coordinate.artifact != "tools"),
+            "a system-scoped dependency has no artifact row; the module graph is the only source"
+        );
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let (warnings, _guard) = capture_warnings();
+        export_to(&store, &lock, &m2).await;
+
+        let captured = warnings.lock().unwrap_or_else(|err| err.into_inner());
+        let system_warning = captured
+            .iter()
+            .find(|entry| entry.contains("system-scoped dependencies not exported"))
+            .unwrap_or_else(|| panic!("expected a system-scope warning, got {captured:?}"));
+        assert!(
+            system_warning.contains("com.example:tools:9.9"),
+            "the warning must name the coordinate, got: {system_warning}"
+        );
+
+        // The export still succeeds and still ships everything it can.
+        assert!(m2.join("com/example/app/1.0/app-1.0.jar").exists());
+        assert!(
+            !m2.join("com/example/tools/9.9").exists(),
+            "the system-scoped dependency has no bytes to export"
+        );
+    }
+
+    /// Negative control: the same project without a `systemPath` dependency
+    /// must not warn about one.
+    #[tokio::test]
+    async fn export_without_system_scoped_dependencies_stays_quiet() {
+        let store_dir = tempdir().expect("store dir");
+        let store = Store::open(store_dir.path()).expect("store");
+        let lock = system_scope_fixture(&store, false).await;
+
+        let m2_dir = tempdir().expect("m2 dir");
+        let m2 = m2_dir.path().join("repository");
+        let (warnings, _guard) = capture_warnings();
+        export_to(&store, &lock, &m2).await;
+
+        let captured = warnings.lock().unwrap_or_else(|err| err.into_inner());
+        assert!(
+            !captured
+                .iter()
+                .any(|entry| entry.contains("system-scoped dependencies not exported")),
+            "no system-scoped dependency, no warning; got {captured:?}"
+        );
     }
 
     /// Parse a flat collection of `<tag>text</tag>` occurrences out of a

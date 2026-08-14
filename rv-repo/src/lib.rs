@@ -12,7 +12,8 @@ pub mod sync;
 
 pub use artifact::ArtifactRequest;
 pub use client::{RepoClient, SnapshotResolution, same_origin_redirect_policy};
-pub use error::RepoError;
+pub use error::{RedirectRejectionKind, RepoError};
 pub use fetch::{FetchProgress, sha1_hex_file};
 pub use metadata::Metadata;
 pub use repository::{Repository, is_snapshot_version, normalize_repo_url};
+pub use sync::repository_for_package;

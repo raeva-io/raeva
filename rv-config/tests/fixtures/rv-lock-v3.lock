@@ -1,0 +1,34 @@
+schema_version = 3
+config_hash = "b90cbd61745cd63049dfe2b6e2d5a5efc43a04ad9e683a9799979a7c63421fb9"
+
+[[platforms]]
+platform = "linux-x86_64"
+
+[[platforms.packages]]
+group_id = "org.example"
+artifact_id = "alpha"
+version = "1.2.3"
+packaging = "jar"
+repo_url = "https://repo.example/maven2/"
+direct_scope = "compile"
+
+[platforms.packages.checksum]
+algorithm = "sha256"
+digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[platforms.packages]]
+group_id = "org.example"
+artifact_id = "beta"
+version = "2.0.0"
+packaging = "jar"
+repo_url = "https://repo.example/maven2/"
+
+[platforms.packages.checksum]
+algorithm = "sha1"
+digest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[[platforms.edges]]
+from = 0
+to = 1
+scope = "runtime"
+optional = false

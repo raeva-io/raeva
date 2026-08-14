@@ -31,6 +31,54 @@ pub enum ExportError {
         expected: String,
         actual: String,
     },
+    #[error(
+        "support-POM closure exceeds the limit of {limit} unique POMs; refusing to write an incomplete offline repository. Raise the limit with {variable}=<count>"
+    )]
+    SupportClosureTooLarge {
+        limit: usize,
+        variable: &'static str,
+    },
+    #[error(
+        "support POM {coordinate} was recorded during resolution but is missing from the content store; refusing to write an incomplete offline repository. {hint}"
+    )]
+    MissingSupportPom {
+        coordinate: String,
+        hint: &'static str,
+    },
+    #[error(
+        "rv.lock pins the POM for {coordinate} to sha256 {digest}, but those bytes are not in the content store; refusing to export a POM this lockfile was not resolved against. {hint}"
+    )]
+    MissingPinnedPom {
+        coordinate: String,
+        digest: String,
+        hint: &'static str,
+    },
+    #[error(
+        "rv.lock pins the POM for {coordinate} to two different digests ({first}, {second}); Maven has one local-repository path per coordinate, so no export can satisfy both. Run `rv sync` to rewrite rv.lock"
+    )]
+    ConflictingPinnedPom {
+        coordinate: String,
+        first: String,
+        second: String,
+    },
+    #[error(
+        "rv.lock pins the pom-packaged artifact {coordinate} to sha256 {artifact} but its POM to {pom}; for packaging=pom those are the same Maven file, so no export can write both. Run `rv sync` to rewrite rv.lock"
+    )]
+    ConflictingPomPackagedPin {
+        coordinate: String,
+        artifact: String,
+        pom: String,
+    },
+    #[error(
+        "{coordinate} is claimed by two different files: {first_source} names sha256 {first}, {second_source} names sha256 {second}; Maven has one local-repository path per coordinate, so no export can write both. Run `rv sync` to rewrite rv.lock"
+    )]
+    ConflictingExportSources {
+        coordinate: String,
+        first_source: &'static str,
+        first: String,
+        second_source: &'static str,
+        second: String,
+    },
     #[error("invalid coordinate: {0}")]
     InvalidCoordinate(String),
     #[error("path traversal attempt detected: {0}")]

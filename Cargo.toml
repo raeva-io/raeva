@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Raeva"]
 license = "MIT OR Apache-2.0"
@@ -22,14 +22,14 @@ homepage = "https://raeva.io"
 
 [workspace.dependencies]
 # Workspace crates
-rv-config = { path = "rv-config", version = "0.2.0" }
-rv-maven-model = { path = "rv-maven-model", version = "0.2.0" }
-rv-repo = { path = "rv-repo", version = "0.2.0" }
-rv-resolver = { path = "rv-resolver", version = "0.2.0" }
-rv-sbom = { path = "rv-sbom", version = "0.2.0" }
-rv-store = { path = "rv-store", version = "0.2.0" }
-rv-version = { path = "rv-version", version = "0.2.0" }
-rv-vuln = { path = "rv-vuln", version = "0.2.0" }
+rv-config = { path = "rv-config", version = "0.3.0" }
+rv-maven-model = { path = "rv-maven-model", version = "0.3.0" }
+rv-repo = { path = "rv-repo", version = "0.3.0" }
+rv-resolver = { path = "rv-resolver", version = "0.3.0" }
+rv-sbom = { path = "rv-sbom", version = "0.3.0" }
+rv-store = { path = "rv-store", version = "0.3.0" }
+rv-version = { path = "rv-version", version = "0.3.0" }
+rv-vuln = { path = "rv-vuln", version = "0.3.0" }
 
 # Third-party dependencies (alphabetical)
 aes = "0.8"
@@ -55,6 +55,7 @@ hex = "0.4"
 indexmap = { version = "2.12", features = ["serde"] }
 indicatif = "0.17"
 jsonschema = { version = "=0.48.2", default-features = false }
+keyring = "4.1"
 lru = "0.12"
 moka = { version = "0.12", features = ["future", "sync"] }
 owo-colors = "4"
@@ -67,6 +68,7 @@ r2d2_sqlite = "0.24"
 rand = "0.8"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+rpassword = "7.4"
 rusqlite = { version = "0.31", features = ["bundled"] }
 rustls = { version = "0.23", features = ["ring"] }
 secrecy = { version = "0.8", features = ["serde"] }

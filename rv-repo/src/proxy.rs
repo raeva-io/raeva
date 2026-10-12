@@ -6,26 +6,7 @@ use url::Url;
 use crate::error::RepoError;
 
 pub(crate) fn build_proxy(config: &ProxyConfig) -> Result<reqwest::Proxy, RepoError> {
-    // Maven's default when <protocol> is absent is HTTP-only. Only route HTTPS
-    // (or all) traffic through the proxy when explicitly configured.
-    let protocol = config.protocol.as_deref().unwrap_or("http");
-    let proxy_url = build_proxy_url(protocol, &config.host, config.port)?;
-    let non_proxy_hosts = config.non_proxy_hosts.clone();
-
-    let mut proxy = if non_proxy_hosts.is_empty() {
-        match protocol.to_ascii_lowercase().as_str() {
-            "https" => reqwest::Proxy::https(proxy_url)?,
-            "all" => reqwest::Proxy::all(proxy_url)?,
-            _ => reqwest::Proxy::http(proxy_url)?,
-        }
-    } else {
-        // Custom per-URL routing: honour non_proxy_hosts regardless of protocol.
-        let proxy_url_str = proxy_url.clone();
-        let protocol_lower = protocol.to_ascii_lowercase();
-        reqwest::Proxy::custom(move |url| {
-            route_through_proxy(&protocol_lower, url, &proxy_url_str, &non_proxy_hosts)
-        })
-    };
+    let mut proxy = build_unauthenticated_proxy(config)?;
 
     match config.auth_type.unwrap_or(ProxyAuthType::Basic) {
         ProxyAuthType::Basic => {
@@ -70,6 +51,33 @@ pub(crate) fn build_proxy(config: &ProxyConfig) -> Result<reqwest::Proxy, RepoEr
             proxy = proxy.custom_http_auth(header);
         }
     }
+
+    Ok(proxy)
+}
+
+/// Build a proxy with sync's URL validation and bypass routing, without reading
+/// credentials or emitting diagnostics. Invalid proxy URLs return an error.
+pub fn build_unauthenticated_proxy(config: &ProxyConfig) -> Result<reqwest::Proxy, RepoError> {
+    // Maven's default when <protocol> is absent is HTTP-only. Only route HTTPS
+    // (or all) traffic through the proxy when explicitly configured.
+    let protocol = config.protocol.as_deref().unwrap_or("http");
+    let proxy_url = build_proxy_url(protocol, &config.host, config.port)?;
+    let non_proxy_hosts = config.non_proxy_hosts.clone();
+
+    let proxy = if non_proxy_hosts.is_empty() {
+        match protocol.to_ascii_lowercase().as_str() {
+            "https" => reqwest::Proxy::https(proxy_url)?,
+            "all" => reqwest::Proxy::all(proxy_url)?,
+            _ => reqwest::Proxy::http(proxy_url)?,
+        }
+    } else {
+        // Custom per-URL routing: honour non_proxy_hosts regardless of protocol.
+        let proxy_url_str = proxy_url.clone();
+        let protocol_lower = protocol.to_ascii_lowercase();
+        reqwest::Proxy::custom(move |url| {
+            route_through_proxy(&protocol_lower, url, &proxy_url_str, &non_proxy_hosts)
+        })
+    };
 
     Ok(proxy)
 }
@@ -346,6 +354,7 @@ mod tests {
         let non_proxy = vec![".example.com".to_string(), "*.internal".to_string()];
         assert!(should_bypass_proxy("repo.example.com", &non_proxy));
         assert!(should_bypass_proxy("api.internal", &non_proxy));
+        assert!(should_bypass_proxy("deep.api.internal", &non_proxy));
     }
 
     /// Regression: hostnames and IPv4 literals must build a plain
@@ -389,6 +398,9 @@ mod tests {
         // forwarded.
         let err = build_proxy_url("http", "host:with:colons", 8080).unwrap_err();
         assert!(format!("{err}").contains("IPv6"));
+
+        assert!(build_proxy_url("http", "proxy.example/path", 8080).is_err());
+        assert!(build_proxy_url("http", "   ", 8080).is_err());
     }
 
     /// Regression: the full `build_proxy` path must wire these

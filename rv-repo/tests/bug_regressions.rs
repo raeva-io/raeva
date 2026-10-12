@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// rustls 0.23 requires a process-level `CryptoProvider`. The integration
 /// tests live outside the binary that normally installs it, so seed it here
@@ -22,67 +21,21 @@ fn ensure_crypto_provider() {
 use rv_config::{Config, RepoConfig, ResolvedPaths};
 use rv_repo::{ArtifactRequest, RepoClient, Repository};
 use rv_store::Store;
+use rv_test_support::http::{Response, StubServer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Tiny one-shot HTTP/1.1 stub. The handler closure inspects the request line
-/// (e.g. `GET /path HTTP/1.1`) and returns an HTTP response body. Listens until
-/// `expected_requests` connections have been served, then drops.
-async fn spawn_stub<F>(handler: F, expected_requests: u32) -> std::net::SocketAddr
-where
-    F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let handler = Arc::new(handler);
-    let served = Arc::new(AtomicU32::new(0));
-    tokio::spawn(async move {
-        while served.load(Ordering::SeqCst) < expected_requests {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => break,
-            };
-            let handler = handler.clone();
-            let served = served.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let mut total = Vec::new();
-                loop {
-                    let n = match sock.read(&mut buf).await {
-                        Ok(n) => n,
-                        Err(_) => return,
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    total.extend_from_slice(&buf[..n]);
-                    if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request_line = std::str::from_utf8(&total)
-                    .ok()
-                    .and_then(|s| s.lines().next())
-                    .unwrap_or("")
-                    .to_string();
-                let response = handler(&request_line);
-                let _ = sock.write_all(&response).await;
-                let _ = sock.shutdown().await;
-                served.fetch_add(1, Ordering::SeqCst);
-            });
-        }
-    });
-    addr
-}
-
 fn build_config(temp: &tempfile::TempDir, url: String) -> Config {
-    let paths = ResolvedPaths::discover().expect("paths");
+    let paths = ResolvedPaths::for_testing().expect("paths");
     let repo_config = RepoConfig {
         id: Some("stub".to_string()),
         url,
         releases: Some(true),
         snapshots: Some(false),
         snapshots_update_policy: None,
+        releases_update_policy: None,
+        releases_checksum_policy: None,
+        snapshots_checksum_policy: None,
     };
     Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![repo_config])
 }
@@ -116,25 +69,14 @@ async fn missing_checksum_does_not_orphan_blob_in_store() {
     // Stub: 200 OK for the .jar GET; 404 for any .sha256/.sha1 request.
     // The artifact bytes are arbitrary — the test will fail if the bytes
     // ever hit CAS, regardless of content.
-    let addr = spawn_stub(
-        |request_line| {
-            if request_line.contains(".sha256") || request_line.contains(".sha1") {
-                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-            } else {
-                let body = b"unverified-jar-bytes-must-not-land-in-cas";
-                let mut resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .into_bytes();
-                resp.extend_from_slice(body);
-                resp
-            }
-        },
-        // Worst case: 1x .jar + 1x .sha256 + 1x .sha1.
-        8,
-    )
-    .await;
+    let server = StubServer::start(|request| {
+        if request.path.contains(".sha256") || request.path.contains(".sha1") {
+            Response::new(404, "")
+        } else {
+            Response::new(200, "unverified-jar-bytes-must-not-land-in-cas")
+        }
+    });
+    let addr = server.addr();
 
     let config = build_config(&temp, format!("http://{addr}/"));
     let client = RepoClient::new(&config).await.expect("client");
@@ -162,11 +104,11 @@ async fn missing_checksum_does_not_orphan_blob_in_store() {
     );
 }
 
-/// Regression: `maven-metadata.xml` must be sidecar-verified. A stub that
+/// Strict metadata policy requires checksum verification. A stub that
 /// serves a valid-looking metadata body together with a bogus `.sha256`
 /// sidecar must produce `ChecksumMismatch`, not a parsed metadata document.
 #[tokio::test]
-async fn metadata_with_bad_sidecar_is_rejected() {
+async fn metadata_with_bad_sidecar_is_rejected_under_fail_policy() {
     use rv_version::{Coord, Version};
 
     ensure_crypto_provider();
@@ -187,37 +129,23 @@ async fn metadata_with_bad_sidecar_is_rejected() {
     // above is nothing like this string, so verification must fail.
     const BAD_SIDECAR: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-    let addr = spawn_stub(
-        |request_line| {
-            if request_line.contains(".sha256") {
-                let mut resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    BAD_SIDECAR.len()
-                )
-                .into_bytes();
-                resp.extend_from_slice(BAD_SIDECAR.as_bytes());
-                resp
-            } else if request_line.contains(".sha1") {
-                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-            } else {
-                let mut resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    METADATA_BODY.len()
-                )
-                .into_bytes();
-                resp.extend_from_slice(METADATA_BODY.as_bytes());
-                resp
-            }
-        },
-        8,
-    )
-    .await;
+    let server = StubServer::start(|request| {
+        if request.path.contains(".sha256") {
+            Response::new(200, BAD_SIDECAR)
+        } else if request.path.contains(".sha1") {
+            Response::new(404, "")
+        } else {
+            Response::new(200, METADATA_BODY)
+        }
+    });
+    let addr = server.addr();
 
     let config = build_config(&temp, format!("http://{addr}/"));
     let client = RepoClient::new(&config).await.expect("client");
 
     let repo_config = config.repositories().first().expect("repo").clone();
-    let repo = Repository::from(&repo_config);
+    let mut repo = Repository::from(&repo_config);
+    repo.releases_checksum_policy = rv_config::ChecksumPolicy::Fail;
     let coord = Coord {
         group_id: "com.example".into(),
         artifact_id: "demo".into(),
@@ -239,10 +167,7 @@ async fn metadata_with_bad_sidecar_is_rejected() {
 /// to a single network round trip.
 type PathHits = Arc<std::sync::Mutex<std::collections::HashMap<String, u32>>>;
 
-/// Long-lived HTTP/1.1 stub. Unlike `spawn_stub`, this one keeps accepting
-/// connections until the returned handle is dropped, so a slow client that
-/// re-uses the connection or fans out many requests is not racing the
-/// listener's "served N then exit" loop.
+/// Dedicated stub for the deliberately delayed concurrent dedup test.
 async fn spawn_recording_stub<F>(handler: F, hits: PathHits) -> std::net::SocketAddr
 where
     F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
@@ -475,33 +400,27 @@ async fn ensure_artifacts_repairs_deleted_explicit_pom_dependency() {
 
     let hits: PathHits = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let pom_sha_for_handler = pom_sha256.clone();
-    let addr = spawn_recording_stub(
-        move |request_line| {
-            let path = request_line.split_whitespace().nth(1).unwrap_or("");
-            let body: Option<Vec<u8>> = if path.ends_with("pom-dep-1.0.0.pom.sha256") {
-                Some(pom_sha_for_handler.as_bytes().to_vec())
-            } else if path.ends_with("pom-dep-1.0.0.pom") {
-                Some(pom_body.to_vec())
-            } else {
-                None
-            };
-            match body {
-                Some(b) => {
-                    let mut resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        b.len()
-                    )
-                    .into_bytes();
-                    resp.extend_from_slice(&b);
-                    resp
-                }
-                None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_vec(),
-            }
-        },
-        hits.clone(),
-    )
-    .await;
+    let recorded = hits.clone();
+    let server = StubServer::start(move |request| {
+        let path = request.path.as_str();
+        *recorded
+            .lock()
+            .expect("hits map")
+            .entry(path.to_string())
+            .or_insert(0) += 1;
+        let body: Option<Vec<u8>> = if path.ends_with("pom-dep-1.0.0.pom.sha256") {
+            Some(pom_sha_for_handler.as_bytes().to_vec())
+        } else if path.ends_with("pom-dep-1.0.0.pom") {
+            Some(pom_body.to_vec())
+        } else {
+            None
+        };
+        match body {
+            Some(body) => Response::new(200, body),
+            None => Response::new(404, ""),
+        }
+    });
+    let addr = server.addr();
 
     let config = build_config(&temp, format!("http://{addr}/"));
     let client = RepoClient::new(&config).await.expect("client");

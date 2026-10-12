@@ -179,7 +179,11 @@ pub(super) fn build_lock_data(graph: &Graph) -> Result<(Vec<LockPackage>, Vec<Lo
             .cmp(&b.from)
             .then(a.to.cmp(&b.to))
             .then(a.scope.cmp(&b.scope))
+            .then(a.optional.cmp(&b.optional))
     });
+
+    // Distinct declarations may collapse to the same serialized relationship.
+    edges.dedup();
 
     let mut packages = Vec::with_capacity(nodes.len());
     for (idx, node) in nodes.iter() {
@@ -192,6 +196,7 @@ pub(super) fn build_lock_data(graph: &Graph) -> Result<(Vec<LockPackage>, Vec<Lo
                     node.repo_url
                         .as_ref()
                         .ok_or_else(|| ResolveError::ArtifactNotFound {
+                            dropped_repos: Vec::new(),
                             coord: node.coord.to_string(),
                             searched: Vec::new(),
                         })?;
@@ -199,6 +204,7 @@ pub(super) fn build_lock_data(graph: &Graph) -> Result<(Vec<LockPackage>, Vec<Lo
                     node.checksum
                         .as_ref()
                         .ok_or_else(|| ResolveError::ArtifactNotFound {
+                            dropped_repos: Vec::new(),
                             coord: node.coord.to_string(),
                             searched: Vec::new(),
                         })?;
@@ -306,10 +312,15 @@ pub(crate) fn filter_repos_for_version<'a>(
 pub(crate) fn merge_repos(base: Vec<Repository>, extra: Vec<Repository>) -> Vec<Repository> {
     let total_capacity = base.len() + extra.len();
     let mut seen = HashSet::with_capacity(total_capacity);
-    let mut merged = Vec::with_capacity(total_capacity);
+    let mut merged: Vec<Repository> = Vec::with_capacity(total_capacity);
     for repo in base.into_iter().chain(extra) {
         if seen.insert(repo.url.clone()) {
             merged.push(repo);
+        } else if (repo.releases_checksum_policy == rv_config::ChecksumPolicy::Fail
+            || repo.snapshots_checksum_policy == rv_config::ChecksumPolicy::Fail)
+            && let Some(existing) = merged.iter_mut().find(|r| r.url == repo.url)
+        {
+            existing.merge_checksum_policies(&repo);
         }
     }
     merged
@@ -343,6 +354,26 @@ mod tests {
     use rv_maven_model::Scope;
     use rv_repo::Repository;
     use rv_version::Coord;
+
+    #[test]
+    fn merge_repos_preserves_explicit_fail_from_either_declaration() {
+        let default = Repository::new(None, "https://example.com/", true, true);
+        let mut strict = default.clone();
+        strict.releases_checksum_policy = rv_config::ChecksumPolicy::Fail;
+        strict.snapshots_checksum_policy = rv_config::ChecksumPolicy::Fail;
+        for (first, second) in [(default.clone(), strict.clone()), (strict, default)] {
+            let repos = merge_repos(vec![first], vec![second]);
+            assert_eq!(repos.len(), 1);
+            assert_eq!(
+                repos[0].releases_checksum_policy,
+                rv_config::ChecksumPolicy::Fail
+            );
+            assert_eq!(
+                repos[0].snapshots_checksum_policy,
+                rv_config::ChecksumPolicy::Fail
+            );
+        }
+    }
 
     fn coord(version: &str) -> Coord {
         Coord::parse(&format!("g:a:{version}")).unwrap()

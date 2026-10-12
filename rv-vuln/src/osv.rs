@@ -704,9 +704,11 @@ fn validate_purl(purl: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use rv_test_support::http::{Response, StubServer};
     use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Mutex;
 
     use super::{MAX_ERROR_BODY_BYTES, MAX_SUCCESS_BODY_BYTES, OsvClient, VulnError};
 
@@ -745,74 +747,37 @@ mod tests {
         String::from_utf8(request).expect("request UTF-8")
     }
 
-    fn request_path(request: &str) -> &str {
-        request
-            .lines()
-            .next()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .expect("request path")
-    }
-
-    fn spawn_mock_server(response_body: &'static str) -> (String, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let addr = listener.local_addr().expect("mock server address");
-
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept connection");
-            let request = read_request(&mut stream);
+    fn spawn_mock_server(response_body: &'static str) -> (String, StubServer) {
+        let server = StubServer::start(move |request| {
+            let request = &request.raw;
             assert!(request.starts_with("POST /v1/query"));
             assert!(request.contains("pkg:maven/com.example/demo@1.2.3"));
             assert!(!request.contains("\"ecosystem\""));
             assert!(!request.contains("\"name\""));
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
+            Response::new(200, response_body).header("Content-Type", "application/json")
         });
-
-        (format!("http://{}/v1", addr), handle)
+        (format!("http://{}/v1", server.addr()), server)
     }
 
     fn spawn_routed_mock_server(
         routes: Vec<(&'static str, Vec<&'static str>)>,
-    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let addr = listener.local_addr().expect("mock server address");
-        let total: usize = routes.iter().map(|(_, responses)| responses.len()).sum();
-        let mut routes: HashMap<String, VecDeque<&'static str>> = routes
-            .into_iter()
-            .map(|(path, responses)| (path.to_string(), responses.into()))
-            .collect();
-
-        let handle = std::thread::spawn(move || {
-            let mut requests = Vec::with_capacity(total);
-            for _ in 0..total {
-                let (mut stream, _) = listener.accept().expect("accept connection");
-                let request = read_request(&mut stream);
-                let path = request_path(&request);
-                let body = routes
-                    .get_mut(path)
-                    .and_then(VecDeque::pop_front)
-                    .unwrap_or_else(|| panic!("unexpected request path {path}"));
-                requests.push(request);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write response");
-            }
-            requests
+    ) -> (String, StubServer) {
+        let routes: Mutex<HashMap<String, VecDeque<&'static str>>> = Mutex::new(
+            routes
+                .into_iter()
+                .map(|(path, responses)| (path.to_string(), responses.into()))
+                .collect(),
+        );
+        let server = StubServer::start(move |request| {
+            let body = routes
+                .lock()
+                .expect("routes")
+                .get_mut(&request.path)
+                .and_then(VecDeque::pop_front)
+                .unwrap_or_else(|| panic!("unexpected request path {}", request.path));
+            Response::new(200, body).header("Content-Type", "application/json")
         });
-
-        (format!("http://{}/v1", addr), handle)
+        (format!("http://{}/v1", server.addr()), server)
     }
 
     fn spawn_custom_mock_server(
@@ -882,7 +847,12 @@ mod tests {
             .block_on(client.query("pkg:maven/com.example/demo@1.2.3"))
             .expect("query succeeds");
 
-        let bodies = handle.join().expect("server thread");
+        let bodies: Vec<_> = handle
+            .requests()
+            .into_iter()
+            .map(|request| request.raw)
+            .collect();
+        handle.stop();
         assert_eq!(bodies.len(), 2, "client should issue two requests");
         // Only follow-up requests carry a page token.
         assert!(!bodies[0].contains("page_token"));
@@ -913,7 +883,8 @@ mod tests {
             .block_on(client.query_batch(&["pkg:maven/com.example/demo@1.2.3".to_string()]))
             .expect("batch query succeeds");
 
-        handle.join().expect("server thread");
+        assert_eq!(handle.answered(), 4);
+        handle.stop();
 
         assert_eq!(result.results.len(), 1);
         let mut ids: Vec<&str> = result.results[0]
@@ -937,7 +908,8 @@ mod tests {
             .block_on(client.query("pkg:maven/com.example/demo@1.2.3"))
             .expect("query succeeds");
 
-        handle.join().expect("server thread");
+        assert_eq!(handle.answered(), 2);
+        handle.stop();
         let ids: Vec<&str> = vulnerabilities
             .iter()
             .map(|vuln| vuln.id.as_str())
@@ -955,7 +927,8 @@ mod tests {
             .block_on(client.query("pkg:maven/com.example/demo@1.2.3"))
             .expect_err("cyclic pagination must fail");
 
-        handle.join().expect("server thread");
+        assert_eq!(handle.answered(), 2);
+        handle.stop();
         assert!(error.to_string().contains("repeated page token"));
     }
 
@@ -970,7 +943,8 @@ mod tests {
             .block_on(client.query_batch(&["pkg:maven/com.example/demo@1.2.3".to_string()]))
             .expect_err("cyclic pagination must fail");
 
-        handle.join().expect("server thread");
+        assert_eq!(handle.answered(), 2);
+        handle.stop();
         assert!(error.to_string().contains("repeated page token"));
     }
 
@@ -988,7 +962,8 @@ mod tests {
             .block_on(client.query_batch(&["pkg:maven/com.example/demo@1.2.3".to_string()]))
             .expect_err("mismatched detail id must fail");
 
-        handle.join().expect("server thread");
+        assert_eq!(handle.answered(), 2);
+        handle.stop();
         assert!(error.to_string().contains("OSV-A"));
     }
 
@@ -1070,7 +1045,8 @@ mod tests {
         assert_eq!(vulnerabilities[0].id, "OSV-2024-0001");
         assert_eq!(vulnerabilities[0].aliases, vec!["CVE-2024-0001"]);
 
-        handle.join().expect("server thread");
+        assert_eq!(handle.answered(), 1);
+        handle.stop();
     }
 
     #[test]

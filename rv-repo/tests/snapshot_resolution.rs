@@ -6,13 +6,16 @@ use rv_version::{Coord, Version};
 #[ignore] // Requires network access to the Spring snapshot repository.
 async fn resolves_snapshot_version_from_remote_repo() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let paths = ResolvedPaths::discover().expect("paths");
+    let paths = ResolvedPaths::for_testing().expect("paths");
     let repo_config = RepoConfig {
         id: Some("spring-snapshot".to_string()),
         url: "https://repo.spring.io/snapshot/".to_string(),
         releases: Some(false),
         snapshots: Some(true),
         snapshots_update_policy: Some(UpdatePolicy::Always),
+        releases_update_policy: None,
+        releases_checksum_policy: None,
+        snapshots_checksum_policy: None,
     };
 
     let config =

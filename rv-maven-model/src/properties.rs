@@ -33,6 +33,11 @@ fn allowlist_cell() -> &'static RwLock<Option<Vec<String>>> {
     ENV_SUBSTITUTION_ALLOWLIST.get_or_init(|| RwLock::new(None))
 }
 
+/// Tests that install or depend on the allowlist hold this lock, since it is
+/// process-wide and the test harness runs tests in parallel.
+#[cfg(test)]
+pub(crate) static ENV_ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Install the process-wide `${env.*}` substitution allowlist, replacing any
 /// previously installed policy.
 ///
@@ -106,7 +111,7 @@ const DEFAULT_JAVA_VERSION: &str = "17";
 /// `java.version` falls back to the `JAVA_VERSION` env var or a documented
 /// sentinel ([`DEFAULT_JAVA_VERSION`]).
 ///
-/// Supply-chain hardening (finding #57): the host-path / host-identity
+/// Supply-chain hardening: the host-path / host-identity
 /// sysprops `user.home`, `user.dir`, and `java.home` are deliberately
 /// excluded from this map. They are attacker-readable when a transitive
 /// POM embeds e.g. `${user.home}` in a value that then lands in `rv.lock`,
@@ -228,8 +233,7 @@ impl PropertyMap {
     }
 
     /// Interpolate `${...}` references in `input` using only the entries in this
-    /// map. No `${project.*}` substitutions are attempted; use
-    /// [`Self::interpolate_str_with_project`] when project context is needed.
+    /// map. No `${project.*}` substitutions are attempted.
     pub fn interpolate_str_no_project(&self, input: &str) -> Result<String, PomError> {
         self.interpolate_str_with(input, None)
     }
@@ -478,7 +482,7 @@ fn resolve_builtin(key: &str, project: Option<&ProjectInfo>) -> Option<String> {
     // standard Maven sysprop key resolves to the host value instead of
     // falling through to the literal `${...}`. Host-path / host-identity
     // sysprops (`user.home`, `user.dir`, `java.home`) are excluded from this
-    // map (finding #57) and therefore fall through unresolved.
+    // map and therefore fall through unresolved.
     if let Some(value) = sysprops_for_interpolation().get(key) {
         return Some(value.clone());
     }
@@ -579,6 +583,9 @@ mod tests {
 
     #[test]
     fn interpolates_env_properties() {
+        let _guard = ENV_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The allowlist is set once per process. The first test that needs an
         // allowlisted env var installs the full set the test suite cares about;
         // other tests can rely on it because `OnceLock::set` after that is a
@@ -613,6 +620,9 @@ mod tests {
     /// matching the desired fail-closed behaviour).
     #[test]
     fn env_substitution_without_allowlist_is_blocked() {
+        let _guard = ENV_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Don't install the allowlist here: the global state may already be
         // pinned by a previously-run test. What we DO know is that
         // `RAEVA_TEST_DISALLOWED_SECRET` is not on the allowlist installed by
@@ -649,6 +659,9 @@ mod tests {
     /// previous test's allowlist would silently win in `cfg(test)` builds.
     #[test]
     fn reset_helper_restores_fail_closed_default() {
+        let _guard = ENV_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_env_substitution_allowlist(vec!["RAEVA_TEST_KEEP".to_string()]);
         assert_eq!(
             env_substitution_allowlist(),
@@ -667,6 +680,9 @@ mod tests {
     /// overwrite. Run two installs back to back and check the second wins.
     #[test]
     fn allowlist_overwrite_in_tests_takes_effect() {
+        let _guard = ENV_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_env_substitution_allowlist(vec!["RAEVA_TEST_A".to_string()]);
         set_env_substitution_allowlist(vec!["RAEVA_TEST_B".to_string()]);
         let snap = env_substitution_allowlist().expect("allowlist installed");
@@ -677,6 +693,9 @@ mod tests {
     /// added to the allowlist does substitute.
     #[test]
     fn env_substitution_with_allowlist_resolves() {
+        let _guard = ENV_ALLOWLIST_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Install (idempotently) the allowlist used across these tests.
         set_env_substitution_allowlist(vec![
             "RAEVA_TEST_ENV".to_string(),
@@ -1098,7 +1117,7 @@ mod tests {
         }
     }
 
-    /// Finding #57: the host-path / host-identity sysprops `user.home`,
+    /// The host-path / host-identity sysprops `user.home`,
     /// `user.dir`, and `java.home` must NOT appear in the interpolation map, so
     /// a (possibly transitive) POM that references them cannot read the host's
     /// filesystem layout via a value that lands in the lockfile, an error

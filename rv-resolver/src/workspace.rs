@@ -175,6 +175,17 @@ impl Workspace {
             .filter_map(|index| self.modules.get(*index))
     }
 
+    /// Return the effective version for a unique reactor member with this group and artifact.
+    /// Return `None` if no member matches or several do.
+    pub(crate) fn unique_version(&self, group_id: &str, artifact_id: &str) -> Option<String> {
+        let mut candidates = self.candidates(group_id, artifact_id);
+        let module = candidates.next()?;
+        candidates
+            .next()
+            .is_none()
+            .then(|| module.gav().version.clone())
+    }
+
     pub(crate) fn apply_root_maven_config(&self, activation: &mut ActivationContext) {
         self.maven_config.apply(activation);
     }
@@ -273,12 +284,25 @@ struct DiscoveryParentResolver {
 }
 
 impl rv_maven_model::ParentResolver for DiscoveryParentResolver {
+    fn is_root_model(&self) -> bool {
+        true
+    }
+
     fn resolve_parent(&self, parent: &rv_maven_model::Parent) -> Result<Option<Pom>, PomError> {
-        self.base.resolve_parent(parent)
+        // Discovery only loads accepted local parents; remote fetching is disabled.
+        let mut pom = self.base.resolve_parent(parent)?;
+        if let Some(pom) = &mut pom {
+            pom.mark_root_repositories();
+        }
+        Ok(pom)
     }
 
     fn strict_parent_resolution(&self) -> bool {
         false
+    }
+
+    fn skips_remote_parents(&self) -> bool {
+        true
     }
 }
 
@@ -536,11 +560,13 @@ impl MavenConfig {
                 }
             } else if let Some(property) = token.strip_prefix("-D") {
                 config.add_property(property);
-            } else if token == "-P" || token == "-!P" {
+            } else if token == "-P" || token == "-!P" || token == "--activate-profiles" {
                 if let Some(profiles) = tokens.get(index + 1) {
                     config.add_profiles(profiles, token == "-!P");
                     index += 1;
                 }
+            } else if let Some(profiles) = token.strip_prefix("--activate-profiles=") {
+                config.add_profiles(profiles, false);
             } else if let Some(profiles) = token.strip_prefix("-!P") {
                 config.add_profiles(profiles.trim_start_matches('='), true);
             } else if let Some(profiles) = token.strip_prefix("-P") {
@@ -991,6 +1017,16 @@ mod tests {
 
         assert_eq!(config.active_profiles, ["alpha", "beta"]);
         assert_eq!(config.inactive_profiles, ["off", "legacy", "unused"]);
+    }
+
+    #[test]
+    fn parses_profile_switch_forms_like_maven() {
+        let config = MavenConfig::parse(
+            "-P spring\n-Pa,-b,+c\n-P=d\n--activate-profiles e,!f\n--activate-profiles=g",
+        );
+
+        assert_eq!(config.active_profiles, ["spring", "a", "c", "d", "e", "g"]);
+        assert_eq!(config.inactive_profiles, ["b", "f"]);
     }
 
     #[test]

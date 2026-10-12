@@ -10,7 +10,8 @@ use serde::Deserialize;
 use crate::encryption::{SecuritySettings, is_encrypted, sanitize_password};
 use crate::error::{ConfigError, io_error_with_context};
 use crate::settings::{
-    AuthConfig, MirrorConfig, ProxyConfig, RepoConfig, SettingsProfile, UpdatePolicy,
+    AuthConfig, ChecksumPolicy, MirrorConfig, ProxyConfig, RepoConfig, SettingsProfile,
+    UpdatePolicy,
 };
 
 /// Upper bound on parseable settings.xml size. Real settings.xml files are far
@@ -469,6 +470,7 @@ struct PolicyXml {
     #[serde(default, deserialize_with = "deserialize_bool_lenient")]
     enabled: Option<bool>,
     update_policy: Option<String>,
+    checksum_policy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -653,8 +655,11 @@ impl SettingsXml {
                                 r.repository
                                     .into_iter()
                                     .map(|r| {
-                                        let releases =
-                                            r.releases.and_then(|p| p.enabled).or(Some(true));
+                                        let releases = r
+                                            .releases
+                                            .as_ref()
+                                            .and_then(|p| p.enabled)
+                                            .or(Some(true));
                                         let snapshots = r
                                             .snapshots
                                             .as_ref()
@@ -671,6 +676,21 @@ impl SettingsXml {
                                             releases,
                                             snapshots,
                                             snapshots_update_policy,
+                                            releases_update_policy: r
+                                                .releases
+                                                .as_ref()
+                                                .and_then(|p| p.update_policy.as_deref())
+                                                .and_then(UpdatePolicy::parse),
+                                            releases_checksum_policy: r
+                                                .releases
+                                                .as_ref()
+                                                .and_then(|p| p.checksum_policy.as_deref())
+                                                .and_then(ChecksumPolicy::parse),
+                                            snapshots_checksum_policy: r
+                                                .snapshots
+                                                .as_ref()
+                                                .and_then(|p| p.checksum_policy.as_deref())
+                                                .and_then(ChecksumPolicy::parse),
                                         }
                                     })
                                     .collect()
@@ -723,6 +743,22 @@ mod tests {
     use super::MavenSettings;
     use crate::settings::UpdatePolicy;
     use secrecy::ExposeSecret;
+
+    #[test]
+    fn parses_repository_checksum_policies() {
+        let xml = "<settings><profiles><profile><id>strict</id><repositories><repository><url>https://example.com/</url><releases><updatePolicy>always</updatePolicy><checksumPolicy>fail</checksumPolicy></releases><snapshots><enabled>true</enabled><checksumPolicy>fail</checksumPolicy></snapshots></repository></repositories></profile></profiles></settings>";
+        let settings = MavenSettings::parse_with_security(xml, None).unwrap();
+        let repo = &settings.profiles.as_ref().unwrap()[0].profile.repositories[0];
+        assert_eq!(repo.releases_update_policy, Some(UpdatePolicy::Always));
+        assert_eq!(
+            repo.releases_checksum_policy,
+            Some(crate::ChecksumPolicy::Fail)
+        );
+        assert_eq!(
+            repo.snapshots_checksum_policy,
+            Some(crate::ChecksumPolicy::Fail)
+        );
+    }
 
     #[test]
     fn parses_minimal_settings() {
@@ -1370,7 +1406,7 @@ mod tests {
           </servers>
         </settings>
         ";
-        tracing::subscriber::with_default(collector, || {
+        rv_test_support::with_default(collector, || {
             let settings = MavenSettings::parse_with_security(xml, None).unwrap();
             assert!(settings.servers.as_ref().unwrap()[0].password.is_none());
         });

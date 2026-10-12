@@ -67,6 +67,8 @@ pub fn run_cli() -> ExitCode {
         return ExitCode::from(130);
     };
 
+    output::flush_warning_summary();
+
     if let Err(err) = result {
         let code = err.exit_code();
         // `AlreadyReported` means the command has already written its full

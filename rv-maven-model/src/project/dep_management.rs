@@ -24,12 +24,42 @@ pub(super) fn resolve_dependencies(
     properties: &PropertyMap,
     project: &ProjectInfo,
 ) -> Result<Vec<Dependency>, PomError> {
-    let mut resolved = Vec::new();
-    let index = build_managed_dep_index(management);
+    resolve_dependencies_impl(deps, management, properties, project, true)
+}
 
+fn resolve_dependencies_impl(
+    deps: Vec<Dependency>,
+    management: &DependencyManagement,
+    properties: &PropertyMap,
+    project: &ProjectInfo,
+    validate: bool,
+) -> Result<Vec<Dependency>, PomError> {
+    if deps.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = build_managed_dep_index(management);
+    resolve_dependencies_with(
+        deps,
+        |dep| find_managed_dependency_indexed(dep, &index),
+        properties,
+        project,
+        validate,
+    )
+}
+
+/// Resolve `deps`, taking managed entries from `managed`. Callers that look
+/// up several management lists pass their own lookup instead of merging them.
+pub(super) fn resolve_dependencies_with<'m>(
+    deps: Vec<Dependency>,
+    managed: impl Fn(&Dependency) -> Option<&'m Dependency>,
+    properties: &PropertyMap,
+    project: &ProjectInfo,
+    validate: bool,
+) -> Result<Vec<Dependency>, PomError> {
+    let mut resolved = Vec::with_capacity(deps.len());
     for dep in deps {
-        let mut dep = resolve_dependency(dep, properties, project)?;
-        if let Some(managed) = find_managed_dependency_indexed(&dep, &index) {
+        let mut dep = interpolate_dependency(dep, properties, project)?;
+        if let Some(managed) = managed(&dep) {
             apply_managed_dependency(&mut dep, managed);
         }
         if dep.version.is_none() {
@@ -40,6 +70,9 @@ pub(super) fn resolve_dependencies(
                  the resolver will attempt to supply a version from outer management"
             );
         }
+        if validate {
+            dep.validate_system_scope()?;
+        }
         resolved.push(dep);
     }
 
@@ -47,6 +80,17 @@ pub(super) fn resolve_dependencies(
 }
 
 pub(super) fn resolve_dependency(
+    dep: Dependency,
+    properties: &PropertyMap,
+    project: &ProjectInfo,
+) -> Result<Dependency, PomError> {
+    let resolved = interpolate_dependency(dep, properties, project)?;
+    // Validate `<systemPath>` after interpolation so exporters cannot emit invalid entries.
+    resolved.validate_system_scope()?;
+    Ok(resolved)
+}
+
+fn interpolate_dependency(
     dep: Dependency,
     properties: &PropertyMap,
     project: &ProjectInfo,
@@ -63,7 +107,7 @@ pub(super) fn resolve_dependency(
         }
     };
     let trim_opt = |o: Option<String>| o.map(trim_string);
-    let resolved = Dependency {
+    Ok(Dependency {
         group_id: trim_string(properties.interpolate_str(&dep.group_id, project)?),
         artifact_id: trim_string(properties.interpolate_str(&dep.artifact_id, project)?),
         version: trim_opt(properties.interpolate_opt(dep.version.as_deref(), project)?),
@@ -77,12 +121,7 @@ pub(super) fn resolve_dependency(
             .map(|e| resolve_exclusion(e, properties, project))
             .collect::<Result<Vec<_>, _>>()?,
         system_path: properties.interpolate_opt(dep.system_path.as_deref(), project)?,
-    };
-    // After property interpolation, enforce Maven's systemPath requirement so
-    // we fail loudly instead of letting downstream exporters emit broken
-    // entries. Non-system deps short-circuit.
-    resolved.validate_system_scope()?;
-    Ok(resolved)
+    })
 }
 
 fn resolve_exclusion(
@@ -152,14 +191,16 @@ pub(super) fn apply_managed_dependency(dep: &mut Dependency, managed: &Dependenc
     if dep.scope.is_none() && managed.scope.is_some() {
         dep.scope.clone_from(&managed.scope);
     }
-    if dep.optional.is_none() {
-        dep.optional.clone_from(&managed.optional);
-    }
+    // Maven manages version, scope, type, classifier, and exclusions, but not `<optional>`.
     if dep.type_.is_none() {
         dep.type_.clone_from(&managed.type_);
     }
     if dep.classifier.is_none() {
         dep.classifier.clone_from(&managed.classifier);
+    }
+    // Maven's model merger fills a missing `<systemPath>` from dependencyManagement.
+    if dep.system_path.is_none() {
+        dep.system_path.clone_from(&managed.system_path);
     }
     // Maven semantics: a managed entry's exclusions UNION with any exclusions
     // declared on the concrete dependency, so exclusions the BOM author intended

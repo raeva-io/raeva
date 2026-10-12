@@ -13,6 +13,7 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
+use crate::blob::BlobId;
 use crate::error::{
     ConfigError, io_error_with_context, toml_de_error_with_context, toml_ser_error_with_context,
 };
@@ -1704,6 +1705,52 @@ impl Checksum {
     }
 }
 
+/// Parsed lockfile checksum pin with a lowercase digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumPin {
+    Sha256(BlobId),
+    Sha1(String),
+}
+
+/// Why a lockfile checksum is not a usable pin. Callers add the coordinate.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChecksumPinError {
+    #[error("unsupported checksum algorithm")]
+    UnsupportedAlgorithm,
+    #[error("{0}")]
+    InvalidSha256Digest(String),
+    #[error("sha1 digest must be 40 hex chars")]
+    InvalidSha1Digest,
+}
+
+impl ChecksumPin {
+    pub fn parse(checksum: &Checksum) -> Result<Self, ChecksumPinError> {
+        // Re-check even after Lockfile::read so in-memory checksums are validated too.
+        match normalize_checksum_algorithm(&checksum.algorithm) {
+            Some("sha256") => checksum
+                .digest
+                .parse()
+                .map(Self::Sha256)
+                .map_err(ChecksumPinError::InvalidSha256Digest),
+            Some("sha1") => {
+                let digest = checksum.digest.trim().to_ascii_lowercase();
+                if digest.len() != 40 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(ChecksumPinError::InvalidSha1Digest);
+                }
+                Ok(Self::Sha1(digest))
+            }
+            _ => Err(ChecksumPinError::UnsupportedAlgorithm),
+        }
+    }
+
+    pub fn expected_blob_id(&self) -> Option<&BlobId> {
+        match self {
+            Self::Sha256(id) => Some(id),
+            Self::Sha1(_) => None,
+        }
+    }
+}
+
 /// Normalize a lockfile checksum algorithm string to a canonical form.
 ///
 /// Accepts case-insensitive `sha256`, `sha-256`, `sha1`, `sha-1` and returns
@@ -1939,8 +1986,10 @@ fn atomic_replace(src: &Path, dst: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Checksum, LOCKFILE_SCHEMA_VERSION, LockEdge, LockGav, LockPackage, LockPlatform, Lockfile,
+        Checksum, ChecksumPin, ChecksumPinError, LOCKFILE_SCHEMA_VERSION, LockEdge, LockGav,
+        LockPackage, LockPlatform, Lockfile,
     };
+    use crate::blob::BlobId;
     use crate::error::ConfigError;
     use crate::platform::Platform;
     use std::collections::BTreeMap;
@@ -3055,6 +3104,98 @@ digest = "{upper}"
         }
         // The same file loads fine under the real cap.
         Lockfile::read(&path).expect("small lockfile must load under the default cap");
+    }
+
+    #[test]
+    fn checksum_pin_parses_sha256() {
+        let blob = BlobId::from_bytes(b"checksum pin");
+        let checksum = Checksum::new("sha256", blob.as_str().to_ascii_uppercase());
+        let pin = ChecksumPin::parse(&checksum).unwrap();
+        assert_eq!(pin, ChecksumPin::Sha256(blob.clone()));
+        assert_eq!(pin.expected_blob_id(), Some(&blob));
+    }
+
+    #[test]
+    fn checksum_pin_accepts_algorithm_spellings() {
+        for algorithm in [
+            "sha256",
+            "SHA256",
+            "sHa256",
+            "sha-256",
+            "sHa-256",
+            " SHA-256 ",
+        ] {
+            let blob = BlobId::from_bytes(b"checksum pin");
+            assert_eq!(
+                ChecksumPin::parse(&Checksum::new(algorithm, blob.as_str())).unwrap(),
+                ChecksumPin::Sha256(blob),
+            );
+        }
+        for algorithm in ["sha1", "SHA1", "sHa1", "sha-1", "sHa-1", " SHA-1 "] {
+            assert_eq!(
+                ChecksumPin::parse(&Checksum::new(algorithm, "a".repeat(40))).unwrap(),
+                ChecksumPin::Sha1("a".repeat(40)),
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_pin_normalizes_sha1_digest() {
+        let digest = "aAbBcCdDeEfF00112233445566778899aAbBcCdD";
+        let checksum = Checksum::new("sha1", format!(" \t{digest}\n"));
+        let pin = ChecksumPin::parse(&checksum).unwrap();
+        assert_eq!(pin, ChecksumPin::Sha1(digest.to_ascii_lowercase()));
+        assert_eq!(pin.expected_blob_id(), None);
+    }
+
+    #[test]
+    fn checksum_pin_rejects_bad_lengths() {
+        for (algorithm, length) in [("sha256", 64), ("sha1", 40)] {
+            for size in [0, length - 1, length + 1] {
+                let err =
+                    ChecksumPin::parse(&Checksum::new(algorithm, "a".repeat(size))).unwrap_err();
+                let expected = if algorithm == "sha256" {
+                    ChecksumPinError::InvalidSha256Digest("invalid blob id length".to_string())
+                } else {
+                    ChecksumPinError::InvalidSha1Digest
+                };
+                assert_eq!(err, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_pin_rejects_non_hex_digests() {
+        for (algorithm, length) in [("sha256", 64), ("sha1", 40)] {
+            for digest in ["g".repeat(length), "\u{00e9}".repeat(length / 2)] {
+                let err = ChecksumPin::parse(&Checksum::new(algorithm, digest)).unwrap_err();
+                let expected = if algorithm == "sha256" {
+                    ChecksumPinError::InvalidSha256Digest("invalid blob id characters".to_string())
+                } else {
+                    ChecksumPinError::InvalidSha1Digest
+                };
+                assert_eq!(err, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_pin_does_not_trim_sha256_digest() {
+        let checksum = Checksum::new("sha256", format!(" {} ", "a".repeat(64)));
+        assert_eq!(
+            ChecksumPin::parse(&checksum).unwrap_err(),
+            ChecksumPinError::InvalidSha256Digest("invalid blob id length".to_string()),
+        );
+    }
+
+    #[test]
+    fn checksum_pin_rejects_unsupported_algorithms() {
+        for algorithm in ["md5", "sha512", "", " SHA-512 "] {
+            assert_eq!(
+                ChecksumPin::parse(&Checksum::new(algorithm, "invalid digest")).unwrap_err(),
+                ChecksumPinError::UnsupportedAlgorithm,
+            );
+        }
     }
 
     /// Uppercase `"SHA-256"` / `"SHA-1"` must normalize to lowercase canonical.

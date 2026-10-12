@@ -66,32 +66,54 @@ impl MirrorSelector {
     /// id-matched `AuthConfig` is unaffected because the user opted into
     /// that pairing.
     pub(crate) fn resolve_with_host_change(&self, repo: &Repository) -> (Repository, bool) {
-        if let Some(mirror) = self.matching_mirror(repo) {
-            // Treat `mirror.url == repo.url` as "no mirror matched". Without
-            // this, the fallback path in `RepoClient::resolve_repo_with_fallback`
-            // would see a substitution and retry the origin against itself.
-            if mirror.url == repo.url {
+        let (resolved, _, host_changed) = resolve_mirror_impl(&self.mirrors, repo, true);
+        (resolved, host_changed)
+    }
+}
+
+/// Resolve silently to the effective repository, applied mirror, and whether
+/// the origin (scheme, host, or effective port) changed, preserving repository policies.
+pub fn resolve_mirror<'a>(
+    mirrors: &'a [rv_config::MirrorConfig],
+    repo: &Repository,
+) -> (Repository, Option<&'a rv_config::MirrorConfig>, bool) {
+    resolve_mirror_impl(mirrors, repo, false)
+}
+
+fn resolve_mirror_impl<'a>(
+    mirrors: &'a [rv_config::MirrorConfig],
+    repo: &Repository,
+    diagnostics: bool,
+) -> (Repository, Option<&'a rv_config::MirrorConfig>, bool) {
+    if let Some(mirror) = matching_mirror(mirrors, repo, diagnostics) {
+        // Treat `mirror.url == repo.url` as "no mirror matched". Without
+        // this, the fallback path in `RepoClient::resolve_repo_with_fallback`
+        // would see a substitution and retry the origin against itself.
+        if mirror.url == repo.url {
+            if diagnostics {
                 tracing::warn!(
                     sec_code = "MIRROR_SELF_REF",
                     id = ?repo.id,
                     "mirror points at the repo it mirrors; ignoring"
                 );
-                return (repo.clone(), false);
             }
-            let host_changed = origins_differ(&repo.url, &mirror.url);
-            // Inherit the origin repo's id (so its configured credentials keep
-            // applying) ONLY when the mirror has no id of its own and we are
-            // not crossing hosts. Inheriting the origin id across a host
-            // boundary would let `lookup_auth` id-match and forward the
-            // origin's id-scoped credential to the foreign mirror host, which
-            // is the exact leak the host_changed suppression exists to prevent. A
-            // mirror with its OWN explicit id is left untouched: the user opted
-            // into that pairing.
-            let id = match mirror.id.clone() {
-                Some(mirror_id) => Some(mirror_id),
-                None if host_changed => None,
-                None => repo.id.clone(),
-            };
+            return (repo.clone(), None, false);
+        }
+        let host_changed = origins_differ(&repo.url, &mirror.url);
+        // Inherit the origin repo's id (so its configured credentials keep
+        // applying) ONLY when the mirror has no id of its own and we are
+        // not crossing hosts. Inheriting the origin id across a host
+        // boundary would let `lookup_auth` id-match and forward the
+        // origin's id-scoped credential to the foreign mirror host, which
+        // is the exact leak the host_changed suppression exists to prevent. A
+        // mirror with its OWN explicit id is left untouched: the user opted
+        // into that pairing.
+        let id = match mirror.id.clone() {
+            Some(mirror_id) => Some(mirror_id),
+            None if host_changed => None,
+            None => repo.id.clone(),
+        };
+        if diagnostics {
             tracing::debug!(
                 original_url = %repo.url,
                 mirror_url = %mirror.url,
@@ -100,38 +122,40 @@ impl MirrorSelector {
             );
             if host_changed {
                 tracing::warn!(
+                    sec_code = "CROSS_HOST_MIRROR",
                     original_url = %repo.url,
                     mirror_url = %mirror.url,
                     "mirror substitution crossed hosts; default credentials will not be forwarded"
                 );
             }
-            let resolved = Repository::new(
-                id,
-                mirror.url.clone(),
-                repo.releases_enabled,
-                repo.snapshots_enabled,
-            )
-            .with_snapshot_policy(repo.snapshots_update_policy);
-            return (resolved, host_changed);
         }
-
-        (repo.clone(), false)
+        // A mirror changes the endpoint, not the origin's policies.
+        let mut resolved = repo.clone();
+        resolved.id = id;
+        resolved.url = crate::repository::normalize_repo_url(&mirror.url);
+        return (resolved, Some(mirror), host_changed);
     }
 
-    pub(crate) fn matching_mirror(&self, repo: &Repository) -> Option<&rv_config::MirrorConfig> {
-        // Maven's `DefaultMirrorSelector` runs two passes: an exact single-ID
-        // match wins over any wildcard or pattern match, regardless of list
-        // order. Without this, `[{mirrorOf:"*"}, {mirrorOf:"central"}]` would
-        // shadow the second entry for `central`.
-        self.mirrors
-            .iter()
-            .find(|mirror| is_exact_id_mirror(mirror, repo))
-            .or_else(|| {
-                self.mirrors
-                    .iter()
-                    .find(|mirror| matches_mirror(mirror, repo))
-            })
-    }
+    (repo.clone(), None, false)
+}
+
+fn matching_mirror<'a>(
+    mirrors: &'a [rv_config::MirrorConfig],
+    repo: &Repository,
+    diagnostics: bool,
+) -> Option<&'a rv_config::MirrorConfig> {
+    // Maven's `DefaultMirrorSelector` runs two passes: an exact single-ID
+    // match wins over any wildcard or pattern match, regardless of list
+    // order. Without this, `[{mirrorOf:"*"}, {mirrorOf:"central"}]` would
+    // shadow the second entry for `central`.
+    mirrors
+        .iter()
+        .find(|mirror| is_exact_id_mirror(mirror, repo))
+        .or_else(|| {
+            mirrors
+                .iter()
+                .find(|mirror| matches_mirror(mirror, repo, diagnostics))
+        })
 }
 
 fn is_exact_id_mirror(mirror: &rv_config::MirrorConfig, repo: &Repository) -> bool {
@@ -142,7 +166,7 @@ fn is_exact_id_mirror(mirror: &rv_config::MirrorConfig, repo: &Repository) -> bo
     patterns.len() == 1 && patterns[0] == repo_id
 }
 
-fn matches_mirror(mirror: &rv_config::MirrorConfig, repo: &Repository) -> bool {
+fn matches_mirror(mirror: &rv_config::MirrorConfig, repo: &Repository, diagnostics: bool) -> bool {
     let patterns = expand_patterns(&mirror.mirror_of);
     if patterns.is_empty() {
         return false;
@@ -152,10 +176,10 @@ fn matches_mirror(mirror: &rv_config::MirrorConfig, repo: &Repository) -> bool {
     let mut matched = false;
     for pattern in patterns {
         if let Some(rule) = pattern.strip_prefix('!') {
-            if pattern_matches(rule, repo, mirror_id) {
+            if pattern_matches(rule, repo, mirror_id, diagnostics) {
                 return false;
             }
-        } else if pattern_matches(&pattern, repo, mirror_id) {
+        } else if pattern_matches(&pattern, repo, mirror_id, diagnostics) {
             matched = true;
         }
     }
@@ -172,7 +196,7 @@ fn expand_patterns(patterns: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn pattern_matches(pattern: &str, repo: &Repository, mirror_id: &str) -> bool {
+fn pattern_matches(pattern: &str, repo: &Repository, mirror_id: &str, diagnostics: bool) -> bool {
     if pattern == "*" {
         return true;
     }
@@ -193,7 +217,7 @@ fn pattern_matches(pattern: &str, repo: &Repository, mirror_id: &str) -> bool {
         return !is_external_repo(&repo.url);
     }
     // Unrecognized pseudo-patterns: warn once and fall through to exact-id comparison.
-    if pattern.starts_with("external:") || pattern.starts_with("internal:") {
+    if diagnostics && (pattern.starts_with("external:") || pattern.starts_with("internal:")) {
         warn_unknown_pattern_once(pattern, mirror_id);
     }
     match repo.id.as_deref() {
@@ -260,6 +284,61 @@ mod tests {
             url: url.to_string(),
             mirror_of: mirror_of.iter().map(|value| value.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn public_resolution_is_quiet_and_matches_sync() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::prelude::*;
+
+        struct CountEvents(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountEvents {
+            fn on_event(
+                &self,
+                _: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let events = Arc::new(AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry().with(CountEvents(events.clone()));
+        rv_test_support::with_default(subscriber, || {
+            let mut repo = Repository::new(
+                Some("central".to_string()),
+                "https://nexus.corp/repo/",
+                true,
+                true,
+            );
+            repo.releases_checksum_policy = rv_config::ChecksumPolicy::Fail;
+            repo.snapshots_update_policy = rv_config::UpdatePolicy::Always;
+            for url in [
+                "https://nexus.corp/repo/",
+                "https://nexus.corp/mirror/",
+                "http://nexus.corp:8081/mirror/",
+            ] {
+                let mirrors = vec![mirror_config("corp", url, &["external:quiet-test", "*"])];
+                events.store(0, Ordering::Relaxed);
+                let (resolved, applied, changed) = super::resolve_mirror(&mirrors, &repo);
+                assert_eq!(events.load(Ordering::Relaxed), 0);
+                assert_eq!(
+                    resolved.releases_checksum_policy,
+                    repo.releases_checksum_policy
+                );
+                assert_eq!(
+                    resolved.snapshots_update_policy,
+                    repo.snapshots_update_policy
+                );
+                assert_eq!(applied.is_some(), url != repo.url);
+                let selector = MirrorSelector::from_mirrors(mirrors);
+                assert_eq!(
+                    (resolved, changed),
+                    selector.resolve_with_host_change(&repo)
+                );
+                assert!(events.load(Ordering::Relaxed) > 0);
+            }
+        });
     }
 
     #[test]

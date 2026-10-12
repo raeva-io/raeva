@@ -16,7 +16,7 @@ mod properties;
 mod repository;
 mod scope;
 
-pub use activation::{Activation, ActivationContext};
+pub use activation::{Activation, ActivationContext, jvm_os_arch};
 pub use dependency::{Dependency, DependencyManagement, Exclusion};
 pub use effective::{EffectiveDescriptor, Gav};
 pub use error::PomError;

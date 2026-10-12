@@ -27,15 +27,15 @@ pub use limited_read::{
     read_project_input, read_project_input_string,
 };
 pub use lock::{
-    Checksum, LEGACY_ROOT_ARTIFACT, LEGACY_ROOT_GROUP, LEGACY_ROOT_VERSION, LOCK_SUPPORT_POMS_KEY,
-    LOCKFILE_SCHEMA_VERSION, LockArtifact, LockCoordinate, LockEdge, LockGav, LockModule,
-    LockModulePackage, LockPackage, LockPlatform, LockResolution, LockResolutionStrategy,
-    LockSnapshot, Lockfile, LockfileGuard, SupportPomLine, decode_support_pom_lines,
-    encode_support_pom_lines, normalize_checksum_algorithm,
+    Checksum, ChecksumPin, ChecksumPinError, LEGACY_ROOT_ARTIFACT, LEGACY_ROOT_GROUP,
+    LEGACY_ROOT_VERSION, LOCK_SUPPORT_POMS_KEY, LOCKFILE_SCHEMA_VERSION, LockArtifact,
+    LockCoordinate, LockEdge, LockGav, LockModule, LockModulePackage, LockPackage, LockPlatform,
+    LockResolution, LockResolutionStrategy, LockSnapshot, Lockfile, LockfileGuard, SupportPomLine,
+    decode_support_pom_lines, encode_support_pom_lines, normalize_checksum_algorithm,
 };
 pub use path_utils::canonicalize_existing_prefix;
 pub use paths::ResolvedPaths;
 pub use platform::Platform;
 pub use settings::{
-    AuthConfig, MirrorConfig, ProxyAuthType, ProxyConfig, RepoConfig, UpdatePolicy,
+    AuthConfig, ChecksumPolicy, MirrorConfig, ProxyAuthType, ProxyConfig, RepoConfig, UpdatePolicy,
 };

@@ -17,7 +17,10 @@ pub fn pom_matches_parent(pom: &Pom, parent: &Parent) -> bool {
     if let Some(version) = pom.version.as_deref()
         && version != parent.version
     {
-        return false;
+        // `parent` is already interpolated, so a CI-friendly `${revision}`
+        // version on the candidate has to be expanded from its own properties.
+        let expanded = pom.properties.interpolate_str_no_project(version);
+        return expanded.is_ok_and(|expanded| expanded == parent.version);
     }
     true
 }
@@ -48,6 +51,17 @@ mod tests {
         let pom = make_pom(Some("com.example"), Some("parent"), Some("1.0"));
         let parent = make_parent("com.example", "parent", "1.0");
         assert!(pom_matches_parent(&pom, &parent));
+    }
+
+    #[test]
+    fn matches_unflattened_revision_through_own_properties() {
+        let mut pom = make_pom(Some("com.example"), Some("parent"), Some("${revision}"));
+        pom.properties.insert("revision", "0.0.20");
+        let parent = make_parent("com.example", "parent", "0.0.20");
+        assert!(pom_matches_parent(&pom, &parent));
+
+        let parent = make_parent("com.example", "parent", "0.0.21");
+        assert!(!pom_matches_parent(&pom, &parent));
     }
 
     #[test]

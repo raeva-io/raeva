@@ -56,8 +56,10 @@ impl<'a, B: Backend> Solver<'a, B> {
             // network/parse cost on every cache hit.
             let resolved_project = match cached {
                 Some(mapped) => {
+                    // A terminal coordinate maps to itself in the cache; this is not a cycle.
+                    let terminal = mapped == current;
                     current = mapped;
-                    if !chain.insert(current.clone()) {
+                    if !terminal && !chain.insert(current.clone()) {
                         return Err(ResolveError::RelocationCycle(format_relocation_cycle(
                             &chain, &current,
                         )));

@@ -27,7 +27,7 @@ fn write_pom(path: &Path, group_id: &str, artifact_id: &str, version: &str) {
 }
 
 fn test_context(project_root: &Path, store_dir: &Path) -> ResolveContext {
-    let paths = ResolvedPaths::discover().expect("paths");
+    let paths = ResolvedPaths::for_testing().expect("paths");
     let config = Config::for_testing_with_repos(project_root.to_path_buf(), paths, Vec::new());
     let store = Arc::new(Store::open(store_dir).expect("store"));
     let platform = Platform::new("linux", "x86_64").unwrap();
@@ -43,6 +43,7 @@ mod workspace_resolution {
     use rv_config::{Config, Platform, RepoConfig, ResolvedPaths};
     use rv_repo::{RepoClient, Repository};
     use rv_store::Store;
+    use rv_test_support::http::{Response, StubServer};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -74,62 +75,18 @@ mod workspace_resolution {
         response
     }
 
-    async fn spawn_repository() -> (String, Arc<Mutex<Vec<String>>>) {
-        spawn_repository_with_routes(repository_routes()).await
+    fn spawn_repository() -> (String, StubServer) {
+        spawn_repository_with_routes(repository_routes())
     }
 
-    async fn spawn_repository_with_routes(
-        routes: HashMap<String, Vec<u8>>,
-    ) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let address = listener.local_addr().expect("address");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let request_log = Arc::clone(&requests);
-        let routes = Arc::new(routes);
-
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let routes = Arc::clone(&routes);
-                let request_log = Arc::clone(&request_log);
-                tokio::spawn(async move {
-                    let mut bytes = Vec::new();
-                    let mut buffer = [0_u8; 4096];
-                    loop {
-                        let Ok(read) = socket.read(&mut buffer).await else {
-                            return;
-                        };
-                        if read == 0 {
-                            return;
-                        }
-                        bytes.extend_from_slice(&buffer[..read]);
-                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let path = std::str::from_utf8(&bytes)
-                        .ok()
-                        .and_then(|request| request.lines().next())
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/")
-                        .to_string();
-                    request_log
-                        .lock()
-                        .expect("request log poisoned")
-                        .push(path.clone());
-                    let payload = routes
-                        .get(&path)
-                        .map(|body| response("200 OK", body))
-                        .unwrap_or_else(|| response("404 Not Found", b""));
-                    let _ = socket.write_all(&payload).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
+    fn spawn_repository_with_routes(routes: HashMap<String, Vec<u8>>) -> (String, StubServer) {
+        let server = StubServer::start(move |request| {
+            routes.get(&request.path).map_or_else(
+                || Response::new(404, ""),
+                |body| Response::new(200, body.clone()),
+            )
         });
-
-        (format!("http://{address}/"), requests)
+        (format!("http://{}/", server.addr()), server)
     }
 
     /// Like [`spawn_repository_with_routes`], but every `.jar` request is
@@ -290,6 +247,9 @@ mod workspace_resolution {
             releases: Some(true),
             snapshots: Some(true),
             snapshots_update_policy: None,
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         }
     }
 
@@ -300,7 +260,7 @@ mod workspace_resolution {
         initial_repositories: bool,
     ) -> (Resolver, tempfile::TempDir) {
         ensure_crypto_provider();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let repositories = repo_url
             .map(|url| vec![repo_config(url)])
             .unwrap_or_default();
@@ -388,10 +348,168 @@ mod workspace_resolution {
         assert_eq!(result.module_gav.version, "1");
     }
 
+    /// A dependency download and a root's parent/BOM build are polled by the
+    /// same reactor task. The server releases the dependency only once the
+    /// root has crossed the synchronous parent-fetch bridge. Building the root
+    /// inline then waits on the sibling's OnceCell, preventing its initializer
+    /// from ever being polled again, even after the HTTP response arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_model_does_not_block_sibling_pom_initializer() {
+        use futures::FutureExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::Poll;
+        use std::time::Duration;
+        use tokio::sync::{Notify, oneshot, watch};
+
+        const BOM: &[u8] = br"<project><modelVersion>4.0.0</modelVersion>
+          <groupId>test</groupId><artifactId>shared</artifactId><version>1</version>
+          <packaging>pom</packaging><dependencyManagement><dependencies><dependency>
+          <groupId>test</groupId><artifactId>managed</artifactId><version>7</version>
+          </dependency></dependencies></dependencyManagement></project>";
+        const PARENT: &[u8] = br"<project><modelVersion>4.0.0</modelVersion>
+          <groupId>test</groupId><artifactId>parent</artifactId><version>1</version>
+          <packaging>pom</packaging><dependencyManagement><dependencies><dependency>
+          <groupId>test</groupId><artifactId>shared</artifactId><version>1</version>
+          <type>pom</type><scope>import</scope>
+          </dependency></dependencies></dependencyManagement></project>";
+        let started = Arc::new(Notify::new());
+        let gets = Arc::new(AtomicUsize::new(0));
+        let (release, released) = watch::channel(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server_started = Arc::clone(&started);
+        let server_gets = Arc::clone(&gets);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let started = Arc::clone(&server_started);
+                let gets = Arc::clone(&server_gets);
+                let release = release.clone();
+                let mut released = released.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buffer[..n]),
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&request);
+                    let path = request.split_whitespace().nth(1).unwrap();
+                    let payload = match path {
+                        "/test/shared/1/shared-1.pom" => {
+                            gets.fetch_add(1, Ordering::SeqCst);
+                            started.notify_one();
+                            released.wait_for(|value| *value).await.unwrap();
+                            response("200 OK", BOM)
+                        }
+                        "/test/parent/1/parent-1.pom" => {
+                            // This request can only come from the root's sync
+                            // bridge. The sibling already owns the BOM cell.
+                            release.send_replace(true);
+                            response("200 OK", PARENT)
+                        }
+                        _ => response("404 Not Found", b""),
+                    };
+                    let _ = socket.write_all(&payload).await;
+                });
+            }
+        });
+
+        ensure_crypto_provider();
+        let tmp = tempfile::tempdir().unwrap();
+        let pom_path = tmp.path().join("pom.xml");
+        std::fs::write(
+            &pom_path,
+            br"<project><modelVersion>4.0.0</modelVersion>
+          <parent><groupId>test</groupId><artifactId>parent</artifactId><version>1</version>
+          <relativePath/></parent><artifactId>root</artifactId></project>",
+        )
+        .unwrap();
+        let config = Config::for_testing_with_repos(
+            tmp.path().to_path_buf(),
+            ResolvedPaths::from_raeva_home(tmp.path().join("raeva")),
+            vec![repo_config(&url)],
+        );
+        let client = RepoClient::new(&config)
+            .await
+            .unwrap()
+            .with_allow_missing_checksums(true);
+        let repos: Vec<_> = config.repositories().iter().map(Repository::from).collect();
+        let store = Arc::new(Store::open(&tmp.path().join("store")).unwrap());
+        let ctx = ResolveContext::new(
+            config,
+            repos.clone(),
+            store,
+            Platform::new("linux", "x86_64").unwrap(),
+            Some(client.clone()),
+        );
+        let resolver = Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
+        let repo = repos[0].clone();
+        let download = Arc::new(Mutex::new(Some(
+            async move {
+                client
+                    .fetch_pom(&repo, &rv_repo::ArtifactRequest::new("test", "shared", "1"))
+                    .await
+            }
+            .boxed(),
+        )));
+
+        // A timeout on the reactor task itself cannot fire while that task is
+        // synchronously blocked. Time it on an independent task, and on failure
+        // drop the initializer to let the root take over its cell. This breaks
+        // the deadlock for cleanup instead of stranding a runtime thread.
+        let rescue = Arc::clone(&download);
+        let (done, finished) = oneshot::channel();
+        let watchdog = tokio::spawn(async move {
+            let result = tokio::time::timeout(Duration::from_secs(5), finished).await;
+            if result.is_err() {
+                rescue.lock().unwrap().take();
+            }
+            result
+        });
+        let dependency = futures::future::poll_fn(|cx| {
+            let mut slot = download.lock().unwrap();
+            match slot.as_mut() {
+                Some(future) => future.poll_unpin(cx).map(Some),
+                None => Poll::Ready(None),
+            }
+        });
+        let root = async {
+            started.notified().await;
+            resolver
+                .load_root_project(&pom_path, &repos, None, None)
+                .await
+        };
+        // Like buffer_unordered, join! polls both futures on this one task.
+        let (dependency, root) = futures::join!(dependency, root);
+        let _ = done.send(());
+        let completed = watchdog.await.unwrap();
+        server.abort();
+        completed
+            .expect("root model deadlocked the sibling POM initializer")
+            .unwrap();
+        assert_eq!(dependency.unwrap().unwrap().as_ref(), BOM);
+        let (_, project, _, _) = root.unwrap();
+        assert_eq!(project.artifact_id, "root");
+        assert_eq!(
+            project.dependency_management.dependencies[0]
+                .version
+                .as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            gets.load(Ordering::SeqCst),
+            1,
+            "shared BOM must download once"
+        );
+    }
+
     #[tokio::test]
     async fn exact_sibling_keeps_outgoing_external_edges() {
         let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (url, _) = spawn_repository().await;
+        let (url, _server) = spawn_repository();
         let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
 
         let result = resolve_module(&resolver, &workspace, "app/pom.xml")
@@ -429,7 +547,7 @@ mod workspace_resolution {
     #[tokio::test]
     async fn range_selects_workspace_or_higher_repository_candidate() {
         let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (url, _) = spawn_repository().await;
+        let (url, _server) = spawn_repository();
         let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
 
         let sibling = resolve_module(&resolver, &workspace, "range-app/pom.xml")
@@ -463,7 +581,7 @@ mod workspace_resolution {
         );
         assert_eq!(sibling_lib.coord.version.as_str(), "1");
 
-        let (url, _) = spawn_repository().await;
+        let (url, _server) = spawn_repository();
         let (with_repository, _store) = resolver(workspace.root(), Some(&url), false, true).await;
         let repository = resolve_module(&with_repository, &workspace, "dynamic-app/pom.xml")
             .await
@@ -476,7 +594,7 @@ mod workspace_resolution {
     #[tokio::test]
     async fn sibling_bom_import_manages_external_dependency() {
         let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (url, _) = spawn_repository().await;
+        let (url, _server) = spawn_repository();
         let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
 
         let result = resolve_module(&resolver, &workspace, "bom-app/pom.xml")
@@ -507,7 +625,7 @@ mod workspace_resolution {
     #[tokio::test]
     async fn sibling_test_jar_keeps_requested_classifier_identity() {
         let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (url, _) = spawn_repository().await;
+        let (url, _server) = spawn_repository();
         let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
 
         let result = resolve_module(&resolver, &workspace, "classifier-app/pom.xml")
@@ -556,9 +674,141 @@ mod workspace_resolution {
         );
     }
 
+    /// A reactor parent may import a sibling BOM through `${project.version}`.
+    /// The BOM's parent uses `${revision}` from the root, so lookup needs its reactor identity.
+    #[tokio::test]
+    async fn sibling_bom_import_with_revision_parent_resolves() {
+        let (url, _server) = spawn_repository();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |path: &str, xml: &str| {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(path, xml).expect("write pom");
+        };
+        write(
+            "pom.xml",
+            r#"<project><modelVersion>4.0.0</modelVersion>
+<groupId>t</groupId><artifactId>root</artifactId><version>${revision}</version><packaging>pom</packaging>
+<properties><revision>1.0-SNAPSHOT</revision></properties>
+<modules><module>bom</module><module>mid</module></modules></project>"#,
+        );
+        write(
+            "bom/pom.xml",
+            r#"<project><modelVersion>4.0.0</modelVersion>
+<parent><groupId>t</groupId><artifactId>root</artifactId><version>${revision}</version></parent>
+<artifactId>bom</artifactId><packaging>pom</packaging>
+<dependencyManagement><dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId><version>2</version></dependency></dependencies></dependencyManagement></project>"#,
+        );
+        write(
+            "mid/pom.xml",
+            r#"<project><modelVersion>4.0.0</modelVersion>
+<parent><groupId>t</groupId><artifactId>root</artifactId><version>${revision}</version></parent>
+<artifactId>mid</artifactId><packaging>pom</packaging>
+<modules><module>leaf</module></modules>
+<dependencyManagement><dependencies><dependency><groupId>t</groupId><artifactId>bom</artifactId><version>${project.version}</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement></project>"#,
+        );
+        write(
+            "mid/leaf/pom.xml",
+            r#"<project><modelVersion>4.0.0</modelVersion>
+<parent><groupId>t</groupId><artifactId>mid</artifactId><version>${revision}</version></parent>
+<artifactId>leaf</artifactId>
+<dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId></dependency></dependencies></project>"#,
+        );
+        let workspace = Workspace::discover(dir.path()).expect("workspace");
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+
+        let result = resolve_module(&resolver, &workspace, "mid/leaf/pom.xml")
+            .await
+            .expect("sibling BOM with a ${revision} parent must resolve");
+        let (_, lib) = node_by_artifact(&result.graph, "lib");
+
+        assert_eq!(lib.coord.version.as_str(), "2");
+    }
+
+    /// A missing required `<systemPath>` invalidates a dependency POM.
+    /// Maven warns, keeps the artifact, and discards its transitive dependencies.
+    #[tokio::test]
+    async fn invalid_system_dependency_in_remote_pom_drops_transitives() {
+        let broken_pom = br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.vendor</groupId>
+  <artifactId>broken</artifactId>
+  <version>1</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.external</groupId>
+      <artifactId>leaf</artifactId>
+      <version>1</version>
+    </dependency>
+    <dependency>
+      <groupId>jdk.tools</groupId>
+      <artifactId>jdk.tools</artifactId>
+      <version>1.8</version>
+      <scope>system</scope>
+    </dependency>
+  </dependencies>
+</project>"#;
+        let leaf_pom = br#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.external</groupId>
+  <artifactId>leaf</artifactId>
+  <version>1</version>
+</project>"#;
+        let routes = HashMap::from([
+            (
+                "/org/vendor/broken/1/broken-1.pom".to_string(),
+                broken_pom.to_vec(),
+            ),
+            (
+                "/org/vendor/broken/1/broken-1.jar".to_string(),
+                b"jar".to_vec(),
+            ),
+            (
+                "/org/external/leaf/1/leaf-1.pom".to_string(),
+                leaf_pom.to_vec(),
+            ),
+        ]);
+        let (url, _requests) = spawn_repository_with_routes(routes);
+        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
+        std::fs::write(
+            workspace_dir.path().join("pom.xml"),
+            r"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1</version>
+  <dependencies>
+    <dependency>
+      <groupId>org.vendor</groupId>
+      <artifactId>broken</artifactId>
+      <version>1</version>
+    </dependency>
+  </dependencies>
+</project>",
+        )
+        .expect("write pom");
+        let workspace = Workspace::discover(workspace_dir.path()).expect("workspace");
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+
+        let result = resolve_module(&resolver, &workspace, "pom.xml")
+            .await
+            .expect("an invalid dependency POM must not fail the build");
+
+        node_by_artifact(&result.graph, "broken");
+        assert!(
+            result.graph.node_indices().all(|index| {
+                result
+                    .graph
+                    .node(index)
+                    .is_none_or(|node| node.coord.artifact_id.as_str() != "leaf")
+            }),
+            "transitives of an invalid POM are not available"
+        );
+    }
+
     #[tokio::test]
     async fn sibling_declared_repository_is_trusted() {
-        let (url, requests) = spawn_repository().await;
+        let (url, requests) = spawn_repository();
         let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
         copy_tree(&fixture("basic"), workspace_dir.path()).expect("copy fixture");
         let repo_owner = workspace_dir.path().join("repo-owner/pom.xml");
@@ -577,16 +827,15 @@ mod workspace_resolution {
         assert!(vendor.repo_url.is_some());
         assert!(
             requests
-                .lock()
-                .expect("request log")
+                .requests()
                 .iter()
-                .any(|path| path == "/org/vendor/only-here/1/only-here-1.pom")
+                .any(|request| request.path == "/org/vendor/only-here/1/only-here-1.pom")
         );
     }
 
     #[tokio::test]
     async fn per_module_driver_resolves_in_discovery_order_with_bounded_budget() {
-        let (url, _) = spawn_repository().await;
+        let (url, _server) = spawn_repository();
         let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
         copy_tree(&fixture("basic"), workspace_dir.path()).expect("copy fixture");
         let repo_owner = workspace_dir.path().join("repo-owner/pom.xml");
@@ -634,7 +883,6 @@ mod workspace_resolution {
     #[test]
     fn module_concurrency_cap_is_documented_and_sane() {
         assert_eq!(crate::MAX_WORKSPACE_MODULE_CONCURRENCY, 4);
-        assert_eq!(crate::MAX_WORKSPACE_NETWORK_CONCURRENCY, 4);
         assert_eq!(crate::MAX_WORKSPACE_ARTIFACT_POPULATIONS, 1);
     }
 
@@ -696,7 +944,7 @@ mod workspace_resolution {
                 "{}",
                 corpus_drift_hint(project_name, corpus_ref)
             );
-            let paths = ResolvedPaths::discover().expect("paths");
+            let paths = ResolvedPaths::for_testing().expect("paths");
             let mut config =
                 Config::for_testing_with_repos(project_root.clone(), paths, Vec::new());
             config.network.concurrency = 16;
@@ -801,7 +1049,7 @@ mod workspace_resolution {
                 format!("shared-dep-{dep}").into_bytes(),
             );
         }
-        let (url, _requests) = spawn_repository_with_routes(routes).await;
+        let (url, _requests) = spawn_repository_with_routes(routes);
 
         let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
         let module_names: Vec<String> = (0..MODULES).map(|m| format!("m{m}")).collect();
@@ -1497,7 +1745,69 @@ async fn parent_pom_repositories_propagate_to_resolver() {
     );
 }
 
-/// #2: the ROOT project's own parent must fail closed even in normal
+/// Root `file://${project.basedir}` repositories reach the solver after interpolation.
+/// Unsupported schemes must fail before resolution.
+#[tokio::test]
+async fn root_file_repository_is_interpolated_and_bad_schemes_fail_fast() {
+    use crate::ResolutionStrategy;
+
+    let store_tmp = tempfile::tempdir().unwrap();
+    let pom_for = |url: &str| {
+        format!(
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>local</id>
+      <url>{url}</url>
+    </repository>
+  </repositories>
+</project>
+"#
+        )
+    };
+
+    let good_tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        good_tmp.path().join("pom.xml"),
+        pom_for("file:///${project.basedir}/lib"),
+    )
+    .unwrap();
+    let ctx = test_context(good_tmp.path(), store_tmp.path());
+    let resolver = crate::Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
+    let (_coord, _project, observed, _support) = resolver
+        .load_root_project(&good_tmp.path().join("pom.xml"), &[], None, None)
+        .await
+        .expect("file repository is supported");
+    let expected = format!("{}/lib", good_tmp.path().display());
+    assert!(
+        observed
+            .iter()
+            .any(|repo| repo.is_local() && repo.url.contains(expected.trim_start_matches('/'))),
+        "observed: {:?}",
+        observed.iter().map(|r| &r.url).collect::<Vec<_>>()
+    );
+    assert!(observed.iter().all(|repo| !repo.url.contains("${")));
+
+    let bad_tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        bad_tmp.path().join("pom.xml"),
+        pom_for("ftp://files.example/m2/"),
+    )
+    .unwrap();
+    let ctx = test_context(bad_tmp.path(), store_tmp.path());
+    let resolver = crate::Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
+    let err = resolver
+        .load_root_project(&bad_tmp.path().join("pom.xml"), &[], None, None)
+        .await
+        .expect_err("ftp repositories are unsupported");
+    assert!(err.to_string().contains("unsupported URL"), "{err}");
+}
+
+/// The ROOT project's own parent must fail closed even in normal
 /// (non-`--frozen`) mode. A root pom declaring a parent that cannot be
 /// resolved (no local `../pom.xml` match, no remote client) must error rather
 /// than silently producing a lock from a model Maven itself cannot build.
@@ -1605,20 +1915,23 @@ fn repo_backend_extend_repos_accumulates_unique_urls() {
     assert_eq!(backend.repos_snapshot().len(), 1);
 
     // Extending with a new URL appends; duplicate URLs are ignored.
-    backend.extend_repos(vec![
-        Repository::new(
-            Some("private".to_string()),
-            "https://repo.example/private/",
-            true,
-            false,
-        ),
-        Repository::new(
-            Some("central-dup".to_string()),
-            "https://repo.example/central/",
-            true,
-            false,
-        ),
-    ]);
+    backend.extend_repos(
+        vec![
+            Repository::new(
+                Some("private".to_string()),
+                "https://repo.example/private/",
+                true,
+                false,
+            ),
+            Repository::new(
+                Some("central-dup".to_string()),
+                "https://repo.example/central/",
+                true,
+                false,
+            ),
+        ],
+        Some("g:a:1"),
+    );
 
     let snapshot = backend.repos_snapshot();
     assert_eq!(snapshot.len(), 2, "duplicate URL should not be added");
@@ -1780,6 +2093,41 @@ async fn workspace_support_pom_flush_failure_is_fatal() {
         matches!(error, crate::ResolveError::Store(_)),
         "expected a store error, got {error:?}"
     );
+}
+
+/// Each distinct buffered `(key, bytes)` pair is written once, in the order of
+/// its last observation, so the last observation decides the index entry.
+#[test]
+fn support_pom_buffer_writes_each_distinct_pom_once_in_last_seen_order() {
+    let key =
+        |artifact: &str| rv_config::ArtifactKey::new("com.example", artifact, "1", "pom", None);
+    let take = |observations: &[(&str, &[u8])]| {
+        let mut buffer = super::backend::SupportPomBuffer::default();
+        for (artifact, bytes) in observations {
+            buffer.record(key(artifact), &rv_config::BlobId::from_bytes(bytes), bytes);
+        }
+        buffer.take_in_write_order()
+    };
+
+    let kept = take(&[
+        ("bom", b"<a/>"),
+        ("parent", b"<p/>"),
+        ("bom", b"<a/>"),
+        ("bom", b"<a/>"),
+        ("parent", b"<p/>"),
+    ]);
+    assert_eq!(
+        kept,
+        [
+            (key("bom"), b"<a/>".to_vec()),
+            (key("parent"), b"<p/>".to_vec())
+        ]
+    );
+
+    // Distinct bytes for one coordinate are both kept; A, B, A writes B, A.
+    let kept = take(&[("bom", b"<a/>"), ("bom", b"<b/>"), ("bom", b"<a/>")]);
+    let bytes: Vec<_> = kept.iter().map(|(_, b)| b.as_slice()).collect();
+    assert_eq!(bytes, [b"<b/>".as_slice(), b"<a/>".as_slice()]);
 }
 
 mod pom_packaging_identity {
@@ -1980,7 +2328,7 @@ mod stall_watchdog {
 
     /// The watchdog watches progress events, never elapsed time, so work that
     /// is slow but alive — a big reactor on a slow mirror — never trips it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn never_fires_while_progress_keeps_landing() {
         let progress = Arc::new(WorkspaceProgress::new());
         progress.enter(0, "alpha/pom.xml", WorkPhase::Graph);
@@ -2032,4 +2380,49 @@ mod stall_watchdog {
             "alpha/pom.xml (graph), reactor (support POM flush)"
         );
     }
+}
+
+#[test]
+fn lock_edges_deduplicate_declarations_that_serialize_identically() {
+    let node = |name: &str| Node {
+        coord: Coord::parse(name).unwrap(),
+        scope: Scope::Compile,
+        repo_url: Some(Arc::from("mock://repo")),
+        checksum: Some(Checksum::new("sha256", "abcd")),
+        workspace_module: None,
+        local: false,
+        system_path: None,
+    };
+    let mut graph = Graph::new(node("test:root:1"));
+    let a = graph.insert_node(node("test:a:1"));
+    let b = graph.insert_node(node("test:b:1"));
+    let edge = Edge {
+        scope: Scope::Compile,
+        optional: false,
+        exclusions: Vec::new(),
+        requested: None,
+    };
+    graph.add_edge(graph.root(), a, edge.clone());
+    graph.add_edge(a, b, edge.clone());
+    graph.add_edge(
+        a,
+        b,
+        Edge {
+            requested: Some("[1,2)".into()),
+            ..edge.clone()
+        },
+    );
+    graph.add_edge(
+        a,
+        b,
+        Edge {
+            optional: true,
+            ..edge
+        },
+    );
+    assert_eq!(graph.edges(a).count(), 3);
+    let (_, edges) = super::build_lock_data(&graph).unwrap();
+    assert_eq!(edges.len(), 2);
+    assert!(!edges[0].optional);
+    assert!(edges[1].optional);
 }

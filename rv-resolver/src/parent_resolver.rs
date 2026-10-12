@@ -578,7 +578,7 @@ fn build_activation_context_with_props(
 ) -> ActivationContext {
     let mut ctx = ActivationContext::from_system();
 
-    // #5: during a `--platforms` cross-build the profile-activation OS must be
+    // During a `--platforms` cross-build the profile-activation OS must be
     // the TARGET platform, not the host. Maven activates `<os>` profiles
     // against the JVM `os.name`/`os.arch` of the build target; resolving for
     // `macos-aarch64` on a Linux CI box must activate macOS profiles, not
@@ -591,7 +591,7 @@ fn build_activation_context_with_props(
     };
     if let Some(platform) = platform.as_ref() {
         let os_name = rust_os_to_maven_name(platform.os());
-        let os_arch = platform.arch().to_string();
+        let os_arch = rv_maven_model::jvm_os_arch(platform.os(), platform.arch()).to_string();
         ctx.os_family = maven_os_family(platform.os()).map(str::to_string);
         ctx.os_name = Some(os_name.clone());
         ctx.os_arch = Some(os_arch.clone());
@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn build_activation_context_sets_base_dir() {
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config = Config::for_testing_with_repos(PathBuf::from("."), paths, Vec::new());
         let base_dir = Some(PathBuf::from("/test/dir"));
 
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn build_activation_context_sets_platform_properties() {
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config = Config::for_testing_with_repos(PathBuf::from("."), paths, Vec::new());
 
         let ctx = build_activation_context(None, &config, None);
@@ -698,26 +698,27 @@ mod tests {
             return;
         };
         // `os_name` is the Maven/JVM-mapped name (e.g. "mac os x"), not the raw
-        // Rust os ("macos"); `os_arch` passes through unchanged.
+        // Rust os ("macos"); `os_arch` is the JVM's name for the arch.
         let expected_os_name = rust_os_to_maven_name(platform.os());
+        let expected_arch = rv_maven_model::jvm_os_arch(platform.os(), platform.arch());
         assert_eq!(ctx.os_name.as_deref(), Some(expected_os_name.as_str()));
-        assert_eq!(ctx.os_arch.as_deref(), Some(platform.arch()));
+        assert_eq!(ctx.os_arch.as_deref(), Some(expected_arch));
         assert_eq!(
             ctx.properties.get("os.name").map(String::as_str),
             Some(expected_os_name.as_str())
         );
         assert_eq!(
             ctx.properties.get("os.arch").map(String::as_str),
-            Some(platform.arch())
+            Some(expected_arch)
         );
     }
 
-    /// #5: a TARGET platform threaded into the builder drives os.name/os.arch
+    /// A TARGET platform threaded into the builder drives os.name/os.arch
     /// and os.family, regardless of the host the resolver runs on. This is what
     /// makes `--platforms macos-aarch64` activate macOS profiles on a Linux CI.
     #[test]
     fn build_activation_context_uses_target_platform() {
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config = Config::for_testing_with_repos(PathBuf::from("."), paths, Vec::new());
         let target = Platform::new("macos", "aarch64").unwrap();
 
@@ -743,15 +744,32 @@ mod tests {
     /// A Windows target on any host maps to os.name "windows", family "windows".
     #[test]
     fn build_activation_context_target_windows() {
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config = Config::for_testing_with_repos(PathBuf::from("."), paths, Vec::new());
         let target = Platform::new("windows", "x86_64").unwrap();
 
         let ctx = build_activation_context(None, &config, Some(&target));
 
         assert_eq!(ctx.os_name.as_deref(), Some("windows"));
-        assert_eq!(ctx.os_arch.as_deref(), Some("x86_64"));
+        assert_eq!(ctx.os_arch.as_deref(), Some("amd64"));
         assert_eq!(ctx.os_family.as_deref(), Some("windows"));
+    }
+
+    /// brotli4j and similar POMs activate their native dependency on
+    /// `<arch>amd64</arch>`, the JVM's name for x86_64 on Linux.
+    #[test]
+    fn build_activation_context_linux_x86_64_uses_jvm_arch() {
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let config = Config::for_testing_with_repos(PathBuf::from("."), paths, Vec::new());
+        let target = Platform::new("linux", "x86_64").unwrap();
+
+        let ctx = build_activation_context(None, &config, Some(&target));
+
+        assert_eq!(ctx.os_arch.as_deref(), Some("amd64"));
+        assert_eq!(
+            ctx.properties.get("os.arch").map(String::as_str),
+            Some("amd64")
+        );
     }
 
     #[test]

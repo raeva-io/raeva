@@ -1,14 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use jsonschema::{Retrieve, Uri, Validator};
+use rv_test_support::http::{Response, StubServer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -84,90 +82,37 @@ fn copy_tree(source: &Path, target: &Path) {
     }
 }
 
-fn response(status: &str, body: &[u8]) -> Vec<u8> {
-    let mut response = format!(
-        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    response.extend_from_slice(body);
-    response
-}
-
-fn handle_connection(mut socket: TcpStream, routes: &HashMap<String, Vec<u8>>) {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let Ok(read) = socket.read(&mut buffer) else {
-            return;
-        };
-        if read == 0 {
-            return;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let path = std::str::from_utf8(&request)
-        .ok()
-        .and_then(|request| request.lines().next())
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
-    let payload = if let Some(base_path) = path.strip_suffix(".sha256") {
+fn repository_response(path: &str, routes: &HashMap<String, Vec<u8>>) -> Response {
+    if let Some(base_path) = path.strip_suffix(".sha256") {
         routes.get(base_path).map_or_else(
-            || response("404 Not Found", b""),
-            |body| response("200 OK", hex::encode(Sha256::digest(body)).as_bytes()),
+            || Response::new(404, ""),
+            |body| Response::new(200, hex::encode(Sha256::digest(body))),
         )
     } else {
         routes.get(path).map_or_else(
-            || response("404 Not Found", b""),
-            |body| response("200 OK", body),
+            || Response::new(404, ""),
+            |body| Response::new(200, body.clone()),
         )
-    };
-    let _ = socket.write_all(&payload);
-    let _ = socket.flush();
+    }
 }
 
 /// Route table a test can rewrite while the fixture repository is serving it.
 type MutableRoutes = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
-/// Repository whose route bodies can be rewritten after it starts serving, so
-/// a test can republish a POM at the same origin the lockfile recorded.
-fn spawn_mutable_repository(routes: HashMap<String, Vec<u8>>) -> (String, MutableRoutes) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture repository");
-    let address = listener.local_addr().expect("fixture repository address");
+fn spawn_mutable_repository(
+    routes: HashMap<String, Vec<u8>>,
+) -> (String, MutableRoutes, StubServer) {
     let routes = Arc::new(Mutex::new(routes));
-    let served = Arc::clone(&routes);
-    thread::spawn(move || {
-        for socket in listener.incoming() {
-            let Ok(socket) = socket else {
-                break;
-            };
-            let served = Arc::clone(&served);
-            thread::spawn(move || {
-                let snapshot = served.lock().expect("routes lock").clone();
-                handle_connection(socket, &snapshot);
-            });
-        }
+    let served = routes.clone();
+    let server = StubServer::start(move |request| {
+        repository_response(&request.path, &served.lock().expect("routes lock"))
     });
-    (format!("http://{address}/"), routes)
+    (format!("http://{}/", server.addr()), routes, server)
 }
 
-fn spawn_repository(routes: HashMap<String, Vec<u8>>) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture repository");
-    let address = listener.local_addr().expect("fixture repository address");
-    let routes = Arc::new(routes);
-    thread::spawn(move || {
-        for socket in listener.incoming() {
-            let Ok(socket) = socket else {
-                break;
-            };
-            let routes = Arc::clone(&routes);
-            thread::spawn(move || handle_connection(socket, &routes));
-        }
-    });
-    format!("http://{address}/")
+fn spawn_repository(routes: HashMap<String, Vec<u8>>) -> (String, StubServer) {
+    let server = StubServer::start(move |request| repository_response(&request.path, &routes));
+    (format!("http://{}/", server.addr()), server)
 }
 
 fn snapshot_publication(advanced: bool) -> (&'static str, u32) {
@@ -217,128 +162,42 @@ fn snapshot_route(path: &str, advanced: bool) -> Option<Vec<u8>> {
     }
 }
 
-fn handle_snapshot_connection(mut socket: TcpStream, advanced: &AtomicBool) {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    loop {
-        let Ok(read) = socket.read(&mut buffer) else {
-            return;
-        };
-        if read == 0 {
-            return;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let path = std::str::from_utf8(&request)
-        .ok()
-        .and_then(|request| request.lines().next())
-        .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/");
-    let advanced = advanced.load(Ordering::SeqCst);
-    let payload = if let Some(base_path) = path.strip_suffix(".sha256") {
-        snapshot_route(base_path, advanced).map_or_else(
-            || response("404 Not Found", b""),
-            |body| response("200 OK", hex::encode(Sha256::digest(body)).as_bytes()),
-        )
-    } else {
-        snapshot_route(path, advanced).map_or_else(
-            || response("404 Not Found", b""),
-            |body| response("200 OK", &body),
-        )
-    };
-    let _ = socket.write_all(&payload);
-    let _ = socket.flush();
-}
-
-fn spawn_snapshot_repository() -> (String, Arc<AtomicBool>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind snapshot repository");
-    let address = listener.local_addr().expect("snapshot repository address");
+fn spawn_snapshot_repository() -> (String, Arc<AtomicBool>, StubServer) {
     let advanced = Arc::new(AtomicBool::new(false));
-    let server_state = Arc::clone(&advanced);
-    thread::spawn(move || {
-        for socket in listener.incoming() {
-            let Ok(socket) = socket else {
-                break;
-            };
-            let advanced = Arc::clone(&server_state);
-            thread::spawn(move || handle_snapshot_connection(socket, &advanced));
+    let server_state = advanced.clone();
+    let server = StubServer::start(move |request| {
+        let advanced = server_state.load(Ordering::SeqCst);
+        if let Some(base_path) = request.path.strip_suffix(".sha256") {
+            snapshot_route(base_path, advanced).map_or_else(
+                || Response::new(404, ""),
+                |body| Response::new(200, hex::encode(Sha256::digest(body))),
+            )
+        } else {
+            snapshot_route(&request.path, advanced)
+                .map_or_else(|| Response::new(404, ""), |body| Response::new(200, body))
         }
     });
-    (format!("http://{address}/"), advanced)
+    (format!("http://{}/", server.addr()), advanced, server)
 }
 
-fn read_http_request(stream: &mut TcpStream) -> String {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    let mut expected_length = None;
-    loop {
-        let read = stream.read(&mut buffer).expect("read mock request");
-        assert_ne!(read, 0, "mock request ended before its body");
-        request.extend_from_slice(&buffer[..read]);
-        if expected_length.is_none()
-            && let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
-        {
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let body_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.split_once(':').and_then(|(name, value)| {
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().expect("Content-Length"))
-                    })
-                })
-                .unwrap_or(0);
-            expected_length = Some(header_end + 4 + body_length);
-        }
-        if expected_length.is_some_and(|length| request.len() >= length) {
-            break;
-        }
-    }
-    String::from_utf8(request).expect("mock request UTF-8")
-}
-
-fn spawn_osv(
-    routes: Vec<(&'static str, &'static str)>,
-) -> (String, thread::JoinHandle<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind OSV mock");
-    let address = listener.local_addr().expect("OSV mock address");
-    let request_count = routes.len();
-    let mut routes = routes.into_iter().fold(
+fn spawn_osv(routes: Vec<(&'static str, &'static str)>) -> (String, StubServer) {
+    let routes = Mutex::new(routes.into_iter().fold(
         HashMap::<String, VecDeque<&'static str>>::new(),
         |mut routes, (path, body)| {
             routes.entry(path.to_string()).or_default().push_back(body);
             routes
         },
-    );
-    let server = thread::spawn(move || {
-        let mut requests = Vec::with_capacity(request_count);
-        for _ in 0..request_count {
-            let (mut stream, _) = listener.accept().expect("accept OSV request");
-            let request = read_http_request(&mut stream);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .expect("OSV request path");
-            let body = routes
-                .get_mut(path)
-                .and_then(VecDeque::pop_front)
-                .unwrap_or_else(|| panic!("unexpected OSV request path {path}"));
-            requests.push(request);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write OSV response");
-        }
-        requests
+    ));
+    let server = StubServer::start(move |request| {
+        let body = routes
+            .lock()
+            .expect("routes")
+            .get_mut(&request.path)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| panic!("unexpected OSV request path {}", request.path));
+        Response::new(200, body).header("Content-Type", "application/json")
     });
-    (format!("http://{address}/v1"), server)
+    (format!("http://{}/v1", server.addr()), server)
 }
 
 fn basic_routes() -> HashMap<String, Vec<u8>> {
@@ -489,6 +348,46 @@ fn write_mediation_project(project: &Path, repo_url: &str) {
     .expect("write mediation pom.xml");
 }
 
+#[test]
+fn malformed_pom_diagnostics_redact_repository_credentials() {
+    let (repo, _repo_server) = spawn_repository(HashMap::from([
+        (
+            "/org/test/mid/1/mid-1.pom".into(),
+            b"<project><broken></project>".to_vec(),
+        ),
+        (
+            "/org/test/leaf/1/leaf-1.pom".into(),
+            b"<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId><artifactId>leaf</artifactId><version>1</version></project>".to_vec(),
+        ),
+    ]));
+    let secret_url = repo.replacen("http://", "http://private-user:private-password@", 1)
+        + "?token=private-query-token";
+    for json in [false, true] {
+        let project = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        write_mediation_project(project.path(), &secret_url);
+        let args = if json {
+            vec!["--json", "sync"]
+        } else {
+            vec!["sync"]
+        };
+        let output = run_rv(project.path(), home.path(), &args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(!output.status.success(), "{combined}");
+        assert!(combined.contains("org.test:mid:1 from"), "{combined}");
+        assert!(combined.contains("broken"), "{combined}");
+        for secret in ["private-user", "private-password", "private-query-token"] {
+            assert!(!combined.contains(secret), "{combined}");
+        }
+        if json {
+            let envelope: Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(envelope["success"], false);
+        }
+    }
+}
+
 fn locked_versions(lock_path: &Path, artifact_id: &str) -> Vec<String> {
     let lock = rv_config::Lockfile::read(lock_path).expect("read lock");
     let mut versions: Vec<String> = lock
@@ -591,7 +490,7 @@ fn m2_path(root: &Path, group: &str, artifact: &str, version: &str, extension: &
 fn resolution_strategy_is_persisted_and_gates_lock_reuse() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
-    let repo_url = spawn_repository(mediation_routes());
+    let (repo_url, _repo_url_server) = spawn_repository(mediation_routes());
     write_mediation_project(project.path(), &repo_url);
     let lock_path = project.path().join("rv.lock");
 
@@ -669,7 +568,7 @@ fn resolution_strategy_is_persisted_and_gates_lock_reuse() {
 fn online_frozen_resolves_afresh_while_offline_frozen_checks_hashes_only() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
-    let repo_url = spawn_repository(mediation_routes());
+    let (repo_url, _repo_url_server) = spawn_repository(mediation_routes());
     write_mediation_project(project.path(), &repo_url);
     let lock_path = project.path().join("rv.lock");
 
@@ -735,7 +634,7 @@ fn online_frozen_resolves_afresh_while_offline_frozen_checks_hashes_only() {
 fn partial_platform_sync_drops_platforms_locked_under_other_resolution_inputs() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
-    let repo_url = spawn_repository(mediation_routes());
+    let (repo_url, _repo_url_server) = spawn_repository(mediation_routes());
     write_mediation_project(project.path(), &repo_url);
     let lock_path = project.path().join("rv.lock");
 
@@ -825,7 +724,7 @@ fn partial_platform_sync_drops_platforms_locked_under_other_resolution_inputs() 
 fn frozen_accepts_unchanged_external_snapshot_metadata() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
-    let (repo_url, _advanced) = spawn_snapshot_repository();
+    let (repo_url, _advanced, _server) = spawn_snapshot_repository();
     write_snapshot_project(project.path(), &repo_url);
 
     let initial = run_rv(project.path(), home.path(), &["sync"]);
@@ -846,7 +745,7 @@ fn frozen_accepts_unchanged_external_snapshot_metadata() {
 fn frozen_rejects_advanced_external_snapshot_and_names_coordinate() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
-    let (repo_url, advanced) = spawn_snapshot_repository();
+    let (repo_url, advanced, _server) = spawn_snapshot_repository();
     write_snapshot_project(project.path(), &repo_url);
 
     let initial = run_rv(project.path(), home.path(), &["sync"]);
@@ -951,7 +850,7 @@ fn downgrade_lock_to_v3(lock_path: &Path, repo_url_override: Option<&str>) -> Ve
 fn frozen_legacy_lock_keeps_local_checks_despite_stale_snapshot() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
-    let (repo_url, advanced) = spawn_snapshot_repository();
+    let (repo_url, advanced, _server) = spawn_snapshot_repository();
     // `snapshots-update-policy = "always"` expires the lock's SNAPSHOT pins
     // immediately, which is the condition that used to force a re-resolve.
     write_snapshot_project(project.path(), &repo_url);
@@ -1010,7 +909,7 @@ fn frozen_legacy_lock_keeps_local_checks_despite_stale_snapshot() {
 fn frozen_legacy_lock_keeps_local_checks_despite_unconfigured_origin() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
-    let (repo_url, _advanced) = spawn_snapshot_repository();
+    let (repo_url, _advanced, _server) = spawn_snapshot_repository();
     write_release_project(project.path(), &repo_url);
 
     assert_success(
@@ -1040,7 +939,7 @@ fn reactor_sync_frozen_diff_and_exports_are_module_aware() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
     copy_tree(&fixture("basic"), project.path());
-    let repo_url = spawn_repository(basic_routes());
+    let (repo_url, _repo_url_server) = spawn_repository(basic_routes());
     write_config(project.path(), &repo_url);
 
     let first = run_rv(project.path(), home.path(), &["sync"]);
@@ -1215,7 +1114,12 @@ fn reactor_sync_frozen_diff_and_exports_are_module_aware() {
         .output()
         .expect("run aggregate vuln");
     assert_success(&aggregate_vuln, "aggregate reactor vuln");
-    let requests = osv.join().expect("OSV aggregate server");
+    let requests: Vec<_> = osv
+        .requests()
+        .into_iter()
+        .map(|request| request.raw)
+        .collect();
+    osv.stop();
     assert_eq!(requests.len(), 1, "aggregate scan uses one OSV query set");
     let request = &requests[0];
     assert!(request.contains("pkg:maven/org.test/app-only@1"));
@@ -1242,7 +1146,12 @@ fn reactor_sync_frozen_diff_and_exports_are_module_aware() {
         .output()
         .expect("run selected vuln");
     assert_success(&selected_vuln, "selected reactor vuln");
-    let requests = osv.join().expect("OSV selected server");
+    let requests: Vec<_> = osv
+        .requests()
+        .into_iter()
+        .map(|request| request.raw)
+        .collect();
+    osv.stop();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].contains("pkg:maven/org.test/shared@1"));
     assert!(!requests[0].contains("app-only"));
@@ -1274,7 +1183,8 @@ fn reactor_sync_frozen_diff_and_exports_are_module_aware() {
         findings["data"]["results"][0]["affected_modules"],
         serde_json::json!(["app/pom.xml", "lib/pom.xml"])
     );
-    assert_eq!(osv.join().expect("OSV findings server").len(), 2);
+    assert_eq!(osv.requests().len(), 2);
+    osv.stop();
 
     let cyclonedx_first = run_rv(
         project.path(),
@@ -1560,9 +1470,9 @@ fn reactor_sync_rejects_same_coordinate_with_different_bytes() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
     copy_tree(&fixture("conflict"), project.path());
-    let dummy_url = spawn_repository(HashMap::new());
-    let repo_a = spawn_repository(conflict_routes(b"bytes from repository A"));
-    let repo_b = spawn_repository(conflict_routes(b"bytes from repository B"));
+    let (dummy_url, _dummy_url_server) = spawn_repository(HashMap::new());
+    let (repo_a, _repo_a_server) = spawn_repository(conflict_routes(b"bytes from repository A"));
+    let (repo_b, _repo_b_server) = spawn_repository(conflict_routes(b"bytes from repository B"));
     for module in ["a", "b"] {
         let pom = project.path().join(module).join("pom.xml");
         let contents = fs::read_to_string(&pom)
@@ -1597,7 +1507,7 @@ fn sync_pins_companion_and_support_pom_bytes() {
     let home = TempDir::new().expect("home");
     copy_tree(&fixture("basic"), project.path());
     let routes = basic_routes();
-    let repo_url = spawn_repository(basic_routes());
+    let (repo_url, _repo_url_server) = spawn_repository(basic_routes());
     write_config(project.path(), &repo_url);
 
     assert_success(
@@ -1714,7 +1624,7 @@ fn a_pre_pin_schema_four_lock_migrates_on_the_next_sync() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
     copy_tree(&fixture("basic"), project.path());
-    let repo_url = spawn_repository(basic_routes());
+    let (repo_url, _repo_url_server) = spawn_repository(basic_routes());
     write_config(project.path(), &repo_url);
     let lock_path = project.path().join("rv.lock");
 
@@ -1785,6 +1695,168 @@ fn a_pre_pin_schema_four_lock_migrates_on_the_next_sync() {
     );
 }
 
+fn expire_metadata_cache(home: &Path) {
+    let conn = rusqlite::Connection::open(home.join("metadata.db")).expect("open metadata cache");
+    let poms = conn
+        .execute("UPDATE pom_cache SET fetched_at = 1, expires_at = 2", [])
+        .expect("expire POMs");
+    assert!(poms > 0, "fixture must have cached POMs");
+    conn.execute(
+        "UPDATE version_list_cache SET fetched_at = 1, expires_at = 2",
+        [],
+    )
+    .expect("expire metadata");
+}
+
+#[test]
+fn offline_resolution_uses_expired_companion_parent_bom_and_version_list() {
+    let project = TempDir::new().expect("project");
+    let home = TempDir::new().expect("home");
+    copy_tree(&fixture("basic"), project.path());
+    let app = project.path().join("app/pom.xml");
+    let pom = fs::read_to_string(&app).unwrap().replace(
+        "<artifactId>shared</artifactId>\n      <version>1</version>",
+        "<artifactId>shared</artifactId>\n      <version>[1,2)</version>",
+    );
+    assert!(pom.contains("[1,2)"));
+    fs::write(app, pom).unwrap();
+    let mut routes = basic_routes();
+    routes.insert(
+        "/org/test/shared/maven-metadata.xml".into(),
+        b"<metadata><versioning><versions><version>1</version></versions></versioning></metadata>"
+            .to_vec(),
+    );
+    let (repo_url, server) = spawn_repository(routes);
+    write_config(project.path(), &repo_url);
+    assert_success(
+        &run_rv(project.path(), home.path(), &["sync"]),
+        "warm cache",
+    );
+    expire_metadata_cache(home.path());
+    let requests = server.requests().len();
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|request| request.path == "/org/test/shared/maven-metadata.xml")
+    );
+    let lock_path = project.path().join("rv.lock");
+    fs::remove_file(&lock_path).unwrap();
+    assert_success(
+        &run_rv(project.path(), home.path(), &["sync", "--offline"]),
+        "offline resolution through expired rows",
+    );
+    assert_eq!(locked_versions(&lock_path, "shared"), ["1"]);
+    assert_eq!(
+        server.requests().len(),
+        requests,
+        "offline resolution must make no HTTP requests"
+    );
+    let conn = rusqlite::Connection::open(home.path().join("metadata.db")).unwrap();
+    for table in ["pom_cache", "version_list_cache"] {
+        let (rows, renewed): (i64, i64) = conn
+            .query_row(
+                &format!("SELECT count(*), sum(fetched_at != 1 OR expires_at != 2) FROM {table}"),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(rows > 0);
+        assert_eq!(renewed, 0, "offline resolution must not renew {table}");
+    }
+}
+
+#[test]
+fn offline_sync_resolves_a_stale_snapshot_lock_from_expired_rows() {
+    let project = TempDir::new().expect("project");
+    let home = TempDir::new().expect("home");
+    let (repo_url, advanced, server) = spawn_snapshot_repository();
+    write_snapshot_project(project.path(), &repo_url);
+    assert_success(
+        &run_rv(project.path(), home.path(), &["sync"]),
+        "warm snapshot cache",
+    );
+    expire_metadata_cache(home.path());
+    let lock_path = project.path().join("rv.lock");
+    let versions = locked_versions(&lock_path, "snapshot");
+    let requests = server.requests().len();
+    advanced.store(true, Ordering::SeqCst);
+    assert_success(
+        &run_rv(project.path(), home.path(), &["sync", "--offline"]),
+        "offline sync with always snapshot policy and expired rows",
+    );
+    assert_eq!(locked_versions(&lock_path, "snapshot"), versions);
+    assert_eq!(
+        server.requests().len(),
+        requests,
+        "offline sync must make no HTTP requests"
+    );
+}
+
+#[test]
+fn frozen_reports_a_republished_pom_with_an_expired_warm_cache() {
+    let project = TempDir::new().expect("project");
+    let home = TempDir::new().expect("home");
+    copy_tree(&fixture("basic"), project.path());
+    let (repo_url, routes, server) = spawn_mutable_repository(basic_routes());
+    write_config(project.path(), &repo_url);
+    assert_success(
+        &run_rv(project.path(), home.path(), &["sync"]),
+        "warm cache",
+    );
+    expire_metadata_cache(home.path());
+    assert_success(
+        &run_rv(project.path(), home.path(), &["sync", "--frozen"]),
+        "frozen sync with expired cache and unchanged repository",
+    );
+    let paths = [
+        "/org/test/external-parent/1/external-parent-1.pom",
+        "/org/test/shared/1/shared-1.pom",
+    ];
+    {
+        let mut routes = routes.lock().unwrap();
+        for path in paths {
+            routes
+                .get_mut(path)
+                .unwrap()
+                .extend_from_slice(b"\n<!-- republished -->");
+        }
+    }
+    expire_metadata_cache(home.path());
+    let requests = server.requests().len();
+    let lock_path = project.path().join("rv.lock");
+    let before = fs::read(&lock_path).unwrap();
+    let output = run_rv(project.path(), home.path(), &["sync", "--frozen"]);
+    assert_eq!(output.status.code(), Some(7));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("support POM changed for org.test:external-parent:1"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("POM changed for org.test:shared:1"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read(&lock_path).unwrap(), before);
+    let conn = rusqlite::Connection::open(home.path().join("metadata.db")).unwrap();
+    for path in paths {
+        assert!(
+            server.requests()[requests..]
+                .iter()
+                .any(|request| request.path == path)
+        );
+        let (bytes, fetched_at, expires_at): (Vec<u8>, i64, i64) = conn
+            .query_row(
+                "SELECT content, fetched_at, expires_at FROM pom_cache WHERE path = ?1",
+                [path.trim_start_matches('/')],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(&bytes, routes.lock().unwrap().get(path).unwrap());
+        assert!(fetched_at > 2 && expires_at > fetched_at);
+    }
+}
+
 /// A companion POM republished with different bytes and an unchanged
 /// dependency graph is drift: a plain `rv sync` would rewrite `pom_sha256`, so
 /// `--frozen` reporting "up to date" would contradict its own contract and let
@@ -1800,7 +1872,7 @@ fn frozen_reports_a_republished_pom_with_an_unchanged_graph() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
     copy_tree(&fixture("basic"), project.path());
-    let (repo_url, routes) = spawn_mutable_repository(basic_routes());
+    let (repo_url, routes, _server) = spawn_mutable_repository(basic_routes());
     write_config(project.path(), &repo_url);
 
     assert_success(
@@ -1883,19 +1955,95 @@ fn frozen_reports_a_republished_pom_with_an_unchanged_graph() {
     );
 }
 
-/// An expired SNAPSHOT update policy must not drag `--frozen --offline` into a
-/// re-resolve. The cached `maven-metadata.xml` such a resolve needs carries the
-/// same TTL that declared the pins stale, so the resolve could only abort with
-/// "not available in local cache" — the run would fail for every project with a
-/// SNAPSHOT dependency and a lockfile older than its update policy, without
-/// ever reporting drift.
+/// Offline frozen validation must not read a POM-declared repository.
+#[test]
+fn offline_frozen_checks_local_inputs_with_a_pom_declared_snapshot_repository() {
+    let project = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let repository = project.path().join("repository");
+    let (timestamp, build) = snapshot_publication(false);
+    for filename in [
+        "maven-metadata.xml".to_string(),
+        format!("snapshot-1.0-{timestamp}-{build}.pom"),
+        format!("snapshot-1.0-{timestamp}-{build}.jar"),
+    ] {
+        let path = format!("org/test/snapshot/1.0-SNAPSHOT/{filename}");
+        let destination = repository.join(&path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(
+            destination,
+            snapshot_route(&format!("/{path}"), false).unwrap(),
+        )
+        .unwrap();
+    }
+    // The locked origin is absent from configuration; only the POM declares it.
+    let empty = project.path().join("empty-repository");
+    fs::create_dir(&empty).unwrap();
+    write_config(
+        project.path(),
+        url::Url::from_directory_path(&empty).unwrap().as_str(),
+    );
+    fs::write(
+        project.path().join("pom.xml"),
+        r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.test</groupId><artifactId>local-root</artifactId><version>1</version>
+  <repositories><repository>
+    <id>project-local</id><url>file://${project.basedir}/repository/</url>
+    <snapshots><enabled>true</enabled></snapshots>
+  </repository></repositories>
+  <dependencies><dependency>
+    <groupId>org.test</groupId><artifactId>snapshot</artifactId><version>1.0-SNAPSHOT</version>
+  </dependency></dependencies>
+</project>"#,
+    )
+    .unwrap();
+    assert_success(
+        &run_rv(project.path(), home.path(), &["sync"]),
+        "initial file snapshot sync",
+    );
+    let lock_path = project.path().join("rv.lock");
+    let before = fs::read(&lock_path).unwrap();
+    let lock = rv_config::Lockfile::read(&lock_path).unwrap();
+    assert!(
+        lock.platforms
+            .iter()
+            .flat_map(|p| p.external_packages())
+            .any(|p| p.repo_url.contains("/repository/"))
+    );
+    fs::remove_dir_all(&repository).unwrap();
+    let frozen = Command::new(env!("CARGO_BIN_EXE_rv"))
+        .arg("-C")
+        .arg(project.path())
+        .args(["sync", "--frozen", "--offline"])
+        .env("RAEVA_HOME", home.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("RUST_LOG", "rv_cli=debug")
+        .output()
+        .unwrap();
+    assert_success(
+        &frozen,
+        "offline frozen sync with a POM-declared file snapshot repository",
+    );
+    let stderr = String::from_utf8_lossy(&frozen.stderr);
+    assert!(stderr.contains("local_inputs_only=true"), "{stderr}");
+    assert_eq!(
+        fs::read(&lock_path).unwrap(),
+        before,
+        "frozen sync must preserve the lock"
+    );
+}
+
+/// An expired SNAPSHOT update policy alone keeps the local-inputs-only
+/// contract offline: cached metadata cannot establish upstream drift.
 #[test]
 fn offline_frozen_accepts_a_stale_snapshot_lock() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
     // `snapshots-update-policy = "always"` expires the lock's SNAPSHOT pins the
     // instant it is written.
-    let (repo_url, _advanced) = spawn_snapshot_repository();
+    let (repo_url, _advanced, _server) = spawn_snapshot_repository();
     write_snapshot_project(project.path(), &repo_url);
 
     assert_success(
@@ -1916,9 +2064,25 @@ fn offline_frozen_accepts_a_stale_snapshot_lock() {
         before,
         "offline --frozen must not rewrite the lockfile"
     );
+    let edited = String::from_utf8(before.clone()).unwrap().replace(
+        &format!("repo_url = \"{repo_url}\""),
+        "repo_url = \"http://127.0.0.1:9/tampered/\"",
+    );
+    assert_ne!(edited.as_bytes(), before);
+    fs::write(&lock_path, &edited).unwrap();
+    let rejected = run_rv(
+        project.path(),
+        home.path(),
+        &["sync", "--frozen", "--offline"],
+    );
+    assert!(
+        !rejected.status.success(),
+        "stale snapshot bypassed origin validation"
+    );
+    assert_eq!(fs::read_to_string(&lock_path).unwrap(), edited);
 }
 
-/// The exception that stays: a lockfile origin the current `rv.toml` does not
+/// The exception that stays: a lockfile origin neither config nor local POMs
 /// declare still forces an offline re-resolve. Repository trust comes from the
 /// model, never from lockfile metadata, and that question is answerable from
 /// the local model plus the POMs a previous sync cached — no network needed.
@@ -1927,7 +2091,7 @@ fn offline_frozen_still_rediscovers_an_unconfigured_origin() {
     let project = TempDir::new().expect("project");
     let home = TempDir::new().expect("home");
     copy_tree(&fixture("basic"), project.path());
-    let repo_url = spawn_repository(basic_routes());
+    let (repo_url, server) = spawn_repository(basic_routes());
     write_config(project.path(), &repo_url);
 
     assert_success(
@@ -1935,6 +2099,8 @@ fn offline_frozen_still_rediscovers_an_unconfigured_origin() {
         "initial sync",
     );
 
+    expire_metadata_cache(home.path());
+    let requests = server.requests().len();
     let lock_path = project.path().join("rv.lock");
     let raw = fs::read_to_string(&lock_path).expect("read lock");
     let edited = raw.replace(
@@ -1962,6 +2128,25 @@ fn offline_frozen_still_rediscovers_an_unconfigured_origin() {
         stderr.contains("external origin changed"),
         "the offline resolve must produce a real diff, not a cache error: {stderr}"
     );
+    assert_eq!(
+        server.requests().len(),
+        requests,
+        "offline rediscovery must make no HTTP requests"
+    );
+    // No cache can establish the graph either: the tampered origin must not
+    // turn a cold frozen-offline validation into a silent success.
+    let empty_home = TempDir::new().expect("empty cache home");
+    let cold = run_rv(
+        project.path(),
+        empty_home.path(),
+        &["sync", "--frozen", "--offline"],
+    );
+    assert!(
+        !cold.status.success(),
+        "tampered origin passed without cache"
+    );
+    let stderr = String::from_utf8_lossy(&cold.stderr);
+    assert!(stderr.contains("not available in local cache"), "{stderr}");
     assert_eq!(
         fs::read_to_string(&lock_path).expect("re-read lock"),
         edited,

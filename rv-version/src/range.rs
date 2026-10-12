@@ -723,7 +723,7 @@ mod tests {
         VersionRange::parse("[1.0,2.0").expect_err("unterminated bracket");
     }
 
-    /// Regression for #53: a range with three or more comma-separated bounds
+    /// Regression: a range with three or more comma-separated bounds
     /// such as `[1.0,2.0,3.0]` is malformed. The old `splitn(2, ',')` folded
     /// the extra `3.0` into the upper-bound string and silently accepted a
     /// range with a bogus `2.0,3.0` upper bound; it must now be a parse error.
@@ -736,7 +736,7 @@ mod tests {
         VersionReq::parse("[1.0,2.0,3.0]").expect_err("[1.0,2.0,3.0] via VersionReq");
     }
 
-    /// Regression for #61: a bare `]`, a stray closing bracket, or any other
+    /// Regression: a bare `]`, a stray closing bracket, or any other
     /// string that carries range punctuation but does not open with `[`/`(`
     /// used to slip through `VersionReq::parse` as a `Soft` pin (a "version"
     /// that never matches a real artifact). It must be a clean parse error.

@@ -4,7 +4,10 @@ use crate::dependency::DependencyManagement;
 use crate::properties::{ProjectInfo, PropertyMap};
 use crate::{Activation, PomError, Profile};
 
-use super::dep_management::{resolve_dependencies, resolve_dependency_management};
+use super::dep_management::{
+    build_managed_dep_index, find_managed_dependency_indexed, resolve_dependencies_with,
+    resolve_dependency_management,
+};
 use super::repositories::resolve_repositories;
 
 pub(super) fn resolve_profiles(
@@ -13,6 +16,9 @@ pub(super) fn resolve_profiles(
     properties: &PropertyMap,
     project: &ProjectInfo,
 ) -> Result<Vec<Profile>, PomError> {
+    // One base index serves every profile; with large BOM imports, rebuilding
+    // it per profile dominated model building.
+    let base_index = std::cell::OnceCell::new();
     profiles
         .into_iter()
         .map(|profile| {
@@ -21,34 +27,35 @@ pub(super) fn resolve_profiles(
                 .activation
                 .map(|a| resolve_activation(a, properties, project))
                 .transpose()?;
-            // Build active_management: base management + profile's resolved management (if any).
-            // Use Cow-like pattern: only clone if we need to extend.
-            let (active_management, resolved_management) =
-                if let Some(profile_management) = profile.dependency_management {
-                    let resolved =
-                        resolve_dependency_management(profile_management, properties, project)?;
-                    let mut active = management.clone();
-                    // Move resolved.dependencies into active, keeping a clone for the return.
-                    let resolved_deps_for_return = resolved.dependencies.clone();
-                    active.dependencies.extend(resolved.dependencies);
-                    (
-                        std::borrow::Cow::Owned(active),
-                        Some(DependencyManagement {
-                            dependencies: resolved_deps_for_return,
-                        }),
-                    )
-                } else {
-                    (std::borrow::Cow::Borrowed(management), None)
-                };
+            let resolved_management = profile
+                .dependency_management
+                .map(|own| resolve_dependency_management(own, properties, project))
+                .transpose()?;
+            let dependencies = if profile.dependencies.is_empty() {
+                Vec::new()
+            } else {
+                let base = base_index.get_or_init(|| build_managed_dep_index(management));
+                let own = resolved_management.as_ref().map(build_managed_dep_index);
+                // Base entries win over the profile's own management for the
+                // same coordinate. Inactive profiles may omit `<systemPath>`,
+                // so validation waits until an active profile is merged.
+                resolve_dependencies_with(
+                    profile.dependencies,
+                    |dep| {
+                        find_managed_dependency_indexed(dep, base).or_else(|| {
+                            own.as_ref()
+                                .and_then(|own| find_managed_dependency_indexed(dep, own))
+                        })
+                    },
+                    properties,
+                    project,
+                    false,
+                )?
+            };
             Ok(Profile {
                 id,
                 activation,
-                dependencies: resolve_dependencies(
-                    profile.dependencies,
-                    &active_management,
-                    properties,
-                    project,
-                )?,
+                dependencies,
                 repositories: resolve_repositories(profile.repositories, properties, project)?,
                 modules: profile
                     .modules
@@ -94,14 +101,26 @@ pub(super) fn resolve_activation(
     properties: &PropertyMap,
     project: &ProjectInfo,
 ) -> Result<Activation, PomError> {
+    interpolate_activation(activation, |value| {
+        properties.interpolate_str(value, project)
+    })
+}
+
+/// Interpolate activation fields before profile selection, including while
+/// reading raw lineage POMs whose parents have not been resolved yet.
+pub(crate) fn interpolate_activation(
+    activation: Activation,
+    interpolate: impl Fn(&str) -> Result<String, PomError>,
+) -> Result<Activation, PomError> {
+    let interpolate_opt = |value: Option<&str>| value.map(&interpolate).transpose();
     use crate::activation::{ActivationFile, ActivationOs, ActivationProperty};
 
     let property = activation
         .property
         .map(|prop| -> Result<_, PomError> {
             Ok(ActivationProperty {
-                name: properties.interpolate_opt(prop.name.as_deref(), project)?,
-                value: properties.interpolate_opt(prop.value.as_deref(), project)?,
+                name: interpolate_opt(prop.name.as_deref())?,
+                value: interpolate_opt(prop.value.as_deref())?,
             })
         })
         .transpose()?;
@@ -110,10 +129,10 @@ pub(super) fn resolve_activation(
         .os
         .map(|os| -> Result<_, PomError> {
             Ok(ActivationOs {
-                name: properties.interpolate_opt(os.name.as_deref(), project)?,
-                family: properties.interpolate_opt(os.family.as_deref(), project)?,
-                arch: properties.interpolate_opt(os.arch.as_deref(), project)?,
-                version: properties.interpolate_opt(os.version.as_deref(), project)?,
+                name: interpolate_opt(os.name.as_deref())?,
+                family: interpolate_opt(os.family.as_deref())?,
+                arch: interpolate_opt(os.arch.as_deref())?,
+                version: interpolate_opt(os.version.as_deref())?,
             })
         })
         .transpose()?;
@@ -122,8 +141,8 @@ pub(super) fn resolve_activation(
         .file
         .map(|file| -> Result<_, PomError> {
             Ok(ActivationFile {
-                exists: properties.interpolate_opt(file.exists.as_deref(), project)?,
-                missing: properties.interpolate_opt(file.missing.as_deref(), project)?,
+                exists: interpolate_opt(file.exists.as_deref())?,
+                missing: interpolate_opt(file.missing.as_deref())?,
             })
         })
         .transpose()?;
@@ -132,7 +151,7 @@ pub(super) fn resolve_activation(
         active_by_default: activation.active_by_default,
         property,
         os,
-        jdk: properties.interpolate_opt(activation.jdk.as_deref(), project)?,
+        jdk: interpolate_opt(activation.jdk.as_deref())?,
         file,
     })
 }

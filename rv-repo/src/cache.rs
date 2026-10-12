@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -119,6 +119,10 @@ pub(crate) struct CacheEntry {
 #[derive(Clone)]
 pub(crate) struct MetadataCache {
     pool: Arc<Pool<SqliteConnectionManager>>,
+    // WAL permits concurrent readers, but only one writer. Queue writes before
+    // taking a pooled connection so our own clones do not exhaust the busy
+    // timeout (or occupy every connection while waiting for the writer).
+    writer: Arc<Mutex<()>>,
 }
 
 impl MetadataCache {
@@ -226,6 +230,7 @@ impl MetadataCache {
 
         Ok(Self {
             pool: Arc::new(pool),
+            writer: Arc::new(Mutex::new(())),
         })
     }
 
@@ -276,6 +281,7 @@ impl MetadataCache {
         content: &[u8],
         ttl: i64,
     ) -> Result<()> {
+        let _writer = self.writer.lock().unwrap_or_else(|err| err.into_inner());
         let conn = self.conn()?;
         let fetched_at = now_epoch_seconds();
         let expires_at = fetched_at.saturating_add(ttl);
@@ -288,45 +294,18 @@ impl MetadataCache {
                  expires_at = excluded.expires_at",
             table.name()
         );
+        // Preserve the SQLite code for the caller's redacted diagnostic. The
+        // generic context wrapper discards it and includes the cache scope,
+        // which can contain repository credentials.
         conn.execute(
             &sql,
             params![repo_url, path, content, fetched_at, expires_at],
-        )
-        .with_context(|| {
-            format!(
-                "failed to insert metadata cache entry for {}:{}",
-                repo_url, path
-            )
-        })
-        .map_err(|err| RepoError::DbError(db_error_with_context(err)))?;
+        )?;
         Ok(())
     }
 
     pub(crate) fn is_expired(expires_at: i64, now: i64) -> bool {
         expires_at <= now
-    }
-
-    /// Deletes all expired entries from all cache tables.
-    /// Returns the total number of deleted rows.
-    pub(crate) fn cleanup_expired(&self) -> Result<usize> {
-        let conn = self.conn()?;
-        let now = now_epoch_seconds();
-        let mut deleted = 0usize;
-
-        for table in [CacheTable::Pom, CacheTable::VersionList] {
-            let sql = format!("DELETE FROM {} WHERE expires_at < ?1", table.name());
-            let count = conn
-                .execute(&sql, params![now])
-                .with_context(|| format!("failed to cleanup expired entries from {}", table.name()))
-                .map_err(|err| RepoError::DbError(db_error_with_context(err)))?;
-            deleted = deleted.saturating_add(count);
-        }
-
-        if deleted > 0 {
-            tracing::debug!(deleted, "cleaned up expired metadata cache entries");
-        }
-
-        Ok(deleted)
     }
 }
 
@@ -374,85 +353,6 @@ mod tests {
         assert!(MetadataCache::is_expired(100, 100));
         assert!(MetadataCache::is_expired(100, 101));
         assert!(!MetadataCache::is_expired(101, 100));
-    }
-
-    #[test]
-    fn cleanup_expired_removes_old_entries() {
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("metadata.db");
-        let cache = MetadataCache::new(&db_path).expect("cache");
-
-        // Insert an entry with negative TTL (already expired in the past)
-        cache
-            .insert_with_ttl(
-                CacheTable::Pom,
-                "https://repo.example/",
-                "com/example/expired/1.0.0/expired-1.0.0.pom",
-                b"<expired/>",
-                -1, // Negative TTL means already expired
-            )
-            .expect("insert expired");
-
-        // Insert a fresh entry with long TTL (1 day).
-        cache
-            .insert_with_ttl(
-                CacheTable::Pom,
-                "https://repo.example/",
-                "com/example/fresh/1.0.0/fresh-1.0.0.pom",
-                b"<fresh/>",
-                24 * 60 * 60,
-            )
-            .expect("insert fresh");
-
-        // Verify both entries exist before cleanup (DB still has them even if expired)
-        assert!(
-            cache
-                .get(
-                    CacheTable::Pom,
-                    "https://repo.example/",
-                    "com/example/expired/1.0.0/expired-1.0.0.pom"
-                )
-                .expect("get")
-                .is_some()
-        );
-        assert!(
-            cache
-                .get(
-                    CacheTable::Pom,
-                    "https://repo.example/",
-                    "com/example/fresh/1.0.0/fresh-1.0.0.pom"
-                )
-                .expect("get")
-                .is_some()
-        );
-
-        // Run cleanup
-        let deleted = cache.cleanup_expired().expect("cleanup");
-        assert_eq!(deleted, 1, "expected 1 deleted, got {deleted}");
-
-        // Expired entry should be gone
-        assert!(
-            cache
-                .get(
-                    CacheTable::Pom,
-                    "https://repo.example/",
-                    "com/example/expired/1.0.0/expired-1.0.0.pom"
-                )
-                .expect("get")
-                .is_none()
-        );
-
-        // Fresh entry should still exist
-        assert!(
-            cache
-                .get(
-                    CacheTable::Pom,
-                    "https://repo.example/",
-                    "com/example/fresh/1.0.0/fresh-1.0.0.pom"
-                )
-                .expect("get")
-                .is_some()
-        );
     }
 
     /// A peer that holds the bootstrap lock and never releases it (wedged

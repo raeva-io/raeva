@@ -64,18 +64,19 @@ impl SecurityConfig {
     }
 
     /// Returns true if the given repository URL is allowed to be inherited from a
-    /// transitive POM declaration. When the global allow-flag is set, all URLs
-    /// pass. Otherwise the URL must share the same scheme, host, and port as
+    /// transitive POM declaration. Only parsed HTTP(S) URLs are eligible, even
+    /// with the global allow-flag. Otherwise the URL must share the same
+    /// scheme, host, and port as
     /// one of the allowlist entries, and the candidate path must start with
     /// the allowlist entry's path (preventing `corp.example` from matching
     /// `corp.example.evil.com`).
     pub fn allows_transitive_repo_url(&self, url: &str) -> bool {
-        if self.allow_transitive_repositories {
-            return true;
-        }
         let Some(candidate) = parse_url_origin(url) else {
             return false;
         };
+        if self.allow_transitive_repositories {
+            return true;
+        }
         self.transitive_repository_allowlist
             .iter()
             .filter_map(|entry| parse_url_origin(entry))
@@ -89,7 +90,7 @@ impl SecurityConfig {
         for entry in &self.transitive_repository_allowlist {
             if parse_url_origin(entry).is_none() {
                 return Err(format!(
-                    "transitive_repository_allowlist entry is not a valid URL: {entry:?}"
+                    "transitive_repository_allowlist entry must be an HTTP(S) URL: {entry:?}"
                 ));
             }
         }
@@ -178,6 +179,10 @@ pub struct NetworkConfig {
     pub retries: usize,
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
+    /// Minimum artifact body throughput in bytes/s; zero disables the check.
+    pub low_speed_limit: u64,
+    /// Rolling throughput window in seconds (must be positive).
+    pub low_speed_time: u64,
 }
 
 /// `[network]` table as written in rv.toml / config.toml. Fields are optional
@@ -194,6 +199,10 @@ pub(crate) struct NetworkConfigToml {
     pub retries: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_speed_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub low_speed_time: Option<u64>,
 }
 
 impl Default for NetworkConfig {
@@ -202,6 +211,8 @@ impl Default for NetworkConfig {
             timeout: default_timeout(),
             retries: default_retries(),
             concurrency: default_concurrency(),
+            low_speed_limit: 1024,
+            low_speed_time: 30,
         }
     }
 }
@@ -221,6 +232,24 @@ const RV_RETRIES_ENV: &str = "RV_RETRIES";
 
 fn default_concurrency() -> usize {
     8
+}
+
+// Invalid overrides preserve the layered TOML value, like RV_TIMEOUT.
+fn network_env_u64(name: &str, fallback: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(value) => match value.parse() {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(env = name, %value, %error, "ignoring invalid network override; expected an unsigned number");
+                fallback
+            }
+        },
+        Err(std::env::VarError::NotPresent) => fallback,
+        Err(error) => {
+            tracing::warn!(env = name, %error, "failed to read network override");
+            fallback
+        }
+    }
 }
 
 impl UserConfig {
@@ -291,6 +320,7 @@ pub struct Config {
     pub lock_path: PathBuf,
     inputs: ConfigInputs,
     maven_data: OnceLock<MavenSettingsData>,
+    os_credentials: bool,
 }
 
 impl std::fmt::Debug for Config {
@@ -326,6 +356,7 @@ impl Clone for Config {
             lock_path: self.lock_path.clone(),
             inputs: self.inputs.clone(),
             maven_data,
+            os_credentials: self.os_credentials,
         }
     }
 }
@@ -461,7 +492,22 @@ impl Config {
                 .concurrency
                 .or(user_network.concurrency)
                 .unwrap_or_else(default_concurrency),
+            low_speed_limit: project_network
+                .low_speed_limit
+                .or(user_network.low_speed_limit)
+                .unwrap_or_else(|| NetworkConfig::default().low_speed_limit),
+            low_speed_time: project_network
+                .low_speed_time
+                .or(user_network.low_speed_time)
+                .unwrap_or_else(|| NetworkConfig::default().low_speed_time),
         };
+        network.low_speed_limit = network_env_u64("RV_LOW_SPEED_LIMIT", network.low_speed_limit);
+        network.low_speed_time = network_env_u64("RV_LOW_SPEED_TIME", network.low_speed_time);
+        if network.low_speed_time == 0 {
+            return Err(ConfigError::InvalidSettings(
+                "network.low_speed_time / RV_LOW_SPEED_TIME must be positive (seconds); use RV_LOW_SPEED_LIMIT=0 to disable the check".into(),
+            ));
+        }
         match std::env::var(RV_TIMEOUT_ENV) {
             Ok(val) => match val.parse() {
                 Ok(timeout) => network.timeout = timeout,
@@ -542,6 +588,7 @@ impl Config {
             lock_path,
             inputs,
             maven_data: OnceLock::new(),
+            os_credentials: true,
         };
 
         // A present-but-malformed settings.xml (bad XML, oversize, DOCTYPE,
@@ -804,7 +851,20 @@ impl Config {
                 user_active_profiles: None,
             },
             maven_data,
+            os_credentials: false,
         }
+    }
+
+    /// Whether credentials stored by `rv login` are read from the OS
+    /// credential store. Test configurations never touch the user's keyring.
+    pub fn os_credentials_enabled(&self) -> bool {
+        self.os_credentials
+    }
+
+    #[doc(hidden)]
+    pub fn without_os_credentials(mut self) -> Self {
+        self.os_credentials = false;
+        self
     }
 }
 
@@ -833,6 +893,15 @@ fn merge_repositories(repositories: &mut Vec<RepoConfig>, underlay: &[RepoConfig
             if existing.snapshots_update_policy.is_none() {
                 existing.snapshots_update_policy = repo.snapshots_update_policy;
             }
+            if existing.releases_update_policy.is_none() {
+                existing.releases_update_policy = repo.releases_update_policy;
+            }
+            if existing.releases_checksum_policy.is_none() {
+                existing.releases_checksum_policy = repo.releases_checksum_policy;
+            }
+            if existing.snapshots_checksum_policy.is_none() {
+                existing.snapshots_checksum_policy = repo.snapshots_checksum_policy;
+            }
             continue;
         }
         repositories.push(repo.clone());
@@ -843,99 +912,24 @@ fn default_repositories() -> Vec<RepoConfig> {
     vec![RepoConfig::maven_central(), RepoConfig::google()]
 }
 
-/// Parsed representation of a URL's origin: scheme, host, optional port, and path.
-/// Used by `allows_transitive_repo_url` to compare origins without a full URL crate.
-#[derive(Debug, PartialEq)]
-struct UrlOrigin<'a> {
-    scheme: &'a str,
-    host: &'a str,
-    /// Explicit port if present; `None` means rely on the scheme default.
-    port: Option<u16>,
-    /// Path component, always starts with `/`.
-    path: &'a str,
+/// Parse HTTP(S) URLs with the fetch layer's parser.
+/// It normalizes scheme whitespace, which must not disguise filesystem access.
+fn parse_url_origin(raw: &str) -> Option<url::Url> {
+    let url = url::Url::parse(raw).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some()).then_some(url)
 }
 
-/// Parse scheme, host, port, and path out of `url`. Returns `None` if the
-/// string doesn't look like a valid `scheme://host[:port][/path]` URL.
-fn parse_url_origin(url: &str) -> Option<UrlOrigin<'_>> {
-    // Split at "://".
-    let (scheme, rest) = url.split_once("://")?;
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-    {
-        return None;
-    }
-    // Authority ends at the first `/`, `?`, or `#`.
-    let (authority, path) = match rest.find(['/', '?', '#']) {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    // Strip userinfo (everything before the last `@` in the authority).
-    let authority = match authority.rfind('@') {
-        Some(idx) => &authority[idx + 1..],
-        None => authority,
-    };
-    // Split host:port, handling IPv6 literals `[::1]:8080`.
-    let (host, port) = if authority.starts_with('[') {
-        // IPv6: `[addr]:port` or `[addr]`.
-        let close = authority.find(']')?;
-        let host = &authority[..=close]; // include brackets
-        let port_str = &authority[close + 1..];
-        let port = if let Some(p) = port_str.strip_prefix(':') {
-            Some(p.parse::<u16>().ok()?)
-        } else {
-            None
-        };
-        (host, port)
-    } else {
-        match authority.rfind(':') {
-            Some(idx) => {
-                let port_str = &authority[idx + 1..];
-                // Make sure the "port" part is all digits (not part of the host).
-                if port_str.chars().all(|c| c.is_ascii_digit()) && !port_str.is_empty() {
-                    (&authority[..idx], Some(port_str.parse::<u16>().ok()?))
-                } else {
-                    (authority, None)
-                }
-            }
-            None => (authority, None),
-        }
-    };
-    if host.is_empty() {
-        return None;
-    }
-    Some(UrlOrigin {
-        scheme,
-        host,
-        port,
-        path: if path.is_empty() { "/" } else { path },
-    })
-}
-
-/// Returns true iff `candidate` shares the same scheme/host/port as `allowed`,
-/// and `candidate`'s path starts with `allowed`'s path.
-fn url_origin_matches(allowed: &UrlOrigin<'_>, candidate: &UrlOrigin<'_>) -> bool {
-    if !allowed.scheme.eq_ignore_ascii_case(candidate.scheme) {
+/// Match the parsed origin and a path prefix aligned to a segment boundary.
+fn url_origin_matches(allowed: &url::Url, candidate: &url::Url) -> bool {
+    if allowed.origin() != candidate.origin() {
         return false;
     }
-    if !allowed.host.eq_ignore_ascii_case(candidate.host) {
-        return false;
-    }
-    if allowed.port != candidate.port {
-        return false;
-    }
-    // Path prefix match that aligns on a segment boundary, so
-    // `/corp` does not prefix-match `/corp-evil`.
-    let allowed_path = allowed.path;
-    let candidate_path = candidate.path;
-    if candidate_path == allowed_path {
-        return true;
-    }
-    let sep_terminated = allowed_path.ends_with('/');
-    candidate_path.starts_with(allowed_path)
-        && (sep_terminated || candidate_path[allowed_path.len()..].starts_with('/'))
+    let allowed_path = allowed.path();
+    let candidate_path = candidate.path();
+    candidate_path == allowed_path
+        || (candidate_path.starts_with(allowed_path)
+            && (allowed_path.ends_with('/')
+                || candidate_path[allowed_path.len()..].starts_with('/')))
 }
 
 /// Build the warning text for an ignored rv.toml sink `field`.
@@ -1036,6 +1030,9 @@ mod tests {
                     releases: Some(true),
                     snapshots: Some(false),
                     snapshots_update_policy: None,
+                    releases_update_policy: None,
+                    releases_checksum_policy: None,
+                    snapshots_checksum_policy: None,
                 }]),
                 ..Default::default()
             };
@@ -1048,6 +1045,9 @@ mod tests {
                     releases: Some(true),
                     snapshots: Some(false),
                     snapshots_update_policy: None,
+                    releases_update_policy: None,
+                    releases_checksum_policy: None,
+                    snapshots_checksum_policy: None,
                 }]),
                 ..Default::default()
             };
@@ -1067,6 +1067,49 @@ mod tests {
                     .iter()
                     .any(|repo| repo.id.as_deref() == Some("user"))
             );
+        });
+    }
+
+    #[test]
+    fn low_speed_config_layers_and_environment() {
+        with_raeva_home(|home| {
+            let project = tempfile::tempdir().unwrap();
+            fs::write(
+                home.join("config.toml"),
+                "[network]\nlow_speed_limit = 2000\nlow_speed_time = 45\n",
+            )
+            .unwrap();
+            fs::write(
+                project.path().join("rv.toml"),
+                "[network]\nlow_speed_limit = 1000\n",
+            )
+            .unwrap();
+            for (limit, time, expected_limit, expected_time) in [
+                (None, None, 1000, 45),
+                (Some("0"), Some("2"), 0, 2),
+                (Some("invalid"), Some("-1"), 1000, 45),
+            ] {
+                temp_env::with_vars(
+                    [("RV_LOW_SPEED_LIMIT", limit), ("RV_LOW_SPEED_TIME", time)],
+                    || {
+                        let config = Config::load(project.path()).unwrap();
+                        assert_eq!(config.network.low_speed_limit, expected_limit);
+                        assert_eq!(config.network.low_speed_time, expected_time);
+                    },
+                );
+            }
+            temp_env::with_var("RV_LOW_SPEED_TIME", Some("0"), || {
+                let error = Config::load(project.path()).unwrap_err().to_string();
+                assert!(error.contains("RV_LOW_SPEED_TIME"), "{error}");
+            });
+            fs::write(
+                project.path().join("rv.toml"),
+                "[network]\nlow_speed_time = 0\n",
+            )
+            .unwrap();
+            temp_env::with_var("RV_LOW_SPEED_TIME", None::<&str>, || {
+                assert!(Config::load(project.path()).is_err());
+            });
         });
     }
 
@@ -1122,6 +1165,9 @@ mod tests {
                     releases: Some(true),
                     snapshots: Some(false),
                     snapshots_update_policy: None,
+                    releases_update_policy: None,
+                    releases_checksum_policy: None,
+                    snapshots_checksum_policy: None,
                 }]),
                 ..Default::default()
             };
@@ -1134,6 +1180,9 @@ mod tests {
                     releases: Some(true),
                     snapshots: Some(false),
                     snapshots_update_policy: None,
+                    releases_update_policy: None,
+                    releases_checksum_policy: None,
+                    snapshots_checksum_policy: None,
                 }]),
                 ..Default::default()
             };
@@ -1372,6 +1421,9 @@ mod tests {
                 releases: None,
                 snapshots: None,
                 snapshots_update_policy: None,
+                releases_update_policy: None,
+                releases_checksum_policy: None,
+                snapshots_checksum_policy: None,
             };
 
             let project_config = ProjectConfig {
@@ -1822,6 +1874,35 @@ allow_project_local_certs = true
             err.contains("allow_project_local_certs") || err.contains("unknown field"),
             "error should mention the unknown field: {err}"
         );
+    }
+
+    #[test]
+    fn transitive_repository_admission_checks_the_parsed_scheme() {
+        use super::SecurityConfig;
+        for global_opt_in in [false, true] {
+            let security = SecurityConfig {
+                allow_transitive_repositories: global_opt_in,
+                transitive_repository_allowlist: vec![
+                    "file:///".to_string(),
+                    "https://corp.example/".to_string(),
+                ],
+                ..Default::default()
+            };
+            for url in [
+                "file:///etc/",
+                "fi\tle:///etc/",
+                "fi\nle:///etc/",
+                "f\riLe:///etc/",
+                "not-a-url",
+                "ftp://corp.example/",
+            ] {
+                assert!(
+                    !security.allows_transitive_repo_url(url),
+                    "admitted {url:?}"
+                );
+            }
+            assert!(security.allows_transitive_repo_url("ht\ttps://corp.example/maven2/"));
+        }
     }
 
     // ---- origin-aware allowlist matching ----

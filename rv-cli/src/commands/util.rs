@@ -42,16 +42,23 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> crate::error::Result<()> {
 }
 
 pub fn read_lockfile(config: &rv_config::Config) -> crate::error::Result<rv_config::Lockfile> {
+    read_lockfile_at(&config.lock_path)
+}
+
+/// Missing, dangling, and non-file lockfiles each get their own diagnostic
+/// before `Lockfile::read` runs.
+fn read_lockfile_at(path: &std::path::Path) -> crate::error::Result<rv_config::Lockfile> {
     use crate::error::CliError;
-    let path = &config.lock_path;
     match path.symlink_metadata() {
         // Path does not exist at all -> classic "missing lockfile" error.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(CliError::LockfileMissing { path: path.clone() });
+            return Err(CliError::LockfileMissing {
+                path: path.to_path_buf(),
+            });
         }
         Err(err) => {
             return Err(CliError::IoWithPath {
-                path: path.clone(),
+                path: path.to_path_buf(),
                 source: err,
             });
         }
@@ -64,22 +71,26 @@ pub fn read_lockfile(config: &rv_config::Config) -> crate::error::Result<rv_conf
             };
             match resolved {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(CliError::LockfileMissing { path: path.clone() });
+                    return Err(CliError::LockfileMissing {
+                        path: path.to_path_buf(),
+                    });
                 }
                 Err(err) => {
                     return Err(CliError::IoWithPath {
-                        path: path.clone(),
+                        path: path.to_path_buf(),
                         source: err,
                     });
                 }
                 Ok(meta) if !meta.is_file() => {
-                    return Err(CliError::LockfileNotAFile { path: path.clone() });
+                    return Err(CliError::LockfileNotAFile {
+                        path: path.to_path_buf(),
+                    });
                 }
                 Ok(_) => {}
             }
         }
     }
-    Ok(rv_config::Lockfile::read(&config.lock_path)?)
+    Ok(rv_config::Lockfile::read(path)?)
 }
 
 pub fn read_fresh_lockfile(
@@ -191,47 +202,7 @@ impl CommandContext {
         let store_dir = config.paths.store_dir.clone();
 
         let (lock_result, store_result) = tokio::join!(
-            tokio::task::spawn_blocking(move || {
-                // Mirror the sync `read_lockfile` path: `symlink_metadata`
-                // first, then resolve through `metadata` if the entry is
-                // a symlink. Using bare `metadata` here would silently
-                // follow symlinks and diverge from the sync path on
-                // broken-link / not-a-file diagnostics.
-                match lock_path.symlink_metadata() {
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(CliError::LockfileMissing { path: lock_path });
-                    }
-                    Err(err) => {
-                        return Err(CliError::IoWithPath {
-                            path: lock_path,
-                            source: err,
-                        });
-                    }
-                    Ok(meta) => {
-                        let resolved = if meta.file_type().is_symlink() {
-                            lock_path.metadata()
-                        } else {
-                            Ok(meta)
-                        };
-                        match resolved {
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                                return Err(CliError::LockfileMissing { path: lock_path });
-                            }
-                            Err(err) => {
-                                return Err(CliError::IoWithPath {
-                                    path: lock_path,
-                                    source: err,
-                                });
-                            }
-                            Ok(meta) if !meta.is_file() => {
-                                return Err(CliError::LockfileNotAFile { path: lock_path });
-                            }
-                            Ok(_) => {}
-                        }
-                    }
-                }
-                rv_config::Lockfile::read(&lock_path).map_err(CliError::from)
-            }),
+            tokio::task::spawn_blocking(move || read_lockfile_at(&lock_path)),
             tokio::task::spawn_blocking(move || {
                 rv_store::Store::open(&store_dir).map_err(CliError::from)
             }),
@@ -281,6 +252,24 @@ mod tests {
             matches!(err, CliError::LockfileNotAFile { .. }),
             "got {err:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_lockfile_follows_symlinks_and_reports_dangling_ones_as_missing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config = config_for(tmp.path());
+        std::os::unix::fs::symlink(tmp.path().join("gone.lock"), &config.lock_path)
+            .expect("dangling symlink");
+        let err = read_lockfile(&config).expect_err("expected LockfileMissing");
+        assert!(matches!(err, CliError::LockfileMissing { .. }), "{err:?}");
+
+        std::fs::remove_file(&config.lock_path).expect("remove symlink");
+        std::fs::create_dir(tmp.path().join("dir.lock")).expect("mkdir");
+        std::os::unix::fs::symlink(tmp.path().join("dir.lock"), &config.lock_path)
+            .expect("directory symlink");
+        let err = read_lockfile(&config).expect_err("expected LockfileNotAFile");
+        assert!(matches!(err, CliError::LockfileNotAFile { .. }), "{err:?}");
     }
 
     #[test]

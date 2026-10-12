@@ -11,7 +11,7 @@
 //! They live in their own integration binary because they mutate `HOME` /
 //! `RAEVA_HOME` to make `Config::load` hermetic.
 
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Mutex, Once};
 
 use rv_config::{
     Checksum, Config, LOCKFILE_SCHEMA_VERSION, LockGav, LockPackage, LockPlatform, Lockfile,
@@ -19,8 +19,7 @@ use rv_config::{
 };
 use rv_repo::{RepoClient, sync};
 use rv_store::Store;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use rv_test_support::http::{Response, StubServer};
 
 /// rustls 0.23 requires a process-level `CryptoProvider`; the integration
 /// binary has to seed it itself.
@@ -39,54 +38,7 @@ const POM_BYTES: &[u8] = b"<project><modelVersion>4.0.0</modelVersion>\
     <groupId>com.example</groupId><artifactId>demo</artifactId>\
     <version>1.0</version></project>";
 
-/// Every request the stub received, verbatim (request line plus headers).
-type RequestLog = Arc<Mutex<Vec<String>>>;
-
-/// A Maven-shaped stub serving `demo-1.0.jar`/`.pom` plus their `.sha256`
-/// sidecars under `/maven/`, recording each request it answers.
-async fn spawn_recording_stub() -> (std::net::SocketAddr, RequestLog) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let log: RequestLog = Arc::new(Mutex::new(Vec::new()));
-    let sink = log.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut sock, _)) = listener.accept().await else {
-                return;
-            };
-            let sink = sink.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 8192];
-                let mut total = Vec::new();
-                loop {
-                    let Ok(read) = sock.read(&mut buf).await else {
-                        return;
-                    };
-                    if read == 0 {
-                        return;
-                    }
-                    total.extend_from_slice(&buf[..read]);
-                    if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request = String::from_utf8_lossy(&total).into_owned();
-                let path = request
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
-                sink.lock().expect("log").push(request);
-                let _ = sock.write_all(&response_for(&path)).await;
-                let _ = sock.shutdown().await;
-            });
-        }
-    });
-    (addr, log)
-}
-
-fn response_for(path: &str) -> Vec<u8> {
+fn response_for(path: &str) -> Response {
     let body: Option<Vec<u8>> = match path {
         "/maven/com/example/demo/1.0/demo-1.0.jar" => Some(JAR_BYTES.to_vec()),
         "/maven/com/example/demo/1.0/demo-1.0.jar.sha256" => {
@@ -99,18 +51,8 @@ fn response_for(path: &str) -> Vec<u8> {
         _ => None,
     };
     match body {
-        Some(body) => {
-            let mut response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .into_bytes();
-            response.extend_from_slice(&body);
-            response
-        }
-        None => {
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
-        }
+        Some(body) => Response::new(200, body),
+        None => Response::new(404, ""),
     }
 }
 
@@ -137,7 +79,11 @@ fn load_config(home: &std::path::Path, rv_toml: &str) -> Config {
             ("USERPROFILE", Some(home_string.as_str())),
             ("RAEVA_HOME", Some(raeva_home.as_str())),
         ],
-        || Config::load(&project).expect("config"),
+        || {
+            Config::load(&project)
+                .expect("config")
+                .without_os_credentials()
+        },
     )
 }
 
@@ -176,11 +122,11 @@ fn single_package_lock(mirror_url: &str) -> (Lockfile, Vec<Platform>) {
     (lock, vec![platform])
 }
 
-fn authorization_headers(log: &RequestLog) -> Vec<String> {
-    log.lock()
-        .expect("log")
+fn authorization_headers(server: &StubServer) -> Vec<String> {
+    server
+        .requests()
         .iter()
-        .flat_map(|request| request.lines())
+        .flat_map(|request| request.raw.lines())
         .filter(|line| {
             line.split(':')
                 .next()
@@ -197,7 +143,8 @@ fn authorization_headers(log: &RequestLog) -> Vec<String> {
 async fn syncing_a_mirror_recorded_row_does_not_leak_the_default_token() {
     ensure_crypto_provider();
     let home = tempfile::tempdir().expect("home");
-    let (addr, log) = spawn_recording_stub().await;
+    let server = StubServer::start(|request| response_for(&request.path));
+    let addr = server.addr();
     let mirror_url = format!("http://{addr}/maven/");
 
     let config = load_config(
@@ -234,10 +181,10 @@ token = "corp-secret-token"
     }
 
     assert!(
-        !log.lock().expect("log").is_empty(),
+        !server.requests().is_empty(),
         "the stub must have been contacted"
     );
-    let sent = authorization_headers(&log);
+    let sent = authorization_headers(&server);
     assert!(
         sent.is_empty(),
         "the default corp token must never reach a cross-host mirror: {sent:?}"
@@ -251,7 +198,8 @@ token = "corp-secret-token"
 async fn syncing_a_same_host_mirror_row_still_sends_the_default_token() {
     ensure_crypto_provider();
     let home = tempfile::tempdir().expect("home");
-    let (addr, log) = spawn_recording_stub().await;
+    let server = StubServer::start(|request| response_for(&request.path));
+    let addr = server.addr();
     let mirror_url = format!("http://{addr}/maven/");
 
     let config = load_config(
@@ -287,7 +235,7 @@ token = "corp-secret-token"
             .expect("the mirror serves the artifact");
     }
 
-    let sent = authorization_headers(&log);
+    let sent = authorization_headers(&server);
     assert!(
         !sent.is_empty(),
         "a same-origin mirror must still receive the configured default credential"

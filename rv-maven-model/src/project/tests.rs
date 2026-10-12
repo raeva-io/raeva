@@ -239,6 +239,97 @@ fn merges_profile_dependencies_when_active() {
     );
 }
 
+/// An inactive profile may omit `<systemPath>` for a system-scoped dependency.
+#[test]
+fn inactive_profile_system_dependency_without_system_path_is_ignored() {
+    let pom_xml = r"
+    <project>
+      <modelVersion>4.0.0</modelVersion>
+      <groupId>com.example</groupId>
+      <artifactId>app</artifactId>
+      <version>1.0.0</version>
+      <profiles>
+        <profile>
+          <id>jdk1.8</id>
+          <activation>
+            <jdk>(,1.8]</jdk>
+          </activation>
+          <dependencies>
+            <dependency>
+              <groupId>jdk.tools</groupId>
+              <artifactId>jdk.tools</artifactId>
+              <scope>system</scope>
+              <optional>true</optional>
+            </dependency>
+          </dependencies>
+        </profile>
+      </profiles>
+    </project>
+    ";
+
+    let ctx = ActivationContext {
+        jdk_version: Some("21".to_string()),
+        ..ActivationContext::default()
+    };
+    let project =
+        Project::from_pom_with_context(Pom::parse(pom_xml).unwrap(), EmptyResolver, &ctx).unwrap();
+    assert!(project.dependencies.is_empty());
+
+    let ctx = ActivationContext {
+        jdk_version: Some("1.8".to_string()),
+        ..ActivationContext::default()
+    };
+    Project::from_pom_with_context(Pom::parse(pom_xml).unwrap(), EmptyResolver, &ctx)
+        .expect_err("an active profile still requires <systemPath>");
+}
+
+/// A system-scoped dependency may inherit `<systemPath>` from dependencyManagement.
+#[test]
+fn system_dependency_takes_system_path_from_management() {
+    let pom_xml = r"
+    <project>
+      <modelVersion>4.0.0</modelVersion>
+      <groupId>com.example</groupId>
+      <artifactId>app</artifactId>
+      <version>1.0.0</version>
+      <dependencyManagement>
+        <dependencies>
+          <dependency>
+            <groupId>jdk.tools</groupId>
+            <artifactId>jdk.tools</artifactId>
+            <version>1.7</version>
+            <scope>system</scope>
+            <systemPath>${java.home}/../lib/tools.jar</systemPath>
+          </dependency>
+        </dependencies>
+      </dependencyManagement>
+      <dependencies>
+        <dependency>
+          <groupId>jdk.tools</groupId>
+          <artifactId>jdk.tools</artifactId>
+          <scope>system</scope>
+          <optional>true</optional>
+        </dependency>
+      </dependencies>
+    </project>
+    ";
+
+    let project = Project::from_pom_with_context(
+        Pom::parse(pom_xml).unwrap(),
+        EmptyResolver,
+        &ActivationContext::default(),
+    )
+    .expect("managed systemPath satisfies the system-scope check");
+    assert_eq!(project.dependencies.len(), 1);
+    assert_eq!(project.dependencies[0].version.as_deref(), Some("1.7"));
+    assert!(
+        project.dependencies[0]
+            .system_path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("/../lib/tools.jar"))
+    );
+}
+
 /// Maven scopes the `activeByDefault` suppression rule to each POM's own
 /// profile set: a child profile activating by condition must not suppress
 /// the parent's default profile, nor the reverse. (Maven runs profile
@@ -495,6 +586,74 @@ fn merges_profile_dependency_management_when_active() {
     assert_eq!(project.dependencies[0].version.as_deref(), Some("2.0.0"));
     assert_eq!(project.dependencies[0].scope.as_deref(), Some("runtime"));
     assert_eq!(project.dependency_management.dependencies.len(), 1);
+}
+
+#[test]
+fn profile_dependencies_take_base_management_before_their_own() {
+    let pom_xml = r"
+    <project>
+      <modelVersion>4.0.0</modelVersion>
+      <groupId>com.example</groupId>
+      <artifactId>app</artifactId>
+      <version>1.0.0</version>
+      <dependencyManagement>
+        <dependencies>
+          <dependency><groupId>org.sample</groupId><artifactId>both</artifactId><version>1.0</version></dependency>
+          <dependency><groupId>org.sample</groupId><artifactId>base</artifactId><version>1.1</version></dependency>
+        </dependencies>
+      </dependencyManagement>
+      <profiles>
+        <profile>
+          <id>empty</id>
+        </profile>
+        <profile>
+          <id>own</id>
+          <dependencyManagement>
+            <dependencies>
+              <dependency><groupId>org.sample</groupId><artifactId>both</artifactId><version>3.0</version></dependency>
+              <dependency><groupId>org.sample</groupId><artifactId>own</artifactId><version>2.0</version></dependency>
+            </dependencies>
+          </dependencyManagement>
+          <dependencies>
+            <dependency><groupId>org.sample</groupId><artifactId>both</artifactId></dependency>
+            <dependency><groupId>org.sample</groupId><artifactId>base</artifactId></dependency>
+            <dependency><groupId>org.sample</groupId><artifactId>own</artifactId></dependency>
+            <dependency><groupId>org.sample</groupId><artifactId>unmanaged</artifactId></dependency>
+          </dependencies>
+        </profile>
+      </profiles>
+    </project>
+    ";
+
+    let project = Project::from_pom_with_context(
+        Pom::parse(pom_xml).unwrap(),
+        EmptyResolver,
+        &ActivationContext::default(),
+    )
+    .unwrap();
+
+    let profile = |id: &str| {
+        project
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .unwrap()
+    };
+    assert!(profile("empty").dependencies.is_empty());
+    let versions: Vec<_> = profile("own")
+        .dependencies
+        .iter()
+        .map(|dep| (dep.artifact_id.as_str(), dep.version.as_deref()))
+        .collect();
+    assert_eq!(
+        versions,
+        [
+            ("both", Some("1.0")),
+            ("base", Some("1.1")),
+            ("own", Some("2.0")),
+            ("unmanaged", None),
+        ]
+    );
 }
 
 #[test]
@@ -912,7 +1071,7 @@ fn managed_scope_applies_when_missing() {
 }
 
 #[test]
-fn managed_optional_applies_when_unspecified() {
+fn managed_optional_is_not_applied() {
     let management = DependencyManagement {
         dependencies: vec![Dependency {
             group_id: "g".to_string(),
@@ -967,7 +1126,7 @@ fn managed_optional_applies_when_unspecified() {
         &project,
     )
     .unwrap();
-    assert_eq!(resolved[0].optional.as_deref(), Some("true"));
+    assert_eq!(resolved[0].optional, None);
     assert_eq!(resolved[1].optional.as_deref(), Some("false"));
 }
 
@@ -2740,6 +2899,84 @@ fn observe_project_repositories_runs_before_parent_fetch() {
     );
 }
 
+// Maven exposes active-profile repositories before resolving a POM's parent.
+// This parent exists only in the profile's repository.
+fn profile_repo_hosted_parent(
+    activation: &str,
+    ctx: &ActivationContext,
+) -> Result<Project, PomError> {
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct HostedParent {
+        observed: RefCell<Vec<String>>,
+    }
+
+    impl ParentResolver for &HostedParent {
+        fn resolve_parent(&self, _parent: &Parent) -> Result<Option<Pom>, PomError> {
+            if !self
+                .observed
+                .borrow()
+                .iter()
+                .any(|u| u == "https://snap.example/")
+            {
+                return Ok(None);
+            }
+            Ok(Some(
+                Pom::parse(
+                    r#"<project><groupId>g</groupId><artifactId>par</artifactId>
+                    <version>1</version></project>"#,
+                )
+                .unwrap(),
+            ))
+        }
+
+        fn strict_parent_resolution(&self) -> bool {
+            true
+        }
+
+        fn observe_project_repositories(&self, repositories: &[crate::Repository]) {
+            self.observed
+                .borrow_mut()
+                .extend(repositories.iter().map(|r| r.url.clone()));
+        }
+    }
+
+    let xml = format!(
+        r#"<project><groupId>g</groupId><artifactId>c</artifactId><version>1</version>
+        <parent><groupId>g</groupId><artifactId>par</artifactId><version>1</version>
+        <relativePath/></parent>
+        <profiles><profile><id>spring</id>{activation}
+        <repositories><repository><id>snap</id><url>https://snap.example/</url>
+        </repository></repositories></profile></profiles></project>"#
+    );
+    let resolver = HostedParent::default();
+    Project::from_pom_with_context(Pom::parse(&xml).unwrap(), &resolver, ctx)
+}
+
+#[test]
+fn explicitly_activated_profile_repositories_serve_parent_fetch() {
+    let ctx = ActivationContext {
+        active_profiles: vec!["spring".to_string()],
+        ..ActivationContext::default()
+    };
+    profile_repo_hosted_parent("", &ctx).expect("parent must resolve via -P profile repository");
+}
+
+#[test]
+fn active_by_default_profile_repositories_serve_parent_fetch() {
+    let activation = "<activation><activeByDefault>true</activeByDefault></activation>";
+    profile_repo_hosted_parent(activation, &ActivationContext::default())
+        .expect("parent must resolve via activeByDefault profile repository");
+}
+
+#[test]
+fn inactive_profile_repositories_do_not_serve_parent_fetch() {
+    let err = profile_repo_hosted_parent("", &ActivationContext::default())
+        .expect_err("inactive profile repository must not be used");
+    assert!(matches!(err, PomError::ParentNotFound(..)), "{err:?}");
+}
+
 // A POM without any <repositories> should not invoke the observer hook.
 #[test]
 fn observe_project_repositories_skipped_when_empty() {
@@ -2865,4 +3102,198 @@ fn empty_version_after_interpolation_is_rejected() {
         }
         other => panic!("expected InvalidModel version error, got: {other:?}"),
     }
+}
+
+/// Maven orders dependencies from child POM to ancestor.
+/// Within each POM, its own dependencies precede its active-profile dependencies.
+/// A child override keeps the child's position and version.
+/// This order decides nearest-wins ties.
+#[test]
+fn orders_child_dependencies_before_inherited_ones() {
+    fn dep(artifact: &str, version: &str) -> String {
+        format!(
+            "<dependency><groupId>g</groupId><artifactId>{artifact}</artifactId>\
+             <version>{version}</version></dependency>"
+        )
+    }
+    let parent = Pom::parse(&format!(
+        r"<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>
+          <artifactId>par</artifactId><version>1</version><packaging>pom</packaging>
+          <dependencies>{}{}{}</dependencies>
+          <profiles><profile><id>pp</id>
+            <activation><activeByDefault>true</activeByDefault></activation>
+            <dependencies>{}</dependencies></profile></profiles></project>",
+        dep("p1", "1"),
+        dep("p2", "1"),
+        dep("p3", "1"),
+        dep("pprof", "1"),
+    ))
+    .unwrap();
+    let child = Pom::parse(&format!(
+        r"<project><modelVersion>4.0.0</modelVersion>
+          <parent><groupId>g</groupId><artifactId>par</artifactId><version>1</version></parent>
+          <artifactId>ch</artifactId>
+          <dependencies>{}{}{}</dependencies>
+          <profiles><profile><id>cp</id>
+            <activation><activeByDefault>true</activeByDefault></activation>
+            <dependencies>{}</dependencies></profile></profiles></project>",
+        dep("c1", "1"),
+        dep("p2", "2"),
+        dep("c2", "1"),
+        dep("cprof", "1"),
+    ))
+    .unwrap();
+
+    let project = Project::from_pom(child, TestResolver { parent }).unwrap();
+    let order: Vec<_> = project
+        .dependencies
+        .iter()
+        .map(|d| format!("{}:{}", d.artifact_id, d.version.as_deref().unwrap_or("?")))
+        .collect();
+    assert_eq!(
+        order,
+        ["c1:1", "p2:2", "c2:1", "cprof:1", "p1:1", "p3:1", "pprof:1"]
+    );
+}
+
+// Inherited repositories must reach the resolver before BOM imports.
+// This BOM exists only in a parent's repository whose URL uses a property.
+#[test]
+fn parent_declared_repositories_are_observed_before_bom_import() {
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct RepoGatedResolver {
+        observed: RefCell<Vec<String>>,
+    }
+
+    impl ParentResolver for RepoGatedResolver {
+        fn resolve_parent(&self, _parent: &Parent) -> Result<Option<Pom>, PomError> {
+            Ok(Some(
+                Pom::parse(
+                    r#"<project>
+                        <groupId>com.base</groupId>
+                        <artifactId>parent</artifactId>
+                        <version>2.0.0</version>
+                        <packaging>pom</packaging>
+                        <properties><snap.url>https://snap.example/repo/</snap.url></properties>
+                        <repositories>
+                            <repository>
+                                <id>snap</id>
+                                <url>${snap.url}</url>
+                                <snapshots><enabled>true</enabled></snapshots>
+                            </repository>
+                        </repositories>
+                    </project>"#,
+                )
+                .unwrap(),
+            ))
+        }
+
+        fn resolve_import_pom(
+            &self,
+            _group_id: &str,
+            _artifact_id: &str,
+            _version: &str,
+            _type_: Option<&str>,
+            _classifier: Option<&str>,
+        ) -> Result<Option<Pom>, PomError> {
+            if self
+                .observed
+                .borrow()
+                .iter()
+                .any(|url| url == "https://snap.example/repo/")
+            {
+                Ok(Some(
+                    Pom::parse(
+                        r#"<project>
+                            <groupId>com.bom</groupId>
+                            <artifactId>bom</artifactId>
+                            <version>1.0-SNAPSHOT</version>
+                            <packaging>pom</packaging>
+                        </project>"#,
+                    )
+                    .unwrap(),
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+
+        fn observe_project_repositories(&self, repositories: &[crate::Repository]) {
+            self.observed
+                .borrow_mut()
+                .extend(repositories.iter().map(|repo| repo.url.clone()));
+        }
+    }
+
+    let pom_xml = r#"<project>
+        <groupId>com.example</groupId>
+        <artifactId>child</artifactId>
+        <parent>
+            <groupId>com.base</groupId>
+            <artifactId>parent</artifactId>
+            <version>2.0.0</version>
+        </parent>
+        <dependencyManagement>
+            <dependencies>
+                <dependency>
+                    <groupId>com.bom</groupId>
+                    <artifactId>bom</artifactId>
+                    <version>1.0-SNAPSHOT</version>
+                    <type>pom</type>
+                    <scope>import</scope>
+                </dependency>
+            </dependencies>
+        </dependencyManagement>
+    </project>"#;
+
+    let resolver = RepoGatedResolver::default();
+    let project = Project::from_pom(Pom::parse(pom_xml).unwrap(), &resolver)
+        .expect("BOM must resolve once the parent's repository is observed");
+    assert!(
+        project
+            .repositories
+            .iter()
+            .any(|repo| repo.url == "https://snap.example/repo/")
+    );
+}
+
+#[test]
+fn repository_provenance_survives_inheritance_without_trusting_remote_parents() {
+    struct Resolver;
+    impl ParentResolver for Resolver {
+        fn is_root_model(&self) -> bool {
+            true
+        }
+        fn resolve_parent(&self, _: &Parent) -> Result<Option<Pom>, PomError> {
+            Ok(Some(Pom::parse(
+                r#"<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>
+                <repositories><repository><id>remote</id><url>https://remote.example/</url><root_declared>true</root_declared><rootDeclared>true</rootDeclared></repository></repositories>
+                </project>"#,
+            )?))
+        }
+    }
+    let pom = Pom::parse(r#"<project><parent><groupId>g</groupId><artifactId>parent</artifactId><version>1</version></parent><artifactId>root</artifactId>
+        <properties><registry>https://root.example/</registry></properties>
+        <profiles><profile><id>active</id><activation><activeByDefault>true</activeByDefault></activation>
+        <repositories><repository><id>local</id><url>${registry}</url></repository></repositories></profile></profiles>
+        </project>"#).unwrap();
+    let project =
+        Project::from_pom_with_context(pom, Resolver, &ActivationContext::default()).unwrap();
+    let root = project
+        .repositories
+        .iter()
+        .find(|r| r.id.as_deref() == Some("local"))
+        .unwrap();
+    let remote = project
+        .repositories
+        .iter()
+        .find(|r| r.id.as_deref() == Some("remote"))
+        .unwrap();
+    assert!(root.root_declared);
+    assert_eq!(root.url, "https://root.example/");
+    assert!(!remote.root_declared);
+    let serialized = quick_xml::se::to_string(root).unwrap();
+    assert!(!serialized.contains("root_declared"));
 }

@@ -1,4 +1,4 @@
-//! Canonical Maven coordinate key (group:artifact:version:packaging[:classifier]).
+//! Canonical Maven coordinate key (`group:artifact:version:packaging[:classifier]`).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -29,7 +29,7 @@ impl ArtifactKey {
             // here keeps the empty/None distinction from leaking into hashing
             // and equality, so a key round-trips losslessly through the index
             // (which stores the classifier as `classifier_key`, i.e. "" for
-            // None). See #55.
+            // None).
             classifier: normalize_classifier(classifier),
         }
     }
@@ -43,7 +43,7 @@ impl ArtifactKey {
 
 /// Reconstruct an `Option<String>` classifier from its stored `classifier_key`
 /// form, where an empty string means "no classifier". Inverse of
-/// [`ArtifactKey::classifier_key`]; keeps the index round-trip consistent (#55).
+/// [`ArtifactKey::classifier_key`]; keeps the index round-trip consistent.
 pub fn classifier_from_key(classifier: impl Into<String>) -> Option<String> {
     normalize_classifier(Some(classifier.into()))
 }
@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn empty_classifier_normalizes_to_none() {
-        // #55: a `Some("")` classifier is indistinguishable from `None` once it
+        // A `Some("")` classifier is indistinguishable from `None` once it
         // round-trips through the index (which stores "" for None), so `new`
         // collapses the two up front to keep hashing/equality consistent.
         let with_empty = ArtifactKey::new("g", "a", "1", "jar", Some(String::new()));
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn classifier_key_round_trips_through_classifier_from_key() {
-        // The stored form (classifier_key) must reconstruct an equal key (#55).
+        // The stored form (classifier_key) must reconstruct an equal key.
         for classifier in [None, Some("sources".to_string()), Some(String::new())] {
             let key = ArtifactKey::new("g", "a", "1", "jar", classifier);
             let reconstructed = ArtifactKey::new(

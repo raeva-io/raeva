@@ -1,0 +1,10 @@
+[package]
+name = "rv-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true

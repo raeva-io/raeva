@@ -150,7 +150,7 @@ mod tests {
         );
     }
 
-    /// #33: a soft pin (bare `1.0` → `VersionReq::Soft`) overridden to 2.0 by
+    /// A soft pin (bare `1.0` -> `VersionReq::Soft`) overridden to 2.0 by
     /// nearest-wins / <dependencyManagement> / a BOM is the intended Maven
     /// outcome, not a conflict. It must NOT be labelled.
     #[test]

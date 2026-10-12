@@ -21,6 +21,17 @@ impl RepoSearchStatus {
     }
 }
 
+/// A transitive repository ignored by the default-deny policy.
+/// Not-found errors include it when its declaring POM is on the dependency path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedRepo {
+    pub url: String,
+    /// `group:artifact:version` of the POM that declared the repository.
+    pub declared_by: String,
+    pub releases_enabled: bool,
+    pub snapshots_enabled: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoStatus {
     Http(u16),
@@ -123,6 +134,8 @@ pub enum ResolveError {
     ArtifactNotFound {
         coord: String,
         searched: Vec<RepoSearchStatus>,
+        /// Ignored transitive repositories declared on the path to `coord`.
+        dropped_repos: Vec<DroppedRepo>,
     },
     #[error("no repositories configured")]
     NoRepositories,
@@ -228,15 +241,18 @@ mod tests {
         let first = ResolveError::ArtifactNotFound {
             coord: "com.example:first:1.0".to_string(),
             searched: vec![],
+            dropped_repos: vec![],
         };
         let rest = vec![
             ResolveError::ArtifactNotFound {
                 coord: "com.example:second:2.0".to_string(),
                 searched: vec![],
+                dropped_repos: vec![],
             },
             ResolveError::ArtifactNotFound {
                 coord: "com.example:third:3.0".to_string(),
                 searched: vec![],
+                dropped_repos: vec![],
             },
         ];
         let err = ResolveError::MultipleArtifactErrors {

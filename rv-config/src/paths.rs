@@ -46,6 +46,20 @@ impl ResolvedPaths {
         })
     }
 
+    /// Paths under a fresh directory in the system temp dir. Tests use this so
+    /// they never share the user's metadata cache: test servers reuse
+    /// loopback ports, and a cached POM keyed by an earlier server's URL would
+    /// be served in place of a request.
+    #[doc(hidden)]
+    pub fn for_testing() -> Result<Self, ConfigError> {
+        let base = tempfile::Builder::new()
+            .prefix("raeva-test-")
+            .tempdir()
+            .map_err(|_| ConfigError::DataDirUnavailable)?
+            .keep();
+        Ok(Self::from_raeva_home(base))
+    }
+
     pub fn from_raeva_home(base: impl Into<PathBuf>) -> Self {
         let base = base.into();
         let store_dir = base.join("store");

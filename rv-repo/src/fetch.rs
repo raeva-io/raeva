@@ -1,15 +1,18 @@
+use std::collections::VecDeque;
 use std::fs::File;
+use std::future::Future;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
 use backon::ExponentialBuilder;
 use bytes::Bytes;
+use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use sha1::Sha1;
-use tokio_stream::StreamExt;
 use url::Url;
 
 use crate::auth::Auth;
@@ -95,7 +98,17 @@ fn request_error(error: reqwest::Error, url: &Url) -> RetryError {
 #[derive(Debug, Clone)]
 pub struct FetchConfig {
     pub retries: usize,
+    /// Timeout for metadata and sidecars, or for headers and idle gaps in artifact streams.
+    /// Artifact idle gaps include waits for the store to consume chunks. EOF ends
+    /// the network deadline; total transfer time has no limit.
     pub timeout: Duration,
+    /// Upper bound on a single artifact body, guarding against a hostile
+    /// server streaming forever.
+    pub max_artifact_size: u64,
+    /// Minimum artifact throughput in bytes/s; zero disables the check.
+    pub low_speed_limit: u64,
+    /// Sliding window of network wait time, excluding store backpressure.
+    pub low_speed_time: Duration,
 }
 
 impl Default for FetchConfig {
@@ -103,6 +116,9 @@ impl Default for FetchConfig {
         Self {
             retries: 2,
             timeout: Duration::from_secs(30),
+            max_artifact_size: DEFAULT_MAX_ARTIFACT_SIZE,
+            low_speed_limit: rv_config::NetworkConfig::default().low_speed_limit,
+            low_speed_time: Duration::from_secs(rv_config::NetworkConfig::default().low_speed_time),
         }
     }
 }
@@ -127,7 +143,9 @@ pub struct Checksum {
 }
 
 const MAX_METADATA_SIZE: u64 = 20 * 1024 * 1024; // 20MB
-const MAX_ARTIFACT_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2GB
+/// Default artifact size cap in bytes, overridden by `RV_MAX_ARTIFACT_SIZE`.
+pub const DEFAULT_MAX_ARTIFACT_SIZE: u64 = 16 * 1024 * 1024 * 1024; // 16GiB
+pub const MAX_ARTIFACT_SIZE_ENV: &str = "RV_MAX_ARTIFACT_SIZE";
 /// Upper bound on an honoured `Retry-After`. A hostile or misconfigured
 /// server can send `Retry-After: 999999999` (≈31 years); without a clamp a
 /// single attempt would sleep effectively forever. Two minutes is well above
@@ -140,14 +158,6 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 /// whitespace scan in `extract_hex_token` against a hostile or oversized
 /// sidecar.
 const MAX_CHECKSUM_SIZE: u64 = 4 * 1024; // 4KB
-
-/// Headerless wrapper kept for the redaction-coverage tests; production
-/// code calls [`classify_response_status_with_headers`] directly so the
-/// `Retry-After` value on a 429 reaches the backoff layer.
-#[cfg(test)]
-fn classify_response_status(status: StatusCode, url: &Url) -> std::result::Result<(), RetryError> {
-    classify_response_status_with_headers(status, url, None)
-}
 
 /// Classifies an HTTP status into permanent/transient; on 429/503 the
 /// `Retry-After` header (integer seconds or RFC 2822 date, per RFC 7231 §7.1.3)
@@ -265,10 +275,14 @@ where
 pub(crate) async fn fetch_bytes(
     client: &Client,
     url: &Url,
+    repository_root: Option<&Url>,
     auth: Option<&Auth>,
     config: &FetchConfig,
     progress: Option<&dyn FetchProgress>,
 ) -> Result<Bytes> {
+    if url.scheme() == "file" {
+        return read_local_bytes(url, repository_root, MAX_METADATA_SIZE, progress).await;
+    }
     tracing::debug!(url = %redact_url(url), method = "GET", "HTTP request start");
     execute_retry(config, || async {
         let mut request = client.get(url.as_str());
@@ -347,21 +361,6 @@ pub(crate) async fn fetch_bytes(
     .await
 }
 
-/// Convert a non-success status code to a RepoError (non-backoff version).
-/// Used only by the redaction-coverage tests; production code routes through
-/// `classify_response_status_with_headers`.
-#[cfg(test)]
-fn classify_status_to_error(status: StatusCode, url: &Url) -> RepoError {
-    let display_url = redact_url(url);
-    if status == StatusCode::NOT_FOUND {
-        RepoError::NotFound(display_url)
-    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        RepoError::AuthError(format!("{status} for {display_url}"))
-    } else {
-        RepoError::UnexpectedResponse(format!("{status} for {display_url}"))
-    }
-}
-
 /// Names what was being downloaded, and from where, for a mid-body failure.
 ///
 /// An artifact body is streamed straight into the store, so a transport error
@@ -382,16 +381,476 @@ fn download_context(coordinate: Option<&ArtifactKey>, url: &Url) -> String {
     }
 }
 
+type ByteStream = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>,
+>;
+
+/// Map a `file://` repository URL to a local path for reading.
+///
+/// Only root and parent POMs may authorize these read-only repositories.
+/// Transitive declarations cannot. Reject decoded `..` segments because percent
+/// encoding can hide them from the URL join check.
+fn local_path(url: &Url) -> Result<std::path::PathBuf> {
+    let path = url.to_file_path().map_err(|()| {
+        RepoError::InvalidCoord(format!("'{}' is not a usable file:// path", url.path()))
+    })?;
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(RepoError::InvalidCoord(format!(
+            "file:// path '{}' contains a parent-directory segment",
+            path.display()
+        )));
+    }
+    Ok(path)
+}
+
+fn local_open_error(err: std::io::Error, path: &std::path::Path) -> RepoError {
+    if err.kind() == std::io::ErrorKind::NotFound {
+        RepoError::NotFound(path.display().to_string())
+    } else {
+        RepoError::Io(std::io::Error::new(
+            err.kind(),
+            format!("{}: {err}", path.display()),
+        ))
+    }
+}
+
+/// Every local read (including metadata and checksum sidecars) must carry its
+/// repository root. A bare file URL is not authority to read an arbitrary file.
+async fn open_local_file(url: &Url, repository_root: Option<&Url>) -> Result<tokio::fs::File> {
+    let root = repository_root.ok_or_else(|| {
+        RepoError::InvalidCoord("file:// read requires a repository root".to_string())
+    })?;
+    let root = local_path(root)?;
+    let path = local_path(url)?;
+    let relative = path
+        .strip_prefix(&root)
+        .map_err(|_| {
+            RepoError::InvalidCoord("file:// path escapes the repository root".to_string())
+        })?
+        .to_path_buf();
+    if relative.as_os_str().is_empty() {
+        return Err(RepoError::InvalidCoord(
+            "file:// path names the repository root".to_string(),
+        ));
+    }
+    let file = tokio::task::spawn_blocking(move || {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|err| local_open_error(err, &root))?;
+        open_confined_file(&canonical_root, &relative).map_err(|err| local_open_error(err, &path))
+    })
+    .await
+    .map_err(|err| {
+        RepoError::Io(std::io::Error::other(format!(
+            "local read task failed: {err}"
+        )))
+    })??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+/// Open a file relative to a directory descriptor, rejecting symlinks in every component.
+/// Walk the canonical root too, preventing ancestor substitution after canonicalization.
+#[cfg(unix)]
+fn open_confined_file(root: &std::path::Path, relative: &std::path::Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+    use std::path::Component;
+
+    let directory_flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
+    let mut directory = open("/", directory_flags, Mode::empty())?;
+    for component in root.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                directory = openat(&directory, name, directory_flags, Mode::empty())?
+            }
+            _ => return Err(std::io::Error::other("invalid canonical repository root")),
+        }
+    }
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::other("invalid repository path component"));
+        };
+        if components.peek().is_some() {
+            directory = openat(&directory, name, directory_flags, Mode::empty())?;
+        } else {
+            // NONBLOCK prevents an adversarial FIFO from hanging the read before
+            // the regular-file check can reject it.
+            let fd = openat(
+                &directory,
+                name,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )?;
+            let file = File::from(fd);
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::other(
+                    "repository entry is not a regular file",
+                ));
+            }
+            return Ok(file);
+        }
+    }
+    Err(std::io::Error::other("empty repository path"))
+}
+
+/// Check each resolved component, not only the final target: a directory link
+/// must not leave the repository even if a later link points back inside it.
+#[cfg(not(unix))]
+fn open_confined_file(root: &std::path::Path, relative: &std::path::Path) -> std::io::Result<File> {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::other("invalid repository path component"));
+        };
+        path.push(name);
+        path = path.canonicalize()?;
+        if !path.starts_with(root) {
+            return Err(std::io::Error::other(
+                "file:// path escapes the repository root",
+            ));
+        }
+    }
+    open_checked_repository_entry(&path)
+}
+
+#[cfg(not(unix))]
+fn open_checked_repository_entry(path: &std::path::Path) -> std::io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "repository entry is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+async fn read_local_bytes(
+    url: &Url,
+    repository_root: Option<&Url>,
+    limit: u64,
+    progress: Option<&dyn FetchProgress>,
+) -> Result<Bytes> {
+    use tokio::io::AsyncReadExt;
+    let path = local_path(url)?;
+    let file = open_local_file(url, repository_root).await?;
+    let mut bytes = Vec::new();
+    // Read one byte past the limit so an oversized file is detected, not truncated.
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|err| local_open_error(err, &path))?;
+    if bytes.len() as u64 > limit {
+        return Err(RepoError::Io(std::io::Error::other(format!(
+            "{} too large (limit {limit} bytes)",
+            path.display()
+        ))));
+    }
+    if let Some(progress) = progress {
+        progress.on_start(url, Some(bytes.len() as u64));
+        progress.on_finish(url, bytes.len());
+    }
+    Ok(Bytes::from(bytes))
+}
+
+async fn open_local_stream(
+    url: &Url,
+    repository_root: Option<&Url>,
+) -> Result<(Option<u64>, ByteStream)> {
+    use tokio::io::AsyncReadExt;
+    let path = local_path(url)?;
+    let file = open_local_file(url, repository_root).await?;
+    let len = file
+        .metadata()
+        .await
+        .map_err(|err| local_open_error(err, &path))?
+        .len();
+    let stream = futures::stream::unfold(file, |mut file| async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), file))
+            }
+            Err(err) => Some((Err(err), file)),
+        }
+    });
+    Ok((Some(len), Box::pin(stream)))
+}
+
 /// Turn a mid-body transport error into an io error that still names the
 /// artifact and repository it came from.
 fn stream_chunk_error(error: reqwest::Error, context: &str) -> std::io::Error {
-    std::io::Error::other(format!("{error}{context}"))
+    let mut reason = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        reason.push_str(": ");
+        reason.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    std::io::Error::other(format!("{reason}{context}"))
+}
+
+fn too_large_message(limit: u64, context: &str) -> String {
+    format!(
+        "artifact exceeds the size limit of {limit} bytes{context} \
+         (raise it with {MAX_ARTIFACT_SIZE_ENV})"
+    )
+}
+
+/// Wait for response headers without imposing a deadline on the body.
+async fn send_for_headers(
+    request: reqwest::RequestBuilder,
+    url: &Url,
+    config: &FetchConfig,
+) -> std::result::Result<reqwest::Response, RetryError> {
+    match tokio::time::timeout(config.timeout, request.send()).await {
+        Ok(result) => result.map_err(|error| request_error(error, url)),
+        Err(_) => Err(RetryError::transient(RepoError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "timed out after {}s waiting for response headers from {} \
+                     (raise RV_TIMEOUT)",
+                config.timeout.as_secs(),
+                redact_url(url)
+            ),
+        )))),
+    }
+}
+
+type ArtifactStream = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>,
+>;
+
+/// Activity observed by the body stream and its consumer's idle deadline.
+/// The critical section only copies an Instant/bool; it never covers I/O.
+struct ArtifactBodyActivity {
+    last_data: tokio::time::Instant,
+    finished: bool,
+}
+
+struct ArtifactIdleDeadline {
+    activity: Arc<Mutex<ArtifactBodyActivity>>,
+    timeout: Duration,
+    context: String,
+}
+
+impl ArtifactIdleDeadline {
+    /// Enforce the idle deadline even while the store awaits filesystem work.
+    /// A timeout around the stream alone cannot fire when its consumer stops polling.
+    ///
+    /// EOF ends this deadline. The store uses its own locking policy for publication;
+    /// canceling a `spawn_blocking` commit cannot stop it from publishing after a retry.
+    async fn run<T>(
+        self,
+        operation: impl Future<Output = std::result::Result<T, rv_store::StoreError>>,
+    ) -> std::result::Result<T, rv_store::StoreError> {
+        let mut operation = std::pin::pin!(operation);
+        let mut deadline = std::pin::pin!(tokio::time::sleep(self.timeout));
+        std::future::poll_fn(|cx| {
+            // Available data or completion takes precedence when the deadline is also ready.
+            if let std::task::Poll::Ready(result) = operation.as_mut().poll(cx) {
+                return std::task::Poll::Ready(result);
+            }
+            let activity = self.activity.lock().unwrap_or_else(|e| e.into_inner());
+            if activity.finished {
+                return std::task::Poll::Pending;
+            }
+            let next = activity.last_data + self.timeout;
+            drop(activity);
+            if deadline.deadline() != next {
+                deadline.as_mut().reset(next);
+            }
+            if deadline.as_mut().poll(cx).is_ready() {
+                return std::task::Poll::Ready(Err(rv_store::StoreError::IoError(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out: no data received for {:?}{} (raise RV_TIMEOUT)",
+                            self.timeout, self.context
+                        ),
+                    ),
+                )));
+            }
+            std::task::Poll::Pending
+        })
+        .await
+    }
+}
+
+/// Bounded rolling history that retains the boundary bucket in full.
+/// This overestimates speed by at most one bucket's bytes, avoiding false rejections
+/// when a chunk straddles the window boundary.
+struct ArtifactSpeedWindow {
+    elapsed: Duration,
+    window: Duration,
+    bucket_width: Duration,
+    buckets: VecDeque<(Duration, Duration, u64)>,
+}
+
+impl ArtifactSpeedWindow {
+    fn new(window: Duration) -> Self {
+        Self {
+            elapsed: Duration::ZERO,
+            window,
+            bucket_width: (window / 32).max(Duration::from_nanos(1)),
+            buckets: VecDeque::new(),
+        }
+    }
+
+    fn observe(&mut self, elapsed: Duration, bytes: u64) -> Option<f64> {
+        self.elapsed += elapsed;
+        let cutoff = self.elapsed.saturating_sub(self.window);
+        while self.elapsed >= self.window
+            && self
+                .buckets
+                .front()
+                .is_some_and(|(_, end, _)| *end <= cutoff)
+        {
+            self.buckets.pop_front();
+        }
+        if bytes != 0 {
+            if let Some((start, end, count)) = self.buckets.back_mut()
+                && self.elapsed - *start < self.bucket_width
+            {
+                *end = self.elapsed;
+                *count += bytes;
+            } else {
+                self.buckets.push_back((self.elapsed, self.elapsed, bytes));
+            }
+        }
+        (self.elapsed >= self.window).then(|| {
+            self.buckets
+                .iter()
+                .map(|(_, _, bytes)| *bytes as f64)
+                .sum::<f64>()
+                / self.window.as_secs_f64()
+        })
+    }
+}
+
+/// Measure throughput using only time spent awaiting network reads.
+/// Exclude headers, file creation, writes, and store publication.
+fn low_speed_body_stream(
+    mut raw: ByteStream,
+    context: String,
+    limit: u64,
+    window: Duration,
+) -> ByteStream {
+    if limit == 0 || window.is_zero() {
+        return raw;
+    }
+    let mut history = ArtifactSpeedWindow::new(window);
+    let mut pending_since = None;
+    let mut tick = Box::pin(tokio::time::sleep(history.bucket_width));
+    Box::pin(futures::stream::poll_fn(move |cx| {
+        let now = tokio::time::Instant::now();
+        let elapsed = pending_since
+            .take()
+            .map_or(Duration::ZERO, |since| now - since);
+        let item = raw.as_mut().poll_next(cx);
+        // Completion and transport errors win over the throughput check.
+        if matches!(item, std::task::Poll::Ready(None | Some(Err(_)))) {
+            return item;
+        }
+        let bytes = match &item {
+            std::task::Poll::Ready(Some(Ok(bytes))) => bytes.len() as u64,
+            _ => 0,
+        };
+        if let Some(rate) = history.observe(elapsed, bytes)
+            && rate < limit as f64
+        {
+            return std::task::Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "artifact download too slow{context}: {rate:.0} bytes/s over {:.3}s \
+                     (minimum {limit} bytes/s); lower RV_LOW_SPEED_LIMIT (0 disables) or \
+                     raise RV_LOW_SPEED_TIME, or set network.low_speed_limit / network.low_speed_time in rv.toml",
+                    window.as_secs_f64(),
+                ),
+            ))));
+        }
+        if item.is_pending() {
+            pending_since = Some(now);
+            // Register a wakeup to check throughput even if no more bytes arrive.
+            tick.as_mut().reset(now + history.bucket_width);
+            let _ = tick.as_mut().poll(cx);
+        }
+        item
+    }))
+}
+
+/// Enforce the size cap and track actual body progress for the idle deadline.
+/// Return the deadline separately so it can be polled even when the store is
+/// awaiting filesystem work rather than polling this stream.
+/// `cap_hit` lets the caller distinguish permanent size failures from retries.
+fn artifact_body_stream(
+    raw_stream: ByteStream,
+    context: String,
+    config: &FetchConfig,
+    bytes_read: Arc<AtomicU64>,
+    cap_hit: Arc<std::sync::atomic::AtomicBool>,
+) -> (ArtifactStream, ArtifactIdleDeadline) {
+    let limit = config.max_artifact_size;
+    let mut raw_stream = low_speed_body_stream(
+        raw_stream,
+        context.clone(),
+        config.low_speed_limit,
+        config.low_speed_time,
+    );
+    let activity = Arc::new(Mutex::new(ArtifactBodyActivity {
+        last_data: tokio::time::Instant::now(),
+        finished: false,
+    }));
+    let idle = ArtifactIdleDeadline {
+        activity: activity.clone(),
+        timeout: config.timeout,
+        context: context.clone(),
+    };
+    let stream = futures::stream::poll_fn(move |cx| {
+        raw_stream.as_mut().poll_next(cx).map(|item| match item {
+            Some(Ok(bytes)) => {
+                let total = bytes_read.load(Ordering::Relaxed) + bytes.len() as u64;
+                if total > limit {
+                    cap_hit.store(true, Ordering::Relaxed);
+                    return Some(Err(std::io::Error::other(too_large_message(
+                        limit, &context,
+                    ))));
+                }
+                if !bytes.is_empty() {
+                    activity.lock().unwrap_or_else(|e| e.into_inner()).last_data =
+                        tokio::time::Instant::now();
+                }
+                bytes_read.store(total, Ordering::Relaxed);
+                Some(Ok(bytes))
+            }
+            None => {
+                activity.lock().unwrap_or_else(|e| e.into_inner()).finished = true;
+                None
+            }
+            Some(Err(error)) => Some(Err(error)),
+        })
+    });
+    (Box::pin(stream), idle)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_stream_to_store_verified(
     client: &Client,
     url: &Url,
+    repository_root: Option<&Url>,
     auth: Option<&Auth>,
     config: &FetchConfig,
     progress: Option<&dyn FetchProgress>,
@@ -400,62 +859,64 @@ pub(crate) async fn fetch_stream_to_store_verified(
 ) -> Result<BlobId> {
     let path = url.path().to_string();
     tracing::debug!(url = %redact_url(url), method = "GET", "HTTP stream request start");
+    let attempts = AtomicU64::new(0);
     execute_retry(config, || async {
-        let mut request = client.get(url.as_str()).timeout(config.timeout);
-        if let Some(auth) = auth {
-            request = auth.apply(request);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| request_error(error, url))?;
-
-        let status = response.status();
-        let content_length = response.content_length();
-        tracing::debug!(url = %redact_url(url), status = %status, content_length = ?content_length, "HTTP stream response");
-        classify_response_status_with_headers(status, url, Some(response.headers()))?;
-
-        let total = content_length;
-        if let Some(len) = total
-            && len > MAX_ARTIFACT_SIZE {
-                return Err(RetryError::permanent(RepoError::Io(
-                    std::io::Error::other(
-                        format!(
-                            "artifact too large: {} bytes (limit {})",
-                            len, MAX_ARTIFACT_SIZE
-                        ),
-                    ),
-                )));
+        let retry = attempts.fetch_add(1, Ordering::Relaxed) != 0;
+        let context = download_context(None, url);
+        let (total, raw_stream) = if url.scheme() == "file" {
+            open_local_stream(url, repository_root).await.map_err(RetryError::permanent)?
+        } else {
+            let mut request = client.get(url.as_str());
+            // Dropping an incomplete HTTP/1 body discards its connection.
+            // Close retry connections too, preserving the configured proxy, TLS, and redirect policy.
+            if retry {
+                request = request.header(reqwest::header::CONNECTION, "close");
             }
+            if let Some(auth) = auth {
+                request = auth.apply(request);
+            }
+
+            let response = send_for_headers(request, url, config).await?;
+
+            let status = response.status();
+            let content_length = response.content_length();
+            tracing::debug!(url = %redact_url(url), status = %status, content_length = ?content_length, "HTTP stream response");
+            classify_response_status_with_headers(status, url, Some(response.headers()))?;
+            let http_context = context.clone();
+            let stream: ByteStream = Box::pin(
+                response
+                    .bytes_stream()
+                    .map(move |chunk| chunk.map_err(|e| stream_chunk_error(e, &http_context))),
+            );
+            (content_length, stream)
+        };
+        if let Some(len) = total
+            && len > config.max_artifact_size
+        {
+            return Err(RetryError::permanent(RepoError::Io(
+                std::io::Error::other(too_large_message(
+                    config.max_artifact_size,
+                    &format!(" ({len} bytes advertised){}", download_context(None, url)),
+                )),
+            )));
+        }
 
         if let Some(progress) = progress {
             progress.on_start(url, total);
         }
 
         let bytes_read = std::sync::Arc::new(AtomicU64::new(0));
-        let bytes_read_clone = bytes_read.clone();
+        let cap_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let context = download_context(None, url);
+        let (boxed_stream, idle) = artifact_body_stream(
+            raw_stream,
+            context,
+            config,
+            bytes_read.clone(),
+            cap_hit.clone(),
+        );
 
-        // Stream chunks through the store's put_stream, which writes to
-        // a temp file incrementally (hashing as it goes) instead of buffering
-        // the entire artifact in memory.
-        let byte_stream = response.bytes_stream().map(move |chunk| match chunk {
-            Ok(bytes) => {
-                if bytes_read_clone.load(Ordering::Relaxed) + bytes.len() as u64 > MAX_ARTIFACT_SIZE {
-                    return Err(std::io::Error::other(format!("artifact too large{context}")));
-                }
-                bytes_read_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                Ok(bytes)
-            }
-            Err(e) => Err(stream_chunk_error(e, &context)),
-        });
-
-        let boxed_stream: std::pin::Pin<Box<dyn futures_core::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>> =
-            Box::pin(byte_stream);
-
-        match store.put_stream_with_origin(boxed_stream).await {
+        match idle.run(store.put_stream_with_origin(boxed_stream)).await {
             Ok((blob, origin)) => {
                 if let Some(progress) = progress {
                     progress.on_finish(url, bytes_read.load(Ordering::Relaxed) as usize);
@@ -523,6 +984,9 @@ pub(crate) async fn fetch_stream_to_store_verified(
 
                 Ok(blob)
             }
+            Err(err) if cap_hit.load(Ordering::Relaxed) => {
+                Err(RetryError::permanent(RepoError::Store(err)))
+            }
             Err(err) => Err(RetryError::transient(RepoError::Store(err))),
         }
     })
@@ -552,6 +1016,7 @@ pub(crate) async fn fetch_stream_to_store_verified(
 pub(crate) async fn fetch_stream_to_store_and_index(
     client: &Client,
     url: &Url,
+    repository_root: Option<&Url>,
     auth: Option<&Auth>,
     config: &FetchConfig,
     progress: Option<&dyn FetchProgress>,
@@ -561,30 +1026,44 @@ pub(crate) async fn fetch_stream_to_store_and_index(
 ) -> Result<BlobId> {
     let path = url.path().to_string();
     tracing::debug!(url = %redact_url(url), method = "GET", "HTTP stream+index request start");
+    let attempts = AtomicU64::new(0);
     execute_retry(config, || async {
-        let mut request = client.get(url.as_str()).timeout(config.timeout);
-        if let Some(auth) = auth {
-            request = auth.apply(request);
-        }
+        let retry = attempts.fetch_add(1, Ordering::Relaxed) != 0;
+        let context = download_context(Some(key), url);
+        let (total, raw_stream) = if url.scheme() == "file" {
+            open_local_stream(url, repository_root).await.map_err(RetryError::permanent)?
+        } else {
+            let mut request = client.get(url.as_str());
+            // Dropping an incomplete HTTP/1 body discards its connection.
+            // Close retry connections too, preserving the configured proxy, TLS, and redirect policy.
+            if retry {
+                request = request.header(reqwest::header::CONNECTION, "close");
+            }
+            if let Some(auth) = auth {
+                request = auth.apply(request);
+            }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|error| request_error(error, url))?;
+            let response = send_for_headers(request, url, config).await?;
 
-        let status = response.status();
-        let content_length = response.content_length();
-        tracing::debug!(url = %redact_url(url), status = %status, content_length = ?content_length, "HTTP stream+index response");
-        classify_response_status_with_headers(status, url, Some(response.headers()))?;
-
-        let total = content_length;
+            let status = response.status();
+            let content_length = response.content_length();
+            tracing::debug!(url = %redact_url(url), status = %status, content_length = ?content_length, "HTTP stream+index response");
+            classify_response_status_with_headers(status, url, Some(response.headers()))?;
+            let http_context = context.clone();
+            let stream: ByteStream = Box::pin(
+                response
+                    .bytes_stream()
+                    .map(move |chunk| chunk.map_err(|e| stream_chunk_error(e, &http_context))),
+            );
+            (content_length, stream)
+        };
         if let Some(len) = total
-            && len > MAX_ARTIFACT_SIZE
+            && len > config.max_artifact_size
         {
             return Err(RetryError::permanent(RepoError::Io(
-                std::io::Error::other(format!(
-                    "artifact too large: {} bytes (limit {})",
-                    len, MAX_ARTIFACT_SIZE
+                std::io::Error::other(too_large_message(
+                    config.max_artifact_size,
+                    &format!(" ({len} bytes advertised){}", download_context(Some(key), url)),
                 )),
             )));
         }
@@ -594,30 +1073,17 @@ pub(crate) async fn fetch_stream_to_store_and_index(
         }
 
         let bytes_read = std::sync::Arc::new(AtomicU64::new(0));
-        let bytes_read_clone = bytes_read.clone();
+        let cap_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let context = download_context(Some(key), url);
+        let (boxed_stream, idle) = artifact_body_stream(
+            raw_stream,
+            context,
+            config,
+            bytes_read.clone(),
+            cap_hit.clone(),
+        );
 
-        let byte_stream = response.bytes_stream().map(move |chunk| match chunk {
-            Ok(bytes) => {
-                if bytes_read_clone.load(Ordering::Relaxed) + bytes.len() as u64
-                    > MAX_ARTIFACT_SIZE
-                {
-                    return Err(std::io::Error::other(format!(
-                        "artifact too large{context}"
-                    )));
-                }
-                bytes_read_clone.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                Ok(bytes)
-            }
-            Err(e) => Err(stream_chunk_error(e, &context)),
-        });
-
-        let boxed_stream: std::pin::Pin<
-            Box<dyn futures_core::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>,
-        > = Box::pin(byte_stream);
-
-        match store.put_stream_and_index(key, boxed_stream).await {
+        match idle.run(store.put_stream_and_index(key, boxed_stream)).await {
             Ok((blob, origin)) => {
                 if let Some(progress) = progress {
                     progress.on_finish(url, bytes_read.load(Ordering::Relaxed) as usize);
@@ -691,6 +1157,9 @@ pub(crate) async fn fetch_stream_to_store_and_index(
 
                 Ok(blob)
             }
+            Err(err) if cap_hit.load(Ordering::Relaxed) => {
+                Err(RetryError::permanent(RepoError::Store(err)))
+            }
             Err(err) => Err(RetryError::transient(RepoError::Store(err))),
         }
     })
@@ -705,9 +1174,16 @@ pub(crate) async fn fetch_stream_to_store_and_index(
 pub(crate) async fn fetch_text(
     client: &Client,
     url: &Url,
+    repository_root: Option<&Url>,
     auth: Option<&Auth>,
     config: &FetchConfig,
 ) -> Result<String> {
+    if url.scheme() == "file" {
+        let bytes = read_local_bytes(url, repository_root, MAX_CHECKSUM_SIZE, None).await?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|err| RepoError::InvalidMetadata(err.to_string()))?;
+        return Ok(text.trim().to_string());
+    }
     tracing::debug!(url = %redact_url(url), method = "GET", "HTTP text request start");
     execute_retry(config, || async {
         let mut request = client.get(url.as_str());
@@ -952,20 +1428,20 @@ mod tests {
         verify_checksum(bytes, &checksum, "hello.txt").unwrap();
     }
 
-    /// Errors produced by `classify_response_status` and
-    /// `classify_status_to_error` must not embed the raw URL when it carries
-    /// a username/password; those errors get logged and surfaced to the
-    /// user, which would leak the password.
+    /// Errors produced by `classify_response_status_with_headers` must not
+    /// embed the raw URL when it carries a username/password; those errors
+    /// get logged and surfaced to the user, which would leak the password.
     #[test]
     fn classify_response_status_redacts_userinfo_in_error_messages() {
-        use super::{classify_response_status, classify_status_to_error};
+        use super::classify_response_status_with_headers;
         use reqwest::StatusCode;
         use url::Url;
 
         let url = Url::parse("https://alice:hunter2@repo.example/com/foo/1.0/foo.jar").unwrap();
 
         // 401 -> AuthError (must redact)
-        let err = classify_response_status(StatusCode::UNAUTHORIZED, &url).unwrap_err();
+        let err = classify_response_status_with_headers(StatusCode::UNAUTHORIZED, &url, None)
+            .unwrap_err();
         let rendered = format!("{err:?}");
         assert!(
             !rendered.contains("hunter2"),
@@ -977,8 +1453,12 @@ mod tests {
         );
 
         // 407 -> AuthError (must redact)
-        let err =
-            classify_response_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED, &url).unwrap_err();
+        let err = classify_response_status_with_headers(
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            &url,
+            None,
+        )
+        .unwrap_err();
         let rendered = format!("{err:?}");
         assert!(
             !rendered.contains("hunter2"),
@@ -986,7 +1466,9 @@ mod tests {
         );
 
         // 503 -> transient UnexpectedResponse (must redact)
-        let err = classify_response_status(StatusCode::SERVICE_UNAVAILABLE, &url).unwrap_err();
+        let err =
+            classify_response_status_with_headers(StatusCode::SERVICE_UNAVAILABLE, &url, None)
+                .unwrap_err();
         let rendered = format!("{err:?}");
         assert!(
             !rendered.contains("hunter2"),
@@ -994,7 +1476,8 @@ mod tests {
         );
 
         // 418 -> permanent UnexpectedResponse (must redact)
-        let err = classify_response_status(StatusCode::IM_A_TEAPOT, &url).unwrap_err();
+        let err =
+            classify_response_status_with_headers(StatusCode::IM_A_TEAPOT, &url, None).unwrap_err();
         let rendered = format!("{err:?}");
         assert!(
             !rendered.contains("hunter2"),
@@ -1002,19 +1485,21 @@ mod tests {
         );
 
         // 404 -> NotFound (must redact)
-        let err = classify_response_status(StatusCode::NOT_FOUND, &url).unwrap_err();
+        let err =
+            classify_response_status_with_headers(StatusCode::NOT_FOUND, &url, None).unwrap_err();
         let rendered = format!("{err:?}");
         assert!(
             !rendered.contains("hunter2"),
             "404 NotFound must not contain credentials: {rendered}"
         );
 
-        // classify_status_to_error (non-backoff variant) must redact too.
-        let err = classify_status_to_error(StatusCode::FORBIDDEN, &url);
-        let rendered = format!("{err}");
+        // 403 -> AuthError (must redact)
+        let err =
+            classify_response_status_with_headers(StatusCode::FORBIDDEN, &url, None).unwrap_err();
+        let rendered = format!("{err:?}");
         assert!(
             !rendered.contains("hunter2"),
-            "403 AuthError (non-backoff) must not contain credentials: {rendered}"
+            "403 AuthError must not contain credentials: {rendered}"
         );
     }
 
@@ -1122,7 +1607,7 @@ mod tests {
         assert!(redacted.contains("example.com/path"));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn execute_retry_runs_exactly_initial_plus_retries() {
         use super::{FetchConfig, RetryError, execute_retry};
         use crate::error::RepoError;
@@ -1135,6 +1620,7 @@ mod tests {
         let config = FetchConfig {
             retries: 3,
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1173,6 +1659,7 @@ mod tests {
         let config = FetchConfig {
             retries: 3,
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1210,6 +1697,7 @@ mod tests {
         let config = FetchConfig {
             retries: 5,
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1232,7 +1720,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn execute_retry_succeeds_after_transient_failures() {
         use super::{FetchConfig, RetryError, execute_retry};
         use crate::error::RepoError;
@@ -1243,6 +1731,7 @@ mod tests {
         let config = FetchConfig {
             retries: 3,
             timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1277,9 +1766,8 @@ mod tests {
         use reqwest::Client;
         use rv_config::{ArtifactKey, BlobId};
         use rv_store::Store;
+        use rv_test_support::http::{Response, StubServer};
         use tempfile::tempdir;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
         use url::Url;
 
         let dir = tempdir().expect("tempdir");
@@ -1299,34 +1787,9 @@ mod tests {
 
         // Tiny HTTP/1.1 server that responds with the same bytes on every
         // request. We only need it to live long enough to satisfy one GET.
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local addr");
         let payload_for_server = payload.clone();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            // Drain the request headers (until \r\n\r\n).
-            let mut buf = [0u8; 4096];
-            let mut total = Vec::new();
-            loop {
-                let n = sock.read(&mut buf).await.expect("read");
-                if n == 0 {
-                    break;
-                }
-                total.extend_from_slice(&buf[..n]);
-                if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                payload_for_server.len()
-            );
-            sock.write_all(header.as_bytes()).await.expect("write head");
-            sock.write_all(&payload_for_server)
-                .await
-                .expect("write body");
-            sock.shutdown().await.ok();
-        });
+        let server = StubServer::start(move |_| Response::new(200, payload_for_server.clone()));
+        let addr = server.addr();
 
         // Wrong SHA-256 pin: represents a malicious or stale sidecar.
         let bad_sidecar = Checksum {
@@ -1339,11 +1802,13 @@ mod tests {
         let cfg = FetchConfig {
             retries: 0,
             timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
         };
 
         let result = fetch_stream_to_store_verified(
             &client,
             &url,
+            None,
             None,
             &cfg,
             None,
@@ -1352,7 +1817,7 @@ mod tests {
         )
         .await;
 
-        let _ = server.await;
+        server.stop();
 
         assert!(
             matches!(result, Err(RepoError::ChecksumMismatch { .. })),
@@ -1392,12 +1857,11 @@ mod tests {
         use reqwest::Client;
         use rv_config::ArtifactKey;
         use rv_store::Store;
+        use rv_test_support::http::{Response, StubServer};
         use std::collections::HashSet;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         use tempfile::tempdir;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
         use url::Url;
 
         let dir = tempdir().expect("tempdir");
@@ -1406,44 +1870,10 @@ mod tests {
 
         // Tiny HTTP server returning a fixed payload on every connection.
         let payload = b"atomic-put-and-index-payload".to_vec();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_server = stop.clone();
         let payload_for_server = payload.clone();
-        let server = tokio::spawn(async move {
-            loop {
-                if stop_for_server.load(Ordering::SeqCst) {
-                    return;
-                }
-                let (mut sock, _) = match listener.accept().await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                let payload = payload_for_server.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let mut total = Vec::new();
-                    loop {
-                        let n = sock.read(&mut buf).await.unwrap_or(0);
-                        if n == 0 {
-                            return;
-                        }
-                        total.extend_from_slice(&buf[..n]);
-                        if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        payload.len()
-                    );
-                    let _ = sock.write_all(head.as_bytes()).await;
-                    let _ = sock.write_all(&payload).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
+        let server = StubServer::start(move |_| Response::new(200, payload_for_server.clone()));
+        let addr = server.addr();
+        let stop = Arc::new(AtomicBool::new(false));
 
         // Concurrent GC: keep sweeping with an empty `keep` set. Any blob
         // that lacks an index row pointing at it would be deleted.
@@ -1461,13 +1891,14 @@ mod tests {
         let cfg = FetchConfig {
             retries: 0,
             timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
         };
 
         // Run several fetches back-to-back so we have multiple chances to
         // race against the GC loop.
         for _ in 0..6 {
             let blob = fetch_stream_to_store_and_index(
-                &client, &url, None, &cfg, None, &store, &key, None,
+                &client, &url, None, None, &cfg, None, &store, &key, None,
             )
             .await
             .expect("indexed fetch");
@@ -1492,9 +1923,7 @@ mod tests {
 
         stop.store(true, Ordering::SeqCst);
         let _ = gc.await;
-        // Connect once to unblock the listener accept loop.
-        let _ = tokio::net::TcpStream::connect(addr).await;
-        let _ = server.await;
+        server.stop();
     }
 
     /// A fan-out of `fetch_stream_to_store_verified` calls with sidecar
@@ -1573,6 +2002,7 @@ mod tests {
             let cfg = FetchConfig {
                 retries: 0,
                 timeout: Duration::from_secs(5),
+                ..Default::default()
             };
             let client = Client::builder().build().expect("client");
 
@@ -1588,6 +2018,7 @@ mod tests {
                         fetch_stream_to_store_verified(
                             &client,
                             &url,
+                            None,
                             None,
                             &cfg,
                             None,
@@ -1624,13 +2055,17 @@ mod tests {
     /// stray spaces between "configuration" and the parenthetical hint.
     #[test]
     fn proxy_auth_407_message_has_no_stray_spaces() {
-        use super::classify_response_status;
+        use super::classify_response_status_with_headers;
         use reqwest::StatusCode;
         use url::Url;
 
         let url = Url::parse("https://repo.example/path").unwrap();
-        let err =
-            classify_response_status(StatusCode::PROXY_AUTHENTICATION_REQUIRED, &url).unwrap_err();
+        let err = classify_response_status_with_headers(
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            &url,
+            None,
+        )
+        .unwrap_err();
         let rendered = format!("{err:?}");
         assert!(
             !rendered.contains("  "),
@@ -1683,9 +2118,10 @@ mod tests {
         let cfg = FetchConfig {
             retries: 0,
             timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
         };
 
-        let result = fetch_text(&client, &url, None, &cfg).await;
+        let result = fetch_text(&client, &url, None, None, &cfg).await;
         let _ = server.await;
 
         match result {
@@ -1744,9 +2180,10 @@ mod tests {
         let cfg = FetchConfig {
             retries: 0,
             timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
         };
 
-        let result = fetch_text(&client, &url, None, &cfg).await;
+        let result = fetch_text(&client, &url, None, None, &cfg).await;
         let _ = server.await;
 
         match result {
@@ -1767,48 +2204,855 @@ mod tests {
     async fn fetch_text_accepts_small_sidecar() {
         use super::{FetchConfig, fetch_text};
         use reqwest::Client;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
+        use rv_test_support::http::{Response, StubServer};
         use url::Url;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
         let payload = "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d  foo.jar\n";
-        let payload_for_server = payload.to_string();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
-            let mut buf = [0u8; 4096];
-            let mut total = Vec::new();
-            loop {
-                let n = sock.read(&mut buf).await.expect("read");
-                if n == 0 {
-                    break;
-                }
-                total.extend_from_slice(&buf[..n]);
-                if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                payload_for_server.len()
-            );
-            let _ = sock.write_all(head.as_bytes()).await;
-            let _ = sock.write_all(payload_for_server.as_bytes()).await;
-            let _ = sock.shutdown().await;
-        });
+        let server = StubServer::start(move |_| Response::new(200, payload));
+        let addr = server.addr();
 
         let url = Url::parse(&format!("http://{addr}/foo.jar.sha1")).expect("url");
         let client = Client::builder().build().expect("client");
         let cfg = FetchConfig {
             retries: 0,
             timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
         };
 
-        let text = fetch_text(&client, &url, None, &cfg)
+        let text = fetch_text(&client, &url, None, None, &cfg)
             .await
             .expect("small sidecar fetch");
-        let _ = server.await;
+        server.stop();
         assert_eq!(text, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d  foo.jar");
+    }
+
+    /// Serve one chunked 200 response per connection.
+    /// Send `chunks` bodies of `chunk_len` bytes, `gap` apart; `hang` leaves the response open.
+    /// Return the URL and a connection counter.
+    async fn spawn_chunked_server(
+        chunks: usize,
+        chunk_len: usize,
+        gap: std::time::Duration,
+        hang: bool,
+    ) -> (url::Url, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_srv = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                hits_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let mut seen = Vec::new();
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => seen.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for _ in 0..chunks {
+                        let mut frame = format!("{chunk_len:x}\r\n").into_bytes();
+                        frame.extend(std::iter::repeat_n(b'x', chunk_len));
+                        frame.extend_from_slice(b"\r\n");
+                        if sock.write_all(&frame).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(gap).await;
+                    }
+                    if hang {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    } else {
+                        let _ = sock.write_all(b"0\r\n\r\n").await;
+                    }
+                });
+            }
+        });
+        let url =
+            url::Url::parse(&format!("http://{addr}/org/ex/big/1.0/big-1.0.jar")).expect("url");
+        (url, hits)
+    }
+
+    /// First connection trickles; a retry can serve the same body immediately.
+    /// Keep the first response open so a successful retry proves a new socket.
+    async fn spawn_low_speed_server(
+        fast_retry: bool,
+    ) -> (
+        url::Url,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let close_seen = Arc::new(AtomicBool::new(false));
+        let server_hits = hits.clone();
+        let server_close = close_seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let attempt = server_hits.fetch_add(1, Ordering::SeqCst);
+                let close = server_close.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    if attempt > 0 {
+                        close.store(
+                            String::from_utf8_lossy(&request)
+                                .to_ascii_lowercase()
+                                .contains("connection: close\r\n"),
+                            Ordering::SeqCst,
+                        );
+                    }
+                    if socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if attempt > 0 && fast_retry {
+                        let _ = socket.write_all(&[b'x'; 10000]).await;
+                    } else {
+                        for _ in 0..100 {
+                            if socket.write_all(&[b'x'; 100]).await.is_err() {
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                });
+            }
+        });
+        (
+            url::Url::parse(&format!("http://{addr}/big.jar")).unwrap(),
+            hits,
+            close_seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn low_speed_exhausts_retries_on_the_verified_path() {
+        low_speed_case(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn low_speed_retries_on_a_new_connection_on_the_verified_path() {
+        low_speed_case(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn low_speed_exhausts_retries_on_the_indexed_path() {
+        low_speed_case(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn low_speed_retries_on_a_new_connection_on_the_indexed_path() {
+        low_speed_case(true, true).await;
+    }
+
+    async fn low_speed_case(indexed: bool, fast_retry: bool) {
+        use super::{FetchConfig, fetch_stream_to_store_and_index, fetch_stream_to_store_verified};
+        use std::{sync::atomic::Ordering, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let store = rv_store::Store::open(dir.path()).unwrap();
+        let (url, hits, close) = spawn_low_speed_server(fast_retry).await;
+        let cfg = FetchConfig {
+            retries: 1,
+            timeout: Duration::from_secs(5),
+            low_speed_limit: 10000,
+            low_speed_time: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let key = big_key();
+        let result = tokio::time::timeout(Duration::from_secs(6), async {
+            if indexed {
+                fetch_stream_to_store_and_index(
+                    &client, &url, None, None, &cfg, None, &store, &key, None,
+                )
+                .await
+            } else {
+                fetch_stream_to_store_verified(&client, &url, None, None, &cfg, None, &store, None)
+                    .await
+            }
+        })
+        .await
+        .expect("bounded retries");
+        if fast_retry {
+            let blob = result.expect("fast second connection succeeds");
+            assert_eq!(
+                std::fs::read(store.get_path(&blob)).unwrap(),
+                vec![b'x'; 10000]
+            );
+            if indexed {
+                assert_eq!(store.lookup_artifact(&key).await.unwrap(), Some(blob));
+            }
+        } else {
+            let message = result.unwrap_err().to_string();
+            for expected in [
+                "artifact download too slow",
+                "bytes/s",
+                "0.300s",
+                "RV_LOW_SPEED_LIMIT",
+                "RV_LOW_SPEED_TIME",
+                url.as_str(),
+            ] {
+                assert!(message.contains(expected), "{message}");
+            }
+            if indexed {
+                assert!(message.contains("org.ex:big"), "{message}");
+            }
+            assert_eq!(store.lookup_artifact(&key).await.unwrap(), None);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(
+            close.load(Ordering::SeqCst),
+            "retry requests Connection: close"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn low_speed_allows_above_floor_disabled_and_small_bodies() {
+        use super::{FetchConfig, fetch_stream_to_store_verified};
+        use std::{sync::atomic::Ordering, time::Duration};
+        // The first two outlast the window. The tiny body finishes before it.
+        for (limit, chunks, size) in [(1000, 12, 1000), (0, 12, 1), (100000, 1, 2048)] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = rv_store::Store::open(dir.path()).unwrap();
+            let (url, hits) =
+                spawn_chunked_server(chunks, size, Duration::from_millis(40), false).await;
+            let cfg = FetchConfig {
+                retries: 0,
+                timeout: Duration::from_secs(5),
+                low_speed_limit: limit,
+                low_speed_time: Duration::from_millis(200),
+                ..Default::default()
+            };
+            let blob = fetch_stream_to_store_verified(
+                &reqwest::Client::new(),
+                &url,
+                None,
+                None,
+                &cfg,
+                None,
+                &store,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::metadata(store.get_path(&blob)).unwrap().len(),
+                (chunks * size) as u64
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn low_speed_ignores_store_backpressure_and_eof_commit() {
+        use super::{FetchConfig, artifact_body_stream};
+        use futures::StreamExt;
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicBool, AtomicU64},
+            },
+            time::Duration,
+        };
+        let raw = futures::stream::unfold(0, |n| async move {
+            if n == 3 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Some((Ok(bytes::Bytes::from_static(b"xx")), n + 1))
+        });
+        let cfg = FetchConfig {
+            timeout: Duration::from_secs(100),
+            low_speed_limit: 1,
+            low_speed_time: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let (mut stream, idle) = artifact_body_stream(
+            Box::pin(raw),
+            " test.jar".into(),
+            &cfg,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        idle.run(async move {
+            // Store creation and writes each take much longer than the window.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            for _ in 0..3 {
+                stream.next().await.unwrap()?;
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            assert!(stream.next().await.is_none());
+            tokio::time::sleep(Duration::from_secs(200)).await;
+            Ok(())
+        })
+        .await
+        .expect("store time must not lower network throughput or cancel commit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn low_speed_window_forgets_fast_start_and_wakes_without_bytes() {
+        use futures::StreamExt;
+        use std::time::Duration;
+        let raw = futures::stream::once(async { Ok(bytes::Bytes::from(vec![0; 100000])) })
+            .chain(futures::stream::pending());
+        let mut stream = super::low_speed_body_stream(
+            Box::pin(raw),
+            " big.jar".into(),
+            1000,
+            Duration::from_secs(2),
+        );
+        stream.next().await.unwrap().unwrap();
+        let start = tokio::time::Instant::now();
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("0 bytes/s"), "{error}");
+        // Tokio timers round up to milliseconds. Detection is within one
+        // sample interval of a full window, including that timer granularity.
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        assert!(start.elapsed() <= Duration::from_millis(2070));
+    }
+
+    #[tokio::test]
+    async fn low_speed_excludes_initial_header_wait() {
+        use super::{FetchConfig, fetch_stream_to_store_verified};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!(
+            "http://{}/tiny.pom",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2048\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(&[b'x'; 2048]).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = rv_store::Store::open(dir.path()).unwrap();
+        let cfg = FetchConfig {
+            retries: 0,
+            timeout: Duration::from_secs(5),
+            low_speed_limit: 100000,
+            low_speed_time: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let blob = fetch_stream_to_store_verified(
+            &reqwest::Client::new(),
+            &url,
+            None,
+            None,
+            &cfg,
+            None,
+            &store,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(store.get_path(&blob)).unwrap().len(),
+            2048
+        );
+        server.await.unwrap();
+    }
+
+    fn big_key() -> rv_config::ArtifactKey {
+        rv_config::ArtifactKey::new("org.ex", "big", "1.0", "jar", None)
+    }
+
+    /// A transfer may exceed `timeout` overall if no idle gap exceeds it.
+    #[tokio::test]
+    async fn artifact_stream_outlasting_timeout_succeeds_while_data_flows() {
+        use super::{FetchConfig, fetch_stream_to_store_and_index};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rv_store::Store::open(dir.path()).expect("open");
+        let (url, _) = spawn_chunked_server(10, 1024, Duration::from_millis(250), false).await;
+        let cfg = FetchConfig {
+            retries: 0,
+            timeout: Duration::from_millis(800),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let client = reqwest::Client::new();
+        let blob = fetch_stream_to_store_and_index(
+            &client,
+            &url,
+            None,
+            None,
+            &cfg,
+            None,
+            &store,
+            &big_key(),
+            None,
+        )
+        .await
+        .expect("slow but steady download must succeed");
+        assert!(
+            started.elapsed() > cfg.timeout,
+            "transfer must outlast the timeout"
+        );
+        let len = std::fs::metadata(store.get_path(&blob))
+            .expect("blob")
+            .len();
+        assert_eq!(len, 10 * 1024);
+    }
+
+    /// A body that goes silent fails with a timeout error naming the artifact.
+    #[tokio::test]
+    async fn artifact_stream_stall_reports_timeout_and_artifact() {
+        use super::{FetchConfig, fetch_stream_to_store_and_index};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rv_store::Store::open(dir.path()).expect("open");
+        let (url, _) = spawn_chunked_server(1, 16, Duration::from_millis(10), true).await;
+        let cfg = FetchConfig {
+            retries: 0,
+            timeout: Duration::from_millis(400),
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let err = fetch_stream_to_store_and_index(
+            &client,
+            &url,
+            None,
+            None,
+            &cfg,
+            None,
+            &store,
+            &big_key(),
+            None,
+        )
+        .await
+        .expect_err("stalled body must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("org.ex:big"), "must name the artifact: {msg}");
+    }
+
+    /// The body deadline must remain active while the store awaits filesystem work.
+    /// Bound the blocking pool and release it after failure so runtime shutdown cannot hang.
+    #[test]
+    fn artifact_idle_timeout_covers_a_blocked_store_and_retries() {
+        use super::{FetchConfig, fetch_stream_to_store_and_index, fetch_stream_to_store_verified};
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for indexed in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = rv_store::Store::open(dir.path()).unwrap();
+                let (url, hits) = spawn_chunked_server(0, 16, Duration::ZERO, true).await;
+                let cfg = FetchConfig {
+                    retries: 1,
+                    timeout: Duration::from_millis(200),
+                    ..Default::default()
+                };
+                let client = reqwest::Client::new();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let (entered, started) = tokio::sync::oneshot::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                });
+                started.await.unwrap();
+                let key = big_key();
+                let outcome = tokio::time::timeout(Duration::from_secs(4), async {
+                    if indexed {
+                        fetch_stream_to_store_and_index(
+                            &client, &url, None, None, &cfg, None, &store, &key, None,
+                        )
+                        .await
+                    } else {
+                        fetch_stream_to_store_verified(
+                            &client, &url, None, None, &cfg, None, &store, None,
+                        )
+                        .await
+                    }
+                })
+                .await;
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                let error = outcome
+                    .expect("idle timeout must not depend on the store polling the body")
+                    .expect_err("the body never arrives");
+                assert!(
+                    error.to_string().contains("timed out: no data received"),
+                    "{error}"
+                );
+                assert!(error.to_string().contains(url.as_str()), "{error}");
+                assert_eq!(hits.load(Ordering::SeqCst), 1 + cfg.retries);
+                assert_eq!(store.lookup_artifact(&key).await.unwrap(), None);
+            }
+        });
+    }
+
+    /// EOF must disable the network deadline before a queued store commit.
+    /// Another store user may hold the publication lock longer than the network timeout.
+    #[tokio::test]
+    async fn artifact_idle_timeout_does_not_cancel_commit_after_eof() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let store = rv_store::Store::open(dir.path()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(".lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let (url, _) = spawn_chunked_server(1, 16, Duration::ZERO, false).await;
+        let cfg = super::FetchConfig {
+            retries: 0,
+            timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let key = big_key();
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                super::fetch_stream_to_store_and_index(
+                    &client, &url, None, None, &cfg, None, &store, &key, None,
+                ),
+                async {
+                    tokio::time::sleep(cfg.timeout * 3).await;
+                    fs2::FileExt::unlock(&lock).unwrap();
+                }
+            )
+        })
+        .await
+        .expect("commit must complete after releasing the store lock");
+        let blob = result.expect("EOF must disarm the network deadline before publication");
+        assert_eq!(store.lookup_artifact(&key).await.unwrap(), Some(blob));
+    }
+
+    #[tokio::test]
+    async fn stalled_headers_exhaust_retries_on_the_verified_path() {
+        stalled_body_case(false, 0).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_partial_body_exhausts_retries_on_the_verified_path() {
+        stalled_body_case(false, 1).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_headers_exhaust_retries_on_the_indexed_path() {
+        stalled_body_case(true, 0).await;
+    }
+
+    #[tokio::test]
+    async fn stalled_partial_body_exhausts_retries_on_the_indexed_path() {
+        stalled_body_case(true, 1).await;
+    }
+
+    /// Headers alone, or a partial body, must time out on every attempt.
+    /// Both store paths must leave no blob or coordinate after failure.
+    /// An outer deadline bounds the test.
+    async fn stalled_body_case(indexed: bool, chunks: usize) {
+        use super::{FetchConfig, fetch_stream_to_store_and_index, fetch_stream_to_store_verified};
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rv_store::Store::open(dir.path()).expect("store");
+        let (url, hits) = spawn_chunked_server(chunks, 16, Duration::ZERO, true).await;
+        let cfg = FetchConfig {
+            retries: 2,
+            timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let key = big_key();
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
+            if indexed {
+                fetch_stream_to_store_and_index(
+                    &client, &url, None, None, &cfg, None, &store, &key, None,
+                )
+                .await
+            } else {
+                fetch_stream_to_store_verified(&client, &url, None, None, &cfg, None, &store, None)
+                    .await
+            }
+        })
+        .await
+        .expect("stalled downloads must not hang")
+        .expect_err("all attempts stall");
+        let message = error.to_string();
+        assert!(message.contains("timed out: no data received"), "{message}");
+        assert!(message.contains(url.as_str()), "{message}");
+        if indexed {
+            assert!(message.contains("org.ex:big"), "{message}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1 + cfg.retries);
+        assert_eq!(store.lookup_artifact(&key).await.unwrap(), None);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
+            0
+        );
+    }
+
+    /// Exceeding the body cap must report `RV_MAX_ARTIFACT_SIZE` without retrying.
+    #[tokio::test]
+    async fn artifact_stream_over_cap_reports_limit_and_is_not_retried() {
+        use super::{FetchConfig, fetch_stream_to_store_verified};
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rv_store::Store::open(dir.path()).expect("open");
+        let (url, hits) = spawn_chunked_server(8, 1024, Duration::from_millis(1), false).await;
+        let cfg = FetchConfig {
+            retries: 2,
+            timeout: Duration::from_secs(5),
+            max_artifact_size: 2048,
+            ..Default::default()
+        };
+        let client = reqwest::Client::new();
+        let err =
+            fetch_stream_to_store_verified(&client, &url, None, None, &cfg, None, &store, None)
+                .await
+                .expect_err("over-cap body must fail");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("size limit of 2048"), "{msg}");
+        assert!(msg.contains("RV_MAX_ARTIFACT_SIZE"), "{msg}");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "cap violations must not be retried"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn checked_repository_entry_rejects_a_replaced_final_symlink() {
+        use super::open_checked_repository_entry;
+        use std::os::windows::fs::symlink_file;
+
+        let dir = tempfile::tempdir().unwrap();
+        let entry = dir.path().join("entry");
+        let target = dir.path().join("target");
+        std::fs::write(&entry, b"original").unwrap();
+        std::fs::write(&target, b"replacement").unwrap();
+        assert!(open_checked_repository_entry(&entry).is_ok());
+        std::fs::remove_file(&entry).unwrap();
+        if let Err(err) = symlink_file(&target, &entry) {
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                return;
+            }
+            panic!("create symlink: {err}");
+        }
+        assert!(open_checked_repository_entry(&entry).is_err());
+    }
+
+    /// Both directory and final-component links must fail through every local
+    /// read entry point, before bytes can enter the content store.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_reads_confine_directory_and_final_symlinks() {
+        use super::{
+            FetchConfig, fetch_bytes, fetch_stream_to_store_and_index,
+            fetch_stream_to_store_verified, fetch_text,
+        };
+        use reqwest::Client;
+        use rv_config::{ArtifactKey, BlobId};
+        use rv_store::Store;
+        use std::os::unix::fs::symlink;
+        use url::Url;
+
+        for directory_link in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("repo");
+            let outside = tmp.path().join("repo-outside");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let secret = b"outside repository bytes";
+            std::fs::write(outside.join("a.jar"), secret).unwrap();
+            if directory_link {
+                symlink(&outside, root.join("g")).unwrap();
+            } else {
+                std::fs::create_dir(root.join("g")).unwrap();
+                symlink(outside.join("a.jar"), root.join("g/a.jar")).unwrap();
+            }
+            let root_url = Url::from_directory_path(&root).unwrap();
+            let url = root_url.join("g/a.jar").unwrap();
+            let client = Client::new();
+            let config = FetchConfig::default();
+            let store = Store::open(&tmp.path().join("store")).unwrap();
+            let key = ArtifactKey::new("g", "a", "1", "jar", None);
+            assert!(
+                fetch_bytes(&client, &url, Some(&root_url), None, &config, None)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fetch_text(&client, &url, Some(&root_url), None, &config)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                fetch_stream_to_store_verified(
+                    &client,
+                    &url,
+                    Some(&root_url),
+                    None,
+                    &config,
+                    None,
+                    &store,
+                    None
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                fetch_stream_to_store_and_index(
+                    &client,
+                    &url,
+                    Some(&root_url),
+                    None,
+                    &config,
+                    None,
+                    &store,
+                    &key,
+                    None
+                )
+                .await
+                .is_err()
+            );
+            assert!(!store.exists_async(&BlobId::from_bytes(secret)).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_reads_require_a_containing_repository_root() {
+        use super::open_local_file;
+        use crate::RepoError;
+        use url::Url;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("secret");
+        std::fs::write(&outside, b"secret").unwrap();
+        let root_url = Url::from_directory_path(&root).unwrap();
+        let url = Url::from_file_path(&outside).unwrap();
+        assert!(matches!(
+            open_local_file(&url, None).await,
+            Err(RepoError::InvalidCoord(_))
+        ));
+        assert!(matches!(
+            open_local_file(&url, Some(&root_url)).await,
+            Err(RepoError::InvalidCoord(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_repository_root_itself_may_be_a_symlink() {
+        use super::read_local_bytes;
+        use url::Url;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.jar"), b"inside").unwrap();
+        let link = tmp.path().join("root-link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let root_url = Url::from_directory_path(&link).unwrap();
+        let url = root_url.join("a.jar").unwrap();
+        let bytes = read_local_bytes(&url, Some(&root_url), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"inside");
+    }
+
+    /// `file://` artifacts go through the same size cap as HTTP ones.
+    #[tokio::test]
+    async fn local_file_artifact_honours_size_cap() {
+        use super::{FetchConfig, fetch_stream_to_store_verified};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = rv_store::Store::open(&dir.path().join("store")).expect("open");
+        let file = dir.path().join("big.jar");
+        std::fs::write(&file, vec![7u8; 4096]).expect("write");
+        let url = url::Url::from_file_path(&file).expect("file url");
+        let root = url::Url::from_directory_path(dir.path()).unwrap();
+        let client = reqwest::Client::new();
+
+        let small = FetchConfig {
+            retries: 0,
+            timeout: Duration::from_secs(5),
+            max_artifact_size: 2048,
+            ..Default::default()
+        };
+        let err = fetch_stream_to_store_verified(
+            &client,
+            &url,
+            Some(&root),
+            None,
+            &small,
+            None,
+            &store,
+            None,
+        )
+        .await
+        .expect_err("over-cap file must fail");
+        assert!(format!("{err:?}").contains("size limit of 2048"), "{err:?}");
+
+        let ok = FetchConfig {
+            max_artifact_size: 4096,
+            ..small
+        };
+        fetch_stream_to_store_verified(&client, &url, Some(&root), None, &ok, None, &store, None)
+            .await
+            .expect("file within cap is stored");
     }
 }

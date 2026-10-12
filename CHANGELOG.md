@@ -7,6 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-13
+
+Maven-compatible conflict resolution, redirects from project repositories,
+faster cold syncs of large reactors, and more robust downloads. Resolution
+results can differ from 0.3.0, so the first `rv sync` may rewrite `rv.lock`.
+
+### Added
+
+- Repositories with a `file://` URL in the root project or its parent chain
+  are read from the local filesystem. `${project.basedir}` is expanded,
+  checksum files are optional, and a plain `-SNAPSHOT` layout without
+  `maven-metadata.xml` works. `--offline` reads these repositories too.
+- `.mvn/maven.config` accepts `--activate-profiles` in addition to `-P`.
+- `RV_MAX_ARTIFACT_SIZE` sets the largest artifact `rv` downloads (default
+  16 GiB). Artifacts stream to disk, and `RV_TIMEOUT` limits the wait for
+  response headers and the idle gap between body chunks instead of the
+  whole transfer.
+- Artifact downloads that stay below 1 KiB/s for 30 seconds are retried on a
+  new connection. `RV_LOW_SPEED_LIMIT` and `RV_LOW_SPEED_TIME` (or
+  `network.low_speed_limit` and `network.low_speed_time`) change the limits.
+- `rv.toml` repository entries accept `releases-checksum-policy` and
+  `snapshots-checksum-policy`.
+
+### Changed
+
+- Nearest-wins conflict resolution follows maven-resolver's
+  `NearestVersionSelector`. It keeps every acceptable candidate and
+  backtracks to the nearest one that satisfies all hard version ranges.
+  Siblings prefer the higher version. A relocated artifact resolves with
+  its own version, and the source coordinate's range does not constrain it.
+- `rv` follows one HTTPS cross-origin redirect from a repository declared in
+  the project's own POMs, including local parents and active profiles. This
+  supports registries such as `repo.spring.io` that redirect downloads to
+  object storage. Authorization headers are not forwarded. Repositories
+  declared only by dependencies still may not redirect across origins.
+- A checksum mismatch on remote `maven-metadata.xml` is retried once and
+  then reported as a `METADATA_CHECKSUM_MISMATCH` warning instead of failing
+  the sync, as Maven's default `warn` checksum policy does. A repository with
+  `<checksumPolicy>fail</checksumPolicy>` still fails. Artifact and POM
+  checksum mismatches always fail.
+- A dependency POM that Maven treats as invalid, such as a system
+  dependency without `systemPath`, keeps its artifact and contributes no
+  transitive dependencies, with a warning. Project and reactor POMs still
+  fail.
+- A dependency-not-found error names ignored transitive repositories that
+  a POM on the dependency path declared, and shows the `rv.toml`
+  `[[repositories]]` entries that would let `rv` search them.
+- Each distinct warning is reported once, in a stable order. Before, a large
+  reactor could repeat one warning hundreds of thousands of times, and the
+  count changed from run to run (during 0.4.0 development, apache/dubbo's
+  `--json` sync output reached 137 MB). Human output groups `TRANSITIVE_REPO_DROPPED` by repository URL
+  and counts `WEAK_HASH_FALLBACK` artifacts. `--json` lists each distinct
+  warning once, sorted by code and context, and `TRANSITIVE_REPO_DROPPED`
+  entries gain a `declared_by` context field.
+- Cold syncs of large reactors are faster. Concurrent requests for the same
+  POM share one download, modules divide the network budget among those
+  still running, a missing snapshot is requested once per run, and a version
+  range downloads only the POMs of versions that can win. Relocations in
+  unselected range alternatives are not discovered, so their targets and
+  target dependency management may be absent from the result.
+- Large reactors resolve with much less memory and CPU. Modules and platforms
+  share parsed POMs, each parent or BOM POM a reactor touches is held once
+  until it is written, and a project's dependency management is indexed once
+  instead of once per profile. Measured against an earlier 0.4.0
+  development build, a warm offline sync of apache/dubbo (116 modules) went
+  from 36 s to 29 s, from 63 s to 37 s of CPU, and from 4.8 GB to 0.7 GB of
+  memory.
+- TLS uses only the ring crypto provider, which `rv` already used at
+  runtime. Building from source no longer compiles AWS-LC or needs CMake.
+
+### Fixed
+
+- `rv doctor` reports which credentials a mirrored request would carry by the
+  same rule sync uses: a mirror that changes the scheme or port, not just the
+  host, does not receive the origin's ID-less default credentials.
+- Offline sync uses cached POMs and Maven metadata after their refresh
+  interval passes, and the cache no longer deletes rows just because they
+  expired.
+- Inherited dependencies are ordered child first, as in Maven, which changes
+  which version wins some conflicts.
+- A transitive dependency that `dependencyManagement` sets to `test` or
+  `provided` scope is kept with its subtree, and a managed `<optional>` is
+  ignored, as in Maven.
+- Parent lookups use repositories declared by already-loaded ancestors and
+  by active profiles, and imported BOMs use the parent chain's
+  repositories.
+- CI-friendly `${revision}` parent versions resolve for reactor BOM imports
+  and for published POMs that were not flattened.
+- A missing `systemPath` is filled from `dependencyManagement`, and inactive
+  profiles no longer fail `systemPath` validation.
+- JDK profile activation matches Maven's `JdkVersionProfileActivator`,
+  including open-ended ranges, negated prefixes, and early-access versions
+  such as `26-ea`. Activation conditions are interpolated before parent
+  lookup.
+- Profile activation compares `<os><arch>` with the JVM's name for the
+  target architecture (`amd64` for x86_64 on Linux and Windows), so
+  `<arch>amd64</arch>` profiles activate as they do in Maven. Native
+  dependencies such as brotli4j's are now locked on those platforms.
+  `${os.arch}` in POMs still expands to the host's Rust architecture name.
+- Relocation no longer reports a false cycle, and dependency management is
+  applied again to the relocated coordinate.
+- Whitespace around POM coordinates is trimmed, and POM parse errors name
+  the POM.
+- `rv sync --frozen --offline` treats a lockfile's mirror URLs as
+  configured origins, so a mirror in `settings.xml` no longer forces a full
+  re-resolve. The SNAPSHOT update policy applies to mirrored lock entries.
+- `rv export-m2` labels parent and BOM POMs fetched through a mirror with
+  the mirror's repository ID, as Maven does.
+- A reactor sync writes each shared parent or BOM POM to the store once.
+- A rare hang when two reactor modules needed the same POM at the same time
+  no longer occurs.
+- A download whose body stalls while the store is busy now times out and is
+  retried.
+- `rv sync --frozen --offline` accepts lockfile origins that the local
+  project POMs declare, and an offline resolve looks in every repository's
+  cache before it reports a miss. A lockfile origin that neither
+  configuration nor the local POMs declare still requires resolution.
+- A failed write to the metadata cache no longer aborts a sync. `rv`
+  warns once and continues with the downloaded bytes.
+- Log output contains ANSI color codes only when stderr is a terminal and
+  `NO_COLOR` is unset.
+
+### Security
+
+- `file://` repository reads stay inside the repository directory. Symbolic
+  links that point outside it are rejected. On Windows, confinement does not
+  guard against the repository being modified during a read.
+- Transitive repositories are admitted by their parsed URL scheme (`http`
+  or `https`), so a URL with embedded control characters cannot reach a
+  `file:` repository.
+- Updated `quick-xml` (RUSTSEC-2026-0194, RUSTSEC-2026-0195), `rustls`,
+  `rustls-webpki`, and `crossbeam-epoch`.
+
 ## [0.3.0] - 2026-08-14
 
 ### Added
@@ -179,7 +312,7 @@ Initial public release.
 - `rv export-m2`: materializes locked artifacts into `~/.m2/repository`,
   including `_remote.repositories` markers with the correct repository ids,
   so Maven can run offline against the locked dependency set. Maven build
-  plugins are out of scope for v1; see the README's Scope section.
+  plugins are out of scope for v1; see [Scope](docs/offline-builds.md#scope).
 - `rv tree`: renders the dependency graph from `rv.lock`.
 - `rv why <coord>`: explains why a dependency is in the graph.
 - `rv doctor`: diagnoses connectivity, authentication, TLS, and proxy issues.
@@ -192,7 +325,8 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
-[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/raeva-io/raeva/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/raeva-io/raeva/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/raeva-io/raeva/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/raeva-io/raeva/releases/tag/v0.1.1

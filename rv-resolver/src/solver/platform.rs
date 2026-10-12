@@ -32,8 +32,6 @@ pub(crate) struct PlatformConstraint {
     /// Managed `<scope>`: overrides a transitive dependency's declared scope
     /// (Maven's ClassicDependencyManager, applied from depth >= 2).
     pub scope: Option<String>,
-    /// Managed `<optional>`: overrides a transitive dependency's declared flag.
-    pub optional: Option<String>,
     /// Managed `<exclusions>`: unioned with a transitive dependency's own
     /// exclusions, pruning the subtree below it. This is the canonical
     /// "globally exclude commons-logging via dependencyManagement" pattern.
@@ -123,7 +121,7 @@ impl PlatformConstraints {
     }
 
     /// Look up the managed entry for a coordinate to read its non-version
-    /// metadata (scope/optional/exclusions). Unlike `apply_constraint`, this
+    /// metadata (scope/exclusions). Unlike `apply_constraint`, this
     /// also matches entries that manage no version at all (a depMgmt entry
     /// with only `<exclusions>` is valid and common).
     pub(crate) fn managed(

@@ -20,8 +20,8 @@ fn run_rv(args: &[&str], dir: &Path) -> Output {
     // Isolate from the developer's environment so a `RUST_LOG` export in the
     // host shell can't flip the suppression we are trying to test.
     cmd.env_remove("RUST_LOG");
-    // Force HOME to a temp dir so any future "user config" surface can't read
-    // from the developer profile.
+    // Keep rv's data and the user config out of the developer profile.
+    cmd.env("RAEVA_HOME", dir.join(".raeva-home"));
     cmd.env("HOME", dir);
     cmd.env("USERPROFILE", dir);
     cmd.output().expect("spawn rv")
@@ -119,15 +119,16 @@ version = "1.0"
 #[test]
 fn json_doctor_failure_emits_single_envelope() {
     let dir = tempdir().unwrap();
-    // RFC 5737 TEST-NET-1 (192.0.2.0/24) is reserved for documentation; the
-    // doctor probe will fail to connect locally without real network egress.
+    let port = closed_local_port();
     fs::write(
         dir.path().join("rv.toml"),
-        r#"
+        format!(
+            r#"
 [[repositories]]
 id = "unreachable"
-url = "http://192.0.2.1/maven2"
-"#,
+url = "http://127.0.0.1:{port}/maven2"
+"#
+        ),
     )
     .expect("write rv.toml");
 
@@ -316,4 +317,11 @@ platform = "linux-x86_64"
         .unwrap_or_else(|err| panic!("stdout is not a single JSON value: {err}\nstdout: {stdout}"));
     assert_eq!(parsed["success"], serde_json::Value::Bool(true));
     assert!(parsed["data"]["path"].is_string(), "missing path: {parsed}");
+}
+
+/// A loopback port with no listener: connecting fails at once with
+/// "connection refused" instead of waiting out a connect timeout.
+fn closed_local_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("local addr").port()
 }

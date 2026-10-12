@@ -184,13 +184,23 @@ impl Default for AuthStore {
 
 impl AuthStore {
     pub(crate) fn from_config(config: &rv_config::Config) -> Result<Self> {
+        let credential_store: Arc<dyn CredentialStore> = if config.os_credentials_enabled() {
+            Arc::new(KeyringCredentialStore)
+        } else {
+            Arc::new(NoCredentialStore)
+        };
         Ok(Self {
             mirror_policy: MirrorAuthPolicy::from_config(config),
             ..Self::new(
                 ConfigAuthLayers::from(config.auth_layers()),
-                Arc::new(KeyringCredentialStore),
+                credential_store,
             )
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn without_os_credentials() -> Self {
+        Self::new(ConfigAuthLayers::default(), Arc::new(NoCredentialStore))
     }
 
     #[cfg(test)]
@@ -502,10 +512,8 @@ impl AuthStore {
     }
 }
 
-#[cfg(test)]
 struct NoCredentialStore;
 
-#[cfg(test)]
 impl CredentialStore for NoCredentialStore {
     fn get(
         &self,
@@ -519,11 +527,15 @@ impl CredentialStore for NoCredentialStore {
         _endpoint: &NormalizedEndpoint,
         _record: &CredentialRecord,
     ) -> std::result::Result<(), CredentialError> {
-        unreachable!("read-only test credential store")
+        Err(CredentialError::BackendUnavailable(
+            "OS credentials are disabled for this configuration".to_string(),
+        ))
     }
 
     fn delete(&self, _endpoint: &NormalizedEndpoint) -> std::result::Result<bool, CredentialError> {
-        unreachable!("read-only test credential store")
+        Err(CredentialError::BackendUnavailable(
+            "OS credentials are disabled for this configuration".to_string(),
+        ))
     }
 }
 
@@ -629,10 +641,6 @@ mod tests {
     use secrecy::{ExposeSecret, Secret};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-    // Scoped tracing subscribers refresh process-global callsite interest.
-    // Keep warning-buffer assertions from installing competing subscribers
-    // while the test harness runs this module in parallel.
-    static WARNING_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Clone, Copy)]
     enum StoreFailure {
@@ -730,16 +738,13 @@ mod tests {
             }
         }
 
-        let _guard = WARNING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let output = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(VecWriter(output.clone()))
             .with_max_level(tracing::Level::WARN)
             .with_ansi(false)
             .finish();
-        tracing::subscriber::with_default(subscriber, body);
+        rv_test_support::with_default(subscriber, body);
         String::from_utf8(output.lock().expect("lock").clone()).expect("UTF-8")
     }
 
@@ -860,39 +865,6 @@ mod tests {
 
     #[test]
     fn cleartext_auth_warn_fires_for_http_non_loopback() {
-        let _warning_guard = WARNING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct VecWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for VecWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for VecWriter {
-            type Writer = VecWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let writer = VecWriter(buf.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(writer)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-
         // Per-instance dedup: a freshly built AuthStore has its own warn
         // set, so test ordering can no longer leak warning state.
         let configs = vec![rv_config::AuthConfig {
@@ -908,7 +880,7 @@ mod tests {
         let loopback = Repository::new(None, "http://127.0.0.1:8080/", true, false);
         let loopback_named = Repository::new(None, "http://localhost/", true, false);
 
-        tracing::subscriber::with_default(subscriber, || {
+        let output = capture_warnings(|| {
             let _ = store.for_repository_with_policy(&plain_repo, false);
             // Second call to same host should NOT emit a duplicate warn.
             let _ = store.for_repository_with_policy(&same_repo, false);
@@ -917,7 +889,6 @@ mod tests {
             let _ = store.for_repository_with_policy(&loopback_named, false);
         });
 
-        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             output.contains("CLEARTEXT_AUTH"),
             "expected CLEARTEXT_AUTH warning, got: {output}"
@@ -1224,38 +1195,6 @@ password = "project-password"
 
     #[test]
     fn unavailable_keyring_warns_once_and_falls_through() {
-        let _warning_guard = WARNING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        use std::io::Write;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct VecWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for VecWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("lock").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for VecWriter {
-            type Writer = VecWriter;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(VecWriter(output.clone()))
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
         let store = AuthStore::with_sources_and_store(
             vec![basic(Some("corp"), "config-user", "config-password")],
             Vec::new(),
@@ -1269,7 +1208,7 @@ password = "project-password"
             false,
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        let output = capture_warnings(|| {
             assert!(
                 store
                     .for_repository_with_policy(&repo, false)
@@ -1284,7 +1223,6 @@ password = "project-password"
             );
         });
 
-        let output = String::from_utf8(output.lock().expect("lock").clone()).expect("UTF-8");
         assert_eq!(output.matches("KEYRING_UNAVAILABLE").count(), 1);
     }
 
@@ -1326,9 +1264,6 @@ password = "project-password"
             }
         }
 
-        let _warning_guard = WARNING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
         let subscriber = tracing_subscriber::fmt()
@@ -1356,7 +1291,7 @@ password = "project-password"
         let first_store = store.clone();
         let first_repo = repo.clone();
         let first = thread::spawn(move || {
-            tracing::subscriber::with_default(subscriber, || {
+            rv_test_support::with_default(subscriber, || {
                 first_store
                     .for_repository_with_policy(&first_repo, false)
                     .expect("first lookup")
@@ -1387,38 +1322,6 @@ password = "project-password"
 
     #[test]
     fn missing_keyring_entry_warns_once_and_falls_through() {
-        let _warning_guard = WARNING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        use std::io::Write;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct VecWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for VecWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("lock").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for VecWriter {
-            type Writer = VecWriter;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(VecWriter(output.clone()))
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
         let store = AuthStore::with_sources_and_store(
             vec![basic(Some("corp"), "config-user", "config-password")],
             Vec::new(),
@@ -1432,7 +1335,7 @@ password = "project-password"
             false,
         );
 
-        tracing::subscriber::with_default(subscriber, || {
+        let output = capture_warnings(|| {
             assert!(
                 store
                     .for_repository_with_policy(&repo, false)
@@ -1447,7 +1350,6 @@ password = "project-password"
             );
         });
 
-        let output = String::from_utf8(output.lock().expect("lock").clone()).expect("UTF-8");
         assert_eq!(output.matches("KEYRING_ENTRY_MISSING").count(), 1);
     }
 

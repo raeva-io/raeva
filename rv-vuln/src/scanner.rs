@@ -306,8 +306,8 @@ fn severity_score(vulnerability: &Vulnerability) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use rv_test_support::http::{Response, StubServer};
+    use std::sync::Mutex;
 
     use packageurl::PackageUrl;
 
@@ -490,36 +490,30 @@ mod tests {
 
     #[tokio::test]
     async fn scan_rejects_incomplete_batch_results() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-        let address = listener.local_addr().expect("mock server address");
-        let server = std::thread::spawn(move || {
-            let responses = [
-                (
-                    "/v1/querybatch",
-                    "200 OK",
-                    r#"{"results":[{"vulns":[{"id":"OSV-MISSING"}]},{"vulns":[]}] }"#,
-                ),
-                (
-                    "/v1/vulns/OSV-MISSING",
-                    "400 Bad Request",
-                    r#"{"message":"missing record"}"#,
-                ),
-            ];
-            for (path, status, body) in responses {
-                let (mut stream, _) = listener.accept().expect("accept request");
-                let mut request = [0_u8; 8192];
-                let size = stream.read(&mut request).expect("read request");
-                let request = String::from_utf8_lossy(&request[..size]);
-                assert!(request.contains(path), "request={request}");
-                let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                );
-                stream
-                    .write_all(response.as_bytes())
-                    .expect("write response");
-            }
+        let responses = [
+            (
+                "/v1/querybatch",
+                200,
+                r#"{"results":[{"vulns":[{"id":"OSV-MISSING"}]},{"vulns":[]}] }"#,
+            ),
+            (
+                "/v1/vulns/OSV-MISSING",
+                400,
+                r#"{"message":"missing record"}"#,
+            ),
+        ];
+        let responses = Mutex::new(responses.into_iter());
+        let server = StubServer::start(move |request| {
+            let (path, status, body) = responses
+                .lock()
+                .expect("responses")
+                .next()
+                .expect("expected request");
+            let request = &request.raw;
+            assert!(request.contains(path), "request={request}");
+            Response::new(status, body).header("Content-Type", "application/json")
         });
+        let address = server.addr();
 
         let scanner = VulnScanner::from_client(
             OsvClient::with_base_url(format!("http://{address}/v1")).expect("OSV client"),
@@ -537,7 +531,8 @@ mod tests {
             VulnError::InvalidResponse(ref details)
                 if details.contains("OSV-MISSING")
         ));
-        server.join().expect("mock server");
+        assert_eq!(server.answered(), 2);
+        server.stop();
     }
 
     fn vulnerability_with_score(score: &str) -> Vulnerability {

@@ -6,9 +6,10 @@ use clap::Args;
 
 use rv_config::{
     AuthConfig, Config, CredentialStore, KeyringCredentialStore, MirrorConfig, NormalizedEndpoint,
-    ProxyConfig,
 };
-use rv_repo::{RepoClient, RepoError, Repository, same_origin_redirect_policy};
+use rv_repo::{
+    RepoClient, RepoError, Repository, build_unauthenticated_proxy, same_origin_redirect_policy,
+};
 use rv_version::Coord;
 
 use crate::error::{CliError, ExitCodes, Result};
@@ -283,163 +284,17 @@ struct MirrorResolution {
     repository: Repository,
     /// `Some(display label)` when a mirror substituted the URL.
     mirror_label: Option<String>,
-    /// True when the substitution crossed hosts (sync suppresses default
+    /// True when the substitution crossed origins (sync suppresses default
     /// credentials in that case).
     host_changed: bool,
 }
 
-/// Replicate the selection rules of rv-repo's crate-internal
-/// `MirrorSelector` over the public `rv_config::MirrorConfig` type, so the
-/// doctor labels and probes the same effective endpoint a real sync fetches
-/// from. Rules mirrored: an exact single-id `mirror_of` match wins over any
-/// wildcard or pattern match regardless of order; `!`-prefixed rules
-/// exclude; the Maven pseudo-patterns (`*`, `central`, `external:*`,
-/// `external:http:*`, `external:https:*`, `internal:*`) are honored; a
-/// mirror whose URL equals the repo URL is ignored; and the resolved repo
-/// only inherits the origin id when the mirror is unnamed and stays on the
-/// same host.
 fn resolve_mirror(mirrors: &[MirrorConfig], repo: &Repository) -> MirrorResolution {
-    let unmirrored = || MirrorResolution {
-        repository: repo.clone(),
-        mirror_label: None,
-        host_changed: false,
-    };
-    let Some(mirror) = matching_mirror(mirrors, repo) else {
-        return unmirrored();
-    };
-    if mirror.url == repo.url {
-        // Self-referential mirror entries are treated as "no mirror
-        // matched", matching the sync path.
-        return unmirrored();
-    }
-    let host_changed = hosts_differ(&repo.url, &mirror.url);
-    let id = match mirror.id.clone() {
-        Some(mirror_id) => Some(mirror_id),
-        None if host_changed => None,
-        None => repo.id.clone(),
-    };
-    let mirror_label = Some(mirror.id.clone().unwrap_or_else(|| "<unnamed>".to_string()));
-    let repository = Repository::new(
-        id,
-        mirror.url.clone(),
-        repo.releases_enabled,
-        repo.snapshots_enabled,
-    );
+    let (repository, mirror, host_changed) = rv_repo::resolve_mirror(mirrors, repo);
     MirrorResolution {
         repository,
-        mirror_label,
+        mirror_label: mirror.map(|m| m.id.clone().unwrap_or_else(|| "<unnamed>".to_string())),
         host_changed,
-    }
-}
-
-fn matching_mirror<'a>(mirrors: &'a [MirrorConfig], repo: &Repository) -> Option<&'a MirrorConfig> {
-    // Maven's `DefaultMirrorSelector` runs two passes: an exact single-ID
-    // match wins over any wildcard or pattern match, regardless of list
-    // order.
-    mirrors
-        .iter()
-        .find(|mirror| is_exact_id_mirror(mirror, repo))
-        .or_else(|| mirrors.iter().find(|mirror| matches_mirror(mirror, repo)))
-}
-
-fn is_exact_id_mirror(mirror: &MirrorConfig, repo: &Repository) -> bool {
-    let Some(repo_id) = repo.id.as_deref() else {
-        return false;
-    };
-    let patterns = expand_patterns(&mirror.mirror_of);
-    patterns.len() == 1 && patterns[0] == repo_id
-}
-
-fn matches_mirror(mirror: &MirrorConfig, repo: &Repository) -> bool {
-    let patterns = expand_patterns(&mirror.mirror_of);
-    if patterns.is_empty() {
-        return false;
-    }
-
-    let mut matched = false;
-    for pattern in patterns {
-        if let Some(rule) = pattern.strip_prefix('!') {
-            if pattern_matches(rule, repo) {
-                return false;
-            }
-        } else if pattern_matches(&pattern, repo) {
-            matched = true;
-        }
-    }
-    matched
-}
-
-fn expand_patterns(patterns: &[String]) -> Vec<String> {
-    patterns
-        .iter()
-        .flat_map(|p| p.split(','))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-fn pattern_matches(pattern: &str, repo: &Repository) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    if pattern == "central" {
-        return repo.id.as_deref() == Some("central");
-    }
-    if pattern == "external:*" {
-        return is_external_repo(&repo.url);
-    }
-    if pattern == "external:http:*" {
-        return is_external_repo(&repo.url) && repo_scheme(&repo.url).as_deref() == Some("http");
-    }
-    if pattern == "external:https:*" {
-        return is_external_repo(&repo.url) && repo_scheme(&repo.url).as_deref() == Some("https");
-    }
-    if pattern == "internal:*" {
-        return !is_external_repo(&repo.url);
-    }
-    // Unrecognized pseudo-patterns fall through to exact-id comparison,
-    // matching Maven (the sync path warns once; doctor stays quiet).
-    match repo.id.as_deref() {
-        Some(id) => id == pattern,
-        None => false,
-    }
-}
-
-fn repo_scheme(url: &str) -> Option<String> {
-    url::Url::parse(url).ok().map(|u| u.scheme().to_string())
-}
-
-/// Compare two URLs by host (case-insensitive). Returns `true` when both URLs
-/// parse and resolve to different hosts; defensively `true` when either fails
-/// to parse, matching the sync path's credential-suppression behaviour.
-fn hosts_differ(original: &str, resolved: &str) -> bool {
-    let host_of = |value: &str| {
-        url::Url::parse(value)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-    };
-    match (host_of(original), host_of(resolved)) {
-        (Some(a), Some(b)) => a != b,
-        _ => true,
-    }
-}
-
-fn is_external_repo(url: &str) -> bool {
-    let parsed = match url::Url::parse(url) {
-        Ok(parsed) => parsed,
-        Err(_) => return false,
-    };
-    match parsed.scheme() {
-        "http" | "https" => match parsed.host() {
-            Some(url::Host::Domain(h)) => h != "localhost",
-            Some(url::Host::Ipv4(addr)) => !addr.is_loopback(),
-            Some(url::Host::Ipv6(addr)) => {
-                !addr.is_loopback() && !addr.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-            }
-            None => false,
-        },
-        _ => false,
     }
 }
 
@@ -705,10 +560,8 @@ fn mirror_probe_urls(mirror: &Repository) -> std::result::Result<(url::Url, Stri
 /// Applies proxy settings from `rv.toml` / `settings.xml` through the same
 /// `ProxyConfig` entries that `RepoClient::new` reads, including
 /// `non_proxy_hosts` routing, so the probe reflects the same proxy path a
-/// sync would take. `rv_repo::proxy::build_proxy` is crate-internal, so the
-/// proxy URL assembly and bypass matching are mirrored locally. Proxy
-/// credentials are not attached: the probe's goal is reachability through
-/// the proxy, and a 407 surfaces as a failure naming the proxy.
+/// sync would take. Proxy credentials are not attached: the probe's goal is
+/// reachability through the proxy, and a 407 surfaces as a failure naming it.
 fn build_doctor_client(config: &Config) -> Result<reqwest::Client> {
     // Match the sync client's proxy policy: only proxies from Maven/rv
     // configuration apply, never HTTP(S)_PROXY environment variables, so the
@@ -720,129 +573,12 @@ fn build_doctor_client(config: &Config) -> Result<reqwest::Client> {
         .timeout(DOCTOR_REQUEST_TIMEOUT);
 
     for proxy_config in config.proxies() {
-        if let Some(proxy) = doctor_proxy(proxy_config) {
+        if let Ok(proxy) = build_unauthenticated_proxy(proxy_config) {
             builder = builder.proxy(proxy);
         }
     }
 
     Ok(builder.build()?)
-}
-
-/// Construct a `reqwest::Proxy` from a `ProxyConfig` entry for the doctor
-/// reachability probe. Returns `None` when the proxy URL cannot be assembled
-/// (the caller skips it rather than aborting the whole doctor run).
-///
-/// When `non_proxy_hosts` is configured the proxy uses custom per-URL
-/// routing that honours the bypass list, matching the sync client.
-fn doctor_proxy(cfg: &ProxyConfig) -> Option<reqwest::Proxy> {
-    let protocol = cfg
-        .protocol
-        .as_deref()
-        .unwrap_or("http")
-        .to_ascii_lowercase();
-    let proxy_url = build_doctor_proxy_url(&protocol, &cfg.host, cfg.port)?;
-
-    if cfg.non_proxy_hosts.is_empty() {
-        return match protocol.as_str() {
-            "https" => reqwest::Proxy::https(&proxy_url).ok(),
-            "all" => reqwest::Proxy::all(&proxy_url).ok(),
-            _ => reqwest::Proxy::http(&proxy_url).ok(),
-        };
-    }
-
-    let non_proxy_hosts = cfg.non_proxy_hosts.clone();
-    Some(reqwest::Proxy::custom(move |url| {
-        let scheme_matches = match protocol.as_str() {
-            "all" => true,
-            "https" => url.scheme() == "https",
-            _ => url.scheme() == "http",
-        };
-        if !scheme_matches {
-            return None;
-        }
-        let host = match url.host_str() {
-            Some(host) => host,
-            None => return Some(proxy_url.clone()),
-        };
-        if should_bypass_proxy(host, &non_proxy_hosts) {
-            None
-        } else {
-            Some(proxy_url.clone())
-        }
-    }))
-}
-
-/// Maven `<nonProxyHosts>` matching: bare `*` matches everything,
-/// `*.suffix` / `.suffix` match the suffix and its subdomains, anything
-/// else is an exact (case-insensitive) host match. Mirrors the
-/// crate-internal `rv_repo::proxy::should_bypass_proxy`.
-fn should_bypass_proxy(host: &str, non_proxy_hosts: &[String]) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-
-    if non_proxy_hosts.iter().any(|entry| entry.trim() == "*") {
-        return true;
-    }
-
-    non_proxy_hosts.iter().any(|entry| {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            return false;
-        }
-
-        if let Some(suffix) = entry.strip_prefix("*.").or_else(|| entry.strip_prefix('.')) {
-            let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
-            !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
-        } else {
-            host == entry.trim_end_matches('.').to_ascii_lowercase()
-        }
-    })
-}
-
-/// Assemble and validate a proxy URL for the doctor probe.
-///
-/// `rv_repo::proxy::build_proxy_url` is crate-internal and cannot be reused
-/// here, so this mirrors its hardening locally. A plain format-string
-/// interpolation of the host would silently accept a value like
-/// `user@evil.example` (reqwest reinterprets it as `userinfo@authority` and
-/// steers the probe to the attacker host) and would never validate IPv6
-/// literals or round-trip the result through `Url::parse`. Returns `None` on
-/// any rejection so the caller skips the malformed entry rather than probing
-/// through a bogus proxy.
-fn build_doctor_proxy_url(protocol: &str, host: &str, port: u16) -> Option<String> {
-    let trimmed = host.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    // Credentials belong in the proxy config's username/password fields, not
-    // embedded in the host; a `@` here would be parsed as userinfo and could
-    // redirect the probe to an unintended authority.
-    if trimmed.contains('@') {
-        return None;
-    }
-    // A bare host or IP literal must not carry URL path/query/fragment
-    // delimiters.
-    if trimmed.contains('/') || trimmed.contains('?') || trimmed.contains('#') {
-        return None;
-    }
-
-    // Bracket bare IPv6 literals (more than one `:`, no surrounding brackets),
-    // but only after confirming the value really is a valid IPv6 address.
-    let authority = if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        trimmed.to_string()
-    } else if trimmed.contains(':') {
-        if trimmed.parse::<std::net::Ipv6Addr>().is_err() {
-            return None;
-        }
-        format!("[{trimmed}]")
-    } else {
-        trimmed.to_string()
-    };
-
-    let candidate = format!("{protocol}://{authority}:{port}");
-    // Round-trip through `url::Url` so any residual malformed component is
-    // surfaced (and skipped) rather than silently accepted by reqwest.
-    url::Url::parse(&candidate).ok()?;
-    Some(candidate)
 }
 
 /// Map per-check outcomes to a single exit code.
@@ -970,9 +706,8 @@ fn format_connection_error(err: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialSource, Outcome, Row, build_doctor_proxy_url, classify_exit_code,
-        classify_probe_error, credential_source, probe_coord, probe_group_artifact, resolve_mirror,
-        should_bypass_proxy,
+        CredentialSource, Outcome, Row, classify_exit_code, classify_probe_error,
+        credential_source, probe_coord, probe_group_artifact, resolve_mirror,
     };
     use crate::error::ExitCodes;
     use rv_config::{
@@ -998,57 +733,7 @@ mod tests {
         )
     }
 
-    /// The doctor proxy builder must apply the same hardening as the
-    /// (crate-internal) rv-repo builder: plain authority for hosts/IPv4,
-    /// bracketed IPv6, and outright rejection of `@`/delimiter-bearing hosts
-    /// and non-IPv6 colon hosts.
-    #[test]
-    fn doctor_proxy_url_brackets_ipv6_and_rejects_unsafe_hosts() {
-        // Plain hostname.
-        assert_eq!(
-            build_doctor_proxy_url("http", "proxy.example", 8080).as_deref(),
-            Some("http://proxy.example:8080")
-        );
-        // IPv4 literal: plain authority.
-        assert_eq!(
-            build_doctor_proxy_url("http", "10.0.0.1", 3128).as_deref(),
-            Some("http://10.0.0.1:3128")
-        );
-        // Bare IPv6 literal: bracketed.
-        assert_eq!(
-            build_doctor_proxy_url("http", "::1", 8080).as_deref(),
-            Some("http://[::1]:8080")
-        );
-        // Pre-bracketed IPv6: passes through.
-        assert_eq!(
-            build_doctor_proxy_url("https", "[2001:db8::1]", 443).as_deref(),
-            Some("https://[2001:db8::1]:443")
-        );
-        // `@` in the host is rejected; it would otherwise be parsed as
-        // userinfo and steer the probe to the wrong authority.
-        assert!(build_doctor_proxy_url("http", "user@evil.example", 8080).is_none());
-        // URL delimiters are rejected.
-        assert!(build_doctor_proxy_url("http", "proxy.example/path", 8080).is_none());
-        // A `:`-bearing host that is not a valid IPv6 literal is rejected.
-        assert!(build_doctor_proxy_url("http", "host:with:colons", 8080).is_none());
-        // Empty host is rejected.
-        assert!(build_doctor_proxy_url("http", "   ", 8080).is_none());
-    }
-
-    /// Doctor's proxy bypass matching must align with the sync path:
-    /// exact hosts, `*.suffix`/`.suffix` rules, and the bare `*` wildcard.
-    #[test]
-    fn doctor_should_bypass_proxy_matches_sync_rules() {
-        let non_proxy = vec!["repo.example.com".to_string(), "*.internal".to_string()];
-        assert!(should_bypass_proxy("repo.example.com", &non_proxy));
-        assert!(should_bypass_proxy("api.internal", &non_proxy));
-        assert!(should_bypass_proxy("deep.api.internal", &non_proxy));
-        assert!(!should_bypass_proxy("sub.repo.example.com", &non_proxy));
-        assert!(should_bypass_proxy("anything", &["*".to_string()]));
-        assert!(should_bypass_proxy("anything", &["  *  ".to_string()]));
-    }
-
-    // --- mirror resolution (doctor replication of rv-repo's selector) ---
+    // --- mirror resolution ---
 
     #[test]
     fn resolve_mirror_matches_by_id_and_labels() {
@@ -1120,6 +805,60 @@ mod tests {
     }
 
     #[test]
+    fn resolve_mirror_scheme_and_port_changes_suppress_origin_credentials() {
+        let repo = repository(Some("corp"), "https://nexus.corp/repo/");
+        for url in [
+            "http://nexus.corp/mirror/",
+            "http://nexus.corp:443/mirror/",
+            "https://nexus.corp:8443/mirror/",
+        ] {
+            for id in [None, Some("mirror"), Some("corp")] {
+                let mirrors = vec![mirror_config(id, url, &["*"])];
+                let resolution = resolve_mirror(&mirrors, &repo);
+                assert!(resolution.host_changed, "{url}");
+                assert_eq!(resolution.repository.id.as_deref(), id);
+                assert_eq!(
+                    resolution.mirror_label.as_deref(),
+                    Some(id.unwrap_or("<unnamed>"))
+                );
+                assert_eq!(
+                    credential_source(
+                        &auth_entries(),
+                        &FakeCredentialStore::empty(),
+                        &resolution.repository,
+                        resolution.host_changed,
+                    ),
+                    id.filter(|id| *id == "corp")
+                        .map(|id| CredentialSource::ConfigId(id.to_string())),
+                    "{url} with mirror id {id:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_mirror_default_port_keeps_origin_credentials() {
+        let mirrors = vec![mirror_config(
+            None,
+            "https://nexus.corp:443/mirror/",
+            &["*"],
+        )];
+        let repo = repository(Some("corp"), "https://nexus.corp/repo/");
+        let resolution = resolve_mirror(&mirrors, &repo);
+        assert!(!resolution.host_changed);
+        assert_eq!(resolution.repository.id, repo.id);
+        assert_eq!(
+            credential_source(
+                &auth_entries(),
+                &FakeCredentialStore::empty(),
+                &resolution.repository,
+                resolution.host_changed,
+            ),
+            Some(CredentialSource::ConfigId("corp".to_string())),
+        );
+    }
+
+    #[test]
     fn resolve_mirror_multi_id_pattern_matches_either() {
         let mirrors = vec![mirror_config(
             Some("multi"),
@@ -1158,6 +897,172 @@ mod tests {
         );
         assert!(resolve_mirror(&mirrors, &internal).mirror_label.is_none());
         assert!(resolve_mirror(&mirrors, &central()).mirror_label.is_some());
+    }
+
+    fn proxy_test_config(root: &std::path::Path, contents: &str) -> rv_config::Config {
+        std::fs::write(root.join("rv.toml"), contents).expect("write config");
+        temp_env::with_vars(
+            [
+                ("HOME", Some(root)),
+                ("USERPROFILE", Some(root)),
+                ("RAEVA_HOME", Some(root)),
+            ],
+            || {
+                let mut config = rv_config::Config::load(root)
+                    .expect("config")
+                    .without_os_credentials();
+                config.ensure_maven_settings_loaded();
+                config.network.timeout = 5;
+                config.network.retries = 0;
+                config
+            },
+        )
+    }
+
+    fn spawn_probe_server(
+        proxied: bool,
+        requests: tokio::sync::mpsc::UnboundedSender<(bool, String)>,
+    ) -> (std::net::SocketAddr, rv_test_support::http::StubServer) {
+        use rv_test_support::http::{Response, StubServer};
+        use sha2::{Digest, Sha256};
+
+        let server = StubServer::start(move |request| {
+            let metadata = "<metadata><groupId>org.apache.maven</groupId><artifactId>maven</artifactId></metadata>";
+            let body = if request.path.ends_with(".sha256") {
+                format!("{:x}", Sha256::digest(metadata.as_bytes()))
+            } else {
+                metadata.to_string()
+            };
+            requests
+                .send((proxied, request.raw.clone()))
+                .expect("record request");
+            Response::new(200, body)
+        });
+        (server.addr(), server)
+    }
+
+    #[tokio::test]
+    async fn doctor_proxy_bypass_matches_sync_client() {
+        let (send, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (origin, origin_task) = spawn_probe_server(false, send.clone());
+        let (proxy, proxy_task) = spawn_probe_server(true, send);
+        for (host, protocol, bypass, proxied) in [
+            ("127.0.0.1", None, "", true),
+            ("127.0.0.1", Some("http"), "127.0.0.1", false),
+            ("127.0.0.1", Some("HTTP"), "127.0.0.1.", false),
+            ("localhost", Some("http"), "  LOCALHOST.  ", false),
+            ("localhost", Some("http"), "*.localhost", false),
+            ("localhost", Some("http"), ".LOCALHOST.", false),
+            ("127.0.0.1", Some("http"), "  *  ", false),
+            ("127.0.0.1", Some("all"), "*", false),
+            ("127.0.0.1", Some("http"), "other.example", true),
+            ("127.0.0.1", Some("http"), "*.other.example", true),
+            ("127.0.0.1", Some("https"), "other.example", false),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let url = format!("http://{host}:{}/", origin.port());
+            let protocol = protocol
+                .map(|p| format!("protocol = {p:?}"))
+                .unwrap_or_default();
+            let bypass_list: Vec<_> = if bypass.is_empty() {
+                Vec::new()
+            } else {
+                vec![bypass]
+            };
+            let config = proxy_test_config(
+                root.path(),
+                &format!(
+                    r#"
+[[repositories]]
+id = "probe"
+url = "{url}"
+[[proxies]]
+{protocol}
+host = "127.0.0.1"
+port = {proxy_port}
+username = "proxy-user"
+password = "proxy-password"
+non_proxy_hosts = {bypass_list:?}
+"#,
+                    proxy_port = proxy.port(),
+                ),
+            );
+            let raw = super::build_doctor_client(&config).expect("doctor client");
+            let sync = rv_repo::RepoClient::new(&config)
+                .await
+                .expect("sync client");
+            let repo = Repository::from(&config.repositories()[0]);
+            assert_eq!(
+                raw.get(&url).send().await.expect("doctor request").status(),
+                200
+            );
+            let (used_proxy, request) = requests.try_recv().expect("doctor request recorded");
+            assert_eq!(
+                used_proxy, proxied,
+                "doctor: {host}, {protocol}, {bypass:?}"
+            );
+            assert!(!request.to_ascii_lowercase().contains("authorization:"));
+            assert!(requests.try_recv().is_err());
+
+            sync.fetch_metadata(&repo, &probe_coord(&repo).expect("coord"))
+                .await
+                .expect("sync metadata and checksum");
+            let mut sync_requests = Vec::new();
+            while let Ok(request) = requests.try_recv() {
+                sync_requests.push(request);
+            }
+            assert!(!sync_requests.is_empty(), "sync must reach the server");
+            for (used_proxy, request) in sync_requests {
+                assert_eq!(
+                    used_proxy, proxied,
+                    "sync: {host}, {protocol}, {bypass:?}, {request}"
+                );
+                let authenticated = request
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization:");
+                assert_eq!(authenticated, proxied, "{request}");
+                assert!(!request.to_ascii_lowercase().contains("\r\nauthorization:"));
+            }
+        }
+        origin_task.stop();
+        proxy_task.stop();
+    }
+
+    #[tokio::test]
+    async fn doctor_skips_invalid_proxy_entries_and_ignores_proxy_credentials() {
+        let (send, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (proxy, task) = spawn_probe_server(true, send);
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = proxy_test_config(
+            root.path(),
+            &format!(
+                r#"
+[[proxies]]
+host = "user@invalid.example"
+port = 8080
+[[proxies]]
+host = "127.0.0.1"
+port = {}
+auth_type = "bearer"
+"#,
+                proxy.port()
+            ),
+        );
+        let client = super::build_doctor_client(&config)
+            .expect("invalid entry skipped, missing token ignored");
+        assert_eq!(
+            client
+                .get("http://repo.invalid/")
+                .send()
+                .await
+                .expect("proxy request")
+                .status(),
+            200
+        );
+        let (proxied, request) = requests.try_recv().expect("request recorded");
+        assert!(proxied);
+        assert!(!request.to_ascii_lowercase().contains("authorization:"));
+        task.stop();
     }
 
     // --- credential source replication ---

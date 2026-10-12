@@ -18,6 +18,7 @@ fn run_rv(args: &[&str], dir: &Path) -> Output {
     let mut cmd = Command::new(rv_bin());
     cmd.args(args).current_dir(dir);
     cmd.env_remove("RUST_LOG");
+    cmd.env("RAEVA_HOME", dir.join(".raeva-home"));
     cmd.env("HOME", dir);
     cmd.env("USERPROFILE", dir);
     cmd.output().expect("spawn rv")

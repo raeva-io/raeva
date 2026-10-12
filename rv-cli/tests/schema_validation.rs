@@ -1,9 +1,8 @@
 mod common;
 
+use rv_test_support::http::{Response, StubServer};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::Path;
 
 use common::{rv_command, temp_project};
@@ -100,7 +99,8 @@ fn generated_documents() -> Documents {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
     let sarif = serde_json::from_slice(&output.stdout).expect("SARIF JSON");
-    server.join().expect("OSV server");
+    assert_eq!(server.answered(), 1);
+    server.stop();
 
     Documents {
         cyclonedx,
@@ -181,23 +181,12 @@ fn command_json(project_root: &Path, home: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("command JSON")
 }
 
-fn spawn_osv(response_body: &'static str) -> (String, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind OSV mock");
-    let address = listener.local_addr().expect("mock address");
-    let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept OSV request");
-        let mut request = [0_u8; 8192];
-        let size = stream.read(&mut request).expect("read OSV request");
-        assert!(size > 0);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response_body}",
-            response_body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write OSV response");
+fn spawn_osv(response_body: &'static str) -> (String, StubServer) {
+    let server = StubServer::start(move |request| {
+        assert!(!request.raw.is_empty());
+        Response::new(200, response_body).header("Content-Type", "application/json")
     });
-    (format!("http://{address}/v1"), handle)
+    (format!("http://{}/v1", server.addr()), server)
 }
 
 fn cyclonedx_validator() -> Validator {

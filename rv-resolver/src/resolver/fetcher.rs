@@ -36,10 +36,15 @@ impl RemotePomFetcher for RepoBackendFetcher {
 
     fn fetch_pom_by_coord(&self, coord: &Coord) -> std::result::Result<Option<Pom>, PomError> {
         match self.backend.fetch_pom_bytes_blocking(coord) {
-            Ok(bytes) => {
+            Ok((bytes, blob)) => {
                 let xml = std::str::from_utf8(&bytes)
                     .map_err(|err| PomError::InvalidModel(err.to_string()))?;
-                let pom = Pom::parse(xml)?;
+                let pom = self
+                    .backend
+                    .ctx
+                    .parsed_poms()
+                    .parse(&blob, xml)
+                    .map_err(|err| PomError::InvalidModel(format!("{coord}: {err}")))?;
                 Ok(Some(pom))
             }
             Err(ResolveError::ArtifactNotFound { .. }) => Ok(None),
@@ -106,7 +111,17 @@ impl RepoParentResolver {
 }
 
 impl rv_maven_model::ParentResolver for RepoParentResolver {
+    fn is_root_model(&self) -> bool {
+        self.trust == RepoTrust::Root
+    }
+
     fn resolve_parent(&self, parent: &Parent) -> std::result::Result<Option<Pom>, PomError> {
+        if self.trust == RepoTrust::Root
+            && let Some(mut pom) = self.base.load_local_parent(parent)
+        {
+            pom.mark_root_repositories();
+            return Ok(Some(pom));
+        }
         self.base.resolve_parent(parent)
     }
 
@@ -134,10 +149,19 @@ impl rv_maven_model::ParentResolver for RepoParentResolver {
         // Merge declared `<repositories>` before the parent fetch runs. A
         // POM that hosts its own parent on a custom repo needs the repo
         // visible during inheritance, and post-resolution merging is too late.
+        if let Some(client) = self.base.fetcher.backend.ctx.client.as_ref() {
+            let root_repos: Vec<_> = repositories
+                .iter()
+                .filter(|repo| repo.root_declared)
+                .cloned()
+                .map(rv_repo::Repository::from)
+                .collect();
+            client.trust_root_repositories(&root_repos);
+        }
         let repos = repositories.iter().cloned().map(rv_repo::Repository::from);
         match self.trust {
             RepoTrust::Root => self.base.fetcher.backend.extend_repos_trusted(repos),
-            RepoTrust::Transitive => self.base.fetcher.backend.extend_repos(repos),
+            RepoTrust::Transitive => self.base.fetcher.backend.extend_repos(repos, None),
         }
     }
 }
@@ -155,7 +179,7 @@ mod tests {
 
     fn backend_with_default_policy() -> RepoBackend {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         let store_tmp = tempfile::tempdir().unwrap();
@@ -167,12 +191,104 @@ mod tests {
 
     fn declared_repo(id: &str, url: &str) -> rv_maven_model::Repository {
         rv_maven_model::Repository {
+            root_declared: false,
             id: Some(id.into()),
             url: url.into(),
             releases_enabled: true,
             snapshots_enabled: false,
             releases_update_policy: None,
             snapshots_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
+        }
+    }
+
+    /// Test redirect authority through model observation and HTTP client selection.
+    /// HTTP distinguishes authorized issuers rejected for transport from untrusted issuers,
+    /// without TLS fixtures or external network access.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_model_redirect_grants_follow_provenance() {
+        use rv_maven_model::{ActivationContext, Pom};
+        use rv_repo::{RedirectRejectionKind, RepoClient, RepoError, Repository};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for (trust, local_parent) in [
+            (RepoTrust::Root, false),
+            (RepoTrust::Root, true),
+            (RepoTrust::Transitive, false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let repo_url = format!("http://{}/repo/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 8192];
+                assert!(socket.read(&mut buffer).await.unwrap() > 0);
+                socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://storage.example/artifact\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            });
+            let paths = ResolvedPaths::from_raeva_home(tmp.path().join("raeva"));
+            let mut config =
+                Config::for_testing_with_repos(tmp.path().to_owned(), paths, Vec::new());
+            config.security.allow_transitive_repositories = true;
+            let client = RepoClient::new(&config).await.unwrap();
+            let store = Arc::new(Store::open(&tmp.path().join("store")).unwrap());
+            let ctx = ResolveContext::new(
+                config,
+                Vec::new(),
+                store,
+                Platform::new("linux", "x86_64").unwrap(),
+                Some(client.clone()),
+            );
+            // Starting URLs, including lockfile-derived URLs, must not grant
+            // redirect authority. Only model observation may grant it.
+            let repo = Repository::new(None, &repo_url, true, false);
+            let backend = RepoBackend::new(&ctx, vec![repo.clone()], false);
+            let declarations = format!(
+                r#"
+                <properties><registry>{repo_url}</registry></properties>
+                <profiles><profile><id>active</id><activation><activeByDefault>true</activeByDefault></activation>
+                <repositories><repository><id>root</id><url>${{registry}}</url><root_declared>true</root_declared></repository></repositories>
+                </profile></profiles>"#
+            );
+            let base = tmp.path().join("child");
+            std::fs::create_dir(&base).unwrap();
+            let xml = if local_parent {
+                std::fs::write(tmp.path().join("pom.xml"), format!("<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>{declarations}</project>")).unwrap();
+                "<project><parent><groupId>g</groupId><artifactId>parent</artifactId><version>1</version></parent><artifactId>child</artifactId></project>".to_string()
+            } else {
+                format!(
+                    "<project><groupId>g</groupId><artifactId>child</artifactId><version>1</version>{declarations}</project>"
+                )
+            };
+            let resolver = RepoParentResolver::with_strict_and_trust(
+                backend,
+                Some(base),
+                Some(tmp.path().to_owned()),
+                true,
+                trust,
+            );
+            super::super::backend::build_project_off_task(
+                Pom::parse(&xml).unwrap(),
+                resolver,
+                ActivationContext::default(),
+            )
+            .await
+            .unwrap();
+            let error = client
+                .fetch_metadata(&repo, &"g:artifact:1".parse().unwrap())
+                .await
+                .unwrap_err();
+            let expected = if trust == RepoTrust::Root {
+                RedirectRejectionKind::InsecureOrigin
+            } else {
+                RedirectRejectionKind::OriginNotConfigured
+            };
+            assert!(
+                matches!(error, RepoError::RedirectRejected { kind, .. } if kind == expected),
+                "{trust:?}, local_parent={local_parent}: {error}"
+            );
+            server.await.unwrap();
         }
     }
 
@@ -246,7 +362,7 @@ mod tests {
     #[test]
     fn observe_with_trust_transitive_merges_when_policy_opens() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let mut config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         config.security.allow_transitive_repositories = true;

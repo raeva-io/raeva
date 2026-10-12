@@ -121,7 +121,33 @@ impl Graph {
     }
 
     pub fn add_edge(&mut self, from: NodeIndex, to: NodeIndex, edge: Edge) -> EdgeIndex {
+        // Requeues and repeated paths must not multiply a declaration's edge.
+        if let Some(existing) = self
+            .graph
+            .edges_connecting(from, to)
+            .find(|e| e.weight() == &edge)
+        {
+            return existing.id();
+        }
         self.graph.add_edge(from, to, edge)
+    }
+
+    pub(crate) fn remove_edge(&mut self, from: NodeIndex, to: NodeIndex, edge: &Edge) -> bool {
+        let existing = self
+            .graph
+            .edges_connecting(from, to)
+            .find(|e| e.weight() == edge)
+            .map(|e| e.id());
+        if let Some(existing) = existing {
+            self.graph.remove_edge(existing);
+        }
+        if self.graph.edges_directed(to, Incoming).next().is_none() && to != self.root {
+            if let Some(node) = self.graph.node_weight(to) {
+                self.index.shift_remove(&CoordKey::from(&node.coord));
+            }
+            return true;
+        }
+        false
     }
 
     /// Replace the resolved version on `node_idx` in place and tear down the
@@ -265,6 +291,18 @@ mod tests {
             exclusions: Vec::new(),
             requested: None,
         }
+    }
+
+    #[test]
+    fn repeated_edge_insertion_is_idempotent_but_preserves_metadata() {
+        let mut graph = Graph::new(node("test:root:1"));
+        let child = graph.insert_node(node("test:child:1"));
+        let first = graph.add_edge(graph.root(), child, edge());
+        assert_eq!(graph.add_edge(graph.root(), child, edge()), first);
+        let mut optional = edge();
+        optional.optional = true;
+        graph.add_edge(graph.root(), child, optional);
+        assert_eq!(graph.edge_indices().count(), 2);
     }
 
     #[test]

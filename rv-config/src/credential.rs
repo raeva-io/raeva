@@ -267,6 +267,16 @@ pub trait CredentialStore: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KeyringCredentialStore;
 
+/// keyring initializes its process-wide backend on first use without
+/// ordering concurrent callers, so every keyring operation runs under one lock.
+static KEYRING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn keyring_guard() -> std::sync::MutexGuard<'static, ()> {
+    KEYRING_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl KeyringCredentialStore {
     fn entry(endpoint: &NormalizedEndpoint) -> Result<keyring::Entry, CredentialError> {
         keyring::Entry::new(KEYRING_SERVICE, endpoint.as_str()).map_err(map_keyring_error)
@@ -278,6 +288,7 @@ impl CredentialStore for KeyringCredentialStore {
         &self,
         endpoint: &NormalizedEndpoint,
     ) -> Result<Option<CredentialRecord>, CredentialError> {
+        let _guard = keyring_guard();
         let entry = Self::entry(endpoint)?;
         let serialized = match entry.get_password() {
             Ok(serialized) => serialized,
@@ -307,12 +318,14 @@ impl CredentialStore for KeyringCredentialStore {
         let serialized = serde_json::to_string(record).map_err(|err| {
             CredentialError::CorruptRecord(format!("could not serialize credential record: {err}"))
         })?;
+        let _guard = keyring_guard();
         Self::entry(endpoint)?
             .set_password(&serialized)
             .map_err(map_keyring_error)
     }
 
     fn delete(&self, endpoint: &NormalizedEndpoint) -> Result<bool, CredentialError> {
+        let _guard = keyring_guard();
         let entry = Self::entry(endpoint)?;
         match entry.delete_credential() {
             Ok(()) => Ok(true),

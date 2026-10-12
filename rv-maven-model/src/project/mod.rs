@@ -9,11 +9,11 @@ mod bom;
 mod dep_management;
 pub(crate) mod profiles;
 mod relocation;
-mod repositories;
+pub(crate) mod repositories;
 
 use crate::activation::evaluate_profiles;
 use crate::dependency::{Dependency, DependencyManagement};
-use crate::inheritance::{ParentResolver, apply_inheritance};
+use crate::inheritance::{ParentResolver, apply_inheritance_in_context, merge_dependency_levels};
 use crate::properties::{ParentInfo, ProjectInfo, PropertyMap};
 use crate::repository::Repository;
 use crate::{ActivationContext, Pom, PomError, Profile, Relocation, Scope};
@@ -63,17 +63,19 @@ impl Project {
         resolver: impl ParentResolver,
         ctx: &ActivationContext,
     ) -> Result<Self, PomError> {
+        let mut pom = pom;
+        if resolver.is_root_model() {
+            pom.mark_root_repositories();
+        }
         // Step 0: Surface the POM's own <repositories> to the resolver before
         // we fetch the parent. A POM that declares a custom repository to
         // host its own parent would otherwise fail: the parent fetch runs
         // first, against the not-yet-extended repository list. The hook is
         // a no-op for resolvers that do not implement it.
-        if !pom.repositories.is_empty() {
-            resolver.observe_project_repositories(&pom.repositories);
-        }
+        crate::inheritance::observe_lineage_repositories(&resolver, &pom, Some(ctx))?;
 
         // Step 1: Resolve full parent chain (inheritance merges parent properties)
-        let pom = apply_inheritance(pom, &resolver)?;
+        let pom = apply_inheritance_in_context(pom, &resolver, Some(ctx))?;
         let project_info = project_info_from_pom(&pom, ctx)?;
         let raw_relocation = pom
             .distribution_management
@@ -117,6 +119,21 @@ impl Project {
         };
         let relocation = resolve_relocation(raw_relocation, &effective_properties, &project_info)?;
 
+        // Expose interpolated POM and active-profile repositories before importing BOMs.
+        // A BOM may exist only in a parent-declared repository whose URL uses properties.
+        let combined_repositories = {
+            let mut repos = pom.repositories;
+            for profile in &active_profiles {
+                repos.extend_from_slice(&profile.repositories);
+            }
+            repos
+        };
+        let repositories =
+            resolve_repositories(combined_repositories, &effective_properties, &project_info)?;
+        if !repositories.is_empty() {
+            resolver.observe_project_repositories(&repositories);
+        }
+
         // Step 4: Resolve BOM imports with complete effective properties.
         // Use fixed-point import resolution so imports that become resolvable
         // after earlier imports contribute properties are retried.
@@ -155,14 +172,24 @@ impl Project {
             mgmt
         };
 
-        // Combine dependencies from POM and active profiles
-        // Move pom.dependencies since we own it
+        // Maven injects active profiles before inheritance, preserving each POM's position.
+        // A profile's `origin_level` indexes its POM in `lineage_dependencies`.
         let combined_dependencies = {
-            let mut deps = pom.dependencies;
-            for profile in &active_profiles {
-                deps.extend_from_slice(&profile.dependencies);
-            }
-            deps
+            let levels: Vec<Vec<Dependency>> = pom
+                .lineage_dependencies
+                .iter()
+                .enumerate()
+                .map(|(level, own)| {
+                    let mut deps = own.clone();
+                    for profile in &active_profiles {
+                        if usize::try_from(profile.origin_level).is_ok_and(|l| l == level) {
+                            deps.extend_from_slice(&profile.dependencies);
+                        }
+                    }
+                    deps
+                })
+                .collect();
+            merge_dependency_levels(&levels)
         };
 
         let dependencies = resolve_dependencies(
@@ -172,18 +199,6 @@ impl Project {
             &project_info,
         )?;
 
-        // Combine repositories from POM and active profiles
-        // Move pom.repositories since we own it
-        let combined_repositories = {
-            let mut repos = pom.repositories;
-            for profile in &active_profiles {
-                repos.extend_from_slice(&profile.repositories);
-            }
-            repos
-        };
-
-        let repositories =
-            resolve_repositories(combined_repositories, &effective_properties, &project_info)?;
         // Aggregation is never inherited. `apply_inheritance` already limits
         // base modules to the current raw POM. Only active profiles
         // originating in that same POM may add modules here.

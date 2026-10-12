@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser, Subcommand};
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::filter::{FilterExt, LevelFilter, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
@@ -169,10 +169,13 @@ fn init_tracing(verbosity: u8, json_mode: bool) {
     });
 
     // Pin tracing output to stderr to keep stdout reserved for command results.
+    // `output::flush_warning_summary` prints collected `sec_code` events.
+    // Printing them here would duplicate each warning.
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
+        .with_ansi(crate::output::stderr_supports_color())
         .with_writer(std::io::stderr)
-        .with_filter(filter);
+        .with_filter(filter.and(filter_fn(|meta| meta.fields().field("sec_code").is_none())));
 
     // Carries its own WARN filter so `sec_code` events still reach the
     // JSON envelope when the fmt layer is set to `off` in `--json` mode.

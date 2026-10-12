@@ -301,6 +301,9 @@ mod tests {
             releases: None,
             snapshots: None,
             snapshots_update_policy: None,
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         }
     }
 

@@ -127,10 +127,10 @@ impl Scope {
     /// Returns the scope to use when traversing a child dependency using full Maven
     /// transitivity rules, or `None` when the child should not be traversed.
     ///
-    /// This differs from [`transitive_from`] in one way: when `parent = Compile` and
+    /// This differs from [`Self::transitive_from`] in one way: when `parent = Compile` and
     /// `child = Test`, Maven propagates with scope `Test` (so that compile-scoped
     /// children of a test dependency appear on the test classpath). The simplified
-    /// [`transitive_from`] skips test-scoped children entirely.
+    /// [`Self::transitive_from`] skips test-scoped children entirely.
     ///
     /// Use this variant when processing `pom.xml` sources where full Maven
     /// compatibility is required.

@@ -7,100 +7,19 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::Once;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use hex::ToHex;
+use rv_test_support::http::{Request, Response, StubServer};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 fn ensure_crypto_provider() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
-}
-
-async fn spawn_stub<F>(handler: F, expected_requests: u32) -> std::net::SocketAddr
-where
-    F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
-{
-    spawn_stub_counted(handler, expected_requests).await.0
-}
-
-/// `spawn_stub` plus a counter of accepted connections, for tests that must
-/// prove the origin was *never* contacted. The count is bumped on accept
-/// rather than after the response so a connection the client opens and drops
-/// still registers as a hit.
-async fn spawn_stub_counted<F>(
-    handler: F,
-    expected_requests: u32,
-) -> (std::net::SocketAddr, Arc<AtomicU32>)
-where
-    F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let handler = Arc::new(handler);
-    let served = Arc::new(AtomicU32::new(0));
-    let hits = Arc::new(AtomicU32::new(0));
-    let hits_out = hits.clone();
-    tokio::spawn(async move {
-        while served.load(Ordering::SeqCst) < expected_requests {
-            let (mut sock, _) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(_) => break,
-            };
-            hits.fetch_add(1, Ordering::SeqCst);
-            let handler = handler.clone();
-            let served = served.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let mut total = Vec::new();
-                loop {
-                    let n = match sock.read(&mut buf).await {
-                        Ok(n) => n,
-                        Err(_) => return,
-                    };
-                    if n == 0 {
-                        return;
-                    }
-                    total.extend_from_slice(&buf[..n]);
-                    if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-                let request_line = std::str::from_utf8(&total)
-                    .ok()
-                    .and_then(|s| s.lines().next())
-                    .unwrap_or("")
-                    .to_string();
-                let response = handler(&request_line);
-                let _ = sock.write_all(&response).await;
-                let _ = sock.shutdown().await;
-                served.fetch_add(1, Ordering::SeqCst);
-            });
-        }
-    });
-    (addr, hits_out)
-}
-
-fn http_ok(body: &[u8]) -> Vec<u8> {
-    let mut resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    resp.extend_from_slice(body);
-    resp
-}
-
-fn http_404() -> Vec<u8> {
-    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
 }
 
 fn write_project_sha1(project: &Path, repo_url: &str, sha1: &str) {
@@ -214,21 +133,18 @@ async fn lock_verify_download_indexes_artifact() {
 
     let body_clone = artifact_body.to_vec();
     let sha256_clone = sha256_hex.clone();
-    let addr = spawn_stub(
-        move |request_line| {
-            if request_line.contains(".sha256") {
-                http_ok(sha256_clone.as_bytes())
-            } else if request_line.contains(".sha1") || request_line.contains(".md5") {
-                http_404()
-            } else if request_line.contains(".jar") {
-                http_ok(&body_clone)
-            } else {
-                http_404()
-            }
-        },
-        32,
-    )
-    .await;
+    let server = StubServer::start(move |request| {
+        if request.path.contains(".sha256") {
+            Response::new(200, sha256_clone.as_bytes())
+        } else if request.path.contains(".sha1") || request.path.contains(".md5") {
+            Response::new(404, "")
+        } else if request.path.contains(".jar") {
+            Response::new(200, body_clone.clone())
+        } else {
+            Response::new(404, "")
+        }
+    });
+    let addr = server.addr();
 
     let project = tempdir().expect("temp project");
     let home = tempdir().expect("temp raeva home");
@@ -312,14 +228,17 @@ async fn run_rv(project: &Path, home: &Path, args: &[&str]) -> std::process::Out
 }
 
 /// Serve a jar plus a matching `.sha256` sidecar; 404 everything else.
-fn jar_routes(body: Vec<u8>, sha256: String) -> impl Fn(&str) -> Vec<u8> + Send + Sync + 'static {
-    move |request_line: &str| {
-        if request_line.contains(".sha256") {
-            http_ok(sha256.as_bytes())
-        } else if request_line.contains(".jar") {
-            http_ok(&body)
+fn jar_routes(
+    body: Vec<u8>,
+    sha256: String,
+) -> impl Fn(&Request) -> Response + Send + Sync + 'static {
+    move |request: &Request| {
+        if request.path.contains(".sha256") {
+            Response::new(200, sha256.as_bytes())
+        } else if request.path.contains(".jar") {
+            Response::new(200, body.clone())
         } else {
-            http_404()
+            Response::new(404, "")
         }
     }
 }
@@ -340,11 +259,8 @@ async fn lock_verify_download_refuses_untrusted_lockfile_origin() {
     let attacker_body: &[u8] = b"attacker-controlled-jar-bytes";
     let attacker_sha256: String = Sha256::digest(attacker_body).encode_hex();
 
-    let (addr, hits) = spawn_stub_counted(
-        jar_routes(attacker_body.to_vec(), attacker_sha256.clone()),
-        32,
-    )
-    .await;
+    let server = StubServer::start(jar_routes(attacker_body.to_vec(), attacker_sha256.clone()));
+    let addr = server.addr();
 
     let project = tempdir().expect("temp project");
     let home = tempdir().expect("temp raeva home");
@@ -393,7 +309,7 @@ async fn lock_verify_download_refuses_untrusted_lockfile_origin() {
 
     // The load-bearing assertion: the attacker origin was never contacted.
     assert_eq!(
-        hits.load(Ordering::SeqCst),
+        server.connections(),
         0,
         "verify must not open a connection to an origin outside the trust roots"
     );
@@ -435,8 +351,8 @@ async fn lock_verify_download_leaves_index_alone_when_the_pin_fails() {
     // What the lockfile pins: something else entirely.
     let pinned_sha256: String = Sha256::digest(b"the-bytes-the-lockfile-pins").encode_hex();
 
-    let (addr, hits) =
-        spawn_stub_counted(jar_routes(served_body.to_vec(), served_sha256.clone()), 32).await;
+    let server = StubServer::start(jar_routes(served_body.to_vec(), served_sha256.clone()));
+    let addr = server.addr();
 
     let project = tempdir().expect("temp project");
     let home = tempdir().expect("temp raeva home");
@@ -490,7 +406,7 @@ async fn lock_verify_download_leaves_index_alone_when_the_pin_fails() {
     // The origin really was contacted: this test exercises the pin gate, not
     // the trust gate.
     assert!(
-        hits.load(Ordering::SeqCst) > 0,
+        server.connections() > 0,
         "the configured origin should have been fetched from"
     );
 

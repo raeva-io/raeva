@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::stream::{self, StreamExt};
 use rv_config::{
-    ArtifactKey, BlobId, Checksum, Config, LockPackage, Lockfile, Platform,
-    normalize_checksum_algorithm,
+    ArtifactKey, BlobId, Checksum, ChecksumPin, ChecksumPinError, Config, LockPackage, Lockfile,
+    Platform,
 };
 
 use rv_store::Store;
@@ -29,18 +29,6 @@ use crate::repository::{Repository, normalize_repo_url};
 /// `OnceCell::get_or_try_init` provides the actual cross-task rendezvous and
 /// is the only place an `.await` happens with respect to a cell.
 type FetchDedupMap = Arc<Mutex<HashMap<ArtifactKey, Arc<OnceCell<BlobId>>>>>;
-
-/// Parsed lockfile pin for a single package, used to enforce integrity at
-/// sync time independently of the repo's sidecar checksum policy.
-#[derive(Debug, Clone)]
-enum LockPin {
-    /// SHA-256 hex digest. Maps directly to a `BlobId`, so a hit can be
-    /// confirmed by a cheap identity check without re-hashing.
-    Sha256(BlobId),
-    /// SHA-1 hex digest. The store is SHA-256 keyed, so verification
-    /// requires re-hashing the on-disk blob with SHA-1.
-    Sha1(String),
-}
 
 /// What a disagreement between the store's coordinate index and a SHA-256 pin
 /// means for the key being checked.
@@ -71,54 +59,31 @@ fn pom_pin_key(package: &LockPackage) -> (String, String, String) {
     )
 }
 
-impl LockPin {
-    fn from_checksum(checksum: &Checksum, coord: &str) -> Result<Self> {
-        // `Lockfile::read` already rewrites the algorithm to a canonical
-        // spelling and rejects unknown algorithms. We defensively re-check
-        // here so callers that hand-build a `LockPackage` (tests, in-memory
-        // resolution) still get a clear error rather than silently dropping
-        // the pin.
-        let canonical = normalize_checksum_algorithm(&checksum.algorithm).ok_or_else(|| {
-            RepoError::UnsupportedChecksum(format!(
-                "{} for {coord} (supported: sha256, sha1)",
-                checksum.algorithm
-            ))
-        })?;
-        match canonical {
-            "sha256" => Ok(LockPin::Sha256(
-                BlobId::from_str(&checksum.digest)
-                    .map_err(|e| RepoError::InvalidMetadata(e.to_string()))?,
-            )),
-            "sha1" => {
-                let digest = checksum.digest.trim().to_ascii_lowercase();
-                if digest.len() != 40 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
-                    return Err(RepoError::InvalidMetadata(format!(
-                        "sha1 digest for {coord} must be 40 hex chars, got {:?}",
-                        checksum.digest
-                    )));
-                }
-                Ok(LockPin::Sha1(digest))
-            }
-            // `normalize_checksum_algorithm` only returns the two canonical
-            // forms above, so this arm is unreachable in practice.
-            other => Err(RepoError::UnsupportedChecksum(other.to_string())),
-        }
-    }
-
-    fn expected_blob_id(&self) -> Option<&BlobId> {
-        match self {
-            LockPin::Sha256(id) => Some(id),
-            LockPin::Sha1(_) => None,
-        }
-    }
+fn lock_pin(checksum: &Checksum, coord: &str) -> Result<ChecksumPin> {
+    ChecksumPin::parse(checksum).map_err(|err| match err {
+        ChecksumPinError::UnsupportedAlgorithm => RepoError::UnsupportedChecksum(format!(
+            "{} for {coord} (supported: sha256, sha1)",
+            checksum.algorithm
+        )),
+        ChecksumPinError::InvalidSha256Digest(message) => RepoError::InvalidMetadata(message),
+        ChecksumPinError::InvalidSha1Digest => RepoError::InvalidMetadata(format!(
+            "sha1 digest for {coord} must be 40 hex chars, got {:?}",
+            checksum.digest
+        )),
+    })
 }
 
 /// Re-hash the on-disk blob against the lockfile pin to catch local tampering
 /// or bit rot (an index-only check would miss both).
-fn verify_blob_against_pin(store: &Store, blob: &BlobId, pin: &LockPin, coord: &str) -> Result<()> {
+fn verify_blob_against_pin(
+    store: &Store,
+    blob: &BlobId,
+    pin: &ChecksumPin,
+    coord: &str,
+) -> Result<()> {
     let path = store.get_path(blob);
     match pin {
-        LockPin::Sha256(expected) => {
+        ChecksumPin::Sha256(expected) => {
             // Re-hash so we surface on-disk corruption, not just an index
             // disagreement. `BlobId::from_file` is SHA-256.
             let actual = BlobId::from_file(&path).map_err(RepoError::Io)?;
@@ -132,7 +97,7 @@ fn verify_blob_against_pin(store: &Store, blob: &BlobId, pin: &LockPin, coord: &
                 })
             }
         }
-        LockPin::Sha1(expected) => {
+        ChecksumPin::Sha1(expected) => {
             let actual = crate::fetch::sha1_hex_file(&path)?;
             if &actual == expected {
                 Ok(())
@@ -354,7 +319,7 @@ async fn ensure_package_artifacts(
         .ok_or_else(|| RepoError::MissingChecksum(key.to_string()))?;
 
     let coord = key.to_string();
-    let pin = LockPin::from_checksum(checksum, &coord)?;
+    let pin = lock_pin(checksum, &coord)?;
     let mut origin = PackageOrigin::new(config, package, trusted_repositories);
 
     if needs_download(store, &key, &pin, &coord, IndexDisagreement::Fatal).await? {
@@ -396,7 +361,7 @@ async fn ensure_package_artifacts(
         // verify against the pin and, if the store no longer holds those
         // bytes, re-fetch and verify what comes back rather than accepting
         // whatever the index currently names.
-        let pom_pin = LockPin::Sha256(expected.clone());
+        let pom_pin = ChecksumPin::Sha256(expected.clone());
         let pom_coord = pom_key.to_string();
         if needs_download(
             store,
@@ -581,7 +546,7 @@ async fn read_parent_coord_from_store(
 async fn needs_download(
     store: &Store,
     key: &ArtifactKey,
-    pin: &LockPin,
+    pin: &ChecksumPin,
     coord: &str,
     on_index_disagreement: IndexDisagreement,
 ) -> Result<bool> {
@@ -651,7 +616,7 @@ async fn adopt_pinned_blob(
     store: &Store,
     key: &ArtifactKey,
     expected: &BlobId,
-    pin: &LockPin,
+    pin: &ChecksumPin,
     coord: &str,
 ) -> Result<bool> {
     if !store.exists_async(expected).await {
@@ -697,7 +662,7 @@ enum BlobCheck {
 async fn verify_pin_repairing_corruption(
     store: &Store,
     blob: &BlobId,
-    pin: &LockPin,
+    pin: &ChecksumPin,
     coord: &str,
 ) -> Result<BlobCheck> {
     let store = store.clone();
@@ -751,7 +716,7 @@ async fn verify_pin_repairing_corruption(
 async fn verify_blob_against_pin_offload(
     store: &Store,
     blob: &BlobId,
-    pin: &LockPin,
+    pin: &ChecksumPin,
     coord: &str,
 ) -> Result<()> {
     let store = store.clone();
@@ -855,6 +820,39 @@ mod tests {
         ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None)
     }
 
+    #[test]
+    fn lock_pin_preserves_unsupported_algorithm_error() {
+        let checksum = Checksum::new(" MD5 ", "abc123");
+        let err = lock_pin(&checksum, "g:a:1:jar").unwrap_err();
+        let message = " MD5  for g:a:1:jar (supported: sha256, sha1)";
+        assert!(matches!(&err, RepoError::UnsupportedChecksum(actual) if actual == message));
+        assert_eq!(
+            err.to_string(),
+            format!("unsupported checksum type: {message}")
+        );
+    }
+
+    #[test]
+    fn lock_pin_preserves_sha256_errors() {
+        for (digest, message) in [
+            ("abc".to_string(), "invalid blob id length"),
+            ("g".repeat(64), "invalid blob id characters"),
+        ] {
+            let err = lock_pin(&Checksum::new("sha256", digest), "g:a:1:jar").unwrap_err();
+            assert!(matches!(&err, RepoError::InvalidMetadata(actual) if actual == message));
+            assert_eq!(err.to_string(), format!("invalid metadata: {message}"));
+        }
+    }
+
+    #[test]
+    fn lock_pin_preserves_sha1_error() {
+        let checksum = Checksum::new("sha1", " AB\"G\n ");
+        let err = lock_pin(&checksum, "g:a:1:jar").unwrap_err();
+        let message = "sha1 digest for g:a:1:jar must be 40 hex chars, got \" AB\\\"G\\n \"";
+        assert!(matches!(&err, RepoError::InvalidMetadata(actual) if actual == message));
+        assert_eq!(err.to_string(), format!("invalid metadata: {message}"));
+    }
+
     /// The parent-chain walk reads a persisted POM blob and extracts its
     /// `<parent>` coordinate so the ancestor can be fetched and exported.
     #[tokio::test]
@@ -918,7 +916,7 @@ mod tests {
         std::fs::set_permissions(&blob_path, perms).unwrap();
         std::fs::write(&blob_path, b"tampered-bytes").unwrap();
 
-        let pin = LockPin::Sha256(good_id.clone());
+        let pin = ChecksumPin::Sha256(good_id.clone());
         let coord = key.to_string();
 
         let needs = needs_download(&store, &key, &pin, &coord, IndexDisagreement::Fatal)
@@ -946,7 +944,7 @@ mod tests {
         let id = store.put_bytes(&payload).await.unwrap();
         store.add_artifact(&key, &id).await.unwrap();
 
-        let pin = LockPin::Sha256(id.clone());
+        let pin = ChecksumPin::Sha256(id.clone());
         let needs = needs_download(
             &store,
             &key,
@@ -979,7 +977,7 @@ mod tests {
         // payload. `Checksum` constructed via lockfile-canonical algorithm.
         let bogus_checksum = Checksum::new("sha1", "0".repeat(40));
         let coord = key.to_string();
-        let pin = LockPin::from_checksum(&bogus_checksum, &coord).unwrap();
+        let pin = lock_pin(&bogus_checksum, &coord).unwrap();
 
         let err = verify_blob_against_pin(&store, &blob, &pin, &coord).unwrap_err();
         match err {
@@ -1014,7 +1012,7 @@ mod tests {
         // A wrong SHA-1 pin for this coordinate (e.g. a stale lockfile entry).
         let bogus = Checksum::new("sha1", "0".repeat(40));
         let coord = key.to_string();
-        let pin = LockPin::from_checksum(&bogus, &coord).unwrap();
+        let pin = lock_pin(&bogus, &coord).unwrap();
 
         let needs = needs_download(&store, &key, &pin, &coord, IndexDisagreement::Fatal)
             .await
@@ -1042,7 +1040,7 @@ mod tests {
         let correct = sha1_hex(&payload);
         // The canonical spelling already comes out of `Lockfile::read`.
         let cs = Checksum::new("sha1", correct);
-        let pin = LockPin::from_checksum(&cs, &key.to_string()).unwrap();
+        let pin = lock_pin(&cs, &key.to_string()).unwrap();
         verify_blob_against_pin(&store, &blob, &pin, &key.to_string()).expect("ok");
     }
 
@@ -1087,7 +1085,7 @@ mod tests {
                 payload[..4].copy_from_slice(&i.to_le_bytes());
                 let id = store.put_bytes(&payload).await.unwrap();
                 store.add_artifact(&key, &id).await.unwrap();
-                let pin = LockPin::Sha256(id);
+                let pin = ChecksumPin::Sha256(id);
                 keys_and_pins.push((key, pin));
             }
 
@@ -1141,7 +1139,7 @@ mod tests {
         use rv_config::{ResolvedPaths, UpdatePolicy};
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         // Only `central` is configured.
         let central = rv_config::RepoConfig {
             id: Some("central".to_string()),
@@ -1149,6 +1147,9 @@ mod tests {
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: Some(UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
         let config = rv_config::Config::for_testing_with_repos(
             temp.path().to_path_buf(),
@@ -1188,13 +1189,16 @@ mod tests {
         use rv_config::{ResolvedPaths, UpdatePolicy};
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let central = rv_config::RepoConfig {
             id: Some("central".to_string()),
             url: "https://repo1.maven.org/maven2/".to_string(),
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: Some(UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
         let config = rv_config::Config::for_testing_with_repos(
             temp.path().to_path_buf(),
@@ -1227,7 +1231,7 @@ mod tests {
         use rv_config::ResolvedPaths;
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             rv_config::Config::for_testing_with_repos(temp.path().to_path_buf(), paths, Vec::new());
         let package = LockPackage {
@@ -1257,7 +1261,7 @@ mod tests {
     }
 
     /// `Checksum.algorithm = "sha-256"` (dash form) parses through
-    /// `LockPin::from_checksum` and verifies identically to `"sha256"`.
+    /// `lock_pin` and verifies identically to `"sha256"`.
     #[tokio::test]
     async fn dashed_sha_256_pin_verifies_like_canonical() {
         let dir = tempdir().unwrap();
@@ -1272,8 +1276,7 @@ mod tests {
         // directly must still resolve to the same pin.
         let hex_digest = hex::encode(Sha256::digest(&payload));
         let cs = Checksum::new("sha-256", hex_digest);
-        let pin =
-            LockPin::from_checksum(&cs, &key.to_string()).expect("dash form must be accepted");
+        let pin = lock_pin(&cs, &key.to_string()).expect("dash form must be accepted");
         verify_blob_against_pin(&store, &blob, &pin, &key.to_string()).expect("verifies");
     }
 
@@ -1329,13 +1332,16 @@ mod tests {
         };
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let central = rv_config::RepoConfig {
             id: Some("central".to_string()),
             url: "https://repo1.maven.org/maven2/".to_string(),
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: Some(UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
         let config = rv_config::Config::for_testing_with_repos(
             temp.path().to_path_buf(),
@@ -1399,13 +1405,16 @@ mod tests {
         use rv_config::{ResolvedPaths, UpdatePolicy};
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let central = rv_config::RepoConfig {
             id: Some("central".to_string()),
             url: "https://repo1.maven.org/maven2/".to_string(),
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: Some(UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
         let config = rv_config::Config::for_testing_with_repos(
             temp.path().to_path_buf(),
@@ -1489,16 +1498,21 @@ mod tests {
     async fn offline_only_config(root: &std::path::Path) -> (rv_config::Config, RepoClient) {
         use rv_config::{ResolvedPaths, UpdatePolicy};
 
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let repo = rv_config::RepoConfig {
             id: Some("fixture".to_string()),
             url: "https://unreachable.invalid/maven2/".to_string(),
             releases: Some(true),
             snapshots: Some(true),
             snapshots_update_policy: Some(UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
-        let config =
+        let mut config =
             rv_config::Config::for_testing_with_repos(root.to_path_buf(), paths, vec![repo]);
+        // The failure is the point; retrying it only adds backoff.
+        config.network.retries = 0;
         let client = RepoClient::new(&config).await.expect("client");
         (config, client)
     }

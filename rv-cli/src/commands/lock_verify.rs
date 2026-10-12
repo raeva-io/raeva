@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -9,8 +8,8 @@ use clap::{Args, Subcommand};
 use futures::stream::{self, StreamExt};
 
 use rv_config::{
-    Checksum, Config, LOCKFILE_SCHEMA_VERSION, LockCoordinate, LockPackage, Lockfile,
-    normalize_checksum_algorithm,
+    Checksum, ChecksumPin, ChecksumPinError, Config, LOCKFILE_SCHEMA_VERSION, LockCoordinate,
+    LockPackage, Lockfile,
 };
 use rv_repo::{ArtifactRequest, RepoClient, Repository, normalize_repo_url, sha1_hex_file};
 use rv_store::{ArtifactKey, BlobId, Store};
@@ -208,8 +207,8 @@ async fn verify_inner(args: &LockVerifyArgs, config: &Config) -> Result<()> {
                     // async index API; resolve the BlobId here, then let
                     // the blocking task focus on the hash pass.
                     let resolved_blob = match &target.expected {
-                        ExpectedPin::Sha256(id) => Some(id.clone()),
-                        ExpectedPin::Sha1(_) => store.lookup_artifact(&target.key).await?,
+                        ChecksumPin::Sha256(id) => Some(id.clone()),
+                        ChecksumPin::Sha1(_) => store.lookup_artifact(&target.key).await?,
                     };
                     let expected_for_task = target.expected.clone();
                     let status = tokio::task::spawn_blocking(move || {
@@ -681,14 +680,14 @@ async fn download_and_verify(
     // For SHA-1 we re-hash the persisted blob (the store is SHA-256 keyed,
     // so there is no shortcut).
     match &target.expected {
-        ExpectedPin::Sha256(expected) => {
+        ChecksumPin::Sha256(expected) => {
             if &blob != expected {
                 return Ok(DownloadOutcome::PinMismatch {
                     actual: blob.as_str().to_string(),
                 });
             }
         }
-        ExpectedPin::Sha1(expected) => {
+        ChecksumPin::Sha1(expected) => {
             let path = store.get_path(&blob);
             let expected = expected.clone();
             let actual = tokio::task::spawn_blocking(move || sha1_hex_file(&path))
@@ -729,7 +728,7 @@ struct ArtifactReachability {
 struct PreparedTarget {
     package: LockPackage,
     key: ArtifactKey,
-    expected: ExpectedPin,
+    expected: ChecksumPin,
     modules: Vec<String>,
 }
 
@@ -826,63 +825,28 @@ fn unpinned_targets_json(targets: &[UnpinnedTarget]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Parsed lockfile pin for a single package.
-///
-/// The lockfile parser canonicalises both `sha256` and `sha1` (see
-/// `rv_config::normalize_checksum_algorithm`). By default `rv sync` falls
-/// back to verifying the SHA-1 sidecar when a repository only publishes
-/// SHA-1 (emitting the WEAK_HASH_FALLBACK warning), so it can write SHA-1
-/// pins. Verify and the downstream consumers must accept the same set or
-/// they reject lockfiles the sync path happily produced.
-#[derive(Debug, Clone)]
-enum ExpectedPin {
-    /// Maps directly to a `BlobId`, so the store CAS path is a cheap
-    /// identity check (no second hash pass needed).
-    Sha256(BlobId),
-    /// 40-char lowercase hex SHA-1 digest. The store is SHA-256 keyed,
-    /// so verification requires re-hashing the on-disk blob with SHA-1.
-    Sha1(String),
-}
-
-fn expected_pin(key: &ArtifactKey, checksum: &Checksum) -> Result<ExpectedPin> {
-    let canonical = normalize_checksum_algorithm(&checksum.algorithm).ok_or_else(|| {
-        CliError::LockfileMismatch {
+fn expected_pin(key: &ArtifactKey, checksum: &Checksum) -> Result<ChecksumPin> {
+    ChecksumPin::parse(checksum).map_err(|err| match err {
+        ChecksumPinError::UnsupportedAlgorithm => CliError::LockfileMismatch {
             details: format!("unsupported checksum {} for {key}", checksum.algorithm),
-        }
-    })?;
-    match canonical {
-        "sha256" => {
-            let id =
-                BlobId::from_str(&checksum.digest).map_err(|e| CliError::Message(e.to_string()))?;
-            Ok(ExpectedPin::Sha256(id))
-        }
-        "sha1" => {
-            let digest = checksum.digest.trim().to_ascii_lowercase();
-            if digest.len() != 40 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(CliError::LockfileMismatch {
-                    details: format!(
-                        "sha1 digest for {key} must be 40 hex chars, got {:?}",
-                        checksum.digest
-                    ),
-                });
-            }
-            Ok(ExpectedPin::Sha1(digest))
-        }
-        // `normalize_checksum_algorithm` only returns the two canonical
-        // spellings above, so this arm is unreachable in practice.
-        other => Err(CliError::LockfileMismatch {
-            details: format!("unsupported checksum {other} for {key}"),
-        }),
-    }
+        },
+        ChecksumPinError::InvalidSha256Digest(message) => CliError::Message(message),
+        ChecksumPinError::InvalidSha1Digest => CliError::LockfileMismatch {
+            details: format!(
+                "sha1 digest for {key} must be 40 hex chars, got {:?}",
+                checksum.digest
+            ),
+        },
+    })
 }
 
 fn verify_pin(
     store: &Store,
     resolved_blob: Option<&BlobId>,
-    expected: &ExpectedPin,
+    expected: &ChecksumPin,
 ) -> Result<VerifyStatus> {
     match expected {
-        ExpectedPin::Sha256(expected) => {
+        ChecksumPin::Sha256(expected) => {
             let path = store.get_path(expected);
             if !path.is_file() {
                 return Ok(VerifyStatus::Missing);
@@ -895,7 +859,7 @@ fn verify_pin(
             }
             Ok(VerifyStatus::Ok)
         }
-        ExpectedPin::Sha1(expected) => {
+        ChecksumPin::Sha1(expected) => {
             // The store is SHA-256 keyed, so we cannot derive the BlobId
             // from a SHA-1 digest. The caller resolved the BlobId via the
             // artifact-key index; missing means the user has never synced
@@ -942,7 +906,7 @@ mod tests {
         let bytes = b"test content";
         let blob_id = store.put_bytes(bytes).await.expect("put bytes");
 
-        let status = verify_pin(&store, None, &ExpectedPin::Sha256(blob_id)).expect("verify");
+        let status = verify_pin(&store, None, &ChecksumPin::Sha256(blob_id)).expect("verify");
         assert!(matches!(status, VerifyStatus::Ok));
     }
 
@@ -952,7 +916,7 @@ mod tests {
         let store = Store::open(dir.path()).expect("open store");
         let missing_id = BlobId::from_bytes(b"nonexistent");
 
-        let status = verify_pin(&store, None, &ExpectedPin::Sha256(missing_id)).expect("verify");
+        let status = verify_pin(&store, None, &ChecksumPin::Sha256(missing_id)).expect("verify");
         assert!(matches!(status, VerifyStatus::Missing));
     }
 
@@ -978,7 +942,7 @@ mod tests {
         }
         std::fs::write(&path, b"corrupted").expect("corrupt file");
 
-        let status = verify_pin(&store, None, &ExpectedPin::Sha256(blob_id)).expect("verify");
+        let status = verify_pin(&store, None, &ChecksumPin::Sha256(blob_id)).expect("verify");
         assert!(matches!(status, VerifyStatus::Corrupt { .. }));
     }
 
@@ -998,7 +962,7 @@ mod tests {
         let sha1_hex = hex::encode(hasher.finalize());
 
         let status =
-            verify_pin(&store, Some(&blob_id), &ExpectedPin::Sha1(sha1_hex)).expect("verify");
+            verify_pin(&store, Some(&blob_id), &ChecksumPin::Sha1(sha1_hex)).expect("verify");
         assert!(matches!(status, VerifyStatus::Ok));
     }
 
@@ -1006,7 +970,7 @@ mod tests {
     async fn verify_pin_sha1_missing_when_not_indexed() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path()).expect("open store");
-        let status = verify_pin(&store, None, &ExpectedPin::Sha1("a".repeat(40))).expect("verify");
+        let status = verify_pin(&store, None, &ChecksumPin::Sha1("a".repeat(40))).expect("verify");
         assert!(matches!(status, VerifyStatus::Missing));
     }
 
@@ -1021,7 +985,7 @@ mod tests {
         // A 40-char hex digest that cannot match the real SHA-1.
         let bad_sha1 = "0".repeat(40);
         let status =
-            verify_pin(&store, Some(&blob_id), &ExpectedPin::Sha1(bad_sha1)).expect("verify");
+            verify_pin(&store, Some(&blob_id), &ChecksumPin::Sha1(bad_sha1)).expect("verify");
         assert!(matches!(status, VerifyStatus::Corrupt { .. }));
     }
 
@@ -1173,13 +1137,16 @@ mod tests {
 
     fn config_with_repo(url: &str) -> (TempDir, Config) {
         let temp = TempDir::new().expect("temp dir");
-        let paths = rv_config::ResolvedPaths::discover().expect("paths");
+        let paths = rv_config::ResolvedPaths::for_testing().expect("paths");
         let repo = rv_config::RepoConfig {
             id: Some("configured".to_string()),
             url: url.to_string(),
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: Some(rv_config::UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
         let config = Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![repo]);
         (temp, config)
@@ -1248,14 +1215,14 @@ mod tests {
         let checksum = rv_config::Checksum::new("sha256", digest);
         let result = expected_pin(&key, &checksum).expect("pin");
         match result {
-            ExpectedPin::Sha256(id) => assert_eq!(id.as_str(), digest),
+            ChecksumPin::Sha256(id) => assert_eq!(id.as_str(), digest),
             other => panic!("expected sha256, got {other:?}"),
         }
     }
 
     /// The lockfile parser and sync path both accept SHA-1 pins, so verify
     /// must accept them too: a 40-char hex SHA-1 digest must parse to
-    /// `ExpectedPin::Sha1`.
+    /// `ChecksumPin::Sha1`.
     #[test]
     fn expected_pin_parses_sha1() {
         let key = ArtifactKey::new("g", "a", "1", "jar", None);
@@ -1263,7 +1230,7 @@ mod tests {
         let checksum = rv_config::Checksum::new("sha1", digest);
         let result = expected_pin(&key, &checksum).expect("pin");
         match result {
-            ExpectedPin::Sha1(d) => assert_eq!(d, digest),
+            ChecksumPin::Sha1(d) => assert_eq!(d, digest),
             other => panic!("expected sha1, got {other:?}"),
         }
     }
@@ -1271,9 +1238,40 @@ mod tests {
     #[test]
     fn expected_pin_rejects_unsupported_algorithm() {
         let key = ArtifactKey::new("g", "a", "1", "jar", None);
-        let checksum = rv_config::Checksum::new("md5", "abc123");
+        let checksum = rv_config::Checksum::new(" MD5 ", "abc123");
         let err = expected_pin(&key, &checksum).expect_err("md5 must be rejected");
-        assert!(matches!(err, CliError::LockfileMismatch { .. }));
+        assert!(matches!(&err, CliError::LockfileMismatch { details }
+            if details == "unsupported checksum  MD5  for g:a:1:jar"));
+        assert_eq!(
+            err.to_string(),
+            "lockfile mismatch: unsupported checksum  MD5  for g:a:1:jar (run 'rv sync' to update)",
+        );
+    }
+
+    #[test]
+    fn expected_pin_preserves_sha256_errors() {
+        let key = ArtifactKey::new("g", "a", "1", "jar", None);
+        for (digest, message) in [
+            ("abc".to_string(), "invalid blob id length"),
+            ("g".repeat(64), "invalid blob id characters"),
+        ] {
+            let err = expected_pin(&key, &Checksum::new("sha256", digest)).unwrap_err();
+            assert!(matches!(&err, CliError::Message(actual) if actual == message));
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
+    #[test]
+    fn expected_pin_preserves_sha1_error() {
+        let key = ArtifactKey::new("g", "a", "1", "jar", None);
+        let checksum = Checksum::new("sha1", " AB\"G\n ");
+        let err = expected_pin(&key, &checksum).unwrap_err();
+        let message = "sha1 digest for g:a:1:jar must be 40 hex chars, got \" AB\\\"G\\n \"";
+        assert!(matches!(&err, CliError::LockfileMismatch { details } if details == message));
+        assert_eq!(
+            err.to_string(),
+            format!("lockfile mismatch: {message} (run 'rv sync' to update)"),
+        );
     }
 
     /// Regression for the verify fan-out: 50 small blobs all verify Ok when
@@ -1303,7 +1301,7 @@ mod tests {
                 let store = Arc::clone(&store_arc);
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        verify_pin(&store, None, &ExpectedPin::Sha256(id))
+                        verify_pin(&store, None, &ChecksumPin::Sha256(id))
                     })
                     .await
                     .map_err(|e| CliError::Message(format!("panic: {e}")))?

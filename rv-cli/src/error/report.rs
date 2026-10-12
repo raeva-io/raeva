@@ -1,6 +1,6 @@
 use rv_maven_model::PomError;
 use rv_repo::{RepoError, is_snapshot_version};
-use rv_resolver::{RepoSearchStatus, RepoStatus, ResolveError};
+use rv_resolver::{DroppedRepo, RepoSearchStatus, RepoStatus, ResolveError};
 use rv_store::StoreError;
 use std::fmt::Write;
 
@@ -50,9 +50,11 @@ pub(crate) fn render_resolve_error(err: &ResolveError) -> String {
     // `Display` rendering. Listing every variant forces the compiler to flag
     // future additions so they get an explicit decision here.
     match err {
-        ResolveError::ArtifactNotFound { coord, searched } => {
-            render_dependency_not_found(coord, searched)
-        }
+        ResolveError::ArtifactNotFound {
+            coord,
+            searched,
+            dropped_repos,
+        } => render_dependency_not_found(coord, searched, dropped_repos),
         ResolveError::NoRepositories => render_no_repositories(),
         ResolveError::VersionConflict {
             coord,
@@ -214,7 +216,107 @@ pub(crate) fn render_vuln_error(err: &rv_vuln::VulnError) -> String {
     }
 }
 
-fn render_dependency_not_found(coord: &str, searched: &[RepoSearchStatus]) -> String {
+/// Generate a short, unique repository ID for a `[[repositories]]` entry.
+fn suggested_repo_id(url: &str, used: &mut Vec<String>) -> String {
+    let parsed = url::Url::parse(url).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .unwrap_or("extra");
+    let base = match host {
+        "repo1.maven.org" => "central".to_string(),
+        "dl.google.com" => "google".to_string(),
+        _ => {
+            let last = parsed
+                .as_ref()
+                .and_then(|u| u.path_segments())
+                .and_then(|mut segments| segments.rfind(|s| !s.is_empty()))
+                .unwrap_or("");
+            let label = host.split('.').next().unwrap_or(host);
+            format!("{label}-{last}")
+        }
+    };
+    let base: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut id = base.clone();
+    let mut n = 2;
+    while used.contains(&id) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    used.push(id.clone());
+    id
+}
+
+/// Show how to enable ignored transitive repositories that could serve the artifact.
+///
+/// `[[repositories]]` replaces the defaults, so the snippet includes searched
+/// repositories. Only configured repositories may issue cross-origin redirects.
+/// The `[security]` allowlist permits transitive declarations without replacing
+/// the defaults, but does not grant redirect authority.
+fn append_dropped_repo_hint(
+    out: &mut String,
+    searched: &[RepoSearchStatus],
+    dropped: &[DroppedRepo],
+) {
+    if dropped.is_empty() {
+        return;
+    }
+    out.push_str(
+        "\n  Ignored transitive repositories: rv ignores dependency POM repositories by default.\n  \
+         Maven would search these for this artifact:\n",
+    );
+    let mut urls: Vec<&str> = Vec::new();
+    for repo in dropped {
+        let _ = writeln!(
+            out,
+            "    - {} (declared by {})",
+            redact_url(&repo.url),
+            repo.declared_by
+        );
+        if !urls.contains(&repo.url.as_str()) {
+            urls.push(&repo.url);
+        }
+    }
+    out.push_str(
+        "\n  To use one, add it to rv.toml. [[repositories]] replaces the built-in defaults, so\n  \
+         keep the repositories already searched:\n",
+    );
+    let mut seen: Vec<&str> = Vec::new();
+    let mut used_ids: Vec<String> = Vec::new();
+    for url in searched.iter().map(|s| s.repo_url.as_str()).chain(urls) {
+        if seen.contains(&url) {
+            continue;
+        }
+        seen.push(url);
+        let redacted = redact_url(url);
+        let _ = write!(
+            out,
+            "\n      [[repositories]]\n      id = \"{}\"\n      url = \"{redacted}\"\n",
+            suggested_repo_id(url, &mut used_ids)
+        );
+    }
+    out.push_str(
+        "\n  Keep only the entries you need. A settings.xml profile <repositories> also works.\n  \
+         [[repositories]] replaces the default repositories. To keep the defaults, add the\n  \
+         URL to [security] transitive_repository_allowlist in rv.toml instead. A repository\n  \
+         that redirects downloads to another host still needs a [[repositories]] entry.\n",
+    );
+}
+
+fn render_dependency_not_found(
+    coord: &str,
+    searched: &[RepoSearchStatus],
+    dropped_repos: &[DroppedRepo],
+) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Dependency not found: {coord}");
     if searched.is_empty() {
@@ -232,6 +334,7 @@ fn render_dependency_not_found(coord: &str, searched: &[RepoSearchStatus]) -> St
         );
     }
     append_searched_section(&mut out, Some(searched));
+    append_dropped_repo_hint(&mut out, searched, dropped_repos);
     out.push_str("\n  If this is an internal artifact, add the private repository to [[repositories]] in rv.toml or settings.xml.\n");
     out.push_str("\n  Suggestions:\n");
     out.push_str("    - Check if the coordinates are correct\n");
@@ -532,6 +635,7 @@ mod tests {
             status: RepoStatus::Http(404),
         }];
         let err = ResolveError::ArtifactNotFound {
+            dropped_repos: Vec::new(),
             coord: "com.example:lib:1.0".to_string(),
             searched,
         };
@@ -645,6 +749,7 @@ mod tests {
 
     fn artifact_not_found(coord: &str, searched: Vec<RepoSearchStatus>) -> ResolveError {
         ResolveError::ArtifactNotFound {
+            dropped_repos: Vec::new(),
             coord: coord.to_string(),
             searched,
         }
@@ -716,5 +821,40 @@ mod tests {
             "missing cap footer in: {rendered}"
         );
         assert!(!rendered.contains(&format!("g:a{}:1.0", total - 1)));
+    }
+
+    #[test]
+    fn dependency_not_found_names_dropped_repo_and_config() {
+        let err = ResolveError::ArtifactNotFound {
+            coord: "com.example:lib:1.0".to_string(),
+            searched: vec![RepoSearchStatus::new(
+                "https://repo1.maven.org/maven2/",
+                RepoStatus::Http(404),
+            )],
+            dropped_repos: vec![rv_resolver::DroppedRepo {
+                url: "https://vendor.example/maven/releases/".to_string(),
+                declared_by: "com.vendor:parent:2.0".to_string(),
+                releases_enabled: true,
+                snapshots_enabled: false,
+            }],
+        };
+        let rendered = render_resolve_error(&err);
+        assert!(rendered.contains(
+            "https://vendor.example/maven/releases/ (declared by com.vendor:parent:2.0)"
+        ));
+        assert!(rendered.contains("[[repositories]]\n      id = \"central\""));
+        assert!(rendered.contains("id = \"vendor-releases\""));
+        assert!(rendered.contains("url = \"https://vendor.example/maven/releases/\""));
+        assert!(rendered.contains("transitive_repository_allowlist"));
+    }
+
+    #[test]
+    fn dependency_not_found_without_dropped_repos_has_no_hint() {
+        let err = ResolveError::ArtifactNotFound {
+            coord: "com.example:lib:1.0".to_string(),
+            searched: vec![],
+            dropped_repos: vec![],
+        };
+        assert!(!render_resolve_error(&err).contains("Ignored transitive"));
     }
 }

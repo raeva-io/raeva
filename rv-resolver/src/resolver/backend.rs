@@ -8,12 +8,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use rv_config::{ArtifactKey, BlobId};
-use rv_maven_model::{Pom, PomError, Project, Scope};
+use rv_maven_model::{ActivationContext, ParentResolver, Pom, PomError, Project, Scope};
 use rv_repo::{ArtifactRequest, Metadata, RepoError, Repository};
 use rv_version::{Coord, Version, VersionReq};
 
 use crate::context::{MetadataKey, ResolveContext};
-use crate::error::{RepoSearchStatus, ResolveError, Result};
+use crate::error::{DroppedRepo, RepoSearchStatus, ResolveError, Result};
 use crate::parent_resolver::build_activation_context_async;
 use crate::solver::{Backend, ResolvedProject, ResolvedVersion};
 use crate::workspace::{Workspace, WorkspaceModule};
@@ -22,7 +22,42 @@ use super::WorkspaceProgress;
 use super::fetcher::RepoParentResolver;
 use super::utils::{dummy_coord, filter_repos_for_version, select_versions};
 
-pub(super) type WorkspaceSupportPomBuffer = Arc<Mutex<Vec<(ArtifactKey, Vec<u8>)>>>;
+pub(super) type WorkspaceSupportPomBuffer = Arc<Mutex<SupportPomBuffer>>;
+
+/// Support POMs that the modules of one reactor resolution observed, held
+/// until every module's graph is built and then written to the store once.
+///
+/// Every module records its parents and BOMs on each observation, so a large
+/// reactor sees the same few hundred POMs hundreds of thousands of times.
+/// Each distinct `(key, bytes)` pair is held once. A repeated observation only
+/// moves the pair later in the write order, so the last observation of a
+/// coordinate still decides which bytes its index row names.
+#[derive(Default)]
+pub(super) struct SupportPomBuffer {
+    entries: HashMap<(ArtifactKey, BlobId), (Vec<u8>, u64)>,
+    next_sequence: u64,
+}
+
+impl SupportPomBuffer {
+    pub(super) fn record(&mut self, key: ArtifactKey, blob: &BlobId, bytes: &[u8]) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        self.entries
+            .entry((key, blob.clone()))
+            .and_modify(|(_, last_seen)| *last_seen = sequence)
+            .or_insert_with(|| (bytes.to_vec(), sequence));
+    }
+
+    /// The distinct pairs, ordered by their last observation.
+    pub(super) fn take_in_write_order(&mut self) -> Vec<(ArtifactKey, Vec<u8>)> {
+        let mut entries: Vec<_> = std::mem::take(&mut self.entries).into_iter().collect();
+        entries.sort_unstable_by_key(|(_, (_, last_seen))| *last_seen);
+        entries
+            .into_iter()
+            .map(|((key, _), (bytes, _))| (key, bytes))
+            .collect()
+    }
+}
 
 /// Bare `group:artifact:version` of a POM. A companion POM is per GAV — one
 /// `.pom` serves every packaging and classifier of a coordinate, and Maven has
@@ -78,6 +113,9 @@ pub(super) struct RepoBackend {
     /// transitive POMs we visit.
     pub(super) seen_repo_urls: Arc<RwLock<HashSet<String>>>,
     pub(super) strict: bool,
+    /// Ignored transitive repositories and their declaring POMs.
+    /// Not-found errors can name repositories that could serve the missing artifact.
+    pub(super) dropped_repos: Arc<Mutex<Vec<DroppedRepo>>>,
     /// Mirror of `ResolveContext::project` keyed by the same `Coord` but
     /// holding only the source-repository URL. The shared project cache
     /// stores only `Project`. Keeping the URL alongside lets a cache hit in
@@ -206,6 +244,7 @@ impl RepoBackend {
             repos: Arc::new(RwLock::new(repos)),
             seen_repo_urls: Arc::new(RwLock::new(seen)),
             strict,
+            dropped_repos: Arc::new(Mutex::new(Vec::new())),
             project_repo_url: Arc::new(RwLock::new(HashMap::new())),
             support_pom_provenance: Arc::new(RwLock::new(HashMap::new())),
             companion_pom_blobs: Arc::new(RwLock::new(HashMap::new())),
@@ -259,6 +298,7 @@ impl RepoBackend {
     pub(super) fn workspace_pom_for_coord(&self, coord: &Coord) -> Option<Pom> {
         let module = self.workspace_module_for_coord(coord)?;
         let mut pom = module.pom().clone();
+        pom.mark_root_repositories();
         // Parent/BOM payload validation runs before inheritance. Workspace
         // identity is the interpolated effective GAV, so expose that identity
         // instead of comparing the request with raw `${revision}` text.
@@ -267,6 +307,15 @@ impl RepoBackend {
         pom.version = Some(module.gav().version.clone());
         if let Some(workspace) = self.workspace.as_deref() {
             workspace.inject_root_properties(&mut pom);
+            // The importing module cannot reach this parent through `<relativePath>`.
+            // Use its reactor identity because its POM may inherit `${revision}`.
+            if let Some(parent) = pom.parent.as_mut()
+                && parent.version.contains("${")
+                && let Some(version) =
+                    workspace.unique_version(&parent.group_id, &parent.artifact_id)
+            {
+                parent.version = version;
+            }
         }
         Some(pom)
     }
@@ -287,6 +336,36 @@ impl RepoBackend {
     }
 
     /// Snapshot the `"g:a:v" -> provenance` records collected for support POMs.
+    /// Ignored transitive repositories declared by a POM on `path` (matched by
+    /// `group:artifact`) that could serve `version` and were not searched.
+    pub(super) fn collect_dropped_repos(
+        &self,
+        path: &[(String, String)],
+        version: &str,
+        searched: &[RepoSearchStatus],
+    ) -> Vec<DroppedRepo> {
+        let snapshot = rv_repo::is_snapshot_version(version);
+        self.dropped_repos
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|d| {
+                let mut parts = d.declared_by.splitn(3, ':');
+                let (g, a) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                path.iter().any(|(pg, pa)| pg == g && pa == a)
+            })
+            .filter(|d| {
+                if snapshot {
+                    d.snapshots_enabled
+                } else {
+                    d.releases_enabled
+                }
+            })
+            .filter(|d| !searched.iter().any(|s| s.repo_url == d.url))
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn support_pom_provenance_snapshot(&self) -> Vec<(String, SupportPomProvenance)> {
         self.support_pom_provenance
             .read()
@@ -351,6 +430,11 @@ impl RepoBackend {
                 if seen.insert(repo.url.clone()) {
                     added.push(repo.clone());
                     guard.push(repo);
+                } else if (repo.releases_checksum_policy == rv_config::ChecksumPolicy::Fail
+                    || repo.snapshots_checksum_policy == rv_config::ChecksumPolicy::Fail)
+                    && let Some(existing) = guard.iter_mut().find(|r| r.url == repo.url)
+                {
+                    existing.merge_checksum_policies(&repo);
                 }
             }
         }
@@ -388,32 +472,46 @@ impl RepoBackend {
     /// transitive POM should not be able to redirect later fetches. Users opt
     /// in globally via the `[security] allow_transitive_repositories` flag or
     /// narrowly via the URL-prefix `transitive_repository_allowlist`.
-    pub(super) fn extend_repos(&self, extra: impl IntoIterator<Item = Repository>) {
+    ///
+    /// `declared_by` identifies the POM as `group:artifact:version`.
+    /// Report and remember dropped repositories only when this identity is known.
+    /// The parent-chain hook passes `None`; the post-parse call supplies the identity.
+    pub(super) fn extend_repos(
+        &self,
+        extra: impl IntoIterator<Item = Repository>,
+        declared_by: Option<&str>,
+    ) {
         let policy = &self.ctx.config.security;
         let mut filtered: Vec<Repository> = Vec::new();
-        let mut ignored = 0usize;
         for repo in extra {
+            // A dependency POM must never point the resolver at the local
+            // filesystem, whatever the transitive-repository policy says.
             if policy.allows_transitive_repo_url(repo.url.as_str()) {
                 filtered.push(repo);
-            } else {
-                ignored += 1;
-                // Tag with `sec_code` so the CLI's WarningCollectorLayer
-                // routes this into the JSON envelope's `data.warnings`
-                // channel even when `--json` suppresses fmt output.
-                tracing::warn!(
-                    sec_code = "TRANSITIVE_REPO_DROPPED",
-                    url = %repo.url,
-                    "ignoring transitive repository declaration; not on allowlist (see [security] allow_transitive_repositories)"
-                );
+                continue;
             }
-        }
-        if ignored > 0 {
+            let Some(declared_by) = declared_by else {
+                continue;
+            };
+            // `sec_code` routes warnings into `data.warnings` even when JSON mode suppresses tracing output.
             tracing::warn!(
                 sec_code = "TRANSITIVE_REPO_DROPPED",
-                ignored,
-                "ignored {} transitive repository declarations under default-deny policy",
-                ignored
+                url = %repo.url,
+                declared_by,
+                "ignoring transitive repository declaration; not on allowlist (see [security] allow_transitive_repositories)"
             );
+            let mut dropped = self.dropped_repos.lock().unwrap_or_else(|e| e.into_inner());
+            if !dropped
+                .iter()
+                .any(|d| d.url == repo.url && d.declared_by == declared_by)
+            {
+                dropped.push(DroppedRepo {
+                    url: repo.url.clone(),
+                    declared_by: declared_by.to_string(),
+                    releases_enabled: repo.releases_enabled,
+                    snapshots_enabled: repo.snapshots_enabled,
+                });
+            }
         }
         if filtered.is_empty() {
             return;
@@ -432,6 +530,11 @@ impl RepoBackend {
                 if seen.insert(repo.url.clone()) {
                     added.push(repo.clone());
                     guard.push(repo);
+                } else if (repo.releases_checksum_policy == rv_config::ChecksumPolicy::Fail
+                    || repo.snapshots_checksum_policy == rv_config::ChecksumPolicy::Fail)
+                    && let Some(existing) = guard.iter_mut().find(|r| r.url == repo.url)
+                {
+                    existing.merge_checksum_policies(&repo);
                 }
             }
         }
@@ -444,21 +547,47 @@ impl RepoBackend {
         &self,
         group_id: &str,
         artifact_id: &str,
-        req: &rv_version::VersionReq,
+        req: &VersionReq,
     ) -> Result<ResolvedVersion> {
+        self.resolve_versions_internal(group_id, artifact_id, req)
+            .await?
+            .pop()
+            .ok_or_else(|| ResolveError::VersionNotFound {
+                coord: format!("{group_id}:{artifact_id}"),
+                requirement: req.to_string(),
+            })
+    }
+
+    async fn resolve_versions_internal(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        req: &rv_version::VersionReq,
+    ) -> Result<Vec<ResolvedVersion>> {
         if let VersionReq::Exact(version) = req
             && let Some(selector) = DynamicVersionSelector::from_token(version.as_str())
         {
             return self
                 .resolve_dynamic_version_internal(group_id, artifact_id, selector)
-                .await;
+                .await
+                .map(|v| vec![v]);
         }
 
         let workspace_versions = self.workspace_versions(group_id, artifact_id);
         let client = match self.ctx.client.as_ref() {
             Some(client) => client,
             None if !workspace_versions.is_empty() => {
-                return select_workspace_version(group_id, artifact_id, req, workspace_versions);
+                select_workspace_version(group_id, artifact_id, req, workspace_versions.clone())?;
+                let mut versions: Vec<_> = workspace_versions
+                    .into_iter()
+                    .filter(|version| req.matches(version))
+                    .map(|version| ResolvedVersion {
+                        version,
+                        repo_url: None,
+                    })
+                    .collect();
+                versions.sort_by(|a, b| a.version.cmp(&b.version));
+                return Ok(versions);
             }
             None => return Err(ResolveError::MissingRepoClient),
         };
@@ -507,7 +636,8 @@ impl RepoBackend {
             .map(|idx| {
                 let repo = &repos[idx];
                 let url: Arc<str> = Arc::clone(&repo_urls[idx]);
-                let key = MetadataKey::new(url, Arc::from(group_id), Arc::from(artifact_id));
+                let key = MetadataKey::new(url, Arc::from(group_id), Arc::from(artifact_id))
+                    .with_checksum_policy(repo.releases_checksum_policy);
                 let dummy = &dummy;
                 async move {
                     if let Some(metadata) = self.ctx.cached_metadata(&key) {
@@ -598,26 +728,22 @@ impl RepoBackend {
                 });
             }
             return Err(ResolveError::ArtifactNotFound {
+                dropped_repos: Vec::new(),
                 coord: format!("{group_id}:{artifact_id}"),
                 searched,
             });
         }
 
-        let mut best: Option<Version> = None;
-        for version in all_versions {
-            if req.matches(&version) {
-                match &best {
-                    Some(current) if current >= &version => {}
-                    _ => best = Some(version),
-                }
-            }
-        }
-
-        if let Some(version) = best {
-            return Ok(ResolvedVersion {
+        let versions: Vec<_> = all_versions
+            .into_iter()
+            .filter(|version| req.matches(version))
+            .map(|version| ResolvedVersion {
                 version,
                 repo_url: None,
-            });
+            })
+            .collect();
+        if !versions.is_empty() {
+            return Ok(versions);
         }
 
         Err(ResolveError::VersionNotFound {
@@ -682,7 +808,8 @@ impl RepoBackend {
             .map(|idx| {
                 let repo = &repos[idx];
                 let url: Arc<str> = Arc::clone(&repo_urls[idx]);
-                let key = MetadataKey::new(url, Arc::from(group_id), Arc::from(artifact_id));
+                let key = MetadataKey::new(url, Arc::from(group_id), Arc::from(artifact_id))
+                    .with_checksum_policy(repo.releases_checksum_policy);
                 let dummy = &dummy;
                 async move {
                     if let Some(metadata) = self.ctx.cached_metadata(&key) {
@@ -797,6 +924,7 @@ impl RepoBackend {
                 });
             }
             return Err(ResolveError::ArtifactNotFound {
+                dropped_repos: Vec::new(),
                 coord: format!("{group_id}:{artifact_id}"),
                 searched,
             });
@@ -853,7 +981,9 @@ impl RepoBackend {
                     if matches!(err, RepoError::NotFound(_)) {
                         continue;
                     }
-                    if err.is_transient() {
+                    // An offline miss is specific to this repository's cache
+                    // scope. A later repository may hold the online result.
+                    if err.is_transient() || matches!(err, RepoError::OfflineNotCached(_)) {
                         last_error = Some(err);
                         continue;
                     }
@@ -873,6 +1003,7 @@ impl RepoBackend {
         }
 
         Err(ResolveError::ArtifactNotFound {
+            dropped_repos: Vec::new(),
             coord: coord.to_string(),
             searched,
         })
@@ -912,7 +1043,7 @@ impl RepoBackend {
             workspace.apply_root_maven_config(&mut activation);
             let mut pom = module.pom().clone();
             workspace.inject_root_properties(&mut pom);
-            let project = Project::from_pom_with_context(pom, resolver, &activation)?;
+            let project = build_project_off_task(pom, resolver, activation).await?;
             let effective_gav = format!(
                 "{}:{}:{}",
                 project.group_id, project.artifact_id, project.version
@@ -979,9 +1110,21 @@ impl RepoBackend {
                     self.note_progress();
                     let xml = std::str::from_utf8(&bytes)
                         .map_err(|err| PomError::InvalidModel(err.to_string()))?;
-                    let pom = Pom::parse(xml)?;
-                    let resolver = RepoParentResolver::with_strict(self.clone(), None, self.strict);
-                    // #5: transitive POMs are also evaluated against the TARGET
+                    let repository_url = repo.base_url()?;
+                    let pom_blob = BlobId::from_bytes(&bytes);
+                    let pom = self
+                        .ctx
+                        .parsed_poms()
+                        .parse(&pom_blob, xml)
+                        .map_err(|err| {
+                            PomError::InvalidModel(format!(
+                                "{coord} from {}: {err}",
+                                rv_repo::redact_url(&repository_url)
+                            ))
+                        })?;
+                    let make_resolver =
+                        || RepoParentResolver::with_strict(self.clone(), None, self.strict);
+                    // Transitive POMs are also evaluated against the TARGET
                     // platform of this resolve pass, not the host.
                     let activation = build_activation_context_async(
                         None,
@@ -989,15 +1132,19 @@ impl RepoBackend {
                         Some(&self.ctx.platform),
                     )
                     .await;
-                    let project = Project::from_pom_with_context(pom, resolver, &activation)?;
+                    let project =
+                        build_remote_project(pom, make_resolver, activation, coord).await?;
                     // Propagate any <repositories> declared by this transitive
                     // POM so later fetches in the same resolution can see them.
-                    self.extend_repos(project.repositories.iter().cloned().map(Repository::from));
+                    self.extend_repos(
+                        project.repositories.iter().cloned().map(Repository::from),
+                        Some(&format_pom_gav(&pom_gav(coord))),
+                    );
                     // Persist and pin the exact bytes this graph node was
                     // parsed from, here, where they are in hand. The download
                     // pass would otherwise re-fetch the same URL and index
                     // whatever it got, and the lockfile would pin that instead.
-                    let pom_blob = self.store_pom_bytes(coord, &bytes).await?;
+                    self.store_pom_bytes(coord, &bytes, &pom_blob).await?;
                     self.record_companion_pom_blob(pom_gav(coord), &pom_blob)?;
                     let repo_url: Arc<str> = Arc::from(repo.url.as_str());
                     self.ctx
@@ -1022,7 +1169,9 @@ impl RepoBackend {
                     if matches!(err, RepoError::NotFound(_)) {
                         continue;
                     }
-                    if err.is_transient() {
+                    // An offline miss is specific to this repository's cache
+                    // scope. A later repository may hold the online result.
+                    if err.is_transient() || matches!(err, RepoError::OfflineNotCached(_)) {
                         last_error = Some(err);
                         continue;
                     }
@@ -1042,6 +1191,7 @@ impl RepoBackend {
         }
 
         Err(ResolveError::ArtifactNotFound {
+            dropped_repos: Vec::new(),
             coord: coord.to_string(),
             searched,
         })
@@ -1050,17 +1200,16 @@ impl RepoBackend {
     /// Sync wrapper around [`Self::fetch_pom_bytes`], for the sync
     /// parent-chain resolver (the only caller).
     ///
-    /// The bridge spawns the future as a task, so it has to own everything it
-    /// touches. `RepoBackend` is `Arc`-backed, so the clone is cheap and every
-    /// clone shares the same repo list, caches and support-POM buffer — a
-    /// borrowed `&self` and an owned clone are interchangeable here.
-    pub(super) fn fetch_pom_bytes_blocking(&self, coord: &Coord) -> Result<Vec<u8>> {
+    /// The bridge spawns an owned task. Cloning copies the context's config
+    /// and repository vector while sharing its store, client internals and
+    /// cache state, plus the backend's mutable repo list and support-POM buffer.
+    pub(super) fn fetch_pom_bytes_blocking(&self, coord: &Coord) -> Result<(Vec<u8>, BlobId)> {
         let backend = self.clone();
         let coord = coord.clone();
         crate::sync_bridge::block_on_async(async move { backend.fetch_pom_bytes(&coord).await })
     }
 
-    async fn fetch_pom_bytes(&self, coord: &Coord) -> Result<Vec<u8>> {
+    async fn fetch_pom_bytes(&self, coord: &Coord) -> Result<(Vec<u8>, BlobId)> {
         let client = self
             .ctx
             .client
@@ -1089,9 +1238,12 @@ impl RepoBackend {
                     // repo than its child is still captured. A store-write
                     // failure is fatal, matching how artifact writes behave
                     // in `populate_artifacts`.
-                    self.persist_support_pom(coord, repo.id.as_deref(), &bytes)
+                    // Maven records the serving mirror's ID in `_remote.repositories`.
+                    let served_by = client.effective_repository(repo);
+                    let blob = self
+                        .persist_support_pom(coord, served_by.id.as_deref(), &bytes)
                         .await?;
-                    return Ok(bytes.to_vec());
+                    return Ok((bytes.to_vec(), blob));
                 }
                 Err(err) => {
                     // A failed response is progress too.
@@ -1100,7 +1252,9 @@ impl RepoBackend {
                     if matches!(err, RepoError::NotFound(_)) {
                         continue;
                     }
-                    if err.is_transient() {
+                    // An offline miss is specific to this repository's cache
+                    // scope. A later repository may hold the online result.
+                    if err.is_transient() || matches!(err, RepoError::OfflineNotCached(_)) {
                         last_error = Some(err);
                         continue;
                     }
@@ -1118,6 +1272,7 @@ impl RepoBackend {
             });
         }
         Err(ResolveError::ArtifactNotFound {
+            dropped_repos: Vec::new(),
             coord: coord.to_string(),
             searched,
         })
@@ -1137,8 +1292,9 @@ impl RepoBackend {
         coord: &Coord,
         repo_id: Option<&str>,
         bytes: &[u8],
-    ) -> Result<()> {
-        let blob = self.store_pom_bytes(coord, bytes).await?;
+    ) -> Result<BlobId> {
+        let blob = BlobId::from_bytes(bytes);
+        self.store_pom_bytes(coord, bytes, &blob).await?;
 
         // Record which repository served this support POM so export-m2 can
         // label its marker correctly even when the parent/BOM lives in a
@@ -1190,24 +1346,23 @@ impl RepoBackend {
                 if entry.repo_id.is_empty() && !observed.repo_id.is_empty() {
                     entry.repo_id = observed.repo_id;
                 }
-                Ok(())
+                Ok(blob)
             }
             None => {
                 recorded.insert(coord_key, observed);
-                Ok(())
+                Ok(blob)
             }
         }
     }
 
     /// Put POM bytes in the content store under their
-    /// `(group, artifact, version, "pom")` key and return their content
-    /// address.
+    /// `(group, artifact, version, "pom")` key.
     ///
     /// A store-write failure is fatal, the same severity `populate_artifacts`
     /// gives an artifact write: the alternative is a lockfile pinning a POM
     /// whose bytes never landed, which `rv export-m2` can only discover
     /// afterwards.
-    async fn store_pom_bytes(&self, coord: &Coord, bytes: &[u8]) -> Result<BlobId> {
+    async fn store_pom_bytes(&self, coord: &Coord, bytes: &[u8], blob: &BlobId) -> Result<()> {
         let key = ArtifactKey::new(
             coord.group_id.to_string(),
             coord.artifact_id.to_string(),
@@ -1215,20 +1370,17 @@ impl RepoBackend {
             "pom",
             None,
         );
-        // The blob id IS the SHA-256 of the bytes, so the digest returned here
-        // names the same blob the deferred workspace flush will put.
-        let blob = BlobId::from_bytes(bytes);
         if let Some(support_poms) = self.workspace_support_poms.as_ref() {
             support_poms
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push((key, bytes.to_vec()));
+                .record(key, blob, bytes);
         } else {
             let written = self.ctx.store.put_bytes(bytes).await?;
             self.ctx.store.add_artifact(&key, &written).await?;
-            debug_assert_eq!(written, blob, "store blob id must be the bytes' SHA-256");
+            debug_assert_eq!(&written, blob, "store blob id must be the bytes' SHA-256");
         }
-        Ok(blob)
+        Ok(())
     }
 }
 
@@ -1250,11 +1402,32 @@ impl Backend for RepoBackend {
         })
     }
 
+    fn resolve_versions<'b>(
+        &'b self,
+        group_id: &'b str,
+        artifact_id: &'b str,
+        req: &'b VersionReq,
+    ) -> crate::solver::BoxFuture<'b, Result<Vec<ResolvedVersion>>> {
+        Box::pin(async move {
+            self.resolve_versions_internal(group_id, artifact_id, req)
+                .await
+        })
+    }
+
     fn resolve_snapshot_version<'b>(
         &'b self,
         coord: &'b Coord,
     ) -> crate::solver::BoxFuture<'b, Result<ResolvedVersion>> {
         Box::pin(async move { self.resolve_snapshot_version_internal(coord).await })
+    }
+
+    fn dropped_repos_on_path(
+        &self,
+        path: &[(String, String)],
+        version: &str,
+        searched: &[RepoSearchStatus],
+    ) -> Vec<DroppedRepo> {
+        self.collect_dropped_repos(path, version, searched)
     }
 
     fn fetch_project<'b>(
@@ -1313,6 +1486,219 @@ mod tests {
     use rv_store::Store;
     use std::str::FromStr;
 
+    #[tokio::test]
+    async fn offline_model_fetches_try_later_repository_caches() {
+        use rv_repo::RepoClient;
+        use rv_test_support::http::{Response, StubServer};
+
+        const POM: &str = "\u{feff}<project><modelVersion>4.0.0</modelVersion>
+            <groupId>test</groupId><artifactId>cached</artifactId><version>1</version>
+            <properties><target>default</target></properties><profiles>
+            <profile><id>x86</id><activation><os><arch>amd64</arch></os></activation>
+            <properties><target>x86</target></properties></profile>
+            <profile><id>arm</id><activation><os><arch>aarch64</arch></os></activation>
+            <properties><target>arm</target></properties></profile>
+            </profiles></project>";
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let server = StubServer::start(|request| {
+            let path = &request.path;
+            let (status, body) = if path.ends_with("maven-metadata.xml") {
+                (
+                    200,
+                    "<metadata><version>1-SNAPSHOT</version><versioning><snapshot><timestamp>20261011.010101</timestamp><buildNumber>1</buildNumber></snapshot></versioning></metadata>",
+                )
+            } else if path.ends_with(".pom") {
+                (200, POM)
+            } else {
+                (404, "")
+            };
+            Response::new(status, body)
+        });
+        let repo_url = format!("http://{}/", server.addr());
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Config::for_testing_with_repos(
+            tmp.path().to_owned(),
+            ResolvedPaths::from_raeva_home(tmp.path().join("raeva")),
+            Vec::new(),
+        );
+        let mut cached = Repository::new(None, &repo_url, true, true);
+        cached.snapshots_update_policy = rv_config::UpdatePolicy::Interval(60);
+        let missing = Repository::new(None, format!("{repo_url}missing/"), true, true);
+        let online = RepoClient::new(&config)
+            .await
+            .unwrap()
+            .with_allow_missing_checksums(true);
+        online.trust_root_repositories(std::slice::from_ref(&cached));
+        for version in ["1", "1-SNAPSHOT"] {
+            online
+                .fetch_pom(&cached, &ArtifactRequest::new("test", "cached", version))
+                .await
+                .unwrap();
+        }
+        server.stop();
+        let offline = RepoClient::new(&config).await.unwrap().with_offline(true);
+        let store = Arc::new(Store::open(&tmp.path().join("store")).unwrap());
+        let repos = vec![missing, cached.clone()];
+        let ctx = ResolveContext::new(
+            config,
+            repos.clone(),
+            store,
+            rv_config::Platform::new("linux", "x86_64").unwrap(),
+            Some(offline),
+        );
+        let backend = RepoBackend::new(&ctx, repos, true);
+        for version in ["1", "1-SNAPSHOT"] {
+            let coord = Coord::parse(&format!("test:cached:{version}")).unwrap();
+            backend
+                .fetch_pom_bytes(&coord)
+                .await
+                .expect("cached parent/BOM in later repository");
+            let project = backend
+                .fetch_project_internal(&coord, Scope::Compile)
+                .await
+                .expect("cached dependency in later repository");
+            assert_eq!(project.repo_url.as_deref(), Some(cached.url.as_str()));
+        }
+        let coord = Coord::parse("test:cached:1-SNAPSHOT").unwrap();
+        let snapshot = backend
+            .resolve_snapshot_version_internal(&coord)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.version.as_str(), "1-20261011.010101-1");
+        let absent = Coord::parse("test:absent:1").unwrap();
+        assert!(matches!(backend.fetch_pom_bytes(&absent).await,
+            Err(ResolveError::RepoWithContext { source: RepoError::OfflineNotCached(_), searched }) if searched.len() == 2));
+
+        for (arch, target) in [("x86_64", "x86"), ("aarch64", "arm")] {
+            let platform_ctx = ResolveContext::from_config_with_state(
+                ctx.config.clone(),
+                Arc::clone(&ctx.store),
+                rv_config::Platform::new("linux", arch).unwrap(),
+                ctx.client.clone(),
+                ctx.state(),
+            );
+            for inactive in [false, true] {
+                let mut config = platform_ctx.config.clone();
+                if inactive {
+                    config.inactive_profiles = vec!["x86".into(), "arm".into()];
+                }
+                let module_ctx = platform_ctx.for_module(config);
+                let module_backend = RepoBackend::new(&module_ctx, vec![cached.clone()], true);
+                let coord = Coord::parse("test:cached:1").unwrap();
+                let result = module_backend
+                    .fetch_project_internal(&coord, Scope::Compile)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.project.properties.get("target").map(String::as_str),
+                    Some(if inactive { "default" } else { target })
+                );
+                assert_eq!(result.repo_url.as_deref(), Some(cached.url.as_str()));
+                assert_eq!(
+                    module_backend.companion_pom_blob(&pom_gav(&coord)),
+                    Some(BlobId::from_bytes(POM.as_bytes()))
+                );
+
+                let parent_resolver =
+                    RepoParentResolver::with_strict(module_backend.clone(), None, true);
+                let raw = tokio::task::spawn_blocking(move || {
+                    parent_resolver.resolve_parent(&rv_maven_model::Parent {
+                        group_id: "test".into(),
+                        artifact_id: "cached".into(),
+                        version: "1".into(),
+                        relative_path: Some(String::new()),
+                    })
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+                assert_eq!(raw, Pom::parse(POM).unwrap());
+                assert_eq!(
+                    module_backend.support_pom_provenance_snapshot(),
+                    vec![("test:cached:1".into(), provenance("", POM.as_bytes()))]
+                );
+            }
+        }
+    }
+
+    /// A missing `systemPath` invalidates a system dependency's POM.
+    /// Maven keeps the artifact but discards all dependencies, including inherited ones.
+    #[tokio::test]
+    async fn invalid_remote_descriptor_discards_inherited_dependencies_without_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Resolver {
+            parent: Pom,
+            calls: Arc<AtomicUsize>,
+        }
+        impl ParentResolver for Resolver {
+            fn resolve_parent(
+                &self,
+                _: &rv_maven_model::Parent,
+            ) -> std::result::Result<Option<Pom>, PomError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(self.parent.clone()))
+            }
+        }
+
+        for inherited in [false, true] {
+            let invalid = "<dependency><groupId>g</groupId><artifactId>broken</artifactId>
+                <version>1</version><scope>system</scope></dependency>";
+            let parent = Pom::parse(&format!(
+                "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>
+                <dependencies><dependency><groupId>g</groupId><artifactId>x</artifactId>
+                <version>1</version></dependency>{}</dependencies></project>",
+                if inherited { invalid } else { "" },
+            ))
+            .unwrap();
+            let pom = Pom::parse(&format!(
+                "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>
+                <version>1</version></parent><artifactId>lib</artifactId>
+                <dependencies>{}</dependencies>
+                <profiles><profile><id>extra</id><activation><activeByDefault>true</activeByDefault></activation>
+                <dependencies><dependency><groupId>g</groupId><artifactId>profile-dep</artifactId>
+                <version>1</version></dependency></dependencies></profile></profiles></project>",
+                if inherited { "" } else { invalid },
+            ))
+            .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let coord = Coord::from_str("g:lib:1").unwrap();
+            let project = build_remote_project(
+                pom.clone(),
+                || Resolver {
+                    parent: parent.clone(),
+                    calls: calls.clone(),
+                },
+                ActivationContext::default(),
+                &coord,
+            )
+            .await
+            .expect("an invalid remote descriptor must still retain its artifact");
+            assert!(project.dependencies.is_empty(), "inherited={inherited}");
+            assert!(project.dependency_management.dependencies.is_empty());
+            assert!(project.profiles.is_empty());
+            assert!(project.repositories.is_empty());
+            assert!(project.relocation.is_none());
+            assert_eq!(
+                (&*project.group_id, &*project.artifact_id, &*project.version),
+                ("g", "lib", "1")
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "must not retry inheritance"
+            );
+
+            // The same invalid model remains an error for a reactor project.
+            assert!(matches!(
+                Project::from_pom_with_context(pom, Resolver { parent, calls }, &ActivationContext::default()),
+                Err(PomError::InvalidModel(message)) if message.contains("<systemPath>")
+            ));
+        }
+    }
+
     fn test_backend_with_config(config: Config) -> RepoBackend {
         let store_tmp = tempfile::tempdir().unwrap();
         test_backend_with_store(config, store_tmp.path())
@@ -1329,7 +1715,7 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         Config::for_testing_with_repos(std::path::PathBuf::from("."), paths, Vec::new())
     }
 
@@ -1565,7 +1951,7 @@ mod tests {
     #[test]
     fn extend_repos_trusted_bypasses_policy() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         // Default policy denies transitive `<repositories>`.
@@ -1587,13 +1973,61 @@ mod tests {
         );
     }
 
+    /// A transitive dependency POM must not be able to add a `file://`
+    /// repository, even when the user opted in to transitive repositories.
+    #[test]
+    fn extend_repos_refuses_file_urls_even_when_transitive_repos_allowed() {
+        let project_tmp = tempfile::tempdir().unwrap();
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let mut config =
+            Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
+        config.security.allow_transitive_repositories = true;
+
+        let backend = test_backend_with_config(config);
+        backend.extend_repos(
+            [
+                Repository::new(Some("local".to_string()), "file:///etc/", true, false),
+                Repository::new(
+                    Some("web".to_string()),
+                    "https://web.example/m2/",
+                    true,
+                    false,
+                ),
+            ],
+            Some("g:a:1"),
+        );
+        // XML character references survive POM parsing as scheme whitespace;
+        // the URL parser subsequently strips them.
+        for scheme in ["fi&#x9;le", "fi&#xA;le", "fi&#xD;le"] {
+            let xml = format!(
+                "<project><repositories><repository>
+                    <id>hostile</id><url>{scheme}:///etc/</url>
+                 </repository></repositories></project>"
+            );
+            let pom = Pom::parse(&xml).unwrap();
+            assert_eq!(pom.repositories.len(), 1);
+            assert!(Repository::from(&pom.repositories[0]).is_local());
+            backend.extend_repos(pom.repositories.iter().map(Repository::from), Some("g:a:1"));
+        }
+        let repos = backend.repos_snapshot();
+        assert!(
+            repos
+                .iter()
+                .any(|repo| repo.url == "https://web.example/m2/")
+        );
+        assert!(repos.iter().all(|repo| {
+            repo.base_url()
+                .is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
+        }));
+    }
+
     /// `extend_repos_trusted` still deduplicates by URL. Calling it
     /// with the same URL twice (and with a URL already present in the
     /// configured repos) yields a single entry.
     #[test]
     fn extend_repos_trusted_is_idempotent() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
 
@@ -1626,19 +2060,22 @@ mod tests {
     #[test]
     fn extend_repos_default_deny_ignores_transitive_repo() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         assert!(!config.security.allow_transitive_repositories);
 
         let backend = test_backend_with_config(config);
         let before = backend.repos_snapshot();
-        backend.extend_repos(std::iter::once(Repository::new(
-            Some("attacker".to_string()),
-            "https://attacker.example/maven2/",
-            true,
-            false,
-        )));
+        backend.extend_repos(
+            std::iter::once(Repository::new(
+                Some("attacker".to_string()),
+                "https://attacker.example/maven2/",
+                true,
+                false,
+            )),
+            Some("g:a:1"),
+        );
         let after = backend.repos_snapshot();
         assert_eq!(
             after.len(),
@@ -1658,18 +2095,21 @@ mod tests {
     #[test]
     fn extend_repos_with_global_opt_in_adds_transitive_repo() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let mut config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         config.security.allow_transitive_repositories = true;
 
         let backend = test_backend_with_config(config);
-        backend.extend_repos(std::iter::once(Repository::new(
-            Some("vendor".to_string()),
-            "https://vendor.example/maven2/",
-            true,
-            false,
-        )));
+        backend.extend_repos(
+            std::iter::once(Repository::new(
+                Some("vendor".to_string()),
+                "https://vendor.example/maven2/",
+                true,
+                false,
+            )),
+            Some("g:a:1"),
+        );
         let after = backend.repos_snapshot();
         assert!(
             after.iter().any(|repo| repo.url.contains("vendor.example")),
@@ -1686,7 +2126,7 @@ mod tests {
     #[test]
     fn extend_repos_dedup_is_constant_time() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let mut config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         config.security.allow_transitive_repositories = true;
@@ -1699,7 +2139,7 @@ mod tests {
             false,
         );
         for _ in 0..1000 {
-            backend.extend_repos(std::iter::once(repo.clone()));
+            backend.extend_repos(std::iter::once(repo.clone()), Some("g:a:1"));
         }
         let after = backend.repos_snapshot();
         assert_eq!(
@@ -1723,7 +2163,7 @@ mod tests {
     #[test]
     fn extend_repos_seeds_seen_from_initial_repos() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let mut config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         config.security.allow_transitive_repositories = true;
@@ -1741,12 +2181,15 @@ mod tests {
         let backend = RepoBackend::new(&ctx, initial, false);
 
         // Re-extend with the same URL: must not double-insert.
-        backend.extend_repos(std::iter::once(Repository::new(
-            Some("central-again".to_string()),
-            "https://central.example/maven2/",
-            true,
-            false,
-        )));
+        backend.extend_repos(
+            std::iter::once(Repository::new(
+                Some("central-again".to_string()),
+                "https://central.example/maven2/",
+                true,
+                false,
+            )),
+            Some("g:a:1"),
+        );
 
         let after = backend.repos_snapshot();
         assert_eq!(
@@ -1783,18 +2226,21 @@ mod tests {
 
         // Default-deny policy; the warn must fire.
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         let backend = test_backend_with_config(config);
 
-        tracing::subscriber::with_default(subscriber, || {
-            backend.extend_repos(std::iter::once(Repository::new(
-                Some("attacker".to_string()),
-                "https://attacker.example/maven2/",
-                true,
-                false,
-            )));
+        rv_test_support::with_default(subscriber, || {
+            backend.extend_repos(
+                std::iter::once(Repository::new(
+                    Some("attacker".to_string()),
+                    "https://attacker.example/maven2/",
+                    true,
+                    false,
+                )),
+                Some("g:a:1"),
+            );
         });
 
         let captured = events.lock().expect("events lock").clone();
@@ -1810,11 +2256,83 @@ mod tests {
                 .any(|m| m.contains("ignoring transitive repository declaration")),
             "per-URL warn must fire for dropped transitive repo; saw: {warn_msgs:?}"
         );
+        assert_eq!(
+            warn_msgs.len(),
+            1,
+            "one warn per dropped declaration, no extra summary; saw: {warn_msgs:?}"
+        );
+    }
+
+    /// Not-found diagnostics retain ignored repositories with their declaring POMs.
+    /// Only unsearched repositories on the dependency path that serve the version qualify.
+    #[test]
+    fn dropped_repos_are_reported_only_for_declarers_on_the_path() {
+        let project_tmp = tempfile::tempdir().unwrap();
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let config =
+            Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
+        let backend = test_backend_with_config(config);
+
+        backend.extend_repos(
+            std::iter::once(Repository::new(
+                Some("jasper".to_string()),
+                "https://jasper.example/releases/",
+                true,
+                false,
+            )),
+            Some("net.sf:jasper:6.0"),
+        );
+        backend.extend_repos(
+            std::iter::once(Repository::new(
+                Some("snap".to_string()),
+                "https://snap.example/snapshots/",
+                false,
+                true,
+            )),
+            Some("net.sf:jasper:6.0"),
+        );
+        backend.extend_repos(
+            std::iter::once(Repository::new(
+                Some("other".to_string()),
+                "https://other.example/",
+                true,
+                false,
+            )),
+            Some("org.other:sibling:1.0"),
+        );
+        // The parent-chain hook passes no declarer and must not record.
+        backend.extend_repos(
+            std::iter::once(Repository::new(
+                Some("anon".to_string()),
+                "https://anon.example/",
+                true,
+                false,
+            )),
+            None,
+        );
+
+        let path = vec![
+            ("com.app".to_string(), "app".to_string()),
+            ("net.sf".to_string(), "jasper".to_string()),
+        ];
+        let hits = backend.collect_dropped_repos(&path, "1.3.43", &[]);
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert_eq!(hits[0].url, "https://jasper.example/releases/");
+        assert_eq!(hits[0].declared_by, "net.sf:jasper:6.0");
+
+        let snapshot_hits = backend.collect_dropped_repos(&path, "1.0-SNAPSHOT", &[]);
+        assert_eq!(snapshot_hits.len(), 1);
+        assert_eq!(snapshot_hits[0].url, "https://snap.example/snapshots/");
+
+        let searched = vec![RepoSearchStatus::new(
+            "https://jasper.example/releases/",
+            crate::error::RepoStatus::Http(404),
+        )];
         assert!(
-            warn_msgs
-                .iter()
-                .any(|m| m.contains("ignored 1 transitive repository declarations")),
-            "summary warn must fire for dropped transitive repos; saw: {warn_msgs:?}"
+            backend
+                .collect_dropped_repos(&path, "1.3.43", &searched)
+                .is_empty(),
+            "an already-searched URL is not a missing option"
         );
     }
 
@@ -1836,12 +2354,12 @@ mod tests {
         });
 
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         let backend = test_backend_with_config(config);
 
-        tracing::subscriber::with_default(subscriber, || {
+        rv_test_support::with_default(subscriber, || {
             backend.extend_repos_trusted(std::iter::once(Repository::new(
                 Some("user".to_string()),
                 "https://user.example/maven2/",
@@ -1867,7 +2385,7 @@ mod tests {
     #[test]
     fn extend_repos_with_prefix_allowlist_adds_matching_repo() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let mut config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         config
@@ -1876,20 +2394,23 @@ mod tests {
             .push("https://allowed.example/".to_string());
 
         let backend = test_backend_with_config(config);
-        backend.extend_repos(vec![
-            Repository::new(
-                Some("allowed".to_string()),
-                "https://allowed.example/maven2/",
-                true,
-                false,
-            ),
-            Repository::new(
-                Some("attacker".to_string()),
-                "https://attacker.example/maven2/",
-                true,
-                false,
-            ),
-        ]);
+        backend.extend_repos(
+            vec![
+                Repository::new(
+                    Some("allowed".to_string()),
+                    "https://allowed.example/maven2/",
+                    true,
+                    false,
+                ),
+                Repository::new(
+                    Some("attacker".to_string()),
+                    "https://attacker.example/maven2/",
+                    true,
+                    false,
+                ),
+            ],
+            Some("g:a:1"),
+        );
         let after = backend.repos_snapshot();
         assert!(
             after
@@ -1915,7 +2436,7 @@ mod tests {
         use rv_repo::RepoClient;
 
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let mut config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         config
@@ -1956,10 +2477,13 @@ mod tests {
             "a repository trusted mid-resolve must become dialable"
         );
 
-        backend.extend_repos(vec![
-            Repository::new(None, "https://approved.internal/maven2/", true, false),
-            Repository::new(None, "https://attacker.example/maven2/", true, false),
-        ]);
+        backend.extend_repos(
+            vec![
+                Repository::new(None, "https://approved.internal/maven2/", true, false),
+                Repository::new(None, "https://attacker.example/maven2/", true, false),
+            ],
+            Some("g:a:1"),
+        );
         assert!(
             client.trusts_host("approved.internal"),
             "an allowlisted transitive repository is trusted, so it is dialable"
@@ -1982,7 +2506,7 @@ mod tests {
         use rv_repo::{Metadata, RepoClient};
 
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         let store_tmp = tempfile::tempdir().unwrap();
@@ -2058,5 +2582,71 @@ mod tests {
             "1.0.0",
             "RELEASE must not pick a version served only by a snapshots-only mirror"
         );
+    }
+}
+
+/// Build the effective model of a dependency POM fetched from a repository.
+///
+/// When a dependency POM lacks a required `<systemPath>`, Maven warns and keeps
+/// the artifact without its transitive dependencies. Reactor POMs fail validation.
+/// Discard the invalid descriptor without repeating inheritance.
+async fn build_remote_project<R>(
+    pom: Pom,
+    make_resolver: impl Fn() -> R,
+    activation: ActivationContext,
+    coord: &Coord,
+) -> Result<Project>
+where
+    R: ParentResolver + Send + 'static,
+{
+    match build_project_off_task(pom, make_resolver(), activation).await {
+        Err(ResolveError::Pom(PomError::InvalidModel(msg))) if msg.contains("<systemPath>") => {
+            tracing::warn!(
+                coord = %coord,
+                "POM is invalid ({msg}); its transitive dependencies are not available"
+            );
+            // DefaultArtifactDescriptorReader returns an empty descriptor.
+            // Repeating inheritance could restore dependencies or fail on the same invalid entry.
+            Ok(Project {
+                group_id: coord.group_id.to_string(),
+                artifact_id: coord.artifact_id.to_string(),
+                version: coord.version.to_string(),
+                packaging: coord.packaging.clone().unwrap_or_else(|| "jar".into()),
+                properties: Default::default(),
+                dependency_management: Default::default(),
+                dependencies: Vec::new(),
+                repositories: Vec::new(),
+                profiles: Vec::new(),
+                modules: Vec::new(),
+                relocation: None,
+            })
+        }
+        other => other,
+    }
+}
+
+/// Build the effective model on a blocking thread.
+///
+/// The synchronous model layer fetches parents and BOMs through
+/// [`crate::sync_bridge::block_on_async`], which parks the calling thread.
+/// Running it inline would block every sibling fetch polled by the same task.
+pub(super) async fn build_project_off_task<R>(
+    pom: Pom,
+    resolver: R,
+    activation: ActivationContext,
+) -> Result<Project>
+where
+    R: ParentResolver + Send + 'static,
+{
+    match tokio::task::spawn_blocking(move || {
+        Project::from_pom_with_context(pom, resolver, &activation)
+    })
+    .await
+    {
+        Ok(project) => Ok(project?),
+        Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+        Err(err) => Err(ResolveError::InternalError(format!(
+            "effective model task failed: {err}"
+        ))),
     }
 }

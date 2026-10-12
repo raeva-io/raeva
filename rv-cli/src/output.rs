@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -147,29 +148,146 @@ impl WarningEntry {
 ///
 /// The warning code catalogue lives in [`WARNING_CODE_CATALOGUE`]; extend it
 /// as new conditions are surfaced.
+///
+/// How often a condition is observed depends on cache hits and task
+/// scheduling, so the collector keeps each distinct warning once and drains
+/// them sorted by code, context and message. Output is then the same on every
+/// run with the same inputs.
 pub struct WarningCollector {
-    entries: Mutex<Vec<WarningEntry>>,
+    entries: Mutex<BTreeMap<(&'static str, String, String), WarningEntry>>,
 }
 
 impl WarningCollector {
     const fn new() -> Self {
         Self {
-            entries: Mutex::new(Vec::new()),
+            entries: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn push(&self, entry: WarningEntry) {
+        // `serde_json` maps keep sorted keys, so this string is canonical.
+        let key = (entry.code, entry.context.to_string(), entry.message.clone());
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        guard.push(entry);
+        guard.entry(key).or_insert(entry);
+    }
+
+    /// Drains the collector and returns the distinct entries in sorted order.
+    fn take(&self) -> Vec<WarningEntry> {
+        let drained = {
+            let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        drained.into_values().collect()
     }
 
     /// Drains the collector and returns the entries serialized as JSON
     /// values, ready to splice into an envelope.
     fn drain_json(&self) -> Vec<serde_json::Value> {
-        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let drained = std::mem::take(&mut *guard);
-        drained.iter().map(WarningEntry::to_json).collect()
+        self.take().iter().map(WarningEntry::to_json).collect()
     }
+}
+
+/// Print collected `sec_code` warnings to stderr using [`summarize_warnings`].
+/// In JSON mode, the caller drains the collector into the envelope instead.
+pub fn flush_warning_summary() {
+    if is_json_mode() {
+        return;
+    }
+    for line in summarize_warnings(&warning_collector().take()) {
+        eprintln!("{}", warning(line));
+    }
+}
+
+/// Collapse distinct warnings into one line per condition.
+/// Group `TRANSITIVE_REPO_DROPPED` by URL, with an example declaring POM.
+/// Group `WEAK_HASH_FALLBACK` by run, and other codes by message and context.
+fn summarize_warnings(entries: &[WarningEntry]) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    struct Group<'a> {
+        first: &'a WarningEntry,
+        count: usize,
+        declarers: BTreeSet<&'a str>,
+    }
+
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, Group<'_>> = Default::default();
+    for entry in entries {
+        let field = |name: &str| entry.context.get(name).and_then(|v| v.as_str());
+        let key = match entry.code {
+            "TRANSITIVE_REPO_DROPPED" => match field("url") {
+                Some(url) => format!("{}|{url}", entry.code),
+                None => continue,
+            },
+            "WEAK_HASH_FALLBACK" => entry.code.to_string(),
+            _ => format!("{}|{}|{}", entry.code, entry.message, entry.context),
+        };
+        let group = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            Group {
+                first: entry,
+                count: 0,
+                declarers: BTreeSet::new(),
+            }
+        });
+        group.count += 1;
+        if let Some(by) = entry.context.get("declared_by").and_then(|v| v.as_str()) {
+            group.declarers.insert(by);
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut dropped_any = false;
+    for key in &order {
+        let group = &groups[key];
+        let entry = group.first;
+        let field = |name: &str| entry.context.get(name).and_then(|v| v.as_str());
+        match entry.code {
+            "TRANSITIVE_REPO_DROPPED" => {
+                let url = field("url").unwrap_or_default();
+                let mut declarers = group.declarers.iter();
+                let by = match (declarers.next(), group.declarers.len()) {
+                    (Some(first), 1) => format!(", declared by {first}"),
+                    (Some(first), n) => format!(", declared by {first} and {} other POMs", n - 1),
+                    (None, _) => String::new(),
+                };
+                lines.push(format!(
+                    "{}: ignored transitive repository {url}{by}",
+                    entry.code
+                ));
+                dropped_any = true;
+            }
+            "WEAK_HASH_FALLBACK" => {
+                lines.push(format!(
+                    "{}: {} artifact checksum(s) verified with SHA-1 only; the repository serves no SHA-256 sidecar (`rv --json` lists each artifact)",
+                    entry.code, group.count
+                ));
+            }
+            _ => {
+                let mut line = entry.message.clone();
+                if let Some(ctx) = entry.context.as_object() {
+                    let fields: Vec<String> = ctx
+                        .iter()
+                        .map(|(k, v)| match v.as_str() {
+                            Some(text) => format!("{k}={text}"),
+                            None => format!("{k}={v}"),
+                        })
+                        .collect();
+                    if !fields.is_empty() {
+                        line.push_str(&format!(" ({})", fields.join(", ")));
+                    }
+                }
+                lines.push(format!("{}: {line}", entry.code));
+            }
+        }
+    }
+    if dropped_any {
+        lines.push(
+            "rv ignores dependency POM repositories by default. For missing dependencies, errors name eligible repositories to add to [security] transitive_repository_allowlist in rv.toml"
+                .to_string(),
+        );
+    }
+    lines.into_iter().map(|l| format!("warning: {l}")).collect()
 }
 
 /// Returns the global warning collector.
@@ -184,6 +302,10 @@ pub fn warning_collector() -> &'static WarningCollector {
 /// to `UNCATALOGUED` in the JSON envelope, so every new
 /// `tracing::warn!(sec_code = ...)` site must add its code here.
 const WARNING_CODE_CATALOGUE: &[(&str, &str)] = &[
+    (
+        "METADATA_CHECKSUM_MISMATCH",
+        "rv accepts remote metadata under the repository policy despite a checksum mismatch after retry",
+    ),
     (
         "WEAK_HASH_FALLBACK",
         "only a weak (SHA-1) checksum sidecar was available; a stronger one could not be obtained",
@@ -697,6 +819,7 @@ mod tests {
     #[test]
     fn all_emitted_sec_codes_are_catalogued() {
         let emitted = [
+            "METADATA_CHECKSUM_MISMATCH",
             "WEAK_HASH_FALLBACK",
             "CROSS_HOST_MIRROR",
             "TRANSITIVE_REPO_DROPPED",
@@ -751,9 +874,9 @@ mod tests {
 
         let drained = collector.drain_json();
         assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0]["code"], "WEAK_HASH_FALLBACK");
-        assert_eq!(drained[0]["context"]["coord"], "g:a:1");
-        assert_eq!(drained[1]["code"], "CROSS_HOST_MIRROR");
+        assert_eq!(drained[0]["code"], "CROSS_HOST_MIRROR");
+        assert_eq!(drained[1]["code"], "WEAK_HASH_FALLBACK");
+        assert_eq!(drained[1]["context"]["coord"], "g:a:1");
 
         // Second drain returns nothing; entries are consumed.
         let empty = collector.drain_json();
@@ -780,7 +903,7 @@ mod tests {
         .with_filter(LevelFilter::WARN);
 
         let subscriber = tracing_subscriber::registry().with(layer);
-        tracing::subscriber::with_default(subscriber, || {
+        rv_test_support::with_default(subscriber, || {
             tracing::warn!(
                 sec_code = "WEAK_HASH_FALLBACK",
                 path = "com/example/lib-1.0.jar",
@@ -791,12 +914,18 @@ mod tests {
                 repo_url = "https://mirror.example/",
                 "cross host mirror"
             );
+            tracing::warn!(
+                sec_code = "METADATA_CHECKSUM_MISMATCH",
+                repository_url = "https://repo.example/",
+                path = "com/example/demo/maven-metadata.xml",
+                "metadata checksum still mismatches after retry"
+            );
             // An untagged warn must NOT be captured.
             tracing::warn!("operator chatter without sec_code");
         });
 
         let captured = sink.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(captured.len(), 2, "tagged warns must be captured");
+        assert_eq!(captured.len(), 3, "tagged warns must be captured");
         assert_eq!(captured[0].code, "WEAK_HASH_FALLBACK");
         assert!(
             captured[0].message.contains("falling back"),
@@ -804,6 +933,13 @@ mod tests {
             captured[0].message
         );
         assert_eq!(captured[1].code, "CROSS_HOST_MIRROR");
+        assert_eq!(captured[2].code, "METADATA_CHECKSUM_MISMATCH");
+        let json = captured[2].to_json();
+        assert_eq!(json["context"]["repository_url"], "https://repo.example/");
+        assert_eq!(
+            json["context"]["path"],
+            "com/example/demo/maven-metadata.xml"
+        );
     }
 
     /// `info!`/`debug!`/`trace!` events with `sec_code` are intentionally
@@ -826,7 +962,7 @@ mod tests {
         .with_filter(LevelFilter::TRACE);
 
         let subscriber = tracing_subscriber::registry().with(layer);
-        tracing::subscriber::with_default(subscriber, || {
+        rv_test_support::with_default(subscriber, || {
             tracing::info!(sec_code = "WEAK_HASH_FALLBACK", "should be skipped");
             tracing::debug!(sec_code = "WEAK_HASH_FALLBACK", "should be skipped too");
         });
@@ -836,5 +972,92 @@ mod tests {
             captured.is_empty(),
             "non-warn levels must not be captured, got {captured:?}"
         );
+    }
+
+    fn dropped(url: &str, by: &str) -> WarningEntry {
+        WarningEntry::new("TRANSITIVE_REPO_DROPPED", "ignoring")
+            .with_context(serde_json::json!({"url": url, "declared_by": by}))
+    }
+
+    fn collect(entries: impl IntoIterator<Item = WarningEntry>) -> Vec<WarningEntry> {
+        let collector = WarningCollector::new();
+        for entry in entries {
+            collector.push(entry);
+        }
+        collector.take()
+    }
+
+    #[test]
+    fn warning_collector_keeps_each_distinct_warning_once_in_sorted_order() {
+        let mirror = |url: &str| {
+            WarningEntry::new("CROSS_HOST_MIRROR", "mirror crossed hosts").with_context(
+                serde_json::json!({"original_url": "https://o.example/", "mirror_url": url}),
+            )
+        };
+        let first = collect([
+            mirror("https://m2.example/"),
+            dropped("https://a.example/", "g:one:1"),
+            mirror("https://m1.example/"),
+            mirror("https://m2.example/"),
+            dropped("https://a.example/", "g:one:1"),
+        ]);
+        let second = collect([
+            dropped("https://a.example/", "g:one:1"),
+            mirror("https://m1.example/"),
+            mirror("https://m2.example/"),
+        ]);
+        let render = |entries: &[WarningEntry]| {
+            entries
+                .iter()
+                .map(WarningEntry::to_json)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(first.len(), 3);
+        assert_eq!(render(&first), render(&second));
+        assert_eq!(first[0].context["mirror_url"], "https://m1.example/");
+        assert_eq!(first[1].context["mirror_url"], "https://m2.example/");
+        assert_eq!(first[2].code, "TRANSITIVE_REPO_DROPPED");
+    }
+
+    #[test]
+    fn summary_collapses_dropped_repos_per_url() {
+        let entries = collect([
+            dropped("https://a.example/", "g:one:1"),
+            dropped("https://a.example/", "g:two:1"),
+            dropped("https://a.example/", "g:one:1"),
+            dropped("https://b.example/", "g:three:1"),
+        ]);
+        let lines = super::summarize_warnings(&entries);
+        assert_eq!(lines.len(), 3, "two URLs plus the policy note: {lines:?}");
+        assert!(lines[0].contains("https://a.example/"));
+        assert!(lines[0].contains("declared by g:one:1 and 1 other POMs"));
+        assert!(lines[1].contains("https://b.example/"));
+        assert!(lines[1].ends_with("declared by g:three:1"));
+        assert!(lines[2].contains("transitive_repository_allowlist"));
+    }
+
+    #[test]
+    fn summary_collapses_identical_and_weak_hash_warnings() {
+        let mirror = || {
+            WarningEntry::new("CROSS_HOST_MIRROR", "mirror crossed hosts")
+                .with_context(serde_json::json!({"mirror_url": "https://m.example/"}))
+        };
+        let weak = |path: &str| {
+            WarningEntry::new("WEAK_HASH_FALLBACK", "sha1")
+                .with_context(serde_json::json!({"path": path}))
+        };
+        let entries = collect([
+            mirror(),
+            weak("a.pom"),
+            mirror(),
+            weak("b.pom"),
+            weak("a.pom"),
+            mirror(),
+        ]);
+        let lines = super::summarize_warnings(&entries);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("CROSS_HOST_MIRROR") && !lines[0].contains("[x"));
+        assert!(lines[1].contains("2 artifact checksum(s)"));
+        assert!(super::summarize_warnings(&[]).is_empty());
     }
 }

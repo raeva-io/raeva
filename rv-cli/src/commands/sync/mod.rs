@@ -54,13 +54,13 @@ use self::system_scope::{enforce_system_scope_policy, warn_system_scope_from_loc
                   graph drift. --frozen --offline checks the local inputs only and does not \
                   detect upstream drift, except when the lockfile records an artifact origin \
                   the configuration no longer declares: that is resolved again offline, from \
-                  cached repository data, so the POMs decide whether the origin is authorized.",
+                  cached data and file repositories, so the POMs decide whether the origin is authorized.",
     after_long_help = "\
 Examples:
   rv sync                          # Resolve and lock dependencies
   rv sync --frozen                 # CI mode: fail if lockfile would change
   rv sync --update                 # Force fresh resolution
-  rv sync --offline                # Use only cached metadata
+  rv sync --offline                # Use cached data and file repositories
   rv sync --platforms linux-x86_64,darwin-aarch64
 "
 )]
@@ -74,7 +74,7 @@ pub struct SyncArgs {
         help = "Re-resolve all dependencies and update rv.lock"
     )]
     pub update: bool,
-    #[arg(long, help = "Work offline using only cached data (no network)")]
+    #[arg(long, help = "Work offline using cached data and file repositories")]
     pub offline: bool,
     #[arg(
         long,
@@ -225,8 +225,6 @@ async fn run_inner(
         let lock = read_lockfile(config)?;
         let selected = require_lock_for_platforms(&lock, &platforms)?;
         warn_system_scope_from_lock(&selected);
-        let snapshot_refresh = lock_requires_snapshot_refresh(&selected, config);
-        let rediscover_repositories = lock_references_unconfigured_origin(&selected, config);
         let models = if lock.schema_version == rv_config::LOCKFILE_SCHEMA_VERSION {
             if !pom_exists {
                 check_frozen_config_hash(None, lock.config_hash.as_deref())?;
@@ -252,12 +250,28 @@ async fn run_inner(
             check_legacy_frozen_strategy(lock_strategy)?;
             None
         };
-        if frozen_checks_local_inputs_only(
+        let snapshot_refresh = lock_requires_snapshot_refresh(&selected, config, |repo| {
+            client.effective_repository_url(repo)
+        });
+        let rediscover_repositories = lock_references_unconfigured_origin(
+            &selected,
+            config,
+            models.as_deref().unwrap_or_default(),
+            |repo| client.effective_repository_url(repo),
+        );
+        let local_inputs_only = frozen_checks_local_inputs_only(
             args.offline,
             models.is_none(),
+            rediscover_repositories,
+        );
+        tracing::debug!(
+            offline = args.offline,
+            local_inputs_only,
             snapshot_refresh,
             rediscover_repositories,
-        ) {
+            "selected frozen validation mode"
+        );
+        if local_inputs_only {
             if !args.offline {
                 ensure_artifacts(&selected, config, store.as_ref(), &client, &platforms, &[])
                     .await?;
@@ -337,8 +351,14 @@ async fn run_inner(
             // we fall through to resolution instead of erroring.
             && let Some(selected) = filter_lock(&lock, &platforms)?
             && frozen_models_match(&selected, &models)
-            && !lock_requires_snapshot_refresh(&selected, config)
-            && !lock_references_unconfigured_origin(&selected, config)
+            && !lock_requires_snapshot_refresh(&selected, config, |repo| {
+                client.effective_repository_url(repo)
+            })
+            // Artifact downloads below use configured repositories only. POM
+            // declarations still need resolution to populate their trust grants.
+            && !lock_references_unconfigured_origin(&selected, config, &[], |repo| {
+                client.effective_repository_url(repo)
+            })
             // Schema 4 accepts the pre-pin shape so an existing lock keeps
             // working, but reusing it forever would leave those coordinates on
             // the store's mutable index — the thing schema 4's pins exist to
@@ -354,11 +374,7 @@ async fn run_inner(
                     .await?;
                 result("Downloaded", "artifacts from lockfile");
             }
-            // Diff the lockfile against itself so the human UX is the
-            // same as the resolve path: a "no changes" section that
-            // makes it obvious sync did inspect the graph. Otherwise an
-            // unchanged sync goes silent and looks indistinguishable from
-            // a no-op cache hit.
+            // Show the same "no changes" section as the resolve path.
             print_lock_diff(&selected, &selected, &platforms);
             let dep_count = count_dependencies(&selected);
             print_summary(dep_count, elapsed_saturating(start));
@@ -768,6 +784,21 @@ pub(crate) fn compute_resolution_config_hash(config: &Config) -> Result<String> 
             &mut hasher,
             &repo.snapshots_update_policy.unwrap_or_default().to_string(),
         );
+        hash_str(
+            &mut hasher,
+            &repo
+                .releases_update_policy
+                .unwrap_or(UpdatePolicy::Daily)
+                .to_string(),
+        );
+        hash_str(
+            &mut hasher,
+            &format!("{:?}", repo.releases_checksum_policy.unwrap_or_default()),
+        );
+        hash_str(
+            &mut hasher,
+            &format!("{:?}", repo.snapshots_checksum_policy.unwrap_or_default()),
+        );
     }
 
     let mirrors = config.mirrors();
@@ -786,6 +817,8 @@ pub(crate) fn compute_resolution_config_hash(config: &Config) -> Result<String> 
     hasher.update(config.network.timeout.to_le_bytes());
     hasher.update((config.network.retries as u64).to_le_bytes());
     hasher.update((config.network.concurrency as u64).to_le_bytes());
+    hasher.update(config.network.low_speed_limit.to_le_bytes());
+    hasher.update(config.network.low_speed_time.to_le_bytes());
     hasher.update(b"security:");
     hasher.update([u8::from(config.security.allow_transitive_repositories)]);
     hash_sorted_strings(
@@ -1457,26 +1490,27 @@ fn checksum_drifted(l: &LockPackage, r: &LockPackage) -> bool {
 ///   (see [`check_legacy_frozen_strategy`]) and is validated no further; the
 ///   next non-frozen sync rewrites it to schema 4, after which the full
 ///   contract applies.
-/// - `--offline`, which cannot reach a repository at all — with one exception:
-///   a lockfile origin that only the current POM can authorize still forces a
-///   re-resolve, because repository trust comes from the model, never from
-///   lockfile metadata, and that question is answerable from the local model
-///   and the cached POMs a previous sync left behind.
+/// - `--offline`, which blocks remote access but permits file repositories,
+///   keeps the local-inputs-only contract with one exception:
+///   a lockfile origin absent from configuration and the local project model
+///   still forces a re-resolve, because repository trust comes from the model,
+///   never from lockfile metadata, and that question is answerable from the local model
+///   and POMs available in the cache or local file repositories. Local root,
+///   reactor module and accepted parent repositories (including active
+///   profiles, interpolation and mirrors) are already known from discovery.
 ///
 /// An expired SNAPSHOT update policy is deliberately NOT such an exception
-/// offline. The cached `maven-metadata.xml` a re-resolve would need carries
-/// exactly the TTL that decided the pins were stale (`update_policy_ttl`), so
-/// the condition that would force the resolve also guarantees the cache entry
-/// behind it has expired: the run could only ever abort with
-/// `OfflineNotCached`, never report drift. Refusing to verify is the honest
-/// outcome, and it is what the local-inputs-only contract already says.
+/// offline. Cached POMs and metadata remain readable after their refresh
+/// interval, but cannot establish whether upstream SNAPSHOTs have changed.
+/// The local-inputs-only contract therefore still applies.
+/// This never exempts an unknown origin: repository trust must still be
+/// established even when SNAPSHOT pins are stale.
 fn frozen_checks_local_inputs_only(
     offline: bool,
     legacy_lock: bool,
-    snapshot_refresh: bool,
     rediscover_repositories: bool,
 ) -> bool {
-    legacy_lock || (offline && (snapshot_refresh || !rediscover_repositories))
+    legacy_lock || (offline && !rediscover_repositories)
 }
 
 /// True when a schema-4 lock still carries POM references the current format
@@ -1527,7 +1561,13 @@ fn lock_pins_incomplete(lock: &Lockfile) -> bool {
     }
 }
 
-fn lock_requires_snapshot_refresh(lock: &Lockfile, config: &Config) -> bool {
+/// Check whether any locked SNAPSHOT needs a refresh.
+/// Match update policies by origin and effective URL because locks record mirror URLs.
+fn lock_requires_snapshot_refresh(
+    lock: &Lockfile,
+    config: &Config,
+    effective_url: impl Fn(&Repository) -> String,
+) -> bool {
     let lockfile_age_secs = config
         .lock_path
         .metadata()
@@ -1542,9 +1582,25 @@ fn lock_requires_snapshot_refresh(lock: &Lockfile, config: &Config) -> bool {
     let mut policies: HashMap<String, UpdatePolicy> = HashMap::new();
     let default_policy = UpdatePolicy::default();
 
-    for repo in config.repositories() {
+    // A mirror URL can represent several origins, so use their shortest eligible TTL.
+    // A releases-only repository cannot contribute a SNAPSHOT policy.
+    for repo in config
+        .repositories()
+        .iter()
+        .filter(|repo| repo.snapshots.unwrap_or(false))
+    {
         let policy = repo.snapshots_update_policy.unwrap_or(default_policy);
-        policies.insert(normalize_repo_url(&repo.url), policy);
+        let effective = effective_url(&Repository::from(repo));
+        for url in [&repo.url, &effective] {
+            policies
+                .entry(normalize_repo_url(url))
+                .and_modify(|current| {
+                    if policy.ttl_secs() < current.ttl_secs() {
+                        *current = policy;
+                    }
+                })
+                .or_insert(policy);
+        }
     }
 
     lock.platforms
@@ -1570,17 +1626,54 @@ fn lock_requires_snapshot_refresh(lock: &Lockfile, config: &Config) -> bool {
         })
 }
 
-fn lock_references_unconfigured_origin(lock: &Lockfile, config: &Config) -> bool {
+/// Check whether configuration or the already loaded local model declares the
+/// lock's recorded URLs. Transitive allowlists do not declare root repositories;
+/// those origins still require model resolution to establish their provenance.
+/// The lock records the effective URL after mirror substitution. Changing or
+/// removing a mirror leaves its recorded URL unmatched and forces resolution.
+fn lock_references_unconfigured_origin(
+    lock: &Lockfile,
+    config: &Config,
+    models: &[ReactorModel],
+    effective_url: impl Fn(&Repository) -> String,
+) -> bool {
+    let repository_urls = |repo: Repository| {
+        let effective = effective_url(&repo);
+        [
+            normalize_repo_url(&repo.url),
+            normalize_repo_url(&effective),
+        ]
+    };
     let configured: HashSet<String> = config
         .repositories()
         .iter()
-        .map(|repo| normalize_repo_url(&repo.url))
+        .map(Repository::from)
+        .flat_map(&repository_urls)
         .collect();
-    lock.platforms
-        .iter()
-        .flat_map(LockPlatform::external_packages)
-        .filter(|package| package.system_path.is_none() && !package.repo_url.is_empty())
-        .any(|package| !configured.contains(&normalize_repo_url(&package.repo_url)))
+    lock.platforms.iter().any(|platform| {
+        let mut declared = configured.clone();
+        for model in models
+            .iter()
+            .filter(|model| model.platform == platform.platform)
+        {
+            declared.extend(
+                model
+                    .workspace
+                    .modules()
+                    .iter()
+                    .flat_map(|module| &module.descriptor.repositories)
+                    .filter(|repo| repo.root_declared)
+                    .cloned()
+                    .map(Repository::from)
+                    .flat_map(&repository_urls),
+            );
+        }
+        platform
+            .external_packages()
+            .into_iter()
+            .filter(|package| package.system_path.is_none() && !package.repo_url.is_empty())
+            .any(|package| !declared.contains(&normalize_repo_url(&package.repo_url)))
+    })
 }
 
 async fn resolve_reactor_lock(
@@ -1592,16 +1685,13 @@ async fn resolve_reactor_lock(
     strategy: ResolutionStrategy,
     strict_parents: bool,
 ) -> Result<ResolvedReactorLock> {
-    // The LRU caches are shared across the platform loop. Each platform pass
-    // resolves the same dependency surface (BOMs, parent POMs, metadata
-    // files), so a per-iteration `from_config` call would discard tens of
-    // MB of warm cache between consecutive platforms.
+    // Module contexts share only the parsed-POM cache from this state, keyed
+    // by blob digest. Each module gets fresh metadata, project and missing-parent
+    // caches, including when the same module is resolved for another platform.
     let shared_state = ResolveState::new();
 
-    // Fan the per-platform resolution out via `try_join_all`, sharing the
-    // same `Arc<ResolveState>`. Awaiting each platform serially would make
-    // a two-platform matrix pay 2× the wall time even though both
-    // resolutions hit the same warm caches independently.
+    // Resolve platforms concurrently; their module contexts reuse parsed POMs
+    // without sharing effective projects or other module resolution caches.
     let futures: Vec<_> = platforms
         .iter()
         .map(|platform| {
@@ -2473,8 +2563,9 @@ mod tests {
         conflicting_support_pom_digest, digest_algorithm_name, elapsed_saturating, filter_lock,
         format_checksum_failure_details, frozen_checks_local_inputs_only, hash_model_inputs,
         lock_artifact, lock_coordinate, lock_pins_incomplete, lock_references_unconfigured_origin,
-        lock_resolution_matches, merge_companion_pom, merge_support_pom,
-        platform_companion_pom_pins, require_lock_for_platforms, support_pom_pins,
+        lock_requires_snapshot_refresh, lock_resolution_matches, merge_companion_pom,
+        merge_support_pom, platform_companion_pom_pins, require_lock_for_platforms,
+        support_pom_pins,
     };
     use crate::error::CliError;
     use clap::Parser;
@@ -2624,13 +2715,16 @@ mod tests {
         use rv_config::{Config, RepoConfig, ResolvedPaths, UpdatePolicy};
 
         let temp = tempfile::tempdir().expect("temp dir");
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let central = RepoConfig {
             id: Some("central".to_string()),
             url: "https://repo1.maven.org/maven2/".to_string(),
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: Some(UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
         let config =
             Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![central]);
@@ -2639,9 +2733,266 @@ mod tests {
         push_package(&mut platform, package("com.example", "demo", "1.0"));
         lock.platforms.push(platform);
 
-        assert!(lock_references_unconfigured_origin(&lock, &config));
+        assert!(lock_references_unconfigured_origin(
+            &lock,
+            &config,
+            &[],
+            |repo| repo.url.clone()
+        ));
         lock.platforms[0].artifacts[0].repo_url = "https://repo1.maven.org/maven2".to_string();
-        assert!(!lock_references_unconfigured_origin(&lock, &config));
+        assert!(!lock_references_unconfigured_origin(
+            &lock,
+            &config,
+            &[],
+            |repo| repo.url.clone()
+        ));
+    }
+
+    /// Discovery supplies only local declarations, including active parent and
+    /// module profiles. Neither inactive profiles nor allowlists grant an origin.
+    #[test]
+    fn frozen_origins_include_local_model_repositories_and_mirrors() {
+        use rv_config::{Config, ResolvedPaths};
+        use std::fs;
+
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("parent")).unwrap();
+        fs::create_dir_all(temp.path().join("child")).unwrap();
+        fs::create_dir_all(temp.path().join(".mvn")).unwrap();
+        fs::write(
+            temp.path().join(".mvn/maven.config"),
+            "-Dregistry=https://local.example\n",
+        )
+        .unwrap();
+        fs::write(temp.path().join("parent/pom.xml"), r#"
+            <project><groupId>test</groupId><artifactId>parent</artifactId><version>1</version>
+              <profiles>
+                <profile><id>parent-active</id><activation><activeByDefault>true</activeByDefault></activation>
+                  <repositories><repository><id>parent</id><url>${registry}/parent/</url></repository></repositories>
+                </profile>
+                <profile><id>inactive</id>
+                  <repositories><repository><id>inactive</id><url>https://inactive.example/</url></repository></repositories>
+                </profile>
+              </profiles>
+            </project>"#).unwrap();
+        fs::write(temp.path().join("pom.xml"), r#"
+            <project><parent><groupId>test</groupId><artifactId>parent</artifactId><version>1</version>
+              <relativePath>parent/pom.xml</relativePath></parent>
+              <artifactId>root</artifactId><packaging>pom</packaging>
+              <repositories><repository><id>root</id><url>${registry}/root/</url></repository></repositories>
+              <modules><module>child</module></modules>
+            </project>"#).unwrap();
+        fs::write(temp.path().join("child/pom.xml"), r#"
+            <project><parent><groupId>test</groupId><artifactId>root</artifactId><version>1</version></parent>
+              <artifactId>child</artifactId><profiles>
+                <profile><id>child-active</id><activation><activeByDefault>true</activeByDefault></activation>
+                  <repositories><repository><id>child</id><url>${registry}/child/</url></repository></repositories>
+                </profile>
+              </profiles>
+            </project>"#).unwrap();
+        let paths = ResolvedPaths::from_raeva_home(temp.path().join("raeva"));
+        let mut config = Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![]);
+        config.security.allow_transitive_repositories = true;
+        let platform = Platform::new("linux", "x86_64").unwrap();
+        let model = super::discover_reactor_model(&config, &platform).unwrap();
+        let mut lock = Lockfile::new();
+        let mut locked = empty_platform("linux", "x86_64");
+        push_package(&mut locked, package("test", "dependency", "1"));
+        lock.platforms.push(locked);
+        let models = [model];
+        for (origin, unknown) in [
+            ("https://local.example/root", false),
+            ("https://local.example/parent/", false),
+            ("https://local.example/child/", false),
+            ("https://mirror.example/child/", false),
+            ("https://inactive.example/", true),
+            ("https://transitive.example/", true),
+        ] {
+            lock.platforms[0].artifacts[0].repo_url = origin.into();
+            assert_eq!(
+                lock_references_unconfigured_origin(&lock, &config, &models, |repo| {
+                    repo.url.replace("local.example", "mirror.example")
+                }),
+                unknown,
+                "{origin}"
+            );
+        }
+        // A declaration activated for another platform cannot authorize this lock.
+        lock.platforms[0].platform = Platform::new("windows", "x86_64").unwrap();
+        lock.platforms[0].artifacts[0].repo_url = "https://local.example/root/".into();
+        assert!(lock_references_unconfigured_origin(
+            &lock,
+            &config,
+            &models,
+            |repo| repo.url.clone()
+        ));
+    }
+
+    /// A lock entry under a mirror URL uses the origin's SNAPSHOT policy.
+    #[test]
+    fn snapshot_policy_follows_the_mirror_url_in_the_lock() {
+        use rv_config::{Config, RepoConfig, ResolvedPaths, UpdatePolicy};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let central = RepoConfig {
+            id: Some("central".to_string()),
+            url: "https://repo1.maven.org/maven2/".to_string(),
+            releases: Some(true),
+            snapshots: Some(true),
+            snapshots_update_policy: Some(UpdatePolicy::Always),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
+        };
+        let config =
+            Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![central]);
+        std::fs::write(&config.lock_path, "").expect("lock file");
+        let mut lock = Lockfile::new();
+        let mut platform = empty_platform("linux", "x86_64");
+        push_package(
+            &mut platform,
+            package("com.example", "demo", "1.0-SNAPSHOT"),
+        );
+        lock.platforms.push(platform);
+        lock.platforms[0].artifacts[0].repo_url = "https://nexus.corp/maven2/".to_string();
+
+        let mirror = |_: &rv_repo::Repository| "https://nexus.corp/maven2/".to_string();
+        assert!(lock_requires_snapshot_refresh(&lock, &config, mirror));
+        assert!(!lock_requires_snapshot_refresh(&lock, &config, |repo| repo
+            .url
+            .clone()));
+    }
+
+    #[test]
+    fn shared_mirror_uses_the_shortest_eligible_snapshot_policy() {
+        use rv_config::{Config, RepoConfig, ResolvedPaths, UpdatePolicy};
+        use std::time::{Duration, SystemTime};
+
+        let cases = [
+            (Some(false), UpdatePolicy::Never, UpdatePolicy::Always, true),
+            (None, UpdatePolicy::Never, UpdatePolicy::Always, true),
+            (Some(true), UpdatePolicy::Never, UpdatePolicy::Always, true),
+            (
+                Some(false),
+                UpdatePolicy::Always,
+                UpdatePolicy::Never,
+                false,
+            ),
+            (None, UpdatePolicy::Always, UpdatePolicy::Never, false),
+            (
+                Some(true),
+                UpdatePolicy::Daily,
+                UpdatePolicy::Interval(15),
+                true,
+            ),
+            (
+                Some(true),
+                UpdatePolicy::Daily,
+                UpdatePolicy::Interval(30),
+                false,
+            ),
+        ];
+        for (snapshots, first_policy, second_policy, refresh) in cases {
+            for reverse in [false, true] {
+                for first_url in ["https://origin.example/", "https://mirror.example"] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let mut repos = vec![
+                        RepoConfig {
+                            id: Some("first".to_string()),
+                            url: first_url.to_string(),
+                            releases: Some(true),
+                            snapshots,
+                            snapshots_update_policy: Some(first_policy),
+                            releases_update_policy: None,
+                            releases_checksum_policy: None,
+                            snapshots_checksum_policy: None,
+                        },
+                        RepoConfig {
+                            id: Some("second".to_string()),
+                            url: "https://snapshots.example/".to_string(),
+                            releases: Some(false),
+                            snapshots: Some(true),
+                            snapshots_update_policy: Some(second_policy),
+                            releases_update_policy: None,
+                            releases_checksum_policy: None,
+                            snapshots_checksum_policy: None,
+                        },
+                    ];
+                    if reverse {
+                        repos.reverse();
+                    }
+                    let config = Config::for_testing_with_repos(
+                        temp.path().to_path_buf(),
+                        ResolvedPaths::for_testing().unwrap(),
+                        repos,
+                    );
+                    let file = std::fs::File::create(&config.lock_path).unwrap();
+                    file.set_modified(SystemTime::now() - Duration::from_secs(20 * 60))
+                        .unwrap();
+                    let mut lock = Lockfile::new();
+                    let mut platform = empty_platform("linux", "x86_64");
+                    push_package(&mut platform, package("g", "a", "1-SNAPSHOT"));
+                    lock.platforms.push(platform);
+                    lock.platforms[0].artifacts[0].repo_url = "https://mirror.example/".to_string();
+                    assert_eq!(
+                        lock_requires_snapshot_refresh(&lock, &config, |_| {
+                            "https://mirror.example/".to_string()
+                        }),
+                        refresh,
+                        "snapshots={snapshots:?}, first={first_policy:?}, second={second_policy:?}, reverse={reverse}, origin={first_url}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A mirror URL passes the fast-path check only while that mirror is configured.
+    #[test]
+    fn lock_written_through_a_mirror_is_not_an_unconfigured_origin() {
+        use rv_config::{Config, RepoConfig, ResolvedPaths, UpdatePolicy};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let central = RepoConfig {
+            id: Some("central".to_string()),
+            url: "https://repo1.maven.org/maven2/".to_string(),
+            releases: Some(true),
+            snapshots: Some(false),
+            snapshots_update_policy: Some(UpdatePolicy::Daily),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
+        };
+        let config =
+            Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![central]);
+        let mut lock = Lockfile::new();
+        let mut platform = empty_platform("linux", "x86_64");
+        push_package(&mut platform, package("com.example", "demo", "1.0"));
+        lock.platforms.push(platform);
+        lock.platforms[0].artifacts[0].repo_url = "https://nexus.corp/maven2/".to_string();
+
+        let same_mirror = |_: &rv_repo::Repository| "https://nexus.corp/maven2".to_string();
+        assert!(!lock_references_unconfigured_origin(
+            &lock,
+            &config,
+            &[],
+            same_mirror
+        ));
+
+        let other_mirror = |_: &rv_repo::Repository| "https://other.corp/maven2/".to_string();
+        assert!(lock_references_unconfigured_origin(
+            &lock,
+            &config,
+            &[],
+            other_mirror
+        ));
+        assert!(lock_references_unconfigured_origin(
+            &lock,
+            &config,
+            &[],
+            |repo| repo.url.clone()
+        ));
     }
 
     /// The schema 1-3 exemption from fresh resolution is unconditional. A
@@ -2652,43 +3003,20 @@ mod tests {
     /// still answer it from the local model and cached POMs.
     #[test]
     fn legacy_frozen_checks_stay_local_regardless_of_force_conditions() {
-        for snapshot_refresh in [false, true] {
-            for rediscover in [false, true] {
-                for offline in [false, true] {
-                    assert!(
-                        frozen_checks_local_inputs_only(
-                            offline,
-                            true,
-                            snapshot_refresh,
-                            rediscover
-                        ),
-                        "legacy lock must stay local-inputs-only \
-                         (offline={offline}, snapshot_refresh={snapshot_refresh}, \
-                         rediscover={rediscover})"
-                    );
-                }
+        for rediscover in [false, true] {
+            for offline in [false, true] {
+                assert!(
+                    frozen_checks_local_inputs_only(offline, true, rediscover),
+                    "legacy lock must stay local-inputs-only \
+                     (offline={offline}, rediscover={rediscover})"
+                );
             }
         }
 
         // A schema-4 lock keeps the existing contract.
-        assert!(frozen_checks_local_inputs_only(true, false, false, false));
-        assert!(!frozen_checks_local_inputs_only(true, false, false, true));
-        assert!(!frozen_checks_local_inputs_only(false, false, false, false));
-    }
-
-    /// An offline `--frozen` run must not be dragged into a re-resolve by an
-    /// expired SNAPSHOT update policy. The cached `maven-metadata.xml` that
-    /// resolve would need carries the same TTL that declared the pins stale, so
-    /// the cache entry is expired whenever this condition fires and the run can
-    /// only abort with `OfflineNotCached`. That holds even when an unconfigured
-    /// origin would otherwise force the resolve.
-    #[test]
-    fn offline_frozen_stays_local_when_the_snapshot_policy_expired() {
-        assert!(frozen_checks_local_inputs_only(true, false, true, false));
-        assert!(frozen_checks_local_inputs_only(true, false, true, true));
-        // Online, an expired policy still resolves afresh: that is the whole
-        // point of the schema-4 contract.
-        assert!(!frozen_checks_local_inputs_only(false, false, true, false));
+        assert!(frozen_checks_local_inputs_only(true, false, false));
+        assert!(!frozen_checks_local_inputs_only(true, false, true));
+        assert!(!frozen_checks_local_inputs_only(false, false, false));
     }
 
     /// Reactor aggregation must not let a module that saw no repository id
@@ -3272,12 +3600,8 @@ mod tests {
         check_support_companion_agreement(&lock).expect("agreeing pins are the healthy shape");
     }
 
-    /// `rv sync --platforms <one>` must preserve every other platform's
-    /// entries from the previous lockfile. The fix is implemented as a
-    /// merge step between the in-memory `lock` (which holds only freshly
-    /// resolved platforms) and `previous_lock`. This unit test exercises
-    /// that merge directly to guard against a future refactor silently
-    /// dropping the un-resolved entries again.
+    /// Merging a partial sync must preserve the previous lockfile's entries
+    /// for platforms that were not resolved in this run.
     #[test]
     fn partial_sync_preserves_other_platforms() {
         use std::collections::HashSet;
@@ -3411,7 +3735,7 @@ mod tests {
         );
     }
 
-    /// #34: a freshly published upstream SNAPSHOT advances the artifact bytes
+    /// A freshly published upstream SNAPSHOT advances the artifact bytes
     /// (and thus the sha256 pin) when its update-policy TTL elapses. The
     /// `--frozen` snapshot-refresh path must NOT treat that as drift, because
     /// the coordinate/edges are unchanged. Release pins keep the strict
@@ -3440,7 +3764,7 @@ mod tests {
         );
     }
 
-    /// #34 guard: the snapshot relaxation must NOT leak into release pins. A
+    /// The snapshot relaxation must NOT leak into release pins. A
     /// release artifact whose checksum changed is genuine drift (a mismatch
     /// between the lockfile and what the repo now serves) and `--frozen` must
     /// reject it.
@@ -3628,17 +3952,14 @@ mod tests {
             !diff.is_empty(),
             "diff must not be empty when packages changed"
         );
-        // Updated entry
         assert!(
             diff.contains("com.example:lib"),
             "updated package must appear in diff: {diff}"
         );
-        // Removed entry
         assert!(
             diff.contains("com.example:other"),
             "removed package must appear in diff: {diff}"
         );
-        // Added entry
         assert!(
             diff.contains("com.example:new-dep"),
             "added package must appear in diff: {diff}"
@@ -3682,7 +4003,6 @@ mod tests {
 
         let mut old = Lockfile::new();
         let mut platform_old = empty_platform("linux", "x86_64");
-        // Add FROZEN_DIFF_DISPLAY_CAP + 3 packages in old (all removed in new).
         for i in 0..(FROZEN_DIFF_DISPLAY_CAP + 3) {
             push_package(
                 &mut platform_old,
@@ -3799,6 +4119,20 @@ mod tests {
             baseline,
             compute_config_hash(&make_config(), &pom_path).expect("hash stable"),
             "config_hash must be deterministic for unchanged inputs"
+        );
+
+        let resolution_baseline = super::compute_resolution_config_hash(&make_config()).unwrap();
+        let mut speed_config = make_config();
+        speed_config.network.low_speed_limit = 0;
+        assert_ne!(
+            resolution_baseline,
+            super::compute_resolution_config_hash(&speed_config).unwrap()
+        );
+        let mut speed_config = make_config();
+        speed_config.network.low_speed_time = 60;
+        assert_ne!(
+            resolution_baseline,
+            super::compute_resolution_config_hash(&speed_config).unwrap()
         );
 
         // Adding `.mvn/maven.config` must change the hash.

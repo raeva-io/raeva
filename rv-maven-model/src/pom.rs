@@ -262,7 +262,7 @@ pub struct Pom {
         deserialize_with = "deserialize_modules"
     )]
     pub modules: Vec<String>,
-    /// The `<build>` section. NOTE (#22): this is parsed and inheritance-merged
+    /// The `<build>` section. NOTE: this is parsed and inheritance-merged
     /// (see `merge_build` in [`crate::inheritance`]) so that plugin-version
     /// inheritance and resource declarations are modelled correctly, but the
     /// `<build>` section is deliberately NOT carried into the effective
@@ -273,6 +273,24 @@ pub struct Pom {
     /// delete the only coverage of plugin-management inheritance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) build: Option<Build>,
+    /// Each lineage POM's dependencies, indexed by profile `origin_level`, child first.
+    /// `apply_inheritance` retains them to preserve Maven's order after profile injection.
+    #[serde(skip)]
+    pub(crate) lineage_dependencies: Vec<Vec<Dependency>>,
+}
+
+impl Pom {
+    /// Mark declarations loaded from a user-owned POM. Call only at the local
+    /// model boundary, never when decoding repository or lockfile payloads.
+    pub fn mark_root_repositories(&mut self) {
+        for repo in self.repositories.iter_mut().chain(
+            self.profiles
+                .iter_mut()
+                .flat_map(|profile| profile.repositories.iter_mut()),
+        ) {
+            repo.root_declared = true;
+        }
+    }
 }
 
 fn deserialize_profiles<'de, D>(deserializer: D) -> Result<Vec<Profile>, D::Error>
@@ -327,7 +345,8 @@ impl Pom {
         // before any other parsing logic runs.
         let xml = strip_utf8_bom(xml);
         Self::reject_doctype(xml)?;
-        let pom: Pom = quick_xml::de::from_str(xml)?;
+        let mut pom: Pom = quick_xml::de::from_str(xml)?;
+        pom.trim_coordinates();
         // A coordinate field carrying a NUL byte (or any other ASCII
         // control character) sails through XML deserialization but then
         // fails downstream when the value gets re-serialized into TOML for
@@ -338,6 +357,39 @@ impl Pom {
         pom.validate_coord_fields()?;
         pom.validate_properties_count()?;
         Ok(pom)
+    }
+
+    /// Trim surrounding whitespace from coordinate fields, as Maven's model reader does.
+    /// This accepts element text split across lines. Validation checks interior characters.
+    fn trim_coordinates(&mut self) {
+        trim_opt(&mut self.group_id);
+        trim_opt(&mut self.artifact_id);
+        trim_opt(&mut self.version);
+        trim_opt(&mut self.packaging);
+        if let Some(parent) = &mut self.parent {
+            trim_str(&mut parent.group_id);
+            trim_str(&mut parent.artifact_id);
+            trim_str(&mut parent.version);
+        }
+        if let Some(relocation) = self
+            .distribution_management
+            .as_mut()
+            .and_then(|dm| dm.relocation.as_mut())
+        {
+            trim_opt(&mut relocation.group_id);
+            trim_opt(&mut relocation.artifact_id);
+            trim_opt(&mut relocation.version);
+        }
+        trim_dependencies(&mut self.dependencies);
+        if let Some(dm) = &mut self.dependency_management {
+            trim_dependencies(&mut dm.dependencies);
+        }
+        for profile in &mut self.profiles {
+            trim_dependencies(&mut profile.dependencies);
+            if let Some(dm) = &mut profile.dependency_management {
+                trim_dependencies(&mut dm.dependencies);
+            }
+        }
     }
 
     /// Reject POMs with an unreasonably large `<properties>` section.
@@ -390,7 +442,7 @@ impl Pom {
             };
             if let Some(byte) = value.as_bytes().iter().find(|b| **b < 0x20).copied() {
                 return Err(PomError::InvalidModel(format!(
-                    "POM <{field}> contains a control character (byte 0x{byte:02x}); \
+                    "POM </project/{field}> contains a control character (byte 0x{byte:02x}); \
                      coordinates must be printable text"
                 )));
             }
@@ -470,6 +522,35 @@ impl Pom {
             }
         }
         Ok(())
+    }
+}
+
+/// Trim characters through U+0020, as Java's `String.trim()` does for Maven element text.
+fn trim_str(value: &mut String) {
+    let trimmed = value.trim_matches(|c| c <= ' ');
+    if trimmed.len() != value.len() {
+        *value = trimmed.to_owned();
+    }
+}
+
+fn trim_opt(value: &mut Option<String>) {
+    if let Some(v) = value {
+        trim_str(v);
+    }
+}
+
+fn trim_dependencies(deps: &mut [Dependency]) {
+    for dep in deps {
+        trim_str(&mut dep.group_id);
+        trim_str(&mut dep.artifact_id);
+        trim_opt(&mut dep.version);
+        trim_opt(&mut dep.type_);
+        trim_opt(&mut dep.classifier);
+        trim_opt(&mut dep.scope);
+        for exclusion in &mut dep.exclusions {
+            trim_str(&mut exclusion.group_id);
+            trim_str(&mut exclusion.artifact_id);
+        }
     }
 }
 
@@ -803,6 +884,72 @@ mod tests {
             }
             other => panic!("expected InvalidModel, got {other:?}"),
         }
+    }
+
+    /// Maven trims surrounding whitespace in coordinate fields.
+    #[test]
+    fn trims_whitespace_around_coordinates() {
+        let xml = "<project>\
+                   <modelVersion>4.0.0</modelVersion>\
+                   <groupId>\n    org.osgi\n  </groupId>\
+                   <artifactId>\n    compendium\n  </artifactId>\
+                   <version>\n\t5.0.0\n</version>\
+                   <packaging>\n jar\n</packaging>\
+                   <parent><groupId>\n p.g\n</groupId><artifactId> pa </artifactId>\
+                   <version>\n1\n</version></parent>\
+                   <dependencies><dependency>\
+                   <groupId>\n  d.g\n</groupId><artifactId>\n d \n</artifactId>\
+                   <version>\n 2 \n</version><type>\n pom\n</type>\
+                   <classifier>\n c\n</classifier><scope>\n test\n</scope>\
+                   <exclusions><exclusion><groupId>\n e.g\n</groupId>\
+                   <artifactId>\n e\n</artifactId></exclusion></exclusions>\
+                   </dependency></dependencies>\
+                   </project>";
+        let pom = Pom::parse(xml).expect("padded coordinates should parse");
+        assert_eq!(pom.group_id.as_deref(), Some("org.osgi"));
+        assert_eq!(pom.artifact_id.as_deref(), Some("compendium"));
+        assert_eq!(pom.version.as_deref(), Some("5.0.0"));
+        assert_eq!(pom.packaging.as_deref(), Some("jar"));
+        let parent = pom.parent.expect("parent");
+        assert_eq!(
+            (parent.group_id, parent.artifact_id, parent.version),
+            ("p.g".into(), "pa".into(), "1".into())
+        );
+        let dep = &pom.dependencies[0];
+        assert_eq!(dep.group_id, "d.g");
+        assert_eq!(dep.artifact_id, "d");
+        assert_eq!(dep.version.as_deref(), Some("2"));
+        assert_eq!(dep.type_.as_deref(), Some("pom"));
+        assert_eq!(dep.classifier.as_deref(), Some("c"));
+        assert_eq!(dep.scope.as_deref(), Some("test"));
+        assert_eq!(dep.exclusions[0].group_id, "e.g");
+        assert_eq!(dep.exclusions[0].artifact_id, "e");
+    }
+
+    /// Padded groupIds in m2e `pluginExecutionFilter` blocks are plugin configuration, not coordinates.
+    #[test]
+    fn ignores_padded_ids_in_plugin_configuration() {
+        let xml = "<project>\
+                   <modelVersion>4.0.0</modelVersion>\
+                   <groupId>g</groupId><artifactId>a</artifactId><version>1</version>\
+                   <build><pluginManagement><plugins><plugin>\
+                   <artifactId>lifecycle-mapping</artifactId>\
+                   <configuration><lifecycleMappingMetadata><pluginExecutions>\
+                   <pluginExecution><pluginExecutionFilter>\
+                   <groupId>\n   org.apache.maven.plugins\n </groupId>\
+                   </pluginExecutionFilter></pluginExecution>\
+                   </pluginExecutions></lifecycleMappingMetadata></configuration>\
+                   </plugin></plugins></pluginManagement></build>\
+                   </project>";
+        Pom::parse(xml).expect("plugin configuration is not validated");
+    }
+
+    #[test]
+    fn interior_control_character_error_names_element_path() {
+        let xml = "<project><groupId>a\nb</groupId><artifactId>x</artifactId>\
+                   <version>1</version></project>";
+        let err = Pom::parse(xml).unwrap_err().to_string();
+        assert!(err.contains("/project/groupId"), "{err}");
     }
 
     #[test]

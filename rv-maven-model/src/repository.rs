@@ -4,6 +4,10 @@ use crate::pom::parse_bool;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Repository {
+    /// Provenance from the resolver for project and local POMs.
+    /// XML, cached models, and lockfile metadata cannot grant it.
+    #[serde(skip)]
+    pub root_declared: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub url: String,
@@ -19,6 +23,10 @@ pub struct Repository {
     /// Raw update-policy token from `<snapshots><updatePolicy>…</updatePolicy></snapshots>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots_update_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub releases_checksum_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots_checksum_policy: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Repository {
@@ -39,6 +47,8 @@ impl<'de> Deserialize<'de> for Repository {
             enabled: Option<String>,
             #[serde(rename = "updatePolicy")]
             update_policy: Option<String>,
+            #[serde(rename = "checksumPolicy")]
+            checksum_policy: Option<String>,
         }
 
         let xml = RepositoryXml::deserialize(deserializer)?;
@@ -67,6 +77,7 @@ impl<'de> Deserialize<'de> for Repository {
         let snapshots_update_policy = extract_update_policy(&xml.snapshots);
 
         Ok(Repository {
+            root_declared: false,
             id: xml.id,
             url: xml
                 .url
@@ -75,6 +86,8 @@ impl<'de> Deserialize<'de> for Repository {
             snapshots_enabled,
             releases_update_policy,
             snapshots_update_policy,
+            releases_checksum_policy: xml.releases.and_then(|p| p.checksum_policy),
+            snapshots_checksum_policy: xml.snapshots.and_then(|p| p.checksum_policy),
         })
     }
 }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::Result;
-use rv_config::UpdatePolicy;
+use rv_config::{ChecksumPolicy, UpdatePolicy};
 
 /// A configured Maven-compatible artifact repository with URL and release/snapshot policies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +24,10 @@ pub struct Repository {
         skip_serializing_if = "is_default_release_policy"
     )]
     pub releases_update_policy: UpdatePolicy,
+    #[serde(default)]
+    pub releases_checksum_policy: ChecksumPolicy,
+    #[serde(default)]
+    pub snapshots_checksum_policy: ChecksumPolicy,
 }
 
 impl Repository {
@@ -41,17 +45,25 @@ impl Repository {
             snapshots_enabled,
             snapshots_update_policy: UpdatePolicy::default(),
             releases_update_policy: default_release_update_policy(),
+            releases_checksum_policy: ChecksumPolicy::default(),
+            snapshots_checksum_policy: ChecksumPolicy::default(),
         }
     }
 
     pub(crate) fn from_config(config: &rv_config::RepoConfig) -> Self {
-        Self::new(
+        let mut out = Self::new(
             config.id.clone(),
             config.url.clone(),
             config.releases.unwrap_or(true),
             config.snapshots.unwrap_or(false),
         )
-        .with_snapshot_policy(config.snapshots_update_policy.unwrap_or_default())
+        .with_snapshot_policy(config.snapshots_update_policy.unwrap_or_default());
+        out.releases_update_policy = config
+            .releases_update_policy
+            .unwrap_or_else(default_release_update_policy);
+        out.releases_checksum_policy = config.releases_checksum_policy.unwrap_or_default();
+        out.snapshots_checksum_policy = config.snapshots_checksum_policy.unwrap_or_default();
+        out
     }
 
     pub(crate) fn from_maven_repo(repo: &rv_maven_model::Repository) -> Self {
@@ -75,7 +87,36 @@ impl Repository {
         {
             out.releases_update_policy = policy;
         }
+        out.releases_checksum_policy = repo
+            .releases_checksum_policy
+            .as_deref()
+            .and_then(ChecksumPolicy::parse)
+            .unwrap_or_default();
+        out.snapshots_checksum_policy = repo
+            .snapshots_checksum_policy
+            .as_deref()
+            .and_then(ChecksumPolicy::parse)
+            .unwrap_or_default();
         out
+    }
+
+    pub(crate) fn metadata_checksum_policy(&self, version: &str) -> ChecksumPolicy {
+        if is_snapshot_version(version) {
+            self.snapshots_checksum_policy
+        } else {
+            self.releases_checksum_policy
+        }
+    }
+
+    /// Preserve explicit strictness when multiple declarations share a URL.
+    /// Repository deduplication must never discard a POM's `fail` policy.
+    pub fn merge_checksum_policies(&mut self, other: &Self) {
+        if other.releases_checksum_policy == ChecksumPolicy::Fail {
+            self.releases_checksum_policy = ChecksumPolicy::Fail;
+        }
+        if other.snapshots_checksum_policy == ChecksumPolicy::Fail {
+            self.snapshots_checksum_policy = ChecksumPolicy::Fail;
+        }
     }
 
     /// Returns true if this repository's release/snapshot policy allows the given version.
@@ -85,6 +126,11 @@ impl Repository {
         } else {
             self.releases_enabled
         }
+    }
+
+    /// True for a read-only `file://` repository on the local filesystem.
+    pub fn is_local(&self) -> bool {
+        self.base_url().is_ok_and(|url| url.scheme() == "file")
     }
 
     pub fn base_url(&self) -> Result<Url> {
@@ -253,6 +299,19 @@ fn base_directory(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Repository, is_snapshot_version};
+
+    #[test]
+    fn local_classification_uses_the_parsed_scheme() {
+        for url in [
+            "file:///repo/",
+            "fi\tle:///repo/",
+            "fi\nle:///repo/",
+            "FI\rLE:///repo/",
+        ] {
+            assert!(Repository::new(None, url, true, true).is_local(), "{url:?}");
+        }
+        assert!(!Repository::new(None, "https://example.com/", true, true).is_local());
+    }
 
     #[test]
     fn normalizes_url_trailing_slash() {

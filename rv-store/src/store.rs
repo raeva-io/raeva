@@ -445,7 +445,7 @@ fn persist_blob_path_with_repair(
                     }
                     // Noclobber publish: if a third writer raced us between
                     // remove_file and link, the link fails with AlreadyExists
-                    // and we verify-and-reuse their inode (#13).
+                    // and we verify-and-reuse their inode.
                     publish_noclobber(&temp_source, target, expected_id, BlobOrigin::Created)
                 }
                 Err(StoreError::IoError(io_err))
@@ -548,7 +548,7 @@ impl Store {
 
         let db_path = path.join(INDEX_DB);
 
-        // Cross-process serialise WAL bootstrap + schema initialization (#2).
+        // Cross-process serialise WAL bootstrap + schema initialization.
         // Two `rv` processes calling `Store::open` concurrently must not race
         // on `PRAGMA journal_mode=WAL` (database-scoped, requires exclusive
         // lock to flip) or on `CREATE TABLE` / `ALTER TABLE` migrations.
@@ -610,7 +610,7 @@ impl Store {
                 .pragma_update(None, "journal_mode", "WAL")
                 .with_context(|| "failed to set journal_mode=WAL")
                 .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-            // Verify the mode actually flipped (#2). SQLite can silently
+            // Verify the mode actually flipped. SQLite can silently
             // fall back to DELETE if the filesystem refuses WAL (network
             // mounts, etc.); a silent fallback would erase the concurrency
             // guarantees the rest of the store relies on.
@@ -676,9 +676,6 @@ impl Store {
             pool: Arc::new(pool),
         };
 
-        // Inline temp cleanup synchronously (#19). The sweep takes a
-        // non-blocking `StoreLock`; if another process is actively writing
-        // it returns immediately and the next open retries.
         sweep_temp_dir(path);
 
         tracing::debug!(path = %path.display(), "store opened");
@@ -695,11 +692,11 @@ impl Store {
         // (it is not zero-copy); the Arc then lets us move ownership across the
         // `spawn_blocking` boundary cheaply. We do this because SHA-256 of
         // multi-MB payloads can stall the tokio runtime if computed on the
-        // async worker, so the hash runs inside `spawn_blocking` below (#7).
+        // async worker, so the hash runs inside `spawn_blocking` below.
         let bytes: Arc<[u8]> = Arc::from(bytes);
 
         tokio::task::spawn_blocking(move || {
-            // Hash on the blocking pool, not the async worker (#7).
+            // Hash on the blocking pool, not the async worker.
             let id = BlobId::from_bytes(&bytes);
             tracing::debug!(sha256 = %id, size, "storing blob");
             let target = root.join(paths::blob_path(&id));
@@ -923,7 +920,7 @@ impl Store {
             // error return here skips the add_artifact below.
             fsync_blob_dirs(&paths::blob_root(&root), &target)?;
 
-            // Stat the just-published blob so we can record size_bytes (#20).
+            // Stat the just-published blob so we can record size_bytes.
             // We just wrote it under the lock, so the stat is essentially free
             // and the row is guaranteed to point at a real file.
             let size_bytes = fs::symlink_metadata(&target).map(|m| m.len()).unwrap_or(0);
@@ -1047,7 +1044,7 @@ impl Store {
             // also takes the lock) cannot interleave and observe a state
             // where a blob file exists but has no index row, or the reverse.
             let _lock = StoreLock::acquire(&root)?;
-            // Verify the blob file exists before writing the row (#11). Stat
+            // Verify the blob file exists before writing the row. Stat
             // only (no re-hash): a hash recompute would dominate the hot
             // path, but a missing inode is cheap to detect and avoids
             // writing a row that no caller could ever follow.
@@ -1106,7 +1103,7 @@ impl Store {
     ///
     /// This API does NOT hold the store lock between the index lookup and
     /// any subsequent file access by the caller; a concurrent GC pass can
-    /// delete the blob in that window (#4). For the read-modify-validate
+    /// delete the blob in that window. For the read-modify-validate
     /// pattern, prefer [`Self::lookup_artifact_locked`], which acquires the
     /// same lock GC takes and stat-verifies the file before returning.
     /// Callers that keep using this method must be prepared to treat a
@@ -1134,7 +1131,7 @@ impl Store {
     }
 
     /// Race-free lookup that takes the store lock for the duration of the
-    /// index query and on-disk stat (#4). Returns `Some(id)` only if a row
+    /// index query and on-disk stat. Returns `Some(id)` only if a row
     /// points at a blob that exists on disk at lookup time. A concurrent GC
     /// sweep is serialised behind this call's lock, so the returned id is
     /// safe to hand to a downstream `Store::get_path` + `open` without a
@@ -1278,27 +1275,17 @@ impl Store {
 
     /// Computes aggregate statistics (blob count and total size) for the store.
     ///
-    /// GC/stats note: this is part of the store's garbage-collection subsystem,
-    /// which is library-internal and intentionally NOT exposed via the `rv` CLI
-    /// for the v1 launch (DECISION #3). The API is kept public and tested so a
-    /// later release (or the deferred cloud component) can wire it up.
-    ///
     /// This walks the on-disk blob tree (via `list_blob_entries`) rather than
     /// reading a SQL aggregate: the index only knows about blobs associated
     /// with an artifact row, so a store that mixes indexed artifacts with raw
     /// `put_bytes` / `put_stream` blobs would be undercounted by an index-only
     /// query. Walking the disk counts every blob exactly once regardless of how
     /// it was written. The cost is O(n) syscalls in the number of blobs; this
-    /// is a library-internal stats/GC path, not a hot lookup path (see #18).
+    /// is a library-internal stats/GC path, not a hot lookup path.
     pub async fn cache_stats(&self) -> Result<CacheStats> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
-            // WHY: walk the disk for the authoritative count. A store that
-            // mixes indexed artifacts with raw `put_bytes` blobs would
-            // otherwise be undercounted: the SQL-only path returns just the
-            // indexed rows and ignores the raw blobs entirely. Walking the
-            // disk gives every blob exactly one count regardless of how it
-            // got there.
+            // Walk the disk, not the index, so raw `put_bytes` blobs count too.
             let entries = store.list_blob_entries()?;
             let total_bytes = entries.iter().map(|entry| entry.size).sum();
             Ok(CacheStats {
@@ -1312,18 +1299,13 @@ impl Store {
 
     /// Removes blobs not in the `keep` set. Pass `dry_run=true` to preview without deleting.
     ///
-    /// GC/stats note: this garbage-collection entry point is library-internal
-    /// and intentionally NOT exposed via the `rv` CLI for the v1 launch
-    /// (DECISION #3). It stays public and tested for a later release / the
-    /// deferred cloud component.
-    ///
     /// `keep` is the caller's snapshot of "blobs I still need", typically
     /// computed from a lockfile BEFORE this call. The snapshot can be stale:
     /// between when the caller built it and when GC actually runs, a
     /// concurrent sync may have indexed a brand-new blob. To avoid
-    /// collecting that new blob as garbage, this method also intersects
-    /// `keep` with `referenced_blob_ids(index)` computed UNDER `StoreLock`
-    /// (#3). Any blob referenced by an index row at lock-acquire time is
+    /// collecting that new blob as garbage, this method unions
+    /// `keep` with `referenced_blob_ids(index)` computed UNDER `StoreLock`.
+    /// Any blob referenced by an index row at lock-acquire time is
     /// protected, even if the caller didn't list it in `keep`.
     pub async fn prune_blobs(&self, keep: &HashSet<BlobId>, dry_run: bool) -> Result<GcSummary> {
         let store = self.clone();
@@ -1331,7 +1313,7 @@ impl Store {
         tokio::task::spawn_blocking(move || {
             let _lock = StoreLock::acquire(&store.root)?;
 
-            // Re-derive the protected set under the lock (#3) so a
+            // Re-derive the protected set under the lock so a
             // concurrent sync that indexed a fresh blob between snapshot
             // and prune cannot lose it. Union with caller's `keep` (which
             // may include uncommitted blobs the caller is about to add).
@@ -1413,7 +1395,7 @@ impl Store {
                 // whose file is missing is dangling regardless of how the
                 // caller classified it.
                 //
-                // Two-phase approach (#1): collect candidate ids via a
+                // Two-phase approach: collect candidate ids via a
                 // short-lived non-transactional SELECT (we hold StoreLock,
                 // no concurrent writer can race), then only open an
                 // IMMEDIATE transaction for the DELETE. Holding an IMMEDIATE
@@ -1507,7 +1489,7 @@ impl Store {
                 }
 
                 // Truncate the WAL so it doesn't grow unboundedly across
-                // GC cycles (#14). TRUNCATE is best-effort; failures are
+                // GC cycles. TRUNCATE is best-effort; failures are
                 // logged at debug and don't fail the GC.
                 if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
                     tracing::debug!(error = %e, "WAL checkpoint TRUNCATE failed after prune");
@@ -1524,10 +1506,6 @@ impl Store {
     }
 
     /// Removes all blobs and clears the artifact index. Pass `dry_run=true` to preview.
-    ///
-    /// GC/stats note: like [`Store::prune_blobs`] / [`Store::cache_stats`], this
-    /// is part of the library-internal garbage-collection subsystem that is NOT
-    /// exposed via the `rv` CLI for the v1 launch (DECISION #3).
     pub async fn clean_blobs(&self, dry_run: bool) -> Result<GcSummary> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1559,7 +1537,7 @@ impl Store {
                 })?;
 
                 // Truncate the WAL after the bulk delete so the journal
-                // doesn't retain now-discarded rows indefinitely (#14).
+                // doesn't retain now-discarded rows indefinitely.
                 if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
                     tracing::debug!(error = %e, "WAL checkpoint TRUNCATE failed after clean");
                 }
@@ -1580,7 +1558,7 @@ impl Store {
             return Ok(Vec::new());
         }
         // Canonicalize the blob root once and assert every discovered entry
-        // stays under it before recording (#5). Guards against symlink-based
+        // stays under it before recording. Guards against symlink-based
         // path traversal that an attacker could plant in the blob tree.
         // Fail closed: if the root cannot be canonicalised, refuse to walk
         // rather than defeating the traversal guard with raw_root. NotFound
@@ -1626,7 +1604,7 @@ impl Store {
                     entry.io_context(|| format!("failed to read entry in {}", dir.display()))?;
                 let path = entry.path();
                 // Use file_type() instead of metadata() so we don't follow
-                // symlinks (#5). metadata() resolves the target, which would
+                // symlinks. metadata() resolves the target, which would
                 // otherwise let the walk descend into symlinked directories.
                 let file_type = match entry.file_type() {
                     Ok(t) => t,
@@ -1653,12 +1631,12 @@ impl Store {
                 }
 
                 // Verify the entry's path stays under the canonicalized blob
-                // root before we record it for deletion (#5). We canonicalize
+                // root before we record it for deletion. We canonicalize
                 // the root exactly once (above) and never traverse symlinks
                 // during the walk, so `path` is built entirely from canonical
                 // components: a lexical `starts_with` is sufficient and avoids
                 // an O(n) `canonicalize` syscall per blob on every GC/stats
-                // call (#19). `fs::canonicalize` resolves symlinks, not
+                // call. `fs::canonicalize` resolves symlinks, not
                 // hardlinks, so it would not catch a hardlinked blob anyway.
                 if !path.starts_with(&canonical_root) {
                     tracing::warn!(
@@ -1702,11 +1680,9 @@ impl Store {
 /// Uses `fs2::FileExt` which wraps `flock(2)` on Unix and `LockFileEx` on
 /// Windows behind a safe API.
 ///
-/// On Linux `flock(2)` locks are per-open-file-description: two threads in
-/// the same process that each open `.lock` would both observe a successful
-/// `try_lock_exclusive`. The `_intra` guard below adds an in-process Mutex
-/// keyed by canonicalised store root so threads serialise before the flock
-/// is even attempted.
+/// Linux `flock(2)` locks belong to open file descriptions, so separate opens
+/// of `.lock` contend within one process. The `_intra` mutex serializes callers
+/// by canonical store root before they acquire the file lock. Both waits share a deadline.
 struct StoreLock {
     file: File,
     _intra: std::sync::MutexGuard<'static, ()>,
@@ -1927,8 +1903,7 @@ mod tests {
         let root_a = dir.path().join("store-a");
         let root_b = dir.path().join("store-b");
 
-        // Pre-seed each store's temp dir with a stale file so we can verify
-        // the cleanup thread observed it. Files older than 24h are removed.
+        // Files older than 24h are removed by the synchronous sweep at open.
         let stale = SystemTime::now() - Duration::from_secs(48 * 3600);
         for root in [&root_a, &root_b] {
             let tmp = root.join(super::TMP_DIR);
@@ -1945,7 +1920,6 @@ mod tests {
         let _a = Store::open(&root_a).expect("open a");
         let _b = Store::open(&root_b).expect("open b");
 
-        // Cleanup runs on a background thread; give it a moment.
         for _ in 0..50 {
             let a_gone = !root_a.join(super::TMP_DIR).join("stale.tmp").exists();
             let b_gone = !root_b.join(super::TMP_DIR).join("stale.tmp").exists();
@@ -1987,7 +1961,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_lookup_round_trips_empty_classifier() {
-        // #55: a key whose classifier is `Some("")` is normalized to `None`,
+        // A key whose classifier is `Some("")` is normalized to `None`,
         // and the index stores/reconstructs it as "" <-> None consistently, so
         // the batch lookup must return a hit keyed by the (normalized) key the
         // caller passed in. A reconstructed key that kept `None` while a
@@ -2103,11 +2077,10 @@ mod tests {
         assert_eq!(store.cache_stats().await.expect("stats").blob_count, 1);
     }
 
-    /// #5/#19: a symlink planted in the blob tree must be skipped by the
+    /// A symlink planted in the blob tree must be skipped by the
     /// directory walk and never counted by `cache_stats` / collected by GC.
-    /// After #19 the per-entry `canonicalize` is gone, so this guards that the
-    /// symlink-skip at traversal time (not the lexical containment check) is
-    /// what protects the walk.
+    /// Symlinks must be skipped during traversal: lexical containment alone
+    /// cannot prevent following them outside the blob tree.
     #[cfg(unix)]
     #[tokio::test]
     async fn list_blob_entries_skips_symlinks() {
@@ -2223,7 +2196,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_removes_unreferenced_blobs() {
-        // Under the #3 fix, `prune_blobs` protects every blob referenced by
+        // `prune_blobs` protects every blob referenced by
         // the index at lock-acquire time so a concurrent indexer's row
         // can't be stranded. To exercise the "remove this blob" path, the
         // caller must remove the row first (or never index it). Here we
@@ -2427,22 +2400,11 @@ mod tests {
         assert!(!verified.contains(&id));
     }
 
-    /// Regression test: `put_stream` followed by `add_artifact`
-    /// has a window where a concurrent `prune_blobs` (GC) can delete the
-    /// freshly-persisted blob before its index row is written, leaving the
-    /// eventual artifact row pointing at a deleted file.
-    ///
-    /// Reproduce the legacy hazard against the unfixed API: call
-    /// `put_stream` directly, then a GC with an empty `keep` set, then
-    /// `add_artifact`. The legacy sequence ends with an indexed row but no
-    /// blob on disk.
-    ///
-    /// With the new `put_stream_and_index` method, the lock is held across
-    /// both halves and a GC observing an empty `keep` set cannot interleave
-    /// in the middle: after `put_stream_and_index` returns, the blob must be
-    /// present AND indexed even if GC runs against an empty keep set
-    /// concurrently or afterwards (since the row now references the blob,
-    /// the caller can pass it in `keep`).
+    /// GC can remove an unindexed blob between `put_stream` and `add_artifact`;
+    /// the latter must reject the missing file without creating an index row.
+    /// `put_stream_and_index` holds the lock across both steps, preventing GC
+    /// from interleaving. Its index row then protects the blob from later GC,
+    /// even with an empty keep set.
     #[tokio::test]
     async fn put_stream_and_index_survives_concurrent_gc() {
         let dir = tempdir().expect("tempdir");
@@ -2467,13 +2429,9 @@ mod tests {
             "artifact must be indexed after atomic put+index"
         );
 
-        // Simulate the previous-API race: between put_stream and add_artifact,
-        // a GC sweep with an empty `keep` set could have deleted the blob.
-        // Under the #11 fix, `add_artifact` stats the blob under the lock and
-        // refuses to record a row pointing at a missing file, so the
-        // dangling-row bug demonstrated here cannot be committed. The file is
-        // gone after GC and a follow-up `add_artifact` errors out instead of
-        // silently creating a dangling row.
+        // GC can delete an unindexed blob between put_stream and add_artifact.
+        // add_artifact checks for the file under the lock and rejects a missing
+        // blob instead of creating a dangling row.
         let key2 = ArtifactKey::new("com.example", "legacy", "1.0.0", "jar", None);
         let chunks2: Vec<Result<Bytes, std::io::Error>> =
             vec![Ok(Bytes::from_static(b"legacy-payload"))];
@@ -2527,10 +2485,8 @@ mod tests {
         );
     }
 
-    /// GC must delete the blob file before the index row, and a crash between
-    /// the two halves must leave a state the next GC sweep can clean up.
-    /// Simulates the crash by deleting the file by hand and then re-running
-    /// `prune_blobs` with an empty `keep` set.
+    /// GC must scrub dangling index rows even with an empty `keep` set.
+    /// Simulate a missing blob by deleting its file while retaining the row.
     #[tokio::test]
     async fn gc_recovers_from_crash_between_file_delete_and_row_delete() {
         let dir = tempdir().expect("tempdir");
@@ -2555,9 +2511,7 @@ mod tests {
             "dangling index row from simulated crash"
         );
 
-        // Step (5): the next GC sweep with an empty keep set must clean up
-        // the dangling row. The fixed code path treats NotFound on the file
-        // delete as success and proceeds to remove the index row.
+        // The recovery sweep removes the row after observing the missing file.
         store
             .prune_blobs(&HashSet::new(), false)
             .await
@@ -2574,9 +2528,7 @@ mod tests {
         assert!(!blob_path.exists(), "file is still gone after recovery GC");
     }
 
-    /// `prune_blobs` protects every blob still pointed at by an index row, so
-    /// the only way to exercise the file-then-row delete path is to remove
-    /// the row first (making the blob unreferenced) before the next prune.
+    /// `prune_blobs` protects indexed blobs; an unindexed blob is collectible.
     #[tokio::test]
     async fn gc_removes_index_row_after_file_delete() {
         let dir = tempdir().expect("tempdir");
@@ -2584,8 +2536,6 @@ mod tests {
 
         let id = store.put_bytes(b"order-test").await.expect("put");
 
-        // Do NOT index the blob: under the new semantics, an indexed blob
-        // is always protected. We're testing the file-delete half of GC.
         let blob_path = store.get_path(&id);
         assert!(blob_path.exists());
         store

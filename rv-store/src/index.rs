@@ -22,7 +22,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
     .with_context(|| "failed to initialize artifacts table")
     .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
 
-    // Backward-compatible migration (#20): older databases predate
+    // Backward-compatible migration: older databases predate
     // `size_bytes`. ALTER TABLE … ADD COLUMN is not directly idempotent
     // in SQLite; treat the "duplicate column" error as a no-op so we
     // can call this on every open without an explicit schema_version.
@@ -215,7 +215,7 @@ pub(crate) fn lookup_artifacts_batch(
                 // Reconstruct via the canonical helper so an empty stored
                 // classifier maps back to `None` consistently with how keys are
                 // written (`classifier_key`), keeping the round-trip lossless
-                // and the resulting key equal to the one the caller queried (#55).
+                // and the resulting key equal to the one the caller queried.
                 Ok((
                     ArtifactKey::new(
                         group_id,

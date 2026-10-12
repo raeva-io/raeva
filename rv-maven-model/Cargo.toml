@@ -7,7 +7,6 @@ repository.workspace = true
 description = "Maven POM parsing and effective model computation for Raeva"
 
 [dependencies]
-rv-version.workspace = true
 
 indexmap.workspace = true
 quick-xml.workspace = true

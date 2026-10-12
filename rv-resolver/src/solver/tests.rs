@@ -13,6 +13,7 @@ use rv_version::{Coord, Version, VersionReq};
 
 #[derive(Default)]
 struct MockBackend {
+    fetches: std::sync::Mutex<Vec<String>>,
     projects: HashMap<String, Project>,
     versions: HashMap<String, Vec<Version>>,
     platform_constraints: HashMap<String, PlatformConstraints>,
@@ -127,6 +128,7 @@ impl Backend for MockBackend {
                 self.versions
                     .get(&key)
                     .ok_or_else(|| ResolveError::ArtifactNotFound {
+                        dropped_repos: Vec::new(),
                         coord: key.clone(),
                         searched: Vec::new(),
                     })?;
@@ -165,17 +167,40 @@ impl Backend for MockBackend {
         })
     }
 
+    fn resolve_versions<'a>(
+        &'a self,
+        group_id: &'a str,
+        artifact_id: &'a str,
+        req: &'a VersionReq,
+    ) -> super::BoxFuture<'a, super::Result<Vec<ResolvedVersion>>> {
+        Box::pin(async move {
+            self.resolve_version(group_id, artifact_id, req).await?;
+            let mut versions: Vec<_> = self.versions[&Self::key(group_id, artifact_id)]
+                .iter()
+                .filter(|version| req.matches(version))
+                .map(|version| ResolvedVersion {
+                    version: version.clone(),
+                    repo_url: Some(Arc::from("mock://repo")),
+                })
+                .collect();
+            versions.sort_by(|a, b| a.version.cmp(&b.version));
+            Ok(versions)
+        })
+    }
+
     fn fetch_project<'a>(
         &'a self,
         coord: &'a Coord,
         _scope: Scope,
     ) -> super::BoxFuture<'a, super::Result<ResolvedProject>> {
         Box::pin(async move {
+            self.fetches.lock().unwrap().push(coord.to_string());
             let project = self
                 .projects
                 .get(&coord.to_string())
                 .cloned()
                 .ok_or_else(|| ResolveError::ArtifactNotFound {
+                    dropped_repos: Vec::new(),
                     coord: coord.to_string(),
                     searched: Vec::new(),
                 })?;
@@ -573,6 +598,236 @@ async fn follows_partial_relocation() {
     assert_eq!(find_version(&graph, "com.old", "lib"), None);
 }
 
+/// A cached terminal self-mapping must not count as a relocation cycle.
+#[tokio::test]
+async fn relocation_onto_already_resolved_target_is_not_a_cycle() {
+    let root = coord("com.example:root:1.0");
+    let mid = coord("com.example:mid:1.0");
+    let ext = coord("org.bc:ext:1.0");
+    let base = coord("org.bc:base:1.0");
+
+    let relocation = Relocation {
+        group_id: None,
+        artifact_id: Some("base".to_string()),
+        version: None,
+        message: None,
+    };
+
+    let backend = MockBackend::default()
+        .with_project(&mid, vec![dep("org.bc", "ext", "1.0")])
+        .with_relocated_project(&ext, relocation, Vec::new())
+        .with_project(&base, Vec::new());
+
+    let solver = Solver::new(&backend);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![
+                dep("org.bc", "base", "1.0"),
+                dep("com.example", "mid", "1.0"),
+            ],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_version(&graph, "org.bc", "base"),
+        Some("1.0".to_string())
+    );
+    assert_eq!(find_version(&graph, "org.bc", "ext"), None);
+}
+
+fn managed_constraint(group: &str, module: &str, version: &str) -> PlatformConstraint {
+    PlatformConstraint {
+        group: group.to_string(),
+        module: module.to_string(),
+        type_: "jar".to_string(),
+        classifier: None,
+        version: ConstraintVersion {
+            requires: Some(version.to_string()),
+            strictly: None,
+        },
+        enforced: false,
+        ..Default::default()
+    }
+}
+
+/// Maven re-applies the root's dependencyManagement to the relocated
+/// coordinates of a transitive dependency.
+#[tokio::test]
+async fn reapplies_management_after_transitive_relocation() {
+    let root = coord("com.example:root:1.0");
+    let mid = coord("com.example:mid:1.0");
+    let old = coord("org.old:lib:6.0");
+    let new_6 = coord("org.new:lib:6.0");
+    let new_7 = coord("org.new:lib:7.0");
+
+    let relocation = Relocation {
+        group_id: Some("org.new".to_string()),
+        artifact_id: None,
+        version: None,
+        message: None,
+    };
+    let backend = MockBackend::default()
+        .with_project(&mid, vec![dep("org.old", "lib", "6.0")])
+        .with_relocated_project(&old, relocation, Vec::new())
+        .with_project(&new_6, Vec::new())
+        .with_project(&new_7, Vec::new());
+
+    let mut constraints = PlatformConstraints::new();
+    constraints.add_constraint(managed_constraint("org.new", "lib", "7.0"));
+
+    let solver = Solver::new(&backend).with_platform_constraints(constraints);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![dep("com.example", "mid", "1.0")],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_version(&graph, "org.new", "lib"),
+        Some("7.0".to_string())
+    );
+}
+
+/// A direct dependency keeps the version it was declared with: Maven's
+/// resolver-level management does not apply at depth 1.
+#[tokio::test]
+async fn direct_relocated_dependency_keeps_declared_version() {
+    let root = coord("com.example:root:1.0");
+    let old = coord("org.old:lib:6.0");
+    let new_6 = coord("org.new:lib:6.0");
+    let new_7 = coord("org.new:lib:7.0");
+
+    let relocation = Relocation {
+        group_id: Some("org.new".to_string()),
+        artifact_id: None,
+        version: None,
+        message: None,
+    };
+    let backend = MockBackend::default()
+        .with_relocated_project(&old, relocation, Vec::new())
+        .with_project(&new_6, Vec::new())
+        .with_project(&new_7, Vec::new());
+
+    let mut constraints = PlatformConstraints::new();
+    constraints.add_constraint(managed_constraint("org.new", "lib", "7.0"));
+
+    let solver = Solver::new(&backend).with_platform_constraints(constraints);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![dep("org.old", "lib", "6.0")],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_version(&graph, "org.new", "lib"),
+        Some("6.0".to_string())
+    );
+}
+
+/// maven-resolver's NearestVersionSelector takes the nearest candidate that
+/// satisfies every hard range, so a nearer version outside a deeper range loses.
+#[tokio::test]
+async fn nearest_conflict_prefers_candidate_satisfying_deeper_range() {
+    let root = coord("com.example:root:1.0");
+    let a = coord("com.example:a:1.0");
+    let b = coord("com.example:b:1.0");
+    let c = coord("com.example:c:1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&a, vec![dep("org.x", "x", "1.0")])
+        .with_project(&b, vec![dep("com.example", "c", "1.0")])
+        .with_project(&c, vec![dep("org.x", "x", "[2.0,3.0)")])
+        .with_project(&coord("org.x:x:1.0"), Vec::new())
+        .with_project(&coord("org.x:x:2.5"), Vec::new())
+        .with_project(&coord("org.x:x:2.0"), Vec::new())
+        .with_versions("org.x", "x", vec!["1.0", "2.0", "2.5", "3.0"]);
+
+    let graph = Solver::new(&backend)
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![
+                dep("com.example", "a", "1.0"),
+                dep("com.example", "b", "1.0"),
+            ],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(find_version(&graph, "org.x", "x"), Some("2.5".to_string()));
+}
+
+/// A nearer candidate that already satisfies the deeper range stays selected.
+#[tokio::test]
+async fn nearest_conflict_keeps_nearer_candidate_inside_deeper_range() {
+    let root = coord("com.example:root:1.0");
+    let b = coord("com.example:b:1.0");
+    let c = coord("com.example:c:1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&b, vec![dep("com.example", "c", "1.0")])
+        .with_project(&c, vec![dep("org.x", "x", "[2.0,3.0)")])
+        .with_project(&coord("org.x:x:2.0"), Vec::new())
+        .with_project(&coord("org.x:x:2.5"), Vec::new())
+        .with_versions("org.x", "x", vec!["2.0", "2.5"]);
+
+    let graph = Solver::new(&backend)
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![dep("org.x", "x", "2.0"), dep("com.example", "b", "1.0")],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(find_version(&graph, "org.x", "x"), Some("2.0".to_string()));
+}
+
+/// Conflicting hard ranges must fail when no candidate satisfies them all.
+#[tokio::test]
+async fn nearest_conflict_fails_when_ranges_are_disjoint() {
+    let root = coord("com.example:root:1.0");
+    let b = coord("com.example:b:1.0");
+    let c = coord("com.example:c:1.0");
+    let d = coord("com.example:d:1.0");
+    let e = coord("com.example:e:1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&b, vec![dep("com.example", "c", "1.0")])
+        .with_project(&c, vec![dep("org.x", "x", "[2.0,3.0)")])
+        .with_project(&d, vec![dep("com.example", "e", "1.0")])
+        .with_project(&e, vec![dep("org.x", "x", "[1.0,1.8)")])
+        .with_project(&coord("org.x:x:1.5"), Vec::new())
+        .with_project(&coord("org.x:x:2.5"), Vec::new())
+        .with_versions("org.x", "x", vec!["1.5", "2.5"]);
+
+    let err = Solver::new(&backend)
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![
+                dep("com.example", "b", "1.0"),
+                dep("com.example", "d", "1.0"),
+            ],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ResolveError::VersionConflict { .. }),
+        "{err:?}"
+    );
+}
+
 #[tokio::test]
 async fn resolves_version_ranges() {
     let root = coord("com.example:root:1.0");
@@ -580,6 +835,7 @@ async fn resolves_version_ranges() {
 
     let backend = MockBackend::default()
         .with_project(&d, Vec::new())
+        .with_project(&coord("com.example:d:1.0"), Vec::new())
         .with_versions("com.example", "d", vec!["1.0", "1.5", "2.0"]);
 
     let solver = Solver::new(&backend);
@@ -2264,29 +2520,34 @@ async fn managed_exclusions_apply_to_transitive_nodes() {
     );
 }
 
+fn managed_scope_constraint(artifact: &str, scope: &str) -> PlatformConstraint {
+    PlatformConstraint {
+        group: "com.example".to_string(),
+        module: artifact.to_string(),
+        type_: "jar".to_string(),
+        classifier: None,
+        scope: Some(scope.to_string()),
+        ..Default::default()
+    }
+}
+
 /// Root depMgmt forces `<scope>test</scope>` on an unscoped transitive
-/// coordinate: the managed scope fills the blank, and the test-scoped
-/// transitive is then dropped from the closure. A dependency that declared its
-/// own scope keeps it (see `managed_scope_does_not_override_declared_child_scope`).
+/// coordinate. Maven prunes transitive test deps on the declared scope, before
+/// management, so the dep stays in the closure as a test dep (with its subtree).
 #[tokio::test]
-async fn managed_scope_test_prunes_transitive() {
+async fn managed_scope_test_keeps_transitive_as_test() {
     let root = coord("com.example:root:1.0");
     let lib = coord("com.example:lib:1.0");
     let extra = coord("com.example:extra:1.0");
+    let leaf = coord("com.example:leaf:1.0");
 
     let backend = MockBackend::default()
         .with_project(&lib, vec![dep_no_scope("com.example", "extra", "1.0")])
-        .with_project(&extra, Vec::new());
+        .with_project(&extra, vec![dep("com.example", "leaf", "1.0")])
+        .with_project(&leaf, Vec::new());
 
     let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "extra".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        scope: Some("test".to_string()),
-        ..Default::default()
-    });
+    constraints.add_constraint(managed_scope_constraint("extra", "test"));
 
     let solver = Solver::new(&backend).with_platform_constraints(constraints);
     let graph = solver
@@ -2299,33 +2560,107 @@ async fn managed_scope_test_prunes_transitive() {
         .unwrap();
 
     assert_eq!(
-        find_version(&graph, "com.example", "extra"),
-        None,
-        "managed test scope must fill in an unscoped transitive and drop it"
+        find_scope(&graph, "com.example", "extra"),
+        Some(Scope::Test),
+        "managed test scope keeps the transitive, as a test dep"
+    );
+    assert_eq!(
+        find_scope(&graph, "com.example", "leaf"),
+        Some(Scope::Test),
+        "the managed-test dep's own compile child is kept, as test"
     );
 }
 
-/// Root depMgmt forces `<optional>true</optional>` on a transitive
-/// coordinate; optional transitives are excluded from the closure.
+/// A dependency managed to test scope retains its subtree under a runtime parent.
+/// This applies even though `transitive_from(Runtime, Test)` returns `None`.
 #[tokio::test]
-async fn managed_optional_prunes_transitive() {
+async fn managed_scope_test_keeps_subtree_under_runtime_parent() {
+    let root = coord("com.example:root:1.0");
+    let lib = coord("com.example:lib:1.0");
+    let extra = coord("com.example:extra:1.0");
+    let leaf = coord("com.example:leaf:1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&lib, vec![dep("com.example", "extra", "1.0")])
+        .with_project(&extra, vec![dep("com.example", "leaf", "1.0")])
+        .with_project(&leaf, Vec::new());
+
+    let mut constraints = PlatformConstraints::new();
+    constraints.add_constraint(managed_scope_constraint("extra", "test"));
+
+    let solver = Solver::new(&backend).with_platform_constraints(constraints);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![Dependency {
+                scope: Some("runtime".to_string()),
+                ..dep("com.example", "lib", "1.0")
+            }],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_scope(&graph, "com.example", "extra"),
+        Some(Scope::Test)
+    );
+    assert!(find_version(&graph, "com.example", "leaf").is_some());
+}
+
+/// A compile dependency managed to `test` remains a child of a direct test dependency.
+#[tokio::test]
+async fn managed_test_scope_keeps_child_of_test_direct_dep() {
+    let root = coord("com.example:root:1.0");
+    let compress = coord("com.example:compress:1.0");
+    let io = coord("com.example:io:1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&compress, vec![dep_no_scope("com.example", "io", "1.0")])
+        .with_project(&io, Vec::new());
+
+    let mut constraints = PlatformConstraints::new();
+    constraints.add_constraint(managed_scope_constraint("io", "test"));
+
+    let solver = Solver::new(&backend).with_platform_constraints(constraints);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![Dependency {
+                scope: Some("test".to_string()),
+                ..dep("com.example", "compress", "1.0")
+            }],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_scope(&graph, "com.example", "io"),
+        Some(Scope::Test),
+        "managed test scope must not drop a test direct dep's transitive"
+    );
+}
+
+/// Maven prunes declared transitive `test` dependencies even when managed to `compile`.
+#[tokio::test]
+async fn declared_test_transitive_stays_dropped_despite_managed_compile() {
     let root = coord("com.example:root:1.0");
     let lib = coord("com.example:lib:1.0");
     let extra = coord("com.example:extra:1.0");
 
     let backend = MockBackend::default()
-        .with_project(&lib, vec![dep("com.example", "extra", "1.0")])
+        .with_project(
+            &lib,
+            vec![Dependency {
+                scope: Some("test".to_string()),
+                ..dep("com.example", "extra", "1.0")
+            }],
+        )
         .with_project(&extra, Vec::new());
 
     let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "extra".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        optional: Some("true".to_string()),
-        ..Default::default()
-    });
+    constraints.add_constraint(managed_scope_constraint("extra", "compile"));
 
     let solver = Solver::new(&backend).with_platform_constraints(constraints);
     let graph = solver
@@ -2337,22 +2672,9 @@ async fn managed_optional_prunes_transitive() {
         .await
         .unwrap();
 
-    assert_eq!(
-        find_version(&graph, "com.example", "extra"),
-        None,
-        "managed optional=true must drop the transitive dependency"
-    );
+    assert_eq!(find_version(&graph, "com.example", "extra"), None);
 }
 
-/// guava-testlib shape: a resolved artifact D (whose parent manages child C's
-/// version) declares C with no `<version>` and an explicit `<scope>compile`.
-/// C's version must come from D's effective dependencyManagement, C must keep
-/// its compile scope (not the management entry's test scope, which would drop it
-/// under the depth > 1 test prune), and C's own transitive dep must be pulled in.
-///
-/// `testlib` is a direct test dep, as jackson-databind declares guava-testlib.
-/// If the management entry's `test` scope were stamped onto `junit`, `junit`
-/// would be pruned at depth 2 and both it and `hamcrest` would vanish.
 #[tokio::test]
 async fn versionless_child_version_from_transitive_depmgmt() {
     let root = coord("com.example:root:1.0");
@@ -2454,14 +2776,10 @@ async fn explicit_child_version_wins_over_transitive_depmgmt() {
     );
 }
 
-/// Root dependencyManagement that carries a `<scope>test</scope>` for a
-/// coordinate must NOT override a transitive dependency that declares its own
-/// scope explicitly. `lib` (compile) declares `child` with an explicit
-/// compile scope; the root management pins `child` to test. The declared
-/// compile scope wins, so `child` stays on the graph rather than being pruned
-/// as a transitive test dependency.
+/// Root dependencyManagement overrides an explicit transitive compile scope with `test`.
+/// Maven retains the dependency and reports "scope managed from compile".
 #[tokio::test]
-async fn managed_scope_does_not_override_declared_child_scope() {
+async fn managed_scope_overrides_declared_child_scope() {
     let root = coord("com.example:root:1.0");
     let lib = coord("com.example:lib:1.0");
     let child = coord("com.example:child:1.0");
@@ -2471,14 +2789,7 @@ async fn managed_scope_does_not_override_declared_child_scope() {
         .with_project(&child, Vec::new());
 
     let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "child".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        scope: Some("test".to_string()),
-        ..Default::default()
-    });
+    constraints.add_constraint(managed_scope_constraint("child", "test"));
 
     let solver = Solver::new(&backend).with_platform_constraints(constraints);
     let graph = solver
@@ -2491,14 +2802,9 @@ async fn managed_scope_does_not_override_declared_child_scope() {
         .unwrap();
 
     assert_eq!(
-        find_version(&graph, "com.example", "child"),
-        Some("1.0".to_string()),
-        "an explicitly declared compile scope must survive a managed test scope"
-    );
-    assert_eq!(
         find_scope(&graph, "com.example", "child"),
-        Some(Scope::Compile),
-        "the child must keep its declared compile scope, not the managed test scope"
+        Some(Scope::Test),
+        "managed test scope overrides the declared compile scope"
     );
 }
 
@@ -2744,8 +3050,10 @@ async fn rv_toml_root_provided_dep_includes_children() {
 // VersionConflict when nearest-wins picks an out-of-range version
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Graph: root → a:1.5 (soft pin, depth=1); root → b:1.0 → a:[2,3) (hard range, depth=2).
+/// Graph: root -> a:[1.5] (depth 1); root -> b:1.0 -> a:[2,3) (depth 2).
 ///
+/// A soft nearer version would instead lose to the range (maven-resolver picks
+/// the nearest candidate satisfying every hard range); a hard pin cannot, so
 /// NearestWins selects a:1.5 (depth=1 wins). When b's transitive requirement
 /// `[2,3)` arrives as the loser, 1.5 ∉ [2,3) → `VersionConflict` must be raised.
 ///
@@ -2779,6 +3087,7 @@ async fn nearest_wins_out_of_range_raises_version_conflict() {
         .with_project(&a_15, Vec::new())
         .with_project(&a_25, Vec::new())
         .with_project(&b, vec![dep_a_range])
+        .with_project(&coord("com.example:a:2.0"), Vec::new())
         .with_versions("com.example", "a", vec!["1.5", "2.0", "2.5"]);
 
     let solver = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
@@ -2786,8 +3095,8 @@ async fn nearest_wins_out_of_range_raises_version_conflict() {
         .solve(SolverRoot {
             coord: root,
             dependencies: vec![
-                dep("com.example", "a", "1.5"), // soft pin, depth=1, wins nearest
-                dep("com.example", "b", "1.0"), // depth=1, pulls a:[2,3) at depth=2
+                dep("com.example", "a", "[1.5]"),
+                dep("com.example", "b", "1.0"),
             ],
             scope: Scope::Compile,
         })
@@ -2851,12 +3160,12 @@ async fn nearest_wins_in_range_succeeds() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// #49: a hard *pin* (`[X]` -> Exact) that loses nearest-wins must raise
+// A hard *pin* (`[X]` -> Exact) that loses nearest-wins must raise
 // VersionConflict, consistent with a hard *range* losing. Earlier only Ranges
 // raised; a losing Exact pin silently accepted the nearest-wins version.
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Graph: root → a:1.5 (soft pin, depth=1); root → b:1.0 → a:[2.5] (hard pin,
+/// Graph: root -> a:[1.5] (hard pin, depth=1); root -> b:1.0 -> a:[2.5] (hard pin,
 /// depth=2). NearestWins selects a:1.5 (depth=1 wins). The transitive hard pin
 /// `[2.5]` arrives as the loser; 1.5 ≠ 2.5 → `VersionConflict` must be raised.
 #[tokio::test]
@@ -2881,8 +3190,8 @@ async fn nearest_wins_loses_hard_pin_raises_version_conflict() {
         .solve(SolverRoot {
             coord: root,
             dependencies: vec![
-                dep("com.example", "a", "1.5"), // soft pin, depth=1, wins nearest
-                dep("com.example", "b", "1.0"), // depth=1, pulls a:[2.5] at depth=2
+                dep("com.example", "a", "[1.5]"),
+                dep("com.example", "b", "1.0"),
             ],
             scope: Scope::Compile,
         })
@@ -3021,3 +3330,56 @@ async fn system_scope_with_version_resolves() {
         Some("1.2.3".to_string())
     );
 }
+
+/// Maven retains a provided dependency's compile child when the root manages it to `test`.
+#[tokio::test]
+async fn managed_test_scope_keeps_child_of_provided_direct_dep() {
+    let root = coord("com.example:root:1.0");
+    let core = coord("com.example:core:1.0");
+    let guava = coord("com.example:guava:1.0");
+
+    let backend = MockBackend::default()
+        .with_project(&core, vec![dep("com.example", "guava", "1.0")])
+        .with_project(&guava, Vec::new());
+
+    let mut constraints = PlatformConstraints::new();
+    constraints.add_constraint(managed_scope_constraint("guava", "test"));
+
+    let solver = Solver::new(&backend).with_platform_constraints(constraints);
+    let graph = solver
+        .solve(SolverRoot {
+            coord: root,
+            dependencies: vec![Dependency {
+                scope: Some("provided".to_string()),
+                ..dep("com.example", "core", "1.0")
+            }],
+            scope: Scope::Compile,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        find_scope(&graph, "com.example", "guava"),
+        Some(Scope::Test)
+    );
+}
+
+#[test]
+fn fetch_share_widens_as_sibling_solves_finish() {
+    let share = Arc::new(super::FetchShare::new(8));
+    assert_eq!(share.current(), 8, "a lone solve gets the whole budget");
+
+    let guards: Vec<_> = (0..4).map(|_| share.enter()).collect();
+    assert_eq!(share.current(), 2, "four running solves split it evenly");
+
+    drop(guards);
+    assert_eq!(share.current(), 8, "finished solves hand their slice back");
+
+    let guards: Vec<_> = (0..32).map(|_| share.enter()).collect();
+    assert_eq!(share.current(), 1, "every solve keeps at least one slot");
+    drop(guards);
+}
+
+mod nearest;
+
+mod lazy_ranges;

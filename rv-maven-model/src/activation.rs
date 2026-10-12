@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use rv_version::{Version, VersionReq};
-
 #[derive(Debug, Clone, Default)]
 pub struct ActivationContext {
     pub properties: HashMap<String, String>,
@@ -32,7 +30,7 @@ impl ActivationContext {
     pub fn from_system() -> Self {
         let mut properties: HashMap<String, String> = HashMap::new();
         let os_name = Some(rust_os_to_maven_name(std::env::consts::OS).to_string());
-        let os_arch = Some(std::env::consts::ARCH.to_string());
+        let os_arch = Some(jvm_os_arch(std::env::consts::OS, std::env::consts::ARCH).to_string());
         let os_family = detect_family(std::env::consts::OS).map(str::to_string);
         // SECURITY: Maven's `os.version` is JVM-supplied (`System.getProperty`).
         // Honouring a host env var here would let a third-party POM activate
@@ -137,7 +135,7 @@ impl Activation {
     /// suppression; it answers the local question "does this block, in
     /// isolation, request activation?".
     ///
-    /// Use [`evaluate_profiles`] for the cross-profile, suppression-aware
+    /// Use `evaluate_profiles` for the cross-profile, suppression-aware
     /// answer when computing the active profile set for an effective POM.
     pub fn is_active(&self, ctx: &ActivationContext) -> bool {
         // `<activeByDefault>true</activeByDefault>` activates the profile in
@@ -453,26 +451,15 @@ fn matches_os_family(expected: Option<&str>, ctx: &ActivationContext) -> bool {
     matched ^ negated
 }
 
+/// Match Maven's `JdkVersionProfileActivator`.
+/// A leading `!` negates a prefix match, including for `![17,)`. Otherwise,
+/// `[` or `(` starts a range; any other value matches a `java.version` prefix.
+/// Malformed ranges never activate.
 fn jdk_active(jdk: &str, ctx: &ActivationContext) -> bool {
     let req = jdk.trim();
     if req.is_empty() {
         return false;
     }
-
-    // Support `!`-negation prefix: `!17` means "activate when JDK is NOT 17".
-    if let Some(negated) = req.strip_prefix('!') {
-        let Some(found) = ctx
-            .jdk_version
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        else {
-            // No JDK version known; cannot confirm the condition, treat as inactive.
-            return false;
-        };
-        return !jdk_matches(negated, found);
-    }
-
     let Some(found) = ctx
         .jdk_version
         .as_deref()
@@ -482,23 +469,97 @@ fn jdk_active(jdk: &str, ctx: &ActivationContext) -> bool {
         return false;
     };
 
-    jdk_matches(req, found)
+    if let Some(negated) = req.strip_prefix('!') {
+        return !found.starts_with(negated);
+    }
+    if req.starts_with('[') || req.starts_with('(') {
+        return jdk_in_range(req, found).unwrap_or(false);
+    }
+    found.starts_with(req)
 }
 
-/// Check whether `req` (a JDK version requirement string without the `!` prefix)
-/// matches `actual` (the concrete JDK version string).
-fn jdk_matches(req: &str, actual: &str) -> bool {
-    if req.starts_with('[') || req.starts_with('(') {
-        let Ok(requirement) = VersionReq::parse(req) else {
-            return false;
+struct JdkBound {
+    value: String,
+    closed: bool,
+}
+
+/// Maven classifies comma-separated pieces by their brackets and ignores
+/// pieces with no bracket. A single bound gets an open upper bound of 99999999.
+fn jdk_in_range(range: &str, actual: &str) -> Option<bool> {
+    let mut bounds: Vec<JdkBound> = Vec::new();
+    for token in java_split(range, &[',']) {
+        let (value, closed) = if token.starts_with('[') {
+            (token.replace('[', ""), true)
+        } else if token.starts_with('(') {
+            (token.replace('(', ""), false)
+        } else if token.ends_with(']') {
+            (token.replace(']', ""), true)
+        } else if token.ends_with(')') {
+            (token.replace(')', ""), false)
+        } else if token.is_empty() {
+            (String::new(), false)
+        } else {
+            continue;
         };
-        let Ok(version) = Version::parse(actual) else {
-            return false;
-        };
-        requirement.matches(&version)
-    } else {
-        actual.starts_with(req)
+        bounds.push(JdkBound {
+            value: value.trim().to_string(),
+            closed,
+        });
     }
+    if bounds.len() < 2 {
+        bounds.push(JdkBound {
+            value: "99999999".to_string(),
+            closed: false,
+        });
+    }
+    use std::cmp::Ordering::*;
+    match jdk_relation(actual, bounds.first()?, true)? {
+        Equal => Some(true),
+        Less => Some(false),
+        Greater => Some(jdk_relation(actual, bounds.get(1)?, false)? != Greater),
+    }
+}
+
+/// Java's split drops trailing empty components, except for an empty input.
+fn java_split<'a>(value: &'a str, separators: &[char]) -> Vec<&'a str> {
+    let mut tokens: Vec<_> = value.split(separators).collect();
+    if !value.is_empty() {
+        while tokens.last().is_some_and(|token| token.is_empty()) {
+            tokens.pop();
+        }
+    }
+    tokens
+}
+
+/// Compare JDK version components as Maven's `JdkVersionProfileActivator` does.
+/// Clean only `java.version`, split it on `._-`, and split bounds on dots.
+/// Compare up to three signed Java integers, stopping at the first difference.
+fn jdk_relation(actual: &str, bound: &JdkBound, is_left: bool) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    if bound.value.is_empty() {
+        return Some(if is_left { Greater } else { Less });
+    }
+    let cleaned: String = actual
+        .chars()
+        .filter(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    let actual_parts = java_split(&cleaned, &['.', '-', '_']);
+    let bound_parts = java_split(&bound.value, &['.']);
+    for i in 0..3 {
+        let actual = actual_parts.get(i).unwrap_or(&"0").parse::<i32>().ok()?;
+        let bound = bound_parts.get(i).unwrap_or(&"0").parse::<i32>().ok()?;
+        match actual.cmp(&bound) {
+            Equal => {}
+            order => return Some(order),
+        }
+    }
+    Some(if bound.closed {
+        Equal
+    } else if is_left {
+        Less
+    } else {
+        Greater
+    })
 }
 
 fn file_active(file: &ActivationFile, ctx: &ActivationContext) -> bool {
@@ -559,6 +620,17 @@ fn rust_os_to_maven_name(rust_os: &str) -> &str {
         "solaris" | "illumos" => "sunos",
         "aix" => "aix",
         _ => rust_os,
+    }
+}
+
+/// The JVM's `os.arch` for a Rust target. OpenJDK reports x86_64 as `amd64`
+/// everywhere except macOS, and POMs activate native profiles on that value.
+pub fn jvm_os_arch<'a>(rust_os: &str, rust_arch: &'a str) -> &'a str {
+    match (rust_os, rust_arch) {
+        ("macos", _) => rust_arch,
+        (_, "x86_64") => "amd64",
+        ("linux", "x86") => "i386",
+        _ => rust_arch,
     }
 }
 
@@ -639,14 +711,6 @@ fn strip_quotes(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serialises the tests in THIS module that mutate the process-wide
-    /// `${env.*}` allowlist so they do not race each other. (The allowlist is
-    /// global crate state shared with `properties.rs`; cross-file races are an
-    /// existing property of that design, but at least our own tests stay
-    /// deterministic relative to one another.)
-    static ENV_ALLOWLIST_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parses_activation() {
@@ -698,7 +762,7 @@ mod tests {
 
     #[test]
     fn property_activation_matches_env_namespace() {
-        let _guard = ENV_ALLOWLIST_GUARD
+        let _guard = crate::properties::ENV_ALLOWLIST_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let key = format!("RAEVA_TEST_ENV_{}", unique_suffix());
@@ -728,7 +792,7 @@ mod tests {
     // profile off host secrets (AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, ...).
     #[test]
     fn env_property_activation_requires_allowlist() {
-        let _guard = ENV_ALLOWLIST_GUARD
+        let _guard = crate::properties::ENV_ALLOWLIST_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let key = format!("RAEVA_TEST_ENV_DENIED_{}", unique_suffix());
@@ -823,6 +887,36 @@ mod tests {
     }
 
     #[test]
+    fn jvm_os_arch_matches_openjdk_names() {
+        assert_eq!(jvm_os_arch("linux", "x86_64"), "amd64");
+        assert_eq!(jvm_os_arch("windows", "x86_64"), "amd64");
+        assert_eq!(jvm_os_arch("macos", "x86_64"), "x86_64");
+        assert_eq!(jvm_os_arch("linux", "aarch64"), "aarch64");
+        assert_eq!(jvm_os_arch("macos", "aarch64"), "aarch64");
+        assert_eq!(jvm_os_arch("linux", "x86"), "i386");
+        assert_eq!(jvm_os_arch("windows", "x86"), "x86");
+    }
+
+    #[test]
+    fn linux_x86_64_activates_amd64_profile() {
+        let xml = "<activation><os><family>Linux</family><arch>amd64</arch></os></activation>";
+        let activation: Activation = quick_xml::de::from_str(xml).unwrap();
+        let ctx = ActivationContext {
+            properties: HashMap::new(),
+            os_name: Some("linux".to_string()),
+            os_family: Some("unix".to_string()),
+            os_arch: Some(jvm_os_arch("linux", "x86_64").to_string()),
+            os_version: None,
+            jdk_version: None,
+            base_dir: None,
+            local_repository: None,
+            active_profiles: Vec::new(),
+            inactive_profiles: Vec::new(),
+        };
+        assert!(activation.is_active(&ctx));
+    }
+
+    #[test]
     fn jdk_activation_matches_range() {
         let activation = Activation {
             active_by_default: false,
@@ -844,6 +938,83 @@ mod tests {
             inactive_profiles: Vec::new(),
         };
         assert!(activation.is_active(&ctx));
+    }
+
+    /// Expected values match Maven's `help:active-profiles` output.
+    #[test]
+    fn jdk_activation_matches_maven_semantics() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("[17,", "21.0.12.1", true),
+            ("[17,", "11", false),
+            ("[17", "21", true),
+            ("[17,)", "21", true),
+            ("[17,]", "21", true),
+            ("17", "21", false),
+            ("17", "17.0.2", true),
+            ("21", "21.0.12.1", true),
+            ("1.8", "1.8.0_292", true),
+            ("1.8", "21", false),
+            ("!1.8", "21", true),
+            ("!1.8", "1.8.0_292", false),
+            ("!17", "17.0.2", false),
+            ("![17,)", "21", true),
+            ("![17,)", "11", true),
+            ("(,1.8]", "21", false),
+            ("(,1.8]", "1.8.0_292", true),
+            ("[1.8,1.9)", "1.8.0_292", true),
+            ("[1.8,1.9)", "21", false),
+            ("[,17]", "21", false),
+            ("[,17]", "11", true),
+            ("[17,21)", "21", false),
+            ("[17,21)", "17.0.2", true),
+            ("[17,21]", "21", true),
+            ("[17,22)", "21.0.12.1", true),
+            ("(21,)", "21", false),
+            ("(21,)", "21.0.12", true),
+            ("[21.0.1,)", "21", false),
+            ("[21.0.1,)", "21.0.12", true),
+            ("(,)", "21", true),
+            ("[17]", "17.0.2", false),
+            ("[abc,)", "21", false),
+            ("17,", "21", false),
+            ("[17,)", "26-ea", true),
+            ("[26,27)", "26-ea", true),
+            ("(26,)", "26-ea", false),
+            ("[17,)", "21.0.2+13", true),
+            ("[21.0.2,21.0.3)", "21.0.2+13", false),
+            ("[21.0.213,21.0.214)", "21.0.2+13", true),
+            ("[1.8,1.9)", "1.8.0_402", true),
+            ("(1.8,)", "1.8.0_402", false),
+            ("[21,22)", "21...", true),
+            ("[21,22)", "21-ea._-", true),
+            ("[21,22)", "21..1", false),
+            ("[21,22)", "21.0.2..999999999999", true),
+            ("[21.,22.)", "21", true),
+            ("[21-0,22)", "21", false),
+            ("[21_0,22)", "21", false),
+            ("[21,22)", "21.2147483648", false),
+            ("[17,)", "21.2147483648", true),
+            ("[21,22)", "21.0.0.2147483648", true),
+            ("[21,21)", "21", true),
+        ];
+        for (jdk, version, expected) in cases {
+            let activation = Activation {
+                active_by_default: false,
+                property: None,
+                os: None,
+                jdk: Some((*jdk).to_string()),
+                file: None,
+            };
+            let ctx = ActivationContext {
+                jdk_version: Some((*version).to_string()),
+                ..ActivationContext::default()
+            };
+            assert_eq!(
+                activation.is_active(&ctx),
+                *expected,
+                "<jdk>{jdk}</jdk> on java.version {version}"
+            );
+        }
     }
 
     #[test]

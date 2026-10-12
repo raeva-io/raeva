@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{ArtifactId, GroupId, Version, VersionError};
 
-/// A fully-qualified Maven coordinate (groupId:artifactId:version[:packaging[:classifier]]).
+/// A fully-qualified Maven coordinate (`groupId:artifactId:version[:packaging[:classifier]]`).
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Coord {
     pub group_id: GroupId,
@@ -450,7 +450,7 @@ mod tests {
         }
     }
 
-    /// Regression for #54: a `Coord` carrying a classifier but NO packaging
+    /// Regression: a `Coord` carrying a classifier but NO packaging
     /// renders as `g:a:1.0::tests` (empty packaging placeholder). Parsing that
     /// back used to fail because the empty middle segment was rejected, so the
     /// serde round-trip was not total. The empty packaging slot before a

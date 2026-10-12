@@ -1,12 +1,11 @@
 mod common;
 
+use rv_test_support::http::{Response, StubServer};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::io::{Read, Write};
-use std::net::TcpListener;
 use std::path::Path;
-use std::thread;
+use std::sync::Mutex;
 
 use common::{rv_command, temp_project};
 use rv_config::{Checksum, LockPackage, LockPlatform, Lockfile};
@@ -104,101 +103,38 @@ fn add_locked_dependency(project_root: &Path, artifact_id: &str) {
     lock.write_atomic(&lock_path).expect("write fixture lock");
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> String {
-    let mut request = Vec::new();
-    let mut buffer = [0u8; 1024];
-    let mut expected_length = None;
-    loop {
-        let size = stream.read(&mut buffer).expect("read OSV request");
-        assert_ne!(size, 0, "OSV request ended before its body was complete");
-        request.extend_from_slice(&buffer[..size]);
-        if expected_length.is_none()
-            && let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
-        {
-            let headers = String::from_utf8_lossy(&request[..header_end]);
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    line.split_once(':').and_then(|(name, value)| {
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().expect("Content-Length"))
-                    })
-                })
-                .unwrap_or(0);
-            expected_length = Some(header_end + 4 + content_length);
-        }
-        if expected_length.is_some_and(|length| request.len() >= length) {
-            break;
-        }
-    }
-    String::from_utf8(request).expect("OSV request UTF-8")
+fn spawn_osv(status: u16, response_body: &'static str) -> (String, StubServer) {
+    let server = StubServer::start(move |_| {
+        Response::new(status, response_body).header("Content-Type", "application/json")
+    });
+    (format!("http://{}/v1", server.addr()), server)
 }
 
-fn spawn_osv(status: &str, response_body: &'static str) -> (String, thread::JoinHandle<String>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind OSV mock");
-    let address = listener.local_addr().expect("mock address");
-    let status = status.to_string();
-    let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept OSV request");
-        let request = read_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response_body}",
-            response_body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write OSV response");
-        request
+fn spawn_osv_routes(routes: Vec<(&'static str, &'static str)>) -> (String, StubServer) {
+    let routes = Mutex::new(routes.into_iter().fold(
+        HashMap::<String, VecDeque<&'static str>>::new(),
+        |mut routes, (path, body)| {
+            routes.entry(path.to_string()).or_default().push_back(body);
+            routes
+        },
+    ));
+    let server = StubServer::start(move |request| {
+        let body = routes
+            .lock()
+            .expect("routes")
+            .get_mut(&request.path)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| panic!("unexpected OSV path {}", request.path));
+        Response::new(200, body).header("Content-Type", "application/json")
     });
-    (format!("http://{address}/v1"), handle)
-}
-
-fn spawn_osv_routes(
-    routes: Vec<(&'static str, &'static str)>,
-) -> (String, thread::JoinHandle<Vec<String>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind OSV mock");
-    let address = listener.local_addr().expect("mock address");
-    let total = routes.len();
-    let mut routes: HashMap<String, VecDeque<&'static str>> =
-        routes
-            .into_iter()
-            .fold(HashMap::new(), |mut routes, (path, body)| {
-                routes.entry(path.to_string()).or_default().push_back(body);
-                routes
-            });
-    let handle = thread::spawn(move || {
-        let mut requests = Vec::with_capacity(total);
-        for _ in 0..total {
-            let (mut stream, _) = listener.accept().expect("accept OSV request");
-            let request = read_request(&mut stream);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .expect("request path");
-            let body = routes
-                .get_mut(path)
-                .and_then(VecDeque::pop_front)
-                .unwrap_or_else(|| panic!("unexpected OSV path {path}"));
-            requests.push(request);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write OSV response");
-        }
-        requests
-    });
-    (format!("http://{address}/v1"), handle)
+    (format!("http://{}/v1", server.addr()), server)
 }
 
 #[test]
 fn vuln_returns_zero_when_scan_has_no_findings() {
     let (project, home) = temp_project();
     write_fresh_lock(project.path(), home.path());
-    let (base_url, server) = spawn_osv("200 OK", "{}");
+    let (base_url, server) = spawn_osv(200, "{}");
 
     let output = rv_command(project.path(), home.path())
         .env("RAEVA_OSV_BASE_URL", base_url)
@@ -212,7 +148,8 @@ fn vuln_returns_zero_when_scan_has_no_findings() {
         "stdout={}",
         String::from_utf8_lossy(&output.stdout)
     );
-    server.join().expect("OSV server");
+    assert_eq!(server.answered(), 1);
+    server.stop();
 }
 
 #[test]
@@ -227,7 +164,7 @@ fn vuln_json_reports_findings_and_preserves_qualified_purl() {
             "affected": []
         }]
     }"#;
-    let (base_url, server) = spawn_osv("200 OK", body);
+    let (base_url, server) = spawn_osv(200, body);
 
     let output = rv_command(project.path(), home.path())
         .env("RAEVA_OSV_BASE_URL", base_url)
@@ -263,7 +200,9 @@ fn vuln_json_reports_findings_and_preserves_qualified_purl() {
         1
     );
 
-    let request = server.join().expect("OSV server");
+    let request = server.requests()[0].raw.clone();
+    assert_eq!(server.answered(), 1);
+    server.stop();
     assert!(
         request.contains("pkg:maven/org.example/demo-lib@2.0.0?classifier=tests&type=test-jar"),
         "request={request}"
@@ -291,7 +230,7 @@ fn vuln_sarif_reports_rules_levels_and_pom_locations() {
             }
         ]
     }"#;
-    let (base_url, server) = spawn_osv("200 OK", body);
+    let (base_url, server) = spawn_osv(200, body);
 
     let output = rv_command(project.path(), home.path())
         .env("RAEVA_OSV_BASE_URL", base_url)
@@ -336,17 +275,15 @@ fn vuln_sarif_reports_rules_levels_and_pom_locations() {
             "pkg:maven/org.example/demo-lib@2.0.0?classifier=tests&type=test-jar"
         );
     }
-    server.join().expect("OSV server");
+    assert_eq!(server.answered(), 1);
+    server.stop();
 }
 
 #[test]
 fn vuln_returns_two_when_osv_rejects_the_query() {
     let (project, home) = temp_project();
     write_fresh_lock(project.path(), home.path());
-    let (base_url, server) = spawn_osv(
-        "400 Bad Request",
-        "{\"message\":\"bad\u{1b}[31m\\r\\nquery\"}",
-    );
+    let (base_url, server) = spawn_osv(400, "{\"message\":\"bad\u{1b}[31m\\r\\nquery\"}");
 
     let output = rv_command(project.path(), home.path())
         .env("RAEVA_OSV_BASE_URL", base_url)
@@ -373,7 +310,8 @@ fn vuln_returns_two_when_osv_rejects_the_query() {
         envelope["data"]["metadata"]["scanner"]["provider"],
         "osv.dev"
     );
-    server.join().expect("OSV server");
+    assert_eq!(server.answered(), 1);
+    server.stop();
 }
 
 #[test]
@@ -403,7 +341,8 @@ fn vuln_returns_two_when_osv_detail_id_does_not_match() {
             .as_str()
             .is_some_and(|message| message.contains("OSV-A"))
     );
-    server.join().expect("OSV server");
+    assert_eq!(server.answered(), 2);
+    server.stop();
 }
 
 #[test]
@@ -418,7 +357,7 @@ fn vuln_fail_on_threshold_controls_exit_one() {
             "affected": []
         }]
     }"#;
-    let (base_url, server) = spawn_osv("200 OK", body);
+    let (base_url, server) = spawn_osv(200, body);
 
     let output = rv_command(project.path(), home.path())
         .env("RAEVA_OSV_BASE_URL", base_url)
@@ -428,7 +367,8 @@ fn vuln_fail_on_threshold_controls_exit_one() {
 
     assert_eq!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stdout).contains("0 finding(s) at or above the high"));
-    server.join().expect("OSV server");
+    assert_eq!(server.answered(), 1);
+    server.stop();
 }
 
 #[test]
@@ -443,7 +383,7 @@ fn vuln_unknown_severity_meets_every_fail_on_threshold() {
             "affected": []
         }]
     }"#;
-    let (base_url, server) = spawn_osv("200 OK", body);
+    let (base_url, server) = spawn_osv(200, body);
 
     let output = rv_command(project.path(), home.path())
         .env("RAEVA_OSV_BASE_URL", base_url)
@@ -456,7 +396,8 @@ fn vuln_unknown_severity_meets_every_fail_on_threshold() {
         serde_json::from_slice(&output.stdout).expect("JSON envelope");
     assert_eq!(envelope["data"]["threshold_exceeded"], true);
     assert_eq!(envelope["data"]["summary"]["unknown"], 1);
-    server.join().expect("OSV server");
+    assert_eq!(server.answered(), 1);
+    server.stop();
 }
 
 #[test]

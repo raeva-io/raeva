@@ -14,6 +14,10 @@ fn run_rv(args: &[&str], dir: &Path) -> std::process::Output {
     Command::new(rv_bin())
         .args(args)
         .current_dir(dir)
+        .env_remove("RUST_LOG")
+        .env("RAEVA_HOME", dir.join(".raeva-home"))
+        .env("HOME", dir)
+        .env("USERPROFILE", dir)
         .output()
         .expect("failed to run rv")
 }

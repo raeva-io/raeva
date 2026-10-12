@@ -28,7 +28,7 @@ use crate::context::ResolveContext;
 use crate::error::{ResolveError, Result};
 use crate::graph::Graph;
 use crate::solver::{
-    ConstraintVersion, PlatformConstraint, PlatformConstraints, Solver, SolverRoot,
+    ConstraintVersion, FetchShare, PlatformConstraint, PlatformConstraints, Solver, SolverRoot,
 };
 use crate::workspace::Workspace;
 
@@ -119,19 +119,9 @@ pub struct ResolutionResult {
 
 /// Maximum number of module graphs resolved concurrently.
 ///
-/// During the graph/model phase each module receives a share of the workspace
-/// network budget. Four modules keep CPU and model work parallel while
-/// bounding per-reactor memory use.
+/// Four concurrent modules bound reactor memory use. `FetchShare` divides
+/// `network.concurrency` among active solves and increases each share as others finish.
 pub const MAX_WORKSPACE_MODULE_CONCURRENCY: usize = 4;
-
-/// Maximum aggregate fetch budget across an all-reactor resolution.
-///
-/// Every active graph receives at least one slot, so four modules cannot each
-/// open a full `MAX_FETCH_CONCURRENCY` batch. Artifact population runs later
-/// as a serialized phase, where the one active module uses this whole budget.
-/// Four is deliberately low to bound the memory, open files, and connections a
-/// large reactor holds at once.
-pub const MAX_WORKSPACE_NETWORK_CONCURRENCY: usize = 4;
 
 /// Number of module artifact-population passes allowed to use the shared store
 /// at once.
@@ -324,30 +314,38 @@ struct WorkspaceStoreState {
     support_poms: WorkspaceSupportPomBuffer,
     artifact_blobs: Mutex<HashMap<ArtifactKey, HashMap<String, BlobId>>>,
     progress: Arc<WorkspaceProgress>,
+    /// Split the network budget among active module solves.
+    fetch_share: Arc<FetchShare>,
 }
 
 impl WorkspaceStoreState {
     fn new() -> Self {
         Self {
-            support_poms: Arc::new(Mutex::new(Vec::new())),
+            support_poms: Arc::default(),
             artifact_blobs: Mutex::new(HashMap::new()),
             progress: Arc::new(WorkspaceProgress::new()),
+            fetch_share: Arc::new(FetchShare::new(1)),
         }
     }
 
-    fn with_progress(progress: Arc<WorkspaceProgress>) -> Self {
+    fn with_progress(progress: Arc<WorkspaceProgress>, network_budget: usize) -> Self {
         Self {
             progress,
+            fetch_share: Arc::new(FetchShare::new(network_budget)),
             ..Self::new()
         }
     }
 
     #[cfg(test)]
     pub(crate) fn for_testing(support_poms: Vec<(ArtifactKey, Vec<u8>)>) -> Self {
-        Self {
-            support_poms: Arc::new(Mutex::new(support_poms)),
-            ..Self::new()
+        let state = Self::new();
+        {
+            let mut buffer = state.support_poms.lock().unwrap();
+            for (key, bytes) in support_poms {
+                buffer.record(key, &BlobId::from_bytes(&bytes), &bytes);
+            }
         }
+        state
     }
 }
 
@@ -431,7 +429,7 @@ impl Resolver {
     ///
     /// A watchdog runs alongside the resolution and aborts it with
     /// [`ResolveError::WorkspaceStalled`] if nothing at all happens for
-    /// [`WORKSPACE_STALL_TIMEOUT`]. It exists so a future scheduling bug of
+    /// `WORKSPACE_STALL_TIMEOUT`. It exists so a future scheduling bug of
     /// the kind this phase has already had once fails a build with a
     /// diagnostic naming the stuck modules instead of hanging CI forever.
     pub async fn resolve_workspace(&self, workspace: &Workspace) -> Result<WorkspaceResolution> {
@@ -504,12 +502,12 @@ impl Resolver {
             .config
             .network
             .concurrency
-            .clamp(1, MAX_WORKSPACE_NETWORK_CONCURRENCY);
-        let module_concurrency = MAX_WORKSPACE_MODULE_CONCURRENCY
-            .min(configured_concurrency)
-            .min(workspace.len().max(1));
-        let per_module_concurrency = (configured_concurrency / module_concurrency).max(1);
-        let store_state = Arc::new(WorkspaceStoreState::with_progress(progress));
+            .clamp(1, crate::solver::MAX_FETCH_CONCURRENCY);
+        let module_concurrency = MAX_WORKSPACE_MODULE_CONCURRENCY.min(workspace.len().max(1));
+        let store_state = Arc::new(WorkspaceStoreState::with_progress(
+            progress,
+            configured_concurrency,
+        ));
 
         let module_specs: Vec<(usize, String, PathBuf)> = workspace
             .modules()
@@ -529,14 +527,8 @@ impl Resolver {
                 let workspace = Arc::clone(&workspace);
                 let store_state = Arc::clone(&store_state);
                 let mut config = self.ctx.config.clone();
-                config.network.concurrency = per_module_concurrency;
-                let ctx = ResolveContext::new(
-                    config,
-                    self.ctx.repos.clone(),
-                    Arc::clone(&self.ctx.store),
-                    self.ctx.platform.clone(),
-                    self.ctx.client.clone(),
-                );
+                config.network.concurrency = configured_concurrency;
+                let ctx = self.ctx.for_module(config);
                 let resolver = Resolver::with_strategy(ctx, self.strategy).with_strict(self.strict);
                 async move {
                     tracing::debug!(
@@ -577,11 +569,7 @@ impl Resolver {
         flushed?;
 
         let mut modules = Vec::with_capacity(work.len());
-        for mut module in work {
-            // The graph phase split the aggregate budget across concurrent
-            // modules. Artifact population is serialized, so the active
-            // module can use the whole workspace budget.
-            module.resolver.ctx.config.network.concurrency = configured_concurrency;
+        for module in work {
             store_state.progress.enter(
                 module.index,
                 &module.pom_path,
@@ -699,15 +687,11 @@ impl Resolver {
         if !root_dependency_management.dependencies.is_empty() {
             let target = platform_constraints.get_or_insert_with(PlatformConstraints::new);
             for dep in &root_dependency_management.dependencies {
-                // An entry with no version can still manage scope, optional
+                // An entry with no version can still manage scope
                 // or exclusions (a version-less entry carrying only
                 // `<exclusions>` is the canonical global-exclude pattern).
                 let version = dep.version.as_deref();
-                if version.is_none()
-                    && dep.scope.is_none()
-                    && dep.optional.is_none()
-                    && dep.exclusions.is_empty()
-                {
+                if version.is_none() && dep.scope.is_none() && dep.exclusions.is_empty() {
                     continue;
                 }
                 // `resolve_bom_imports` inlines scope=import entries upstream,
@@ -729,7 +713,6 @@ impl Resolver {
                     },
                     enforced: false,
                     scope: dep.scope.clone(),
-                    optional: dep.optional.clone(),
                     exclusions: dep.exclusions.clone(),
                 });
             }
@@ -745,9 +728,17 @@ impl Resolver {
             .network
             .concurrency
             .clamp(1, crate::solver::MAX_FETCH_CONCURRENCY);
-        let solver = Solver::with_strategy(&backend, self.strategy, platform_constraints)
+        let mut solver = Solver::with_strategy(&backend, self.strategy, platform_constraints)
             .with_fetch_concurrency(fetch_concurrency)
             .with_strict_maven_compat(true);
+        // Held across the solve so siblings see this module as running.
+        let _active = match workspace_store.as_ref() {
+            Some(state) => {
+                solver = solver.with_fetch_share(Arc::clone(&state.fetch_share));
+                Some(state.fetch_share.enter())
+            }
+            None => None,
+        };
         let graph = solver.solve(root_spec).await?;
 
         tracing::debug!(
@@ -820,6 +811,7 @@ impl Resolver {
             } else {
                 self.ctx.store.lookup_artifact(&key).await?.ok_or_else(|| {
                     ResolveError::ArtifactNotFound {
+                        dropped_repos: Vec::new(),
                         coord: package.format_coord(),
                         searched: Vec::new(),
                     }
@@ -923,7 +915,7 @@ impl Resolver {
         }
 
         let base_dir = path.parent().map(Path::to_path_buf);
-        // #5: resolve profiles against the TARGET platform for this pass, so a
+        // Resolve profiles against the TARGET platform for this pass, so a
         // `--platforms macos-aarch64` build on a Linux host activates the
         // macOS profiles (and their deps) instead of the host's.
         let activation_base = if workspace.is_some() {
@@ -946,12 +938,15 @@ impl Resolver {
         // during parent resolution. Without this, a POM whose parent only exists
         // on a repo declared in the child (e.g. Jenkins → repo.jenkins-ci.org)
         // would fail because parent resolution happens before repo merging.
+        // Declarations whose URL still holds a `${...}` are skipped here; the
+        // interpolated effective repositories are merged once the model is built.
         let repos_with_pom = if pom.repositories.is_empty() {
             repos.to_vec()
         } else {
             let pom_repos: Vec<Repository> = pom
                 .repositories
                 .iter()
+                .filter(|repo| !repo.url.contains("${"))
                 .cloned()
                 .map(Repository::from)
                 .collect();
@@ -996,7 +991,27 @@ impl Resolver {
             true,
             RepoTrust::Root,
         );
-        let project = Project::from_pom_with_context(pom, resolver, &activation)?;
+        // Reactor roots share a polling task with sibling dependency fetches;
+        // a blocking parent/BOM fetch here could wait forever on a POM
+        // download that only this task can drive.
+        let project = backend::build_project_off_task(pom, resolver, activation).await?;
+        // Reject unsupported repository schemes before resolution can reach them.
+        for repo in &project.repositories {
+            let scheme = repo
+                .url
+                .split_once(':')
+                .map(|(scheme, _)| scheme.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(scheme.as_str(), "http" | "https" | "file") {
+                return Err(ResolveError::Pom(rv_maven_model::PomError::InvalidModel(
+                    format!(
+                        "repository '{}' has unsupported URL '{}'; only http, https and file are supported",
+                        repo.id.as_deref().unwrap_or("<no id>"),
+                        repo.url
+                    ),
+                )));
+            }
+        }
 
         // Snapshot the backend after parent-chain resolution. Parent POMs may
         // have declared `<repositories>` via the `observe_project_repositories`
@@ -1033,13 +1048,11 @@ impl Resolver {
     /// here keeps the invariant that every recorded coordinate has bytes behind
     /// it, since the resolve this provenance belongs to never produces a lock.
     async fn flush_workspace_support_poms(&self, state: &WorkspaceStoreState) -> Result<()> {
-        let pending = {
-            let mut guard = state
-                .support_poms
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *guard)
-        };
+        let pending = state
+            .support_poms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_in_write_order();
 
         for (key, bytes) in pending {
             let blob = self.ctx.store.put_bytes(&bytes).await?;
@@ -1377,7 +1390,11 @@ impl Resolver {
                         .unwrap_or_else(|| {
                             format!("{}:{}", artifact_req.group_id, artifact_req.artifact_id)
                         });
-                    errors.push(ResolveError::ArtifactNotFound { coord, searched });
+                    errors.push(ResolveError::ArtifactNotFound {
+                        dropped_repos: Vec::new(),
+                        coord,
+                        searched,
+                    });
                 }
                 Err(FetchError::Transient { err, searched }) => {
                     errors.push(ResolveError::RepoWithContext {

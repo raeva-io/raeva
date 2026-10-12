@@ -111,6 +111,27 @@ impl<'de> Deserialize<'de> for UpdatePolicy {
     }
 }
 
+/// Maven repository checksum policy, applied only to remote metadata in rv.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChecksumPolicy {
+    #[default]
+    Warn,
+    Fail,
+    Ignore,
+}
+
+impl ChecksumPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "warn" => Some(Self::Warn),
+            "fail" => Some(Self::Fail),
+            "ignore" => Some(Self::Ignore),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoConfig {
@@ -128,6 +149,28 @@ pub struct RepoConfig {
         alias = "snapshots_update_policy"
     )]
     pub snapshots_update_policy: Option<UpdatePolicy>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "releases-update-policy",
+        alias = "releases_update_policy"
+    )]
+    pub releases_update_policy: Option<UpdatePolicy>,
+    /// Metadata checksum policy. Artifact and POM mismatches always fail.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "releases-checksum-policy",
+        alias = "releases_checksum_policy"
+    )]
+    pub releases_checksum_policy: Option<ChecksumPolicy>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "snapshots-checksum-policy",
+        alias = "snapshots_checksum_policy"
+    )]
+    pub snapshots_checksum_policy: Option<ChecksumPolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +280,9 @@ impl RepoConfig {
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: None,
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         }
     }
 
@@ -247,6 +293,9 @@ impl RepoConfig {
             releases: Some(true),
             snapshots: Some(false),
             snapshots_update_policy: None,
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         }
     }
 }
@@ -255,6 +304,25 @@ impl RepoConfig {
 mod tests {
     use super::{AuthConfig, MirrorConfig, ProxyAuthType, ProxyConfig, RepoConfig, UpdatePolicy};
     use secrecy::Secret;
+
+    #[test]
+    fn checksum_policy_toml_is_explicit_and_validated() {
+        let repo: RepoConfig = toml::from_str("url = 'https://example.com/'\nreleases-checksum-policy = 'fail'\nsnapshots-checksum-policy = 'warn'").unwrap();
+        assert_eq!(
+            repo.releases_checksum_policy,
+            Some(super::ChecksumPolicy::Fail)
+        );
+        assert_eq!(
+            repo.snapshots_checksum_policy,
+            Some(super::ChecksumPolicy::Warn)
+        );
+        assert!(
+            toml::from_str::<RepoConfig>(
+                "url = 'https://example.com/'\nsnapshots-checksum-policy = 'strict'"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn update_policy_ttl_secs() {
@@ -280,6 +348,9 @@ mod tests {
             releases: Some(false),
             snapshots: Some(true),
             snapshots_update_policy: Some(UpdatePolicy::Interval(15)),
+            releases_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         };
         let encoded = toml::to_string(&repo).unwrap();
         let decoded: RepoConfig = toml::from_str(&encoded).unwrap();

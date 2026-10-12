@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::activation::evaluate_profiles;
-use crate::inheritance::{ParentResolver, apply_inheritance};
+use crate::inheritance::{ParentResolver, apply_inheritance_in_context};
 use crate::project::profiles::resolve_profiles_for_activation;
 use crate::properties::{ParentInfo, ProjectInfo, PropertyMap};
 use crate::{ActivationContext, Pom, PomError};
@@ -39,6 +39,9 @@ pub struct EffectiveDescriptor {
     pub gav: Gav,
     pub active_profiles: Vec<String>,
     pub modules: Vec<String>,
+    /// Interpolated repositories from this model and its active parent/profile lineage.
+    #[serde(default)]
+    pub repositories: Vec<crate::Repository>,
 }
 
 impl EffectiveDescriptor {
@@ -65,7 +68,11 @@ impl EffectiveDescriptor {
         resolver: impl ParentResolver,
         ctx: &ActivationContext,
     ) -> Result<Self, PomError> {
-        let effective_pom = apply_inheritance(pom, &resolver)?;
+        let mut pom = pom;
+        if resolver.is_root_model() {
+            pom.mark_root_repositories();
+        }
+        let effective_pom = apply_inheritance_in_context(pom, &resolver, Some(ctx))?;
         Self::from_effective_pom(&effective_pom, ctx)
     }
 
@@ -101,7 +108,22 @@ impl EffectiveDescriptor {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let repositories = crate::project::repositories::resolve_repositories(
+            pom.repositories
+                .iter()
+                .chain(
+                    active_profiles
+                        .iter()
+                        .flat_map(|profile| &profile.repositories),
+                )
+                .cloned()
+                .collect(),
+            &effective_properties,
+            &project,
+        )?;
+
         Ok(Self {
+            repositories,
             gav: Gav {
                 group_id: project.group_id,
                 artifact_id: project.artifact_id,

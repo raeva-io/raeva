@@ -2,13 +2,19 @@ use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 
+use crate::activation::evaluate_profiles;
 use crate::dependency::{Dependency, DependencyManagement};
 use crate::error::ParentCoordMismatch;
 use crate::pom::{Build, Parent, Plugin, PluginManagement};
-use crate::{Pom, PomError, PropertyMap};
+use crate::{ActivationContext, Pom, PomError, PropertyMap};
 
 /// Trait for resolving parent POMs and BOM imports during effective model computation.
 pub trait ParentResolver {
+    /// Whether the initial model is a user-owned project POM.
+    fn is_root_model(&self) -> bool {
+        false
+    }
+
     /// Resolves a parent POM by its coordinates. Returns `None` if unavailable.
     fn resolve_parent(&self, parent: &Parent) -> Result<Option<Pom>, PomError>;
     fn resolve_import_pom(
@@ -27,6 +33,12 @@ pub trait ParentResolver {
     /// When false, missing parents are logged as warnings and resolution continues.
     fn strict_parent_resolution(&self) -> bool {
         true
+    }
+
+    /// Report whether this resolver skips remote parents during a local reactor scan.
+    /// A missing parent then does not warrant a warning: full resolution checks it.
+    fn skips_remote_parents(&self) -> bool {
+        false
     }
 
     /// Controls whether missing BOM imports should cause errors.
@@ -51,6 +63,10 @@ pub trait ParentResolver {
 /// resolver rather than consuming it. Useful when a single resolver instance
 /// is reused for multiple `from_pom` calls (tests, BOM imports).
 impl<R: ParentResolver + ?Sized> ParentResolver for &R {
+    fn is_root_model(&self) -> bool {
+        (*self).is_root_model()
+    }
+
     fn resolve_parent(&self, parent: &Parent) -> Result<Option<Pom>, PomError> {
         (*self).resolve_parent(parent)
     }
@@ -72,6 +88,10 @@ impl<R: ParentResolver + ?Sized> ParentResolver for &R {
 
     fn strict_bom_resolution(&self) -> bool {
         (*self).strict_bom_resolution()
+    }
+
+    fn skips_remote_parents(&self) -> bool {
+        (*self).skips_remote_parents()
     }
 
     fn observe_project_repositories(&self, repositories: &[crate::repository::Repository]) {
@@ -101,7 +121,7 @@ pub const MAX_PARENT_CHAIN_DEPTH: usize = 100;
 /// set — an ancestor the hash walker skipped could still change resolution.
 ///
 /// `properties` are the declaring POM's own `<properties>`, exactly what
-/// [`apply_inheritance`] has at the hop: a parent's properties are merged into
+/// `apply_inheritance` has at the hop: a parent's properties are merged into
 /// the child only after the whole chain is walked, so they cannot name their
 /// own POM's parent. A traversal that starts at a POM whose properties
 /// resolution overlays with `-D` user properties must expand that first hop
@@ -142,6 +162,16 @@ pub fn interpolate_parent_with_user_properties(
 }
 
 pub fn apply_inheritance(pom: Pom, resolver: &impl ParentResolver) -> Result<Pom, PomError> {
+    apply_inheritance_in_context(pom, resolver, None)
+}
+
+/// Apply inheritance and expose each ancestor's active-profile repositories.
+/// The resolver uses them to find that ancestor's parent.
+pub(crate) fn apply_inheritance_in_context(
+    pom: Pom,
+    resolver: &impl ParentResolver,
+    ctx: Option<&ActivationContext>,
+) -> Result<Pom, PomError> {
     let mut chain = Vec::new();
     let mut current_pom = pom;
     let mut visited = HashSet::new();
@@ -181,6 +211,10 @@ pub fn apply_inheritance(pom: Pom, resolver: &impl ParentResolver) -> Result<Pom
         match resolver.resolve_parent(&parent)? {
             Some(parent_pom) => {
                 verify_parent_coord(&parent, &parent_pom)?;
+                // Maven uses each ancestor's repositories to find the next parent.
+                // Only URLs expanded from the declaring POM's own properties work here;
+                // the resolver observes the full set after model interpolation.
+                observe_lineage_repositories(resolver, &parent_pom, ctx)?;
                 current_pom = parent_pom;
             }
             None => {
@@ -198,12 +232,21 @@ pub fn apply_inheritance(pom: Pom, resolver: &impl ParentResolver) -> Result<Pom
                     ));
                 };
                 if can_continue_without_parent(last_child, &parent) {
-                    tracing::warn!(
-                        parent_group_id = %parent.group_id,
-                        parent_artifact_id = %parent.artifact_id,
-                        parent_version = %parent.version,
-                        "Parent POM not found, continuing without inheritance."
-                    );
+                    if resolver.skips_remote_parents() {
+                        tracing::debug!(
+                            parent_group_id = %parent.group_id,
+                            parent_artifact_id = %parent.artifact_id,
+                            parent_version = %parent.version,
+                            "Remote parent not loaded during local-only reactor scan."
+                        );
+                    } else {
+                        tracing::warn!(
+                            parent_group_id = %parent.group_id,
+                            parent_artifact_id = %parent.artifact_id,
+                            parent_version = %parent.version,
+                            "Parent POM not found, continuing without inheritance."
+                        );
+                    }
                     if last_child.group_id.is_none() && !parent.group_id.is_empty() {
                         last_child.group_id = Some(parent.group_id.clone());
                     }
@@ -226,8 +269,10 @@ pub fn apply_inheritance(pom: Pom, resolver: &impl ParentResolver) -> Result<Pom
         PomError::InvalidModel("empty inheritance chain: no root POM".to_string())
     })?;
 
+    effective_pom.lineage_dependencies = vec![effective_pom.dependencies.clone()];
+
     while let Some(mut child_pom) = chain.pop() {
-        // Move the parent's property map out instead of cloning it (#32): the
+        // Move the parent's property map out instead of cloning it: the
         // parent (`effective_pom`) is overwritten by `child_pom` at the end of
         // this iteration, and none of the merges below read `parent.properties`,
         // so taking it here avoids a full-map clone at every inheritance level.
@@ -243,20 +288,13 @@ pub fn apply_inheritance(pom: Pom, resolver: &impl ParentResolver) -> Result<Pom
 
         child_pom.properties = merge_properties(parent_properties, &child_pom.properties);
 
-        // Merge dependencies by key (groupId:artifactId:type:classifier),
-        // with child entries overriding parent entries (Maven behavior).
-        {
-            let mut dep_map: IndexMap<DependencyMergeKey, Dependency> = IndexMap::new();
-            for dep in &parent.dependencies {
-                let key = dependency_merge_key(dep);
-                dep_map.insert(key, dep.clone());
-            }
-            for dep in child_pom.dependencies {
-                let key = dependency_merge_key(&dep);
-                dep_map.insert(key, dep);
-            }
-            child_pom.dependencies = dep_map.into_values().collect();
-        }
+        // Maven keeps child dependencies first, then appends unmatched parent entries.
+        // An override keeps the child's position.
+        child_pom.lineage_dependencies = std::iter::once(child_pom.dependencies.clone())
+            .chain(parent.lineage_dependencies.iter().cloned())
+            .collect();
+        child_pom.dependencies =
+            merge_dependency_levels([&child_pom.dependencies, &parent.dependencies]);
 
         child_pom.dependency_management = merge_dependency_management(
             parent.dependency_management.clone(),
@@ -316,6 +354,57 @@ pub fn apply_inheritance(pom: Pom, resolver: &impl ParentResolver) -> Result<Pom
     Ok(effective_pom)
 }
 
+pub(crate) fn observe_lineage_repositories(
+    resolver: &impl ParentResolver,
+    pom: &Pom,
+    ctx: Option<&ActivationContext>,
+) -> Result<(), PomError> {
+    // Maven interpolates activation before selecting a raw model's profiles
+    // and exposing their repositories for the next parent lookup.
+    let profiles = if ctx.is_some() {
+        pom.profiles
+            .iter()
+            .cloned()
+            .map(|mut profile| {
+                profile.activation = profile
+                    .activation
+                    .map(|activation| {
+                        crate::project::profiles::interpolate_activation(activation, |value| {
+                            pom.properties.interpolate_str_no_project(value)
+                        })
+                    })
+                    .transpose()?;
+                Ok(profile)
+            })
+            .collect::<Result<Vec<_>, PomError>>()?
+    } else {
+        Vec::new()
+    };
+    let profile_repositories = ctx.into_iter().flat_map(|ctx| {
+        evaluate_profiles(&profiles, ctx)
+            .into_iter()
+            .flat_map(|profile| profile.repositories.iter())
+    });
+    let usable: Vec<crate::repository::Repository> = pom
+        .repositories
+        .iter()
+        .chain(profile_repositories)
+        .filter_map(|repo| {
+            let url = pom.properties.interpolate_str_no_project(&repo.url).ok()?;
+            if url.contains("${") {
+                return None;
+            }
+            let mut repo = repo.clone();
+            repo.url = url;
+            Some(repo)
+        })
+        .collect();
+    if !usable.is_empty() {
+        resolver.observe_project_repositories(&usable);
+    }
+    Ok(())
+}
+
 /// Reject a fetched parent POM whose coordinates don't match what was
 /// requested, blocking hostile or misrouted parent payloads. Falls back to the
 /// POM's own `<parent>` for groupId/version it inherits but doesn't declare.
@@ -347,11 +436,24 @@ pub fn verify_pom_coord(
         .or_else(|| fetched.parent.as_ref().map(|p| p.group_id.clone()))
         .unwrap_or_default();
     let actual_artifact = fetched.artifact_id.clone().unwrap_or_default();
-    let actual_version = fetched
+    let mut actual_version = fetched
         .version
         .clone()
         .or_else(|| fetched.parent.as_ref().map(|p| p.version.clone()))
         .unwrap_or_default();
+
+    // A POM published with an un-flattened `<version>${revision}</version>`
+    // names itself through its own `<properties>`; the requested coordinate is
+    // always interpolated, so compare against the expanded identity.
+    if actual_version != requested_version
+        && actual_version.contains("${")
+        && let Ok(expanded) = fetched
+            .properties
+            .interpolate_str_no_project(&actual_version)
+        && expanded == requested_version
+    {
+        actual_version = expanded;
+    }
 
     if actual_group != requested_group
         || actual_artifact != requested_artifact
@@ -400,13 +502,31 @@ fn merge_properties(mut parent: PropertyMap, child: &PropertyMap) -> PropertyMap
     //
     // The parent map is taken by value and reused as the merge accumulator,
     // avoiding a full clone of the parent property map at each inheritance
-    // level (#32).
+    // level.
     parent.extend(child);
     parent
 }
 
 // Owned key type for dependency merge deduplication (groupId, artifactId, type, classifier)
 type DependencyMergeKey = (String, String, String, Option<String>);
+
+/// Merge dependency lists from child to ancestor, preserving declaration order.
+/// Later lists contribute only unseen keys; duplicates within a list replace in place.
+pub(crate) fn merge_dependency_levels<'a>(
+    levels: impl IntoIterator<Item = &'a Vec<Dependency>>,
+) -> Vec<Dependency> {
+    let mut merged: IndexMap<DependencyMergeKey, Dependency> = IndexMap::new();
+    for level in levels {
+        let mut own: IndexMap<DependencyMergeKey, Dependency> = IndexMap::new();
+        for dep in level {
+            own.insert(dependency_merge_key(dep), dep.clone());
+        }
+        for (key, dep) in own {
+            merged.entry(key).or_insert(dep);
+        }
+    }
+    merged.into_values().collect()
+}
 
 fn dependency_merge_key(dep: &Dependency) -> DependencyMergeKey {
     (
@@ -475,7 +595,7 @@ fn merge_dependency_management(
 /// Merge parent build into child, filling versionless child plugins from
 /// parent's `<pluginManagement>` (Maven's plugin inheritance rule).
 ///
-/// NOTE (#22): the merged `<build>` is stored on the effective [`Pom`] but is
+/// NOTE: the merged `<build>` is stored on the effective [`Pom`] but is
 /// intentionally NOT propagated into the effective [`crate::Project`] model.
 /// Raeva does not execute builds, so plugins/resources have no v1 consumer.
 /// The merge stays in place to model plugin-version inheritance faithfully,
@@ -641,12 +761,15 @@ mod tests {
 
     fn repo(id: Option<&str>, url: &str) -> Repository {
         Repository {
+            root_declared: false,
             id: id.map(str::to_string),
             url: url.to_string(),
             releases_enabled: true,
             snapshots_enabled: false,
             releases_update_policy: None,
             snapshots_update_policy: None,
+            releases_checksum_policy: None,
+            snapshots_checksum_policy: None,
         }
     }
 
@@ -731,6 +854,212 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// Each loaded ancestor's repositories must be available for the next parent lookup.
+    #[test]
+    fn ancestor_repositories_serve_the_next_parent_lookup() {
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct HostedResolver {
+            observed: RefCell<Vec<String>>,
+        }
+
+        impl ParentResolver for HostedResolver {
+            fn resolve_parent(&self, parent: &Parent) -> Result<Option<Pom>, PomError> {
+                let xml = match parent.artifact_id.as_str() {
+                    "mid" => {
+                        r#"<project><groupId>g</groupId><artifactId>mid</artifactId><version>1</version>
+                        <parent><groupId>g</groupId><artifactId>top</artifactId><version>1</version>
+                        <relativePath/></parent>
+                        <properties><host>https://host.example/</host></properties>
+                        <repositories><repository><id>host</id><url>${host}</url></repository></repositories>
+                        </project>"#
+                    }
+                    "top"
+                        if self
+                            .observed
+                            .borrow()
+                            .iter()
+                            .any(|u| u == "https://host.example/") =>
+                    {
+                        r#"<project><groupId>g</groupId><artifactId>top</artifactId><version>1</version></project>"#
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(Pom::parse(xml).unwrap()))
+            }
+
+            fn strict_parent_resolution(&self) -> bool {
+                true
+            }
+
+            fn observe_project_repositories(&self, repos: &[crate::repository::Repository]) {
+                self.observed
+                    .borrow_mut()
+                    .extend(repos.iter().map(|r| r.url.clone()));
+            }
+        }
+
+        let child = Pom::parse(
+            r#"<project><groupId>g</groupId><artifactId>app</artifactId><version>1</version>
+            <parent><groupId>g</groupId><artifactId>mid</artifactId><version>1</version>
+            <relativePath/></parent></project>"#,
+        )
+        .unwrap();
+        apply_inheritance(child, &HostedResolver::default())
+            .expect("grandparent must resolve via the ancestor's repository");
+    }
+
+    /// An ancestor's active-profile repositories must be available to resolve its parent.
+    #[test]
+    fn ancestor_profile_repositories_serve_the_next_parent_lookup() {
+        use std::cell::RefCell;
+
+        #[derive(Default)]
+        struct HostedResolver {
+            observed: RefCell<Vec<String>>,
+        }
+
+        impl ParentResolver for HostedResolver {
+            fn resolve_parent(&self, parent: &Parent) -> Result<Option<Pom>, PomError> {
+                let xml = match parent.artifact_id.as_str() {
+                    "mid" => {
+                        r#"<project><groupId>g</groupId><artifactId>mid</artifactId><version>1</version>
+                        <parent><groupId>g</groupId><artifactId>top</artifactId><version>1</version>
+                        <relativePath/></parent>
+                        <profiles><profile><id>host</id>
+                        <repositories><repository><id>host</id><url>https://host.example/</url></repository></repositories>
+                        </profile></profiles></project>"#
+                    }
+                    "top"
+                        if self
+                            .observed
+                            .borrow()
+                            .iter()
+                            .any(|u| u == "https://host.example/") =>
+                    {
+                        r#"<project><groupId>g</groupId><artifactId>top</artifactId><version>1</version></project>"#
+                    }
+                    _ => return Ok(None),
+                };
+                Ok(Some(Pom::parse(xml).unwrap()))
+            }
+
+            fn strict_parent_resolution(&self) -> bool {
+                true
+            }
+
+            fn observe_project_repositories(&self, repos: &[crate::repository::Repository]) {
+                self.observed
+                    .borrow_mut()
+                    .extend(repos.iter().map(|r| r.url.clone()));
+            }
+        }
+
+        let child = || {
+            Pom::parse(
+                r#"<project><groupId>g</groupId><artifactId>app</artifactId><version>1</version>
+                <parent><groupId>g</groupId><artifactId>mid</artifactId><version>1</version>
+                <relativePath/></parent></project>"#,
+            )
+            .unwrap()
+        };
+        let ctx = ActivationContext {
+            active_profiles: vec!["host".to_string()],
+            ..ActivationContext::default()
+        };
+        apply_inheritance_in_context(child(), &HostedResolver::default(), Some(&ctx))
+            .expect("grandparent must resolve via the ancestor's active profile repository");
+        apply_inheritance_in_context(
+            child(),
+            &HostedResolver::default(),
+            Some(&ActivationContext::default()),
+        )
+        .expect_err("an inactive profile's repository must not be used");
+    }
+
+    /// Maven interpolates activation fields from each POM's properties before resolving its parent.
+    #[test]
+    fn interpolated_profile_repositories_serve_child_and_ancestor_parent_lookup() {
+        use std::cell::RefCell;
+
+        struct HostedResolver {
+            mid: Pom,
+            observed: RefCell<Vec<String>>,
+        }
+        impl ParentResolver for HostedResolver {
+            fn resolve_parent(&self, parent: &Parent) -> Result<Option<Pom>, PomError> {
+                match parent.artifact_id.as_str() {
+                    "mid" => Ok(Some(self.mid.clone())),
+                    "top" if self.observed.borrow().iter().any(|url| url == "https://host.example/") => {
+                        Ok(Some(Pom::parse(
+                            "<project><groupId>g</groupId><artifactId>top</artifactId><version>1</version></project>",
+                        ).unwrap()))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            fn observe_project_repositories(&self, repos: &[crate::repository::Repository]) {
+                self.observed
+                    .borrow_mut()
+                    .extend(repos.iter().map(|repo| repo.url.clone()));
+            }
+        }
+
+        let hosted_profile = r"<properties><jdk.range>[17,)</jdk.range>
+            <os.family>unix</os.family><property.name>host.enabled</property.name>
+            <property.value>yes</property.value><repo.url>https://host.example/</repo.url></properties>
+            <profiles><profile><id>host</id><activation><jdk>${jdk.range}</jdk>
+            <os><family>${os.family}</family></os>
+            <property><name>${property.name}</name><value>${property.value}</value></property>
+            </activation><repositories><repository><id>host</id><url>${repo.url}</url>
+            </repository></repositories></profile></profiles>";
+        for via_ancestor in [false, true] {
+            let child = Pom::parse(&format!(
+                "<project><artifactId>child</artifactId><parent><groupId>g</groupId>
+                <artifactId>{}</artifactId><version>1</version><relativePath/></parent>{}</project>",
+                if via_ancestor { "mid" } else { "top" },
+                if via_ancestor { "<properties><jdk.range>[99,)</jdk.range></properties>" } else { hosted_profile },
+            )).unwrap();
+            let mid = Pom::parse(&format!(
+                "<project><artifactId>mid</artifactId><parent><groupId>g</groupId>
+                <artifactId>top</artifactId><version>1</version><relativePath/></parent>{hosted_profile}</project>",
+            )).unwrap();
+            for (jdk, property, disabled, expected) in [
+                ("21", "yes", false, true),
+                ("11", "yes", false, false),
+                ("21", "no", false, false),
+                ("21", "yes", true, false),
+            ] {
+                let resolver = HostedResolver {
+                    mid: mid.clone(),
+                    observed: RefCell::default(),
+                };
+                let ctx = ActivationContext {
+                    jdk_version: Some(jdk.into()),
+                    os_family: Some("unix".into()),
+                    properties: HashMap::from([("host.enabled".into(), property.into())]),
+                    inactive_profiles: if disabled {
+                        vec!["host".into()]
+                    } else {
+                        Vec::new()
+                    },
+                    ..ActivationContext::default()
+                };
+                let result = crate::Project::from_pom_with_context(child.clone(), &resolver, &ctx);
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "ancestor={via_ancestor}, jdk={jdk}, property={property}, disabled={disabled}: {result:?}"
+                );
+                if !expected {
+                    assert!(matches!(result, Err(PomError::ParentNotFound(..))));
+                    assert!(resolver.observed.borrow().is_empty());
+                }
+            }
+        }
     }
 
     /// Resolver that returns None for all parents (simulates missing parent).
@@ -959,6 +1288,44 @@ mod tests {
 
         assert!(has_jar, "Expected jar entry to be preserved");
         assert!(has_test_jar, "Expected test-jar entry to be preserved");
+    }
+
+    /// A parent published to a repository with an un-flattened
+    /// `<version>${revision}</version>` names itself through its own
+    /// `<properties>`; the child's request is already interpolated.
+    #[test]
+    fn unflattened_revision_parent_matches_interpolated_request() {
+        struct Fixed(Pom);
+        impl ParentResolver for Fixed {
+            fn resolve_parent(&self, _parent: &Parent) -> Result<Option<Pom>, PomError> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+
+        let published = Pom::parse(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.base</groupId>\
+             <artifactId>parent</artifactId><version>${revision}</version>\
+             <properties><revision>0.0.20</revision></properties></project>",
+        )
+        .unwrap();
+        let child = |version: &str| {
+            let mut child = Pom::default();
+            child.parent = Some(Parent {
+                group_id: "com.base".to_string(),
+                artifact_id: "parent".to_string(),
+                version: version.to_string(),
+                relative_path: None,
+            });
+            child.artifact_id = Some("child".to_string());
+            child
+        };
+
+        let resolver = Fixed(published);
+        assert!(apply_inheritance(child("0.0.20"), &resolver).is_ok());
+        assert!(matches!(
+            apply_inheritance(child("0.0.21"), &resolver),
+            Err(PomError::ParentCoordMismatch(_))
+        ));
     }
 
     /// Regression test: an attacker-controlled remote endpoint returning a

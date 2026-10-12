@@ -12,6 +12,8 @@ use rv_repo::{Metadata, RepoClient, Repository};
 use rv_store::Store;
 use rv_version::Coord;
 
+use crate::parsed_pom_cache::ParsedPomCache;
+
 /// 10k entries covers the transitive set of any realistic project.
 const MAX_METADATA_CACHE_SIZE: usize = 10_000;
 /// Avoids re-hitting the same 404 on every transitive dep resolution.
@@ -22,6 +24,7 @@ pub struct MetadataKey {
     pub repo_url: Arc<str>,
     pub group_id: Arc<str>,
     pub artifact_id: Arc<str>,
+    checksum_fail: bool,
 }
 
 impl MetadataKey {
@@ -30,7 +33,13 @@ impl MetadataKey {
             repo_url,
             group_id,
             artifact_id,
+            checksum_fail: false,
         }
+    }
+
+    pub fn with_checksum_policy(mut self, policy: rv_config::ChecksumPolicy) -> Self {
+        self.checksum_fail = policy == rv_config::ChecksumPolicy::Fail;
+        self
     }
 }
 
@@ -52,9 +61,10 @@ pub struct CachedProject {
     pub pom_blob: BlobId,
 }
 
-/// Shared LRU caches hoisted above the per-platform loop so warm entries
-/// survive across platform passes in a single resolution run.
+/// Resolution caches. Module contexts get fresh metadata, project and
+/// missing-parent caches while sharing parsed POMs across modules and platforms.
 pub struct ResolveState {
+    parsed_poms: Arc<ParsedPomCache>,
     metadata: RwLock<LruCache<MetadataKey, Arc<Metadata>>>,
     /// LRU-bounded; monorepos accumulate hundreds of MB of `Project` data.
     /// `Project` is `Clone`, so eviction is safe (a miss re-parses).
@@ -63,10 +73,8 @@ pub struct ResolveState {
     /// with the active-profile set of the resolve pass that fetched it, and
     /// profiles can activate on `os.name`/`family`/`arch` (and `os.*` system
     /// properties), so the resolved dependencies/management/repositories differ
-    /// per target platform. Multi-platform `rv sync` shares one `ResolveState`
-    /// across concurrent per-platform passes; without the platform in the key
-    /// whichever pass resolved a coordinate first would win and silently
-    /// contaminate every other platform's lockfile section.
+    /// per target platform. Contexts sharing this state must not reuse another
+    /// platform's effective project. Module contexts have separate states.
     projects: RwLock<LruCache<(Coord, Platform), CachedProject>>,
     /// `std::sync::Mutex` because every op is a single LRU `get`/`put` with
     /// no awaits, which lets the sync `ParentResolver` trait probe without
@@ -77,6 +85,15 @@ pub struct ResolveState {
 impl ResolveState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    fn with_parsed_poms(parsed_poms: Arc<ParsedPomCache>) -> Self {
+        Self {
+            parsed_poms,
+            metadata: RwLock::new(new_lru()),
+            projects: RwLock::new(new_lru()),
+            missing_parents: Mutex::new(new_lru()),
+        }
     }
 }
 
@@ -89,11 +106,7 @@ fn new_lru<K: std::hash::Hash + Eq, V>() -> LruCache<K, V> {
 
 impl Default for ResolveState {
     fn default() -> Self {
-        Self {
-            metadata: RwLock::new(new_lru()),
-            projects: RwLock::new(new_lru()),
-            missing_parents: Mutex::new(new_lru()),
-        }
+        Self::with_parsed_poms(Arc::new(ParsedPomCache::default()))
     }
 }
 
@@ -109,8 +122,8 @@ pub struct ResolveContext {
 
 impl ResolveContext {
     /// Test-facing constructor: builds a fresh `ResolveState` every call.
-    /// Production code goes through [`Self::from_config_with_state`] to share
-    /// LRU caches across per-platform contexts.
+    /// Production code uses [`Self::from_config_with_state`]; module contexts
+    /// share only parsed POMs from that state.
     pub fn new(
         config: Config,
         repos: Vec<Repository>,
@@ -128,8 +141,8 @@ impl ResolveContext {
         }
     }
 
-    /// Production constructor: reuses an existing `ResolveState` so LRU
-    /// caches carry across platforms in a multi-platform resolve.
+    /// Reuses an existing `ResolveState`. Derived module contexts retain its
+    /// parsed-POM cache and get fresh metadata, project and missing-parent caches.
     pub fn from_config_with_state(
         config: Config,
         store: Arc<Store>,
@@ -150,6 +163,20 @@ impl ResolveContext {
 
     pub fn state(&self) -> Arc<ResolveState> {
         Arc::clone(&self.state)
+    }
+
+    pub(crate) fn for_module(&self, config: Config) -> Self {
+        Self {
+            config,
+            state: Arc::new(ResolveState::with_parsed_poms(Arc::clone(
+                &self.state.parsed_poms,
+            ))),
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn parsed_poms(&self) -> &ParsedPomCache {
+        &self.state.parsed_poms
     }
 
     pub fn cached_metadata(&self, key: &MetadataKey) -> Option<Arc<Metadata>> {
@@ -219,7 +246,7 @@ mod tests {
 
     fn make_test_ctx() -> ResolveContext {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         let store_tmp = tempfile::tempdir().unwrap();
@@ -293,6 +320,45 @@ mod tests {
         assert!(ctx_arm.cached_project(&coord).is_none());
     }
 
+    #[test]
+    fn modules_share_only_raw_parses_across_platforms() {
+        let ctx = make_test_ctx();
+        let other_platform = ResolveContext::from_config_with_state(
+            ctx.config.clone(),
+            Arc::clone(&ctx.store),
+            rv_config::Platform::new("linux", "aarch64").unwrap(),
+            None,
+            ctx.state(),
+        );
+        let module = ctx.for_module(ctx.config.clone());
+        let coord = Coord::parse("com.example:demo:1.0").unwrap();
+        let missing = pk("com.example", "missing", "1");
+        let metadata = super::MetadataKey::new(
+            Arc::from("https://example.test/"),
+            Arc::from("com.example"),
+            Arc::from("demo"),
+        );
+        module.insert_project(coord.clone(), demo_project(), BlobId::from_bytes(b"pom"));
+        module.insert_metadata(metadata.clone(), rv_repo::Metadata::default());
+        module.mark_parent_missing(missing.clone());
+
+        for platform_ctx in [&ctx, &other_platform] {
+            let sibling = platform_ctx.for_module(platform_ctx.config.clone());
+            assert!(Arc::ptr_eq(
+                &module.state.parsed_poms,
+                &sibling.state.parsed_poms
+            ));
+            assert!(!Arc::ptr_eq(&module.state, &sibling.state));
+            assert!(sibling.cached_project(&coord).is_none());
+            assert!(sibling.cached_metadata(&metadata).is_none());
+            assert!(!sibling.is_parent_missing(&missing));
+        }
+        assert!(!Arc::ptr_eq(
+            &module.state.parsed_poms,
+            &ResolveState::new().parsed_poms
+        ));
+    }
+
     fn pk(group: &str, artifact: &str, version: &str) -> MissingParentKey {
         (Arc::from(group), Arc::from(artifact), Arc::from(version))
     }
@@ -336,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn shared_state_is_visible_across_contexts() {
         let project_tmp = tempfile::tempdir().unwrap();
-        let paths = ResolvedPaths::discover().expect("paths");
+        let paths = ResolvedPaths::for_testing().expect("paths");
         let config =
             Config::for_testing_with_repos(project_tmp.path().to_path_buf(), paths, Vec::new());
         let store_tmp = tempfile::tempdir().unwrap();

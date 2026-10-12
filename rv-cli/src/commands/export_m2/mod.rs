@@ -615,7 +615,7 @@ mod tests {
         Platform,
     };
 
-    /// #5: export-m2 must recover POM-declared repo ids from the lockfile
+    /// Export-m2 must recover POM-declared repo ids from the lockfile
     /// metadata that `rv sync` writes, so markers aren't mislabelled `central`.
     #[test]
     fn lock_repo_ids_round_trips_from_metadata() {
@@ -986,7 +986,7 @@ mod tests {
         );
     }
 
-    /// #37: `--dry-run --with-sources` must report only classifier jars that
+    /// `--dry-run --with-sources` must report only classifier jars that
     /// are actually available (present in the store), not every candidate.
     #[tokio::test]
     async fn dry_run_counts_only_classifiers_present_in_store() {

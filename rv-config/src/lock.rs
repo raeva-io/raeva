@@ -8,8 +8,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use fs2::FileExt;
-use rand::RngCore;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
@@ -1912,8 +1910,10 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    // The file is opened with `create_new`, so a repeated name fails rather
+    // than overwrites; pid and time still separate writers if this fails.
     let mut rand_bytes = [0u8; 6];
-    OsRng.fill_bytes(&mut rand_bytes);
+    let _ = getrandom::fill(&mut rand_bytes);
     let rand_hex = hex::encode(rand_bytes);
     let file_name = format!("{base_name}.tmp.{pid}.{nanos}.{rand_hex}");
     path.with_file_name(file_name)

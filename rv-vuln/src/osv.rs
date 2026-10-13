@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use backoff::ExponentialBackoff;
+use backon::{ExponentialBuilder, Retryable};
 use futures::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::RETRY_AFTER;
@@ -17,7 +17,9 @@ use crate::{Affected, Reference, Result, Severity, VulnError, VulnResult, Vulner
 
 const DEFAULT_BASE_URL: &str = "https://api.osv.dev/v1";
 const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 10;
-const MAX_ELAPSED_TIME_SECS: u64 = 120;
+/// Wall-clock time a request may spend across all of its retries.
+const RETRY_BUDGET: Duration = Duration::from_secs(120);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const SEMAPHORE_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const MAX_OSV_PAGES: usize = 100;
 const MAX_SUCCESS_BODY_BYTES: usize = 20 * 1024 * 1024;
@@ -49,6 +51,7 @@ pub struct OsvClient {
     client: reqwest::Client,
     base_url: String,
     max_concurrent_requests: usize,
+    retry_budget: Duration,
 }
 
 impl OsvClient {
@@ -61,6 +64,7 @@ impl OsvClient {
             client,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            retry_budget: RETRY_BUDGET,
         })
     }
 
@@ -77,6 +81,7 @@ impl OsvClient {
             client,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_concurrent_requests,
+            retry_budget: RETRY_BUDGET,
         })
     }
 
@@ -89,6 +94,7 @@ impl OsvClient {
             client,
             base_url: base_url.into(),
             max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            retry_budget: RETRY_BUDGET,
         })
     }
 
@@ -118,21 +124,8 @@ impl OsvClient {
                 page_token: page_token.clone(),
             };
 
-            let response = retry_with_backoff(|| async {
-                let response = self
-                    .client
-                    .post(&url)
-                    .json(&request)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() || e.is_connect() {
-                            backoff::Error::transient(VulnError::Http(e))
-                        } else {
-                            backoff::Error::permanent(VulnError::Http(e))
-                        }
-                    })?;
-                handle_response_for_retry(response).await
+            let response = retry("query", self.retry_budget, || async {
+                handle_response(self.client.post(&url).json(&request).send().await?).await
             })
             .await?;
 
@@ -283,21 +276,8 @@ impl OsvClient {
             }
 
             let request = OsvBatchRequest { queries };
-            let response = retry_with_backoff(|| async {
-                let response = self
-                    .client
-                    .post(&url)
-                    .json(&request)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() || e.is_connect() {
-                            backoff::Error::transient(VulnError::Http(e))
-                        } else {
-                            backoff::Error::permanent(VulnError::Http(e))
-                        }
-                    })?;
-                handle_response_for_retry(response).await
+            let response = retry("querybatch", self.retry_budget, || async {
+                handle_response(self.client.post(&url).json(&request).send().await?).await
             })
             .await?;
 
@@ -380,40 +360,7 @@ impl OsvClient {
     }
 
     async fn fetch_vulnerability_with_retry(&self, id: &str) -> FetchResult {
-        let backoff = ExponentialBackoff {
-            max_elapsed_time: Some(Duration::from_secs(MAX_ELAPSED_TIME_SECS)),
-            ..ExponentialBackoff::default()
-        };
-
-        let operation = || async {
-            match self.fetch_vulnerability(id).await {
-                Ok(vuln) => Ok(vuln),
-                Err(err @ VulnError::RateLimited { retry_after }) => {
-                    warn!(
-                        vuln_id = %id,
-                        retry_after = ?retry_after,
-                        "rate limited, will retry"
-                    );
-                    Err(backoff::Error::transient(err))
-                }
-                Err(VulnError::Http(source)) if source.is_timeout() || source.is_connect() => {
-                    warn!(vuln_id = %id, "transient OSV request error, will retry");
-                    Err(backoff::Error::transient(VulnError::Http(source)))
-                }
-                // Server errors are transient.
-                Err(err @ VulnError::HttpStatus { status, .. }) if status.is_server_error() => {
-                    warn!(
-                        vuln_id = %id,
-                        status = %status,
-                        "server error fetching vulnerability, will retry"
-                    );
-                    Err(backoff::Error::transient(err))
-                }
-                Err(err) => Err(backoff::Error::permanent(err)),
-            }
-        };
-
-        match backoff::future::retry(backoff, operation).await {
+        match retry(id, self.retry_budget, || self.fetch_vulnerability(id)).await {
             Ok(vulnerability) if vulnerability.id == id => FetchResult::Success(vulnerability),
             Ok(vulnerability) => FetchResult::Failed {
                 id: id.to_string(),
@@ -438,17 +385,54 @@ impl OsvClient {
     }
 }
 
-/// Run an async operation with exponential backoff, retrying on transient errors.
-async fn retry_with_backoff<F, Fut, T>(operation: F) -> Result<T>
+/// Retries transient failures with exponential backoff. A 429's `Retry-After`
+/// is the minimum wait before the next attempt. Retrying stops once the next
+/// wait would end past `budget`, measured from the first attempt.
+async fn retry<T, F, Fut>(request: &str, budget: Duration, operation: F) -> Result<T>
 where
-    F: Fn() -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<T, backoff::Error<VulnError>>>,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
 {
-    let backoff = ExponentialBackoff {
-        max_elapsed_time: Some(Duration::from_secs(MAX_ELAPSED_TIME_SECS)),
-        ..ExponentialBackoff::default()
-    };
-    backoff::future::retry(backoff, operation).await
+    let start = Instant::now();
+    let backoff = ExponentialBuilder::default()
+        .with_min_delay(Duration::from_millis(500))
+        .with_max_delay(MAX_RETRY_DELAY)
+        .with_factor(1.5)
+        .with_jitter()
+        .without_max_times();
+
+    operation
+        .retry(backoff)
+        .when(is_transient)
+        .adjust(move |error, delay| {
+            let mut delay = delay?;
+            if let VulnError::RateLimited {
+                retry_after: Some(after),
+            } = error
+            {
+                delay = delay.max(*after);
+            }
+            let delay = delay.min(MAX_RETRY_DELAY);
+            (start.elapsed() + delay <= budget).then_some(delay)
+        })
+        .notify(|error, delay| {
+            warn!(
+                request,
+                error = %safe_error_message(error),
+                retry_in = ?delay,
+                "OSV request failed, will retry"
+            );
+        })
+        .await
+}
+
+fn is_transient(error: &VulnError) -> bool {
+    match error {
+        VulnError::RateLimited { .. } => true,
+        VulnError::Http(source) => source.is_timeout() || source.is_connect(),
+        VulnError::HttpStatus { status, .. } => status.is_server_error(),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -552,49 +536,14 @@ async fn handle_response(response: reqwest::Response) -> Result<reqwest::Respons
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = sanitize_server_text(&read_response_text(response, MAX_ERROR_BODY_BYTES).await?);
+        // The status decides whether to retry, so a failed body read must not
+        // turn a 4xx into a retryable timeout.
+        let body = match read_response_text(response, MAX_ERROR_BODY_BYTES).await {
+            Ok(text) => sanitize_server_text(&text),
+            Err(VulnError::Http(_)) => String::new(),
+            Err(err) => return Err(err),
+        };
         return Err(VulnError::HttpStatus { status, body });
-    }
-
-    Ok(response)
-}
-
-/// Like `handle_response` but returns `backoff::Error` so it can be used inside retry closures.
-/// 429 and 5xx responses are treated as transient; everything else is permanent.
-async fn handle_response_for_retry(
-    response: reqwest::Response,
-) -> std::result::Result<reqwest::Response, backoff::Error<VulnError>> {
-    if response.status() == StatusCode::TOO_MANY_REQUESTS {
-        let retry_after = parse_retry_after(response.headers());
-        warn!(retry_after = ?retry_after, "rate limited by OSV API, will retry");
-        return Err(backoff::Error::transient(VulnError::RateLimited {
-            retry_after,
-        }));
-    }
-
-    if response.status().is_server_error() {
-        let status = response.status();
-        let body = read_response_text(response, MAX_ERROR_BODY_BYTES)
-            .await
-            .map(|text| sanitize_server_text(&text))
-            .map_err(backoff::Error::permanent)?;
-        warn!(status = %status, "OSV server error, will retry");
-        return Err(backoff::Error::transient(VulnError::HttpStatus {
-            status,
-            body,
-        }));
-    }
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = read_response_text(response, MAX_ERROR_BODY_BYTES)
-            .await
-            .map(|text| sanitize_server_text(&text))
-            .map_err(backoff::Error::permanent)?;
-        return Err(backoff::Error::permanent(VulnError::HttpStatus {
-            status,
-            body,
-        }));
     }
 
     Ok(response)
@@ -652,12 +601,19 @@ fn safe_error_message(error: &VulnError) -> String {
     }
 }
 
+/// Parses `Retry-After` as delta-seconds or any of the three HTTP-date forms.
+/// A past date means no extra wait.
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_secs)
+    let text = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let target = httpdate::parse_http_date(text).ok()?;
+    Some(
+        target
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 fn validate_purl(purl: &str) -> Result<()> {
@@ -710,7 +666,11 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Mutex;
 
-    use super::{MAX_ERROR_BODY_BYTES, MAX_SUCCESS_BODY_BYTES, OsvClient, VulnError};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        MAX_ERROR_BODY_BYTES, MAX_SUCCESS_BODY_BYTES, OsvClient, VulnError, parse_retry_after,
+    };
 
     fn read_request(stream: &mut std::net::TcpStream) -> String {
         let mut request = Vec::new();
@@ -778,6 +738,169 @@ mod tests {
             Response::new(200, body).header("Content-Type", "application/json")
         });
         (format!("http://{}/v1", server.addr()), server)
+    }
+
+    /// Answers with `respond(path, n)`, where `n` counts earlier requests to that path.
+    fn spawn_scripted_mock_server(
+        respond: impl Fn(&str, usize) -> Response + Send + Sync + 'static,
+    ) -> (String, StubServer) {
+        let counts: Mutex<HashMap<String, usize>> = Mutex::new(HashMap::new());
+        let server = StubServer::start(move |request| {
+            let n = {
+                let mut counts = counts.lock().expect("request counts");
+                let count = counts.entry(request.path.clone()).or_default();
+                *count += 1;
+                *count - 1
+            };
+            respond(&request.path, n)
+        });
+        (format!("http://{}/v1", server.addr()), server)
+    }
+
+    const PURL: &str = "pkg:maven/com.example/demo@1.2.3";
+    const ONE_VULN_PAGE: &str = r#"{"vulns": [{"id": "OSV-A", "summary": "a", "affected": []}]}"#;
+
+    fn json(body: &'static str) -> Response {
+        Response::new(200, body).header("Content-Type", "application/json")
+    }
+
+    #[test]
+    fn query_waits_at_least_retry_after_on_429() {
+        let (base_url, server) = spawn_scripted_mock_server(|_, n| match n {
+            0 => Response::new(429, "").header("Retry-After", "2"),
+            _ => json(ONE_VULN_PAGE),
+        });
+        let client = OsvClient::with_base_url(base_url).expect("client");
+
+        let start = Instant::now();
+        let vulns = current_thread_runtime()
+            .block_on(client.query(PURL))
+            .expect("query succeeds after the rate limit");
+
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        assert_eq!(server.answered(), 2);
+        assert_eq!(vulns.len(), 1);
+    }
+
+    #[test]
+    fn vulnerability_fetch_retries_server_errors() {
+        let (base_url, server) = spawn_scripted_mock_server(|path, n| match (path, n) {
+            ("/v1/querybatch", _) => json(r#"{"results":[{"vulns":[{"id":"OSV-A"}]}]}"#),
+            ("/v1/vulns/OSV-A", 0) => Response::new(503, "busy"),
+            ("/v1/vulns/OSV-A", _) => json(r#"{"id":"OSV-A","summary":"a","affected":[]}"#),
+            _ => Response::new(404, ""),
+        });
+        let client = OsvClient::with_base_url(base_url).expect("client");
+
+        let result = current_thread_runtime()
+            .block_on(client.query_batch(&[PURL.to_string()]))
+            .expect("batch");
+
+        assert_eq!(server.answered(), 3);
+        assert!(result.failed_fetches.is_empty());
+        assert_eq!(result.results[0].vulnerabilities[0].id, "OSV-A");
+    }
+
+    #[test]
+    fn client_errors_are_not_retried() {
+        let (base_url, server) = spawn_scripted_mock_server(|_, _| Response::new(400, "bad"));
+        let client = OsvClient::with_base_url(base_url).expect("client");
+
+        let error = current_thread_runtime()
+            .block_on(client.query(PURL))
+            .expect_err("400 fails");
+
+        assert_eq!(server.answered(), 1);
+        assert!(matches!(error, VulnError::HttpStatus { status, .. } if status == 400));
+    }
+
+    #[test]
+    fn unreadable_client_error_body_keeps_the_status_and_is_not_retried() {
+        let (base_url, handle) = spawn_custom_mock_server("401 Unauthorized", "{", 100);
+        let client = OsvClient::with_base_url(base_url).expect("client");
+
+        let error = current_thread_runtime()
+            .block_on(client.query(PURL))
+            .expect_err("401 fails");
+
+        handle.join().expect("server thread");
+        assert!(matches!(error, VulnError::HttpStatus { status, .. } if status == 401));
+    }
+
+    #[test]
+    fn retries_stop_when_the_budget_is_spent() {
+        let (base_url, server) = spawn_scripted_mock_server(|_, _| Response::new(503, "busy"));
+        let mut client = OsvClient::with_base_url(base_url).expect("client");
+        // The first wait is under 1 s, so a 3 s budget always allows a retry.
+        client.retry_budget = Duration::from_secs(3);
+
+        let start = Instant::now();
+        let error = current_thread_runtime()
+            .block_on(client.query(PURL))
+            .expect_err("503 until the budget runs out");
+
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(server.answered() >= 2);
+        assert!(matches!(error, VulnError::HttpStatus { status, .. } if status == 503));
+    }
+
+    #[test]
+    fn retry_after_past_the_budget_fails_without_waiting() {
+        let (base_url, server) =
+            spawn_scripted_mock_server(|_, _| Response::new(429, "").header("Retry-After", "30"));
+        let mut client = OsvClient::with_base_url(base_url).expect("client");
+        client.retry_budget = Duration::from_secs(5);
+
+        let start = Instant::now();
+        let error = current_thread_runtime()
+            .block_on(client.query_batch(&[PURL.to_string()]))
+            .expect_err("rate limited");
+
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(server.answered(), 1);
+        assert!(matches!(
+            error,
+            VulnError::RateLimited { retry_after: Some(after) } if after == Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn rate_limited_vulnerability_fetch_fails_the_batch_without_waiting() {
+        let (base_url, _server) = spawn_scripted_mock_server(|path, _| match path {
+            "/v1/querybatch" => json(r#"{"results":[{"vulns":[{"id":"OSV-A"}]}]}"#),
+            _ => Response::new(429, "").header("Retry-After", "30"),
+        });
+        let mut client = OsvClient::with_base_url(base_url).expect("client");
+        client.retry_budget = Duration::from_secs(5);
+
+        let start = Instant::now();
+        let error = current_thread_runtime()
+            .block_on(client.query_batch(&[PURL.to_string()]))
+            .expect_err("a missing record fails the result");
+
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("OSV-A"));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let parse = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::RETRY_AFTER, value.parse().expect("header"));
+            parse_retry_after(&headers)
+        };
+        assert_eq!(parse(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(parse("Sun, 06 Nov 1994 08:49:37 GMT"), Some(Duration::ZERO));
+        assert_eq!(
+            parse("Sunday, 06-Nov-94 08:49:37 GMT"),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse("Sun Nov  6 08:49:37 1994"), Some(Duration::ZERO));
+        let future =
+            httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(30));
+        let wait = parse(&future).expect("future date");
+        assert!(wait > Duration::from_secs(25) && wait <= Duration::from_secs(30));
+        assert_eq!(parse("soon"), None);
     }
 
     fn spawn_custom_mock_server(

@@ -1719,7 +1719,7 @@ const LOCK_RETRY_MAX: Duration = Duration::from_secs(1);
 fn next_retry_delay(current: Duration) -> Duration {
     let base = (current * 2).min(LOCK_RETRY_MAX);
     let base_nanos = base.as_nanos() as u64;
-    let pct: i64 = rand::Rng::gen_range(&mut rand::thread_rng(), -25..=25);
+    let pct = getrandom::u64().map_or(0, |n| (n % 51) as i64 - 25);
     let delta_nanos = (base_nanos as i64).saturating_mul(pct) / 100;
     let jittered = (base_nanos as i64).saturating_add(delta_nanos).max(1) as u64;
     Duration::from_nanos(jittered)

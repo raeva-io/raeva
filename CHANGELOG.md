@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-13
+
+### Fixed
+
+- `rv vuln` waits at least as long as an OSV `Retry-After` header asks,
+  given in seconds or as an HTTP date and capped at 60 s, before retrying a
+  rate-limited request. Before, it retried on its own schedule and could be
+  rate-limited again. Retries are scheduled within a 120 s budget, and a
+  client error other than 429 whose body cannot be read is no longer retried.
+- `Retry-After` dates in the older RFC 850 and asctime forms are honored,
+  for repository downloads as well as OSV requests.
+
+### Changed
+
+- No unmaintained dependencies remain: OSV retries use `backon`, as
+  repository fetches already did, instead of `backoff` and `instant`;
+  `indicatif` 0.18 drops `number_prefix`; and `tabled` is built without its
+  derive macros, which pulled in `proc-macro-error2`. `lru` 0.18 and
+  `anyhow` 1.0.104 fix three unsoundness advisories. CI now fails on new
+  dependency advisories.
+- `rv` no longer depends directly on `rand` 0.8, and `strum` and `toml` are
+  on the versions the rest of the dependency tree uses, so a build compiles
+  fewer duplicate crates. Library users see `toml` 1.x types in `rv-config`
+  (`Lockfile::extra`, `ConfigError`) and `strum` 0.28 parse errors from
+  `FromStr` on enums such as `Scope`.
+
 ## [0.4.0] - 2026-10-13
 
 Maven-compatible conflict resolution, redirects from project repositories,
@@ -325,7 +351,8 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
-[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/raeva-io/raeva/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/raeva-io/raeva/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/raeva-io/raeva/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/raeva-io/raeva/compare/v0.1.1...v0.2.0

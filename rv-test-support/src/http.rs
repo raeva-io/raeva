@@ -218,11 +218,13 @@ async fn serve(
             head.push_str("Connection: close\r\n");
         }
         head.push_str("\r\n");
+        // Counted before writing: a client that has read the response must
+        // already see it in `answered()`.
+        state.answered.fetch_add(1, Ordering::SeqCst);
         socket.get_mut().write_all(head.as_bytes()).await?;
         if request.method != "HEAD" {
             socket.get_mut().write_all(&response.body).await?;
         }
-        state.answered.fetch_add(1, Ordering::SeqCst);
         if !keep_alive {
             return socket.get_mut().shutdown().await;
         }

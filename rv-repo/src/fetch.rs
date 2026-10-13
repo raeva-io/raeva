@@ -207,17 +207,20 @@ fn classify_response_status_with_headers(
     )))
 }
 
-/// Parse RFC 7231 §7.1.3 `Retry-After`: delta-seconds or HTTP-date. Past
-/// dates clamp to zero; unparseable values yield `None` (caller falls back).
+/// Parse RFC 9110 §10.2.3 `Retry-After`: delta-seconds or any of the three
+/// HTTP-date forms. Past dates clamp to zero; unparseable values yield `None`
+/// (caller falls back).
 fn parse_retry_after(value: &HeaderValue) -> Option<Duration> {
     let text = value.to_str().ok()?.trim();
     if let Ok(secs) = text.parse::<u64>() {
         return Some(Duration::from_secs(secs));
     }
-    let target = chrono::DateTime::parse_from_rfc2822(text).ok()?;
-    let now = chrono::Utc::now();
-    let delta = target.with_timezone(&chrono::Utc) - now;
-    delta.to_std().ok().or(Some(Duration::ZERO))
+    let target = httpdate::parse_http_date(text).ok()?;
+    Some(
+        target
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 async fn execute_retry<F, Fut, T>(config: &FetchConfig, op: F) -> Result<T>
@@ -1518,13 +1521,19 @@ mod tests {
         use super::parse_retry_after;
         use reqwest::header::HeaderValue;
 
-        let future = chrono::Utc::now() + chrono::Duration::seconds(3600);
-        // RFC 7231 IMF-fixdate format. chrono renders it via `to_rfc2822`, which
-        // is the parent format RFC 7231 §7.1.1.1 cites.
-        let formatted = future.to_rfc2822();
-        let header = HeaderValue::from_str(&formatted).unwrap();
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let header = HeaderValue::from_str(&httpdate::fmt_http_date(future)).unwrap();
         let d = parse_retry_after(&header).expect("http-date must parse");
         assert!(d.as_secs() > 3500 && d.as_secs() <= 3600, "got {d:?}");
+
+        for obsolete in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"] {
+            let header = HeaderValue::from_static(obsolete);
+            assert_eq!(
+                parse_retry_after(&header),
+                Some(std::time::Duration::ZERO),
+                "{obsolete}"
+            );
+        }
     }
 
     #[test]

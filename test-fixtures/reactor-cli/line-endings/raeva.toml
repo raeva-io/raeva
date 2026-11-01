@@ -1,0 +1,5 @@
+[[repositories]]
+id = "fixture"
+url = "https://repo.invalid/maven2/"
+releases = true
+snapshots = false

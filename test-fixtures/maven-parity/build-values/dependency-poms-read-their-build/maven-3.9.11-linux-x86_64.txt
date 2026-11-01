@@ -1,0 +1,16 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id
+# from the local repository layout and _remote.repositories
+# lib's POM inherits finalName ${project.artifactId}-pfn and directory pdir
+# from lpar, and its active profile sets defaultGoal pgoal: n1 has the
+# classifier lib-pfn, n2 the version pdir, not aligned since a dependency
+# has no base directory, and n3 the version pgoal. plain's POM sets no
+# <build>, so n4 has the super POM's finalName plain-1.
+result=success
+module=org.d:app:1
+artifact=org.d:lib:1:deps
+artifact=org.d:n1:1:deps
+artifact=org.d:n2:pdir:deps
+artifact=org.d:n3:pgoal:deps
+artifact=org.d:plain:1:deps
+artifact=org.d:n4:1:deps

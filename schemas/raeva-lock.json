@@ -1,0 +1,430 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raeva.io/schemas/raeva-lock.json",
+  "title": "raeva.lock schema 8",
+  "description": "The canonical Raeva lock format. raeva reads and writes schema 8 only; it refuses a lockfile with any other schema version or with a key this schema does not list, in any table, and a plain raeva sync (without --frozen) regenerates it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": {
+      "const": 8,
+      "description": "On-disk schema version."
+    },
+    "config_hash": {
+      "$ref": "#/$defs/text",
+      "description": "Hash of the configuration that can change resolution: repositories, profiles, security settings, effective -P selections, and consulted values and outcomes in resolution.ambient_inputs. Network settings, mirrors, proxies, credentials, and the local repository are excluded."
+    },
+    "resolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "The host inputs the resolution consulted and the command-line options it ran with, by name. Absent when there are neither.",
+      "properties": {
+        "command_line": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "description": "Consulted -D options and explicit -P selections, by name only. Values are never recorded. Unread -D options are omitted.",
+          "items": {
+            "type": "string",
+            "pattern": "^-[DP][!-<>-~]{1,256}$"
+          }
+        },
+        "ambient_inputs": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "description": "What the resolution consulted on the host, sorted as text: java.version, java.home, env.NAME, settings-property:NAME and os-release (the Linux release os-maven-plugin reads) for a value that reached the model, and jdk:SPEC, property:NAME[=VALUE], file:PATH or settings:KEY followed by \" is true\" or \" is false\" for a profile activation condition and its outcome. A condition holds the POM's text, never the host value: file: names a path inside the project relative to raeva.lock, where .. never climbs above it (true when it exists), and settings: a settings.xml condition by a key derived from its text. config_hash covers the current values and outcomes, and the graph digests of each target that lists no host_inputs cover the conditions and host values. Absent when the resolution consulted none. user-property:NAME records a consulted -D lookup, including absent overrides. Its value is covered only by config_hash. user-property-lookup: holds an authored expression and its public POM context, so model interpolation and activation lookups can be repeated with their original property precedence without publishing expanded external names or values. For a private file activation it also records the relative local POM directory, when present, and config_hash covers file existence.",
+          "items": {
+            "type": "string",
+            "pattern": "^(java\\.version|java\\.home|os-release|env\\.[A-Za-z_][A-Za-z0-9_]{0,254}|user-property:[!-<>-~]{1,256}|user-property-lookup:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+|settings-property:[A-Za-z0-9._-]{1,128}|jdk:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)|property:!?(java\\.version|java\\.home|env\\.[A-Za-z_][A-Za-z0-9_]{0,254})(=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256})? is (true|false)|file:(?=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)$)(?!\\.\\.?(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+(/(?!\\.(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+)* is (true|false)|settings:[0-9a-f]{16} is (true|false))$"
+          }
+        }
+      }
+    },
+    "platforms": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/platform" }
+    },
+    "inputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/inputs" }
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repo_ids": {
+          "type": "string",
+          "description": "Newline-separated 'origin<TAB>id' lines for the id'd repositories that backed resolution, so export-m2 can label _remote.repositories markers for POM-declared repos. An origin is spelled as repo_url is and has one line per id it is declared under; no line appears twice. The ids are labels only and grant no repository access. The graph digests of each target that lists no repo_ids cover them."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "targets",
+        "artifacts",
+        "modules"
+      ],
+      "not": {
+        "anyOf": [
+          {
+            "required": [
+              "packages"
+            ]
+          },
+          {
+            "required": [
+              "edges"
+            ]
+          }
+        ]
+      },
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "description": "Unique external artifact pins. Workspace and system-scoped nodes never appear here.",
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "modules": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/module"
+          }
+        },
+        "support_poms": {
+          "type": "array",
+          "description": "The parent POMs and imported BOMs this platform's resolution read from a repository, one row per coordinate. Export ships these exact bytes so an offline Maven build finds every parent and BOM. Rows of two platforms naming one coordinate must pin the same file and bytes, and a row naming the same .pom file as an artifact row's pom_sha256 must pin the same bytes: Maven has one local-repository path per file.",
+          "items": {
+            "$ref": "#/$defs/supportPom"
+          }
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/target"
+          },
+          "description": "Targets sharing these exact artifacts, module graphs, and support POM pins. Each has one separate input record."
+        }
+      }
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_]+-[A-Za-z0-9_]+(@[A-Za-z0-9._+-]{1,32})?$",
+      "description": "OS and architecture, followed by @JDK when a target JDK is configured."
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "profiles",
+            "poms"
+          ],
+          "not": {
+            "required": [
+              "model_hash"
+            ]
+          }
+        },
+        {
+          "required": [
+            "model_hash"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "profiles"
+                ]
+              },
+              {
+                "required": [
+                  "poms"
+                ]
+              },
+              {
+                "required": [
+                  "ambient_inputs"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/target"
+        },
+        "profiles": {
+          "type": "array",
+          "description": "The active profile ids covered by the target input records.",
+          "items": {
+            "type": "string",
+            "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*$"
+          }
+        },
+        "ambient_inputs": {
+          "$ref": "#/$defs/read_names",
+          "description": "The names in resolution.ambient_inputs that every graph of the target read outside any one module's builds. Every graph digest of the target covers them."
+        },
+        "repo_ids": {
+          "type": "string",
+          "description": "The lines of metadata.repo_ids, in its format, that this target's resolution used, when they are not all of metadata.repo_ids; absent when the target used every line. A lock whose targets agree lists none. Every graph digest of the target, when it has poms records, covers it, and a sync of some targets replaces their lines and keeps the others'."
+        },
+        "host_inputs": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "The entries of resolution.ambient_inputs other than property and variable names (conditions and host values) that this target consulted, sorted as text, when they are not all such entries; absent when the target consulted every one, and empty when it consulted none. A lock whose targets agree lists none. Every graph digest of the target, when it has poms records, covers it, and a sync of some targets replaces their entries and keeps the others'.",
+          "items": {
+            "type": "string",
+            "pattern": "^(java\\.version|java\\.home|os-release|user-property-lookup:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+|jdk:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)|property:!?(java\\.version|java\\.home|env\\.[A-Za-z_][A-Za-z0-9_]{0,254})(=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256})? is (true|false)|file:(?=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)$)(?!\\.\\.?(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+(/(?!\\.(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+)* is (true|false)|settings:[0-9a-f]{16} is (true|false))$"
+          }
+        },
+        "poms": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "path",
+              "sha256"
+            ],
+            "properties": {
+              "path": {
+                "$ref": "#/$defs/text"
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "graph": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "A module's graph digest: the lock's config_hash, its sha256 record, its module row, the names in ambient_inputs here and in the target's ambient_inputs, the repository ids and the conditions and host values the target read (its repo_ids and host_inputs, or all of metadata.repo_ids and of those in resolution.ambient_inputs where it lists none), the pin of each support POM the row names, the POM pin of each external package, and every module's path and coordinates. A lock whose graph digests do not match its rows is not trusted."
+              },
+              "ambient_inputs": {
+                "$ref": "#/$defs/read_names",
+                "description": "The other names in resolution.ambient_inputs that this module's graph read. Only a module's record has them. A lock whose resolution.ambient_inputs misses a name a graph read is not trusted."
+              }
+            }
+          },
+          "description": "Separate records for each local POM. A module digest covers normalized bytes, effective coordinates, and active profile ids. A local-parent digest covers normalized bytes and its role. The model hash is recomputed from these records and profiles."
+        },
+        "model_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Opaque model identity for API-created locks without local input records. Sync always writes profiles and poms instead."
+        }
+      }
+    },
+    "read_names": {
+      "type": "array",
+      "uniqueItems": true,
+      "minItems": 1,
+      "description": "Property and variable names, sorted as text.",
+      "items": {
+        "type": "string",
+        "pattern": "^(env\\.[A-Za-z_][A-Za-z0-9_]{0,254}|user-property:[!-<>-~]{1,256}|settings-property:[A-Za-z0-9._-]{1,128})$"
+      }
+    },
+    "coordinate": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A Maven coordinate. group and artifact follow Maven's id rule (ASCII letters, digits, '.', '-', '_'); version, classifier and packaging hold printable ASCII without spaces or any of \\ / : \" < > | ? * # @ %. No component contains '..' or ends with '.', a group does not start with '.', and each is at most 255 bytes. A missing classifier means none; an empty one is invalid.",
+      "required": ["group", "artifact", "version", "packaging"],
+      "properties": {
+        "group": { "$ref": "#/$defs/group" },
+        "artifact": { "$ref": "#/$defs/mavenId" },
+        "version": { "$ref": "#/$defs/component" },
+        "packaging": { "$ref": "#/$defs/component" },
+        "classifier": { "$ref": "#/$defs/component" }
+      }
+    },
+    "group": { "type": "string", "pattern": "^(?!.*\\.\\.)(?!\\.)(?!.*\\.$)[A-Za-z0-9_.-]{1,255}$" },
+    "mavenId": { "type": "string", "pattern": "^(?!.*\\.\\.)(?!.*\\.$)[A-Za-z0-9_.-]{1,255}$" },
+    "component": { "type": "string", "pattern": "^(?!.*\\.\\.)(?!.*\\.$)[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}$" },
+    "text": {
+      "type": "string",
+      "description": "Free text without control characters, line separators or default-ignorable characters such as bidirectional controls and zero-width characters (the reader also refuses the default-ignorable characters outside the Basic Multilingual Plane).",
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*$"
+    },
+    "gav": {"type": "string", "description": "Effective coordinates of a reactor module as group:artifact:version. The version only has to be text without control or invisible characters, since Maven 3.9 only warns about the characters a coordinate bans in a project version.", "pattern": "^[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}:[^\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}$"},
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate", "repo_url", "checksums"],
+      "properties": {
+        "coordinate": { "$ref": "#/$defs/coordinate" },
+        "repo_url": { "$ref": "#/$defs/repoUrl" },
+        "other_repo_urls": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repoUrl" },
+          "description": "The other repositories that served the same file to a module, spelled as repo_url is and sorted. raeva export-m2 writes a _remote.repositories line for the id of each, and of each pom_repo_urls entry, as Maven does for every repository a file was resolved from."
+        },
+        "checksums": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/checksum" },
+          "description": "Payload digests for this artifact file, at least one of sha256 or sha1. The pin prefers sha256 when both are present."
+        },
+        "pom_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the companion .pom bytes this lockfile was resolved against, recorded by raeva sync where those bytes were parsed. Pins which POM export-m2 ships for this coordinate, since the store's coordinate index is last-writer-wins. Every row naming one group:artifact:version must carry the same value, across classifiers and across platforms: Maven has one local-repository path per coordinate. Absent when no repository has a POM for the coordinate, which then has no dependencies."
+        },
+        "pom_repo_urls": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repoUrl" },
+          "description": "The repositories that served the companion POM to a module, spelled as repo_url is and sorted, when they are not the file's own (repo_url and other_repo_urls): a SNAPSHOT POM resolves on its own, and a release POM may come from a repository that lacks the file. A frozen check takes the pinned POM only from these. Absent when the POM came from the file's own repositories."
+        },
+        "snapshot": { "$ref": "#/$defs/snapshot" },
+        "pom_snapshot": { "$ref": "#/$defs/snapshot", "description": "Companion POM build, present only when different from the artifact snapshot build." },
+        "pom_base": {
+          "const": true,
+          "description": "The companion POM is the base -SNAPSHOT.pom: the repository's snapshot metadata names this file's build but no build of its POM, so Maven reads the base file. Only on a row with a snapshot build and no pom_snapshot; pom_sha256 is then that file's digest, or absent when the repository has no base POM."
+        }
+      },
+      "dependentRequired": { "pom_base": ["snapshot"] },
+      "not": { "required": ["pom_base", "pom_snapshot"] }
+    },
+    "repoUrl": {
+      "type": "string",
+      "pattern": "^[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*$",
+      "description": "The repository the artifact was resolved from, as the configuration or a POM declares it, never the mirror that served it: its URL, which raeva never writes with userinfo, a query or a fragment, or, for a file: repository inside the directory that holds raeva.lock, a project-relative origin './' followed by '/'-terminated directory names. raeva refuses an absolute file: URL that names a directory inside that one. A project-relative origin is a key, not a location: it names whichever repository the current configuration or project POMs declare at that path, and grants nothing when none does."
+    },
+    "supportPom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coordinate", "repo_url", "sha256"],
+      "properties": {
+        "coordinate": {
+          "type": "string",
+          "description": "The group:artifact:version the POM text names, with the -SNAPSHOT version of a snapshot build.",
+          "pattern": "^(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.$)[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}$"
+        },
+        "repo_url": {
+          "$ref": "#/$defs/repoUrl",
+          "description": "The repository that served the POM, spelled as an artifact row's repo_url. A restore asks it first, then the other repositories the configuration and POMs declare; the pin decides which bytes are accepted."
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the exact POM bytes resolution parsed."
+        },
+        "snapshot": {
+          "$ref": "#/$defs/snapshot",
+          "description": "The deployed build of a -SNAPSHOT parent or BOM, whose timestamped file holds the pinned bytes. Only on a SNAPSHOT version."
+        }
+      }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timestamp", "build_number"],
+      "properties": {
+        "timestamp": {
+          "type": "string",
+          "pattern": "^[0-9]{8}\\.[0-9]{6}$"
+        },
+        "build_number": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "module": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "gav", "packaging", "packages", "edges"],
+      "properties": {
+        "path": { "$ref": "#/$defs/pomPath" },
+        "gav": { "$ref": "#/$defs/gav" },
+        "packaging": { "$ref": "#/$defs/component" },
+        "packages": {
+          "type": "string",
+          "description": "The module's graph nodes, one per line in tab-separated columns: group:artifact:version, packaging[:classifier], the direct scope (empty for a node reached only through another), the scope the node resolves to as Maven's JavaScopeSelector picks it (empty when it is the direct scope or, for a node reached only through another, compile), the workspace module's POM path for another reactor module, and for a system-scoped file its project-relative path and SHA-256. Empty trailing columns are left out. Lines are sorted; edges refer to them by index from 0. An external package must match its artifact row, which uses the full coordinate rule.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}:[^\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t[0-9a-f]{64})?)?)?)?)?(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}:[^\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t[0-9a-f]{64})?)?)?)?)?)*)?$"
+        },
+        "parent_ranges": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Remote parent range selections for each selected model built in this module's repository context. Omitted when no model lineage has a remote parent range.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "parent", "selected"],
+            "properties": {
+              "model": { "$ref": "#/$defs/gav", "description": "Locked coordinates of the model whose parent lineage used the range, with the SNAPSHOT base version." },
+              "parent": { "$ref": "#/$defs/gav", "description": "Declared parent coordinates, with the range as version." },
+              "selected": { "$ref": "#/$defs/supportPom/properties/coordinate", "description": "Selected parent coordinates before SNAPSHOT file expansion. The group and artifact must match parent, and the version must satisfy its range." }
+            }
+          }
+        },
+        "edges": {
+          "type": "string",
+          "description": "The dependencies between packages, one per line: the depending package's index, the index depended on, then the scope and 'optional', each only when set. The scope is the one the dependency has below the depending package: the scope dependency management gives it, else the one Maven derives from its declared scope and the scope the depending package resolves to. Lines are sorted.",
+          "pattern": "^(?:(?:0|[1-9][0-9]*) (?:0|[1-9][0-9]*)(?: (?:compile|provided|runtime|test|system|import))?(?: optional)?(?:\\n(?:0|[1-9][0-9]*) (?:0|[1-9][0-9]*)(?: (?:compile|provided|runtime|test|system|import))?(?: optional)?)*)?$"
+        },
+        "support_poms": {
+          "type": "string",
+          "description": "The coordinates of every parent and BOM this module's resolution read, one per line, sorted. Each names a support_poms row of the platform, whose pin the module's graph digest covers.",
+          "pattern": "^(?:(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?:\\n(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})*)?$"
+        }
+      }
+    },
+    "pomPath": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*:)(?![\\s\\S]*[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb])(?:[^/]+/)*pom\\.xml$",
+      "description": "Normalized workspace-root-relative POM path using forward slashes, without a drive or other colon, and without control, separator or default-ignorable characters."
+    },
+    "checksum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "digest"],
+      "properties": {
+        "algorithm": { "type": "string" },
+        "digest": { "type": "string" }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        },
+        {
+          "properties": {
+            "algorithm": { "const": "sha1" },
+            "digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

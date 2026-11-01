@@ -5,61 +5,82 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
-    name: fmt + clippy + test
-    runs-on: ubuntu-latest
+  test:
+    name: clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: rustfmt
+        if: runner.os == 'Linux'
         run: cargo fmt --all --check
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.114
+
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # macOS allows 256 open files by default, too few for the parallel
+      # integration tests.
       - name: test
-        run: cargo test --workspace
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then ulimit -n 10240; fi
+          cargo nextest run --workspace --locked --profile ci
 
-  advisories:
-    name: cargo deny advisories
+      # nextest does not run doctests.
+      - name: doctests
+        run: cargo test --doc --workspace --locked
+
+      - name: docs
+        if: runner.os == 'Linux'
+        run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  deny:
+    name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Pinned to the release that ships cargo-deny 0.20.2.
+      - uses: EmbarkStudios/cargo-deny-action@v2.1.1
         with:
-          command: check advisories
+          command: check
 
-  check-windows:
-    name: cargo check (windows)
-    runs-on: windows-latest
+  msrv:
+    name: check (rust-version)
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~\.cargo\registry
-            ~\.cargo\git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      - name: cargo check
-        run: cargo check --workspace
+      - name: check with the declared minimum Rust version
+        run: |
+          rustup toolchain install 1.89 --profile minimal
+          cargo +1.89 check --workspace --all-targets --locked

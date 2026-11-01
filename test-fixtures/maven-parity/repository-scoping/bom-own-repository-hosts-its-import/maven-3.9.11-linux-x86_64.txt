@@ -1,0 +1,9 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# The project imports b1, which declares rb and imports b2, in rb only. The BOM's own repositories serve its
+# nested imports.
+result=success
+module=org.scope:bom-own-repository-hosts-its-import:1
+# org.scope:x:jar:1:compile
+artifact=org.scope:x:1:r1

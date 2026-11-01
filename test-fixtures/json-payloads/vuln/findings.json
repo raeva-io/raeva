@@ -1,0 +1,96 @@
+{
+  "exit_code": 1,
+  "stdout": {
+    "code": "VULNERABILITIES_FOUND",
+    "data": {
+      "complete": true,
+      "failed_records": [],
+      "metadata": {
+        "query_timestamp": "<string>",
+        "scanner": {
+          "database_snapshot": null,
+          "provider": "osv.dev"
+        },
+        "tool": {
+          "name": "raeva",
+          "version": "<raeva-version>"
+        }
+      },
+      "platform": "<host-platform>",
+      "results": [
+        {
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "findings": [
+            {
+              "fixed": null,
+              "id": "GOLDEN-2024-1",
+              "severity": "Critical"
+            }
+          ],
+          "purl": "pkg:maven/org.golden/util@1.0",
+          "suppressed": [],
+          "vex": [],
+          "vulnerabilities": [
+            {
+              "affected": [
+                {
+                  "package": {
+                    "ecosystem": "Maven",
+                    "name": "org.golden:util",
+                    "purl": null
+                  },
+                  "ranges": [],
+                  "versions": [
+                    "1.0"
+                  ]
+                }
+              ],
+              "aliases": [],
+              "details": null,
+              "id": "GOLDEN-2024-1",
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://example.com/GOLDEN-2024-1"
+                }
+              ],
+              "severity": {
+                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                "type": "CVSS_V3"
+              },
+              "summary": "fixture advisory for org.golden:util"
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "critical": 1,
+        "findings_at_or_above_threshold": 1,
+        "high": 0,
+        "low": 0,
+        "medium": 0,
+        "none": 0,
+        "suppressed": 0,
+        "test_only_dependencies": 2,
+        "total_dependencies": 7,
+        "total_vulnerabilities": 1,
+        "unknown": 0,
+        "vulnerable_dependencies": 1
+      },
+      "targets": [
+        {
+          "platform": "<host-platform>"
+        }
+      ],
+      "threshold": "high",
+      "threshold_exceeded": true,
+      "warnings": []
+    },
+    "error": "found 1 known vulnerability at high severity or above",
+    "exit_code": 1,
+    "hints": [],
+    "success": false
+  }
+}

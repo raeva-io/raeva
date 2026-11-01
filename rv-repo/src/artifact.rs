@@ -1,51 +1,47 @@
 use serde::{Deserialize, Serialize};
 
-use rv_version::Coord;
-
-use crate::repository::is_snapshot_version;
+use rv_maven_types::{
+    ArtifactCoord, Coord, CoordinateField, is_snapshot_version, layout,
+    validate_coordinate_component,
+};
 
 const DEFAULT_PACKAGING: &str = "jar";
 
-/// Validates that a coordinate component does not contain path traversal
-/// sequences or path separators that could lead to SSRF when used in URL paths.
+/// One file to fetch from a repository, named by its Maven coordinate.
 ///
-/// Exposed at crate scope so the snapshot-resolution path can run the
-/// server-controlled `<snapshotVersion><value>` through the same gate before
-/// it is spliced into an artifact filename. [`ArtifactRequest::validate`] only
-/// covers the requested coordinate, not the resolved snapshot version.
-pub(crate) fn validate_coordinate_component(
-    component: &str,
-    field: &str,
-) -> std::result::Result<(), String> {
-    if component.is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
-    if component.contains("..") {
-        return Err(format!("{field} must not contain '..'"));
-    }
-    // Reject path separators and URL-significant characters
-    for ch in ['/', '\\', '?', '#', '@', ':'] {
-        if component.contains(ch) {
-            return Err(format!("{field} must not contain '{ch}'"));
-        }
-    }
-    // Reject control characters
-    if component.chars().any(|c| c.is_control()) {
-        return Err(format!("{field} must not contain control characters"));
-    }
-    Ok(())
-}
-
+/// The fields are not checked on construction; [`ArtifactRequest::validate`]
+/// checks them, and the [`crate::RepoClient`] fetch methods call it before
+/// building a URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRequest {
+    /// The group id, such as `org.slf4j`. Its dots become directories.
     pub group_id: String,
+    /// The artifact id, such as `slf4j-api`.
     pub artifact_id: String,
+    /// The version: a release, a `-SNAPSHOT` base version, or a timestamped
+    /// snapshot version.
     pub version: String,
+    /// The file extension, such as `jar` or `pom`. Defaults to `jar`.
     pub packaging: String,
+    /// The classifier, such as `sources`, or `None` for the main artifact.
     pub classifier: Option<String>,
 }
 
+impl From<&ArtifactCoord> for ArtifactRequest {
+    fn from(coord: &ArtifactCoord) -> Self {
+        Self {
+            group_id: coord.group_id().to_string(),
+            artifact_id: coord.artifact_id().to_string(),
+            version: coord.version().to_string(),
+            packaging: coord.extension().to_string(),
+            classifier: coord.classifier().map(str::to_string),
+        }
+    }
+}
+
 impl ArtifactRequest {
+    /// A request for the `jar` of `group_id:artifact_id:version`, with no
+    /// classifier.
     pub fn new(
         group_id: impl Into<String>,
         artifact_id: impl Into<String>,
@@ -60,6 +56,8 @@ impl ArtifactRequest {
         }
     }
 
+    /// A request for `coord`, taking its packaging as the extension (`jar`
+    /// when it has none) and its classifier.
     pub fn from_coord(coord: &Coord) -> Self {
         Self {
             group_id: coord.group_id.to_string(),
@@ -73,36 +71,39 @@ impl ArtifactRequest {
         }
     }
 
+    /// The same request with `packaging` as the file extension.
     pub fn with_packaging(mut self, packaging: impl Into<String>) -> Self {
         self.packaging = packaging.into();
         self
     }
 
+    /// The same request with `classifier` set.
     pub fn with_classifier(mut self, classifier: impl Into<String>) -> Self {
         self.classifier = Some(classifier.into());
         self
     }
 
+    /// The repository-relative path in the standard Maven layout, such as
+    /// `com/example/demo/1.0.0/demo-1.0.0.jar`. The version names both the
+    /// directory and the file. It does not validate the components; call
+    /// [`ArtifactRequest::validate`] first for untrusted input.
     pub fn to_path(&self) -> String {
         self.to_path_with_versions(&self.version, &self.version)
     }
 
-    pub fn to_path_with_versions(&self, dir_version: &str, file_version: &str) -> String {
-        let group_path = self.group_id.replace('.', "/");
-        let filename = if let Some(classifier) = self.classifier.as_deref() {
-            format!(
-                "{}-{}-{}.{}",
-                self.artifact_id, file_version, classifier, self.packaging
-            )
-        } else {
-            format!("{}-{}.{}", self.artifact_id, file_version, self.packaging)
-        };
-        format!(
-            "{}/{}/{}/{}",
-            group_path, self.artifact_id, dir_version, filename
+    pub(crate) fn to_path_with_versions(&self, dir_version: &str, file_version: &str) -> String {
+        layout::artifact_path_from_parts(
+            &self.group_id,
+            &self.artifact_id,
+            dir_version,
+            file_version,
+            &self.packaging,
+            self.classifier.as_deref(),
         )
     }
 
+    /// The request for this coordinate's POM: the same group, artifact and
+    /// version, with the `pom` extension and no classifier.
     pub fn pom(&self) -> Self {
         let mut request = self.clone();
         request.packaging = "pom".to_string();
@@ -110,30 +111,27 @@ impl ArtifactRequest {
         request
     }
 
-    /// Returns true if this artifact version is a snapshot (either `-SNAPSHOT` suffix
-    /// or timestamped snapshot like `1.0-20240101.010101-1`).
-    ///
-    /// Uses the shared `is_snapshot_version` utility from `repository.rs` to avoid
-    /// duplicating the snapshot detection regex.
+    /// `-SNAPSHOT` suffix or a timestamped build such as `1.0-20240101.010101-1`.
     pub fn is_snapshot(&self) -> bool {
         is_snapshot_version(&self.version)
     }
 
-    pub fn base_version(&self) -> Option<&str> {
-        self.version.strip_suffix("-SNAPSHOT")
-    }
-
-    /// Validates that all coordinate components are safe for use in URL paths.
-    /// Returns an error if any component contains path traversal or SSRF-enabling characters.
+    /// Refuse path traversal and SSRF-enabling characters in every coordinate
+    /// part, with [`validate_coordinate_component`].
     pub fn validate(&self) -> std::result::Result<(), String> {
-        validate_coordinate_component(&self.group_id, "group_id")?;
-        validate_coordinate_component(&self.artifact_id, "artifact_id")?;
-        validate_coordinate_component(&self.version, "version")?;
-        validate_coordinate_component(&self.packaging, "packaging")?;
-        if let Some(classifier) = &self.classifier {
-            validate_coordinate_component(classifier, "classifier")?;
-        }
-        Ok(())
+        [
+            (CoordinateField::Group, self.group_id.as_str()),
+            (CoordinateField::Artifact, &self.artifact_id),
+            (CoordinateField::Version, &self.version),
+            (CoordinateField::Extension, &self.packaging),
+        ]
+        .into_iter()
+        .chain(
+            (self.classifier.as_deref())
+                .map(|classifier| (CoordinateField::Classifier, classifier)),
+        )
+        .try_for_each(|(field, value)| validate_coordinate_component(field, value))
+        .map_err(|err| err.to_string())
     }
 }
 
@@ -141,88 +139,23 @@ impl ArtifactRequest {
 mod tests {
     use super::ArtifactRequest;
 
+    /// A coordinate must not smuggle a path or URL control into a request
+    /// for another path, and a refusal must not echo a control character.
     #[test]
-    fn default_packaging_is_jar() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0.0");
-        assert_eq!(req.packaging, "jar");
-    }
-
-    #[test]
-    fn builds_artifact_path() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0.0");
-        assert_eq!(req.to_path(), "com/example/demo/1.0.0/demo-1.0.0.jar");
-    }
-
-    #[test]
-    fn builds_classifier_path() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0.0").with_classifier("tests");
-        assert_eq!(req.to_path(), "com/example/demo/1.0.0/demo-1.0.0-tests.jar");
-    }
-
-    #[test]
-    fn builds_snapshot_filename() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0-SNAPSHOT");
-        let path = req.to_path_with_versions("1.0-SNAPSHOT", "1.0-20240101.010101-1");
-        assert!(path.ends_with("demo-1.0-20240101.010101-1.jar"));
-    }
-
-    #[test]
-    fn pom_clears_classifier() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0.0").with_classifier("tests");
-        let pom = req.pom();
-        assert_eq!(pom.packaging, "pom");
-        assert!(pom.classifier.is_none());
-    }
-
-    #[test]
-    fn detects_regular_snapshot() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0-SNAPSHOT");
-        assert!(req.is_snapshot());
-    }
-
-    #[test]
-    fn detects_timestamped_snapshot() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0-20240101.010101-1");
-        assert!(req.is_snapshot());
-    }
-
-    #[test]
-    fn detects_timestamped_snapshot_with_different_build_number() {
-        let req = ArtifactRequest::new("com.example", "demo", "2.5.3-20230815.123456-42");
-        assert!(req.is_snapshot());
-    }
-
-    #[test]
-    fn release_version_is_not_snapshot() {
-        let req = ArtifactRequest::new("com.example", "demo", "1.0.0");
-        assert!(!req.is_snapshot());
-    }
-
-    #[test]
-    fn version_with_similar_pattern_is_not_snapshot() {
-        // Should not match if pattern is not at the end
-        let req = ArtifactRequest::new("com.example", "demo", "1.0-20240101.010101-1.Final");
-        assert!(!req.is_snapshot());
-    }
-
-    #[test]
-    fn validate_rejects_traversal_and_url_chars() {
-        // Each field must reject path-traversal / URL-control characters so the
-        // coordinate cannot be smuggled into a request that targets another path.
-        let bad = [
-            ("com.example/../evil", "demo", "1.0.0"),
-            ("com.example", "demo/../../etc", "1.0.0"),
-            ("com.example", "demo", "1.0?redirect=evil.com"),
-        ];
-        for (g, a, v) in bad {
-            ArtifactRequest::new(g, a, v)
-                .validate()
-                .expect_err(&format!("{g}:{a}:{v}"));
+    fn validate_refuses_what_the_lock_refuses() {
+        let base = || ArtifactRequest::new("com.example", "demo", "1.0");
+        for request in [
+            ArtifactRequest::new("com.example/../evil", "demo", "1.0.0"),
+            ArtifactRequest::new("com.example", "demo/../../etc", "1.0.0"),
+            ArtifactRequest::new("com.example", "demo", "1.0?redirect=evil.com"),
+            ArtifactRequest::new("com.example", "demo\u{1b}[31m", "1.0"),
+            ArtifactRequest::new("com.example", "de mo", "1.0"),
+            base().with_classifier("x:y"),
+            base().with_classifier(""),
+        ] {
+            let err = request.validate().expect_err(&format!("{request:?}"));
+            assert!(!err.chars().any(char::is_control), "{err:?}");
         }
-    }
-
-    #[test]
-    fn validate_accepts_normal_coordinates() {
         for (g, a, v) in [
             ("com.example", "demo", "1.0.0-SNAPSHOT"),
             ("org.springframework.boot", "spring-boot", "3.2.0"),

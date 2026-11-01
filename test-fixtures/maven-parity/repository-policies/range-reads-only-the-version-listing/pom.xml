@@ -1,0 +1,15 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.t</groupId>
+  <artifactId>range-reads-only-the-version-listing</artifactId>
+  <version>1</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.t</groupId><artifactId>dep</artifactId><version>[1.0,2.0)</version></dependency>
+  </dependencies>
+</project>

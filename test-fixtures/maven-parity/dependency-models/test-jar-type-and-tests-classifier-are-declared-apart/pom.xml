@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.tj</groupId>
+  <artifactId>test-jar-type-and-tests-classifier-are-declared-apart</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.tj</groupId><artifactId>lib</artifactId><version>2.0</version><classifier>tests</classifier></dependency>
+    <dependency><groupId>org.tj</groupId><artifactId>lib</artifactId><version>1.0</version><type>test-jar</type></dependency>
+  </dependencies>
+</project>

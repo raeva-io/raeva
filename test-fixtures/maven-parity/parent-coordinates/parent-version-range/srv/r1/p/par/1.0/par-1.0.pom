@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId><artifactId>par</artifactId><version>1.0</version><packaging>pom</packaging><dependencyManagement><dependencies><dependency><groupId>p</groupId><artifactId>leaf</artifactId><version>1</version></dependency></dependencies></dependencyManagement></project>

@@ -1,0 +1,2 @@
+<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.ci</groupId><artifactId>root</artifactId><version>${revision}</version></parent><artifactId>child</artifactId>
+<properties><pv>${project.parent.version}</pv><v>${project.version}</v></properties></project>

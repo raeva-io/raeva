@@ -1,0 +1,42 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "changed": true,
+      "changed_inputs": [
+        "config_hash",
+        "pom.xml"
+      ],
+      "changes": [
+        {
+          "change": "version",
+          "coordinate": "org.golden:snap:jar",
+          "kind": "external",
+          "module": "pom.xml",
+          "new": null,
+          "new_version": "1.0-20240202.020202-9",
+          "old": null,
+          "old_version": "1.0-20240101.010101-7",
+          "platform": "<host-platform>",
+          "via": [
+            [
+              "org.golden:snap:1.0-SNAPSHOT:jar"
+            ]
+          ],
+          "via_truncated": false
+        }
+      ],
+      "edge_changes": [],
+      "module_changes": [],
+      "new": "<tmp>/project/raeva.lock",
+      "old": "<tmp>/project/old.lock",
+      "platforms_added": [],
+      "platforms_removed": [],
+      "pom_changes": [],
+      "profile_changes": [],
+      "via_limited": false,
+      "warnings": []
+    },
+    "success": true
+  }
+}

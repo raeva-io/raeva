@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.ds</groupId>
+  <artifactId>nearer-provided-path-gives-way-to-runtime</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.ds</groupId><artifactId>p</artifactId><version>1.0</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.ds</groupId><artifactId>r</artifactId><version>1.0</version><scope>runtime</scope></dependency>
+  </dependencies>
+</project>

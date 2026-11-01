@@ -1,0 +1,8 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# RAEVA_PARITY_UNSET_VARIABLE is not set. The .mvn/maven.config -D value is a system property in a's
+# model, so a's env.RAEVA_PARITY_UNSET_VARIABLE condition holds and its profile adds c:1.0
+result=success
+module=org.dm:d-values-answer-env-conditions-in-dependencies:1.0
+artifact=org.dm:a:1.0:repo
+artifact=org.dm:c:1.0:repo

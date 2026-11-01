@@ -1,0 +1,3 @@
+<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.scope</groupId><artifactId>par</artifactId><version>1</version><relativePath/></parent><artifactId>parent-repository-id-with-a-tab</artifactId><repositories><repository><id>
+    r1&#9;tab
+  </id><url>@BASE@/r1/</url></repository><repository><id>central</id><url>@BASE@/empty/</url></repository></repositories></project>

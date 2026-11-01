@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; settings.xml passed with -s
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id from _remote.repositories
+# A POM checksumPolicy is interpolated.
+result=success
+module=org.t:pom-checksum-policy-property:1
+artifact=org.t:rel:1:tested

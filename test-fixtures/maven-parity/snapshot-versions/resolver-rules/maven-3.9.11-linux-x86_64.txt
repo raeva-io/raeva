@@ -1,0 +1,9 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id
+# from the local repository layout and _remote.repositories
+result=success
+module=org.snap:resolver-rules:1.0
+artifact=org.snap:empty-base:SNAPSHOT:snaps
+artifact=org.snap:hyphen-snapshot:1.0-SNAPSHOT:snaps
+artifact=org.snap:timestamped:2.0-SNAPSHOT:snaps
+artifact=org.snap:lowercase-snapshot:1.0-snapshot:rels

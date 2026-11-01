@@ -1,0 +1,3 @@
+# The bytes before and after a POM's root element are what these cases test;
+# never convert line endings.
+* -text

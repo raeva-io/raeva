@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.f4</groupId><artifactId>parent</artifactId><version>1.0</version><relativePath>parent/pom.xml</relativePath></parent>
+  <artifactId>activation-from-parent-property</artifactId>
+  <repositories><repository><id>repo</id><url>file://${project.basedir}/repo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+<profiles><profile><id>child-parent-property</id><activation><property><name>flag</name><value>${expected}</value></property></activation><dependencies><dependency><groupId>org.f4</groupId><artifactId>from-child</artifactId><version>1.0</version></dependency></dependencies></profile></profiles>
+</project>

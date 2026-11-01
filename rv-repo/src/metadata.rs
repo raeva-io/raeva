@@ -1,443 +1,570 @@
-use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::{RepoError, Result};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A parsed `maven-metadata.xml`, either the artifact-level file that lists
+/// versions or the version-level file of a `-SNAPSHOT` that names its
+/// timestamped builds.
+///
+/// The values are server text and are not validated here; callers check a
+/// version before they put it in a path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Metadata {
-    pub group_id: Option<String>,
-    pub artifact_id: Option<String>,
+    /// `<version>`, present in version-level snapshot metadata.
     pub version: Option<String>,
+    /// `<versioning><latest>`: the newest version, snapshots included.
     pub latest: Option<String>,
+    /// `<versioning><release>`: the newest release version.
     pub release: Option<String>,
+    /// `<versioning><versions>`, in document order. Empty when absent.
     pub versions: Vec<String>,
-    pub snapshot: Option<Snapshot>,
-    pub snapshot_versions: Vec<SnapshotVersion>,
+    /// `<versioning><lastUpdated>`, which picks among repositories'
+    /// `<release>` and `<latest>`, and for legacy snapshot metadata.
     pub last_updated: Option<String>,
-    /// Precomputed timestamped snapshot version (e.g. `1.0-20240101.010101-7`),
-    /// derived from `version` + `snapshot` during [`Metadata::parse`]. This is
-    /// a parse-time cache, not an independent input: serializing it would let a
-    /// deserialized `Metadata` carry a value inconsistent with its other
-    /// fields. `#[serde(skip)]` keeps it out of any serde round-trip so it is
-    /// always recomputed by `parse`; the `Serialize`/`Deserialize` derives on
-    /// the struct are retained for API stability.
-    #[serde(skip)]
-    pub snapshot_timestamped: Option<String>,
+    /// `<versioning><snapshot>`: the timestamp and build number of the
+    /// latest snapshot build.
+    pub snapshot: Option<Snapshot>,
+    /// `<versioning><snapshotVersions>`: the timestamped version of each
+    /// classifier and extension. Empty when absent.
+    pub snapshot_versions: Vec<SnapshotVersion>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The `<versioning><snapshot>` element of snapshot metadata. Its fields are
+/// private; [`Metadata::snapshot_timestamped_version`] reads them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub(crate) timestamp: Option<String>,
+    #[serde(default, deserialize_with = "build_number")]
     pub(crate) build_number: Option<u32>,
-    #[serde(default, deserialize_with = "deserialize_bool_lenient")]
-    pub(crate) local_copy: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// `<buildNumber>` as Maven's lenient reader takes it: a Java `int` once
+/// trimmed as `String.trim` does, and 0 for text that is not one. Only a
+/// build above 0 is ever used.
+fn build_number<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    let text = Option::<String>::deserialize(deserializer)?;
+    Ok(text
+        .and_then(|text| text.trim_matches(|c| c <= ' ').parse::<i32>().ok())
+        .and_then(|build| u32::try_from(build).ok()))
+}
+
+/// The version candidate Maven's version resolver takes from one
+/// repository's snapshot metadata for one file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotCandidate {
+    /// A `<snapshotVersion>` of the file.
+    Specific,
+    /// The legacy `<snapshot>`, naming its build or, without one, the base
+    /// version.
+    Generic,
+    /// None: the base version stands only when no repository has one.
+    Absent,
+    /// The build raeva.lock pins, found offline in the cache. It stands
+    /// over the other repositories' candidates, as it did when locked.
+    Pinned,
+}
+
+/// One `<snapshotVersion>` entry: the timestamped version published for one
+/// classifier and extension. Its fields are private;
+/// [`Metadata::snapshot_version_for`] reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SnapshotVersion {
     pub(crate) classifier: Option<String>,
+    #[serde(default)]
     pub(crate) extension: String,
+    #[serde(default)]
     pub(crate) value: String,
     pub(crate) updated: Option<String>,
 }
 
-// Shadow structs for XML parsing
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct MetadataXml {
-    group_id: Option<String>,
-    artifact_id: Option<String>,
     version: Option<String>,
     versioning: Option<VersioningXml>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct VersioningXml {
     latest: Option<String>,
     release: Option<String>,
     versions: Option<VersionsXml>,
+    last_updated: Option<String>,
     snapshot: Option<Snapshot>,
     snapshot_versions: Option<SnapshotVersionsXml>,
-    last_updated: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct VersionsXml {
+    #[serde(default)]
     version: Vec<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotVersionsXml {
+    #[serde(default)]
     snapshot_version: Vec<SnapshotVersion>,
 }
 
-fn deserialize_bool_lenient<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) => {
-            if s.eq_ignore_ascii_case("true") {
-                Ok(Some(true))
-            } else if s.eq_ignore_ascii_case("false") {
-                Ok(Some(false))
-            } else {
-                Ok(None)
-            }
-        }
-        None => Ok(None),
-    }
-}
-
-/// Returns true iff `s` matches the Maven snapshot timestamp pattern
-/// `^\d{8}\.\d{6}$` (e.g. `20240101.010101`). Implemented byte-by-byte to
-/// avoid pulling the `regex` crate into the hot path.
-fn is_valid_snapshot_timestamp(s: &str) -> bool {
-    if s.len() != 15 {
-        return false;
-    }
-    let bytes = s.as_bytes();
-    for (idx, &b) in bytes.iter().enumerate() {
-        match idx {
-            8 => {
-                if b != b'.' {
-                    return false;
-                }
-            }
-            _ => {
-                if !b.is_ascii_digit() {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-/// Strip a leading UTF-8 BOM. Nexus 2.x / Artifactory emit it on
-/// `maven-metadata.xml` and quick-xml otherwise fails to parse.
-fn strip_utf8_bom(s: &str) -> &str {
-    s.strip_prefix('\u{FEFF}').unwrap_or(s)
-}
-
 impl Metadata {
+    /// Parses `xml`, after dropping a leading UTF-8 byte order mark, which
+    /// Nexus 2.x and Artifactory emit.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError::InvalidMetadata`] when the document does not parse. The
+    /// message gives only the document's size, never its text.
     pub fn parse(xml: &str) -> Result<Self> {
-        let xml = strip_utf8_bom(xml);
-        let xml_struct: MetadataXml =
-            quick_xml::de::from_str(xml).map_err(|e| RepoError::InvalidMetadata(e.to_string()))?;
-
-        let mut metadata = Metadata {
-            group_id: xml_struct.group_id,
-            artifact_id: xml_struct.artifact_id,
-            version: xml_struct.version,
-            ..Default::default()
-        };
-
-        if let Some(v) = xml_struct.versioning {
-            metadata.latest = v.latest;
-            metadata.release = v.release;
-            metadata.last_updated = v.last_updated;
-            metadata.snapshot = v.snapshot;
-            if let Some(versions) = v.versions {
-                metadata.versions = versions.version;
-            }
-            if let Some(sv) = v.snapshot_versions {
-                metadata.snapshot_versions = sv.snapshot_version;
-            }
-        }
-
-        metadata.snapshot_timestamped = metadata.snapshot_timestamped_version();
-        Ok(metadata)
+        let xml = xml.strip_prefix('\u{FEFF}').unwrap_or(xml);
+        // The parser's message quotes the document, which is server text, so
+        // the error names only its size.
+        let parsed: MetadataXml = quick_xml::de::from_str(xml).map_err(|_| {
+            RepoError::InvalidMetadata(format!(
+                "maven-metadata.xml is not valid Maven metadata ({} bytes)",
+                xml.len()
+            ))
+        })?;
+        let versioning = parsed.versioning.unwrap_or_default();
+        Ok(Metadata {
+            version: trimmed(parsed.version),
+            latest: trimmed(versioning.latest),
+            release: trimmed(versioning.release),
+            versions: versioning
+                .versions
+                .map(|versions| {
+                    versions
+                        .version
+                        .into_iter()
+                        .filter_map(|version| trimmed(Some(version)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            last_updated: trimmed(versioning.last_updated),
+            snapshot: versioning.snapshot.map(trim_snapshot),
+            snapshot_versions: versioning
+                .snapshot_versions
+                .map(|versions| {
+                    versions
+                        .snapshot_version
+                        .into_iter()
+                        .map(trim_snapshot_version)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
     }
 
+    /// [`Metadata::parse`] for raw bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError::InvalidMetadata`] when the bytes are not UTF-8 or do not
+    /// parse.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let xml = std::str::from_utf8(bytes)
-            .with_context(|| "failed to decode maven-metadata.xml as UTF-8")
-            .map_err(|err| RepoError::InvalidMetadata(err.to_string()))?;
+        let xml = std::str::from_utf8(bytes).map_err(|_| {
+            RepoError::InvalidMetadata(format!(
+                "maven-metadata.xml is not UTF-8 ({} bytes)",
+                bytes.len()
+            ))
+        })?;
         Self::parse(xml)
     }
 
+    /// The timestamped version that `<version>` and `<snapshot>` name, such
+    /// as `1.0-20240101.010101-7`. `None` without a version, a timestamp or a
+    /// build number above zero, or when the timestamp is not
+    /// `YYYYMMDD.HHMMSS`.
     pub fn snapshot_timestamped_version(&self) -> Option<String> {
-        let base_version = self.version.as_deref()?.strip_suffix("-SNAPSHOT")?;
+        let version = self.version.as_deref()?;
         let snapshot = self.snapshot.as_ref()?;
         let timestamp = snapshot.timestamp.as_deref()?;
-        let build = snapshot.build_number?;
-        if !is_valid_snapshot_timestamp(timestamp) {
-            // A malformed `<timestamp>` (anything other than `YYYYMMDD.HHMMSS`)
-            // would round-trip into a filename Maven cannot resolve. Drop the
-            // value and let the caller fall back to base-version semantics.
-            tracing::warn!(
-                timestamp = %timestamp,
-                "snapshot timestamp does not match expected YYYYMMDD.HHMMSS format; ignoring"
-            );
-            return None;
-        }
-        Some(format!("{base_version}-{timestamp}-{build}"))
+        // `DefaultVersionResolver` uses the `<snapshot>` only with a build
+        // number above zero.
+        let build = snapshot.build_number.filter(|build| *build > 0)?;
+        // A malformed `<timestamp>` would round-trip into a filename Maven
+        // cannot resolve; the caller falls back to base-version semantics.
+        rv_maven_types::is_snapshot_timestamp(timestamp)
+            .then(|| rv_maven_types::timestamped_snapshot_version(version, timestamp, build))?
     }
 
-    pub fn snapshot_version_for(&self, classifier: Option<&str>, extension: &str) -> Option<&str> {
-        let from_versions = self
-            .snapshot_versions
+    /// The version to fetch for the file with `classifier` and `extension`:
+    /// its `<snapshotVersion>`, else the version `<snapshot>` names, else a
+    /// `-SNAPSHOT` `<version>` base version. `None` when none applies.
+    ///
+    /// As in Maven, `<snapshot>` applies only without `<snapshotVersions>`,
+    /// and a file the entries omit, a POM included, keeps the base version.
+    pub fn snapshot_version_for(
+        &self,
+        classifier: Option<&str>,
+        extension: &str,
+    ) -> Option<String> {
+        self.snapshot_entry_for(classifier, extension)
+            .map(|entry| entry.value.clone())
+            .or_else(|| {
+                self.snapshot_versions
+                    .is_empty()
+                    .then(|| self.snapshot_timestamped_version())
+                    .flatten()
+            })
+            .or_else(|| {
+                self.version
+                    .clone()
+                    .filter(|version| rv_maven_types::resolves_through_snapshot_metadata(version))
+            })
+    }
+
+    /// The comparison value for the requested snapshot file: its entry's
+    /// `<updated>`, or `<lastUpdated>` for the `<snapshot>`.
+    pub fn snapshot_updated_for(&self, classifier: Option<&str>, extension: &str) -> Option<&str> {
+        match self.snapshot_candidate(classifier, extension) {
+            SnapshotCandidate::Specific => self
+                .snapshot_entry_for(classifier, extension)
+                .and_then(|entry| entry.updated.as_deref()),
+            SnapshotCandidate::Generic => self.last_updated.as_deref(),
+            SnapshotCandidate::Absent | SnapshotCandidate::Pinned => None,
+        }
+    }
+
+    /// The candidate of the file with `classifier` and `extension`, as
+    /// [`Self::snapshot_version_for`] picks it.
+    pub fn snapshot_candidate(
+        &self,
+        classifier: Option<&str>,
+        extension: &str,
+    ) -> SnapshotCandidate {
+        if self.snapshot_entry_for(classifier, extension).is_some() {
+            SnapshotCandidate::Specific
+        } else if self.snapshot_versions.is_empty() && self.snapshot.is_some() {
+            SnapshotCandidate::Generic
+        } else {
+            SnapshotCandidate::Absent
+        }
+    }
+
+    fn snapshot_entry_for(
+        &self,
+        classifier: Option<&str>,
+        extension: &str,
+    ) -> Option<&SnapshotVersion> {
+        self.snapshot_versions
             .iter()
-            .find(|entry| entry.extension == extension && entry.classifier.as_deref() == classifier)
-            .map(|entry| entry.value.as_str());
-
-        if from_versions.is_some() {
-            return from_versions;
-        }
-
-        if let Some(timestamped) = self.snapshot_timestamped.as_deref() {
-            return Some(timestamped);
-        }
-
-        let base_version = self.version.as_deref()?;
-        if base_version.ends_with("-SNAPSHOT") {
-            return Some(base_version);
-        }
-
-        None
+            .filter(|entry| {
+                // Maven skips an entry without a value, and reads an empty
+                // classifier as none.
+                !entry.value.is_empty()
+                    && entry.extension == extension
+                    && entry.classifier.as_deref().unwrap_or_default()
+                        == classifier.unwrap_or_default()
+            })
+            .fold(None, |best: Option<&SnapshotVersion>, entry| {
+                // As Maven merges entries: a later one replaces the kept one
+                // only when its `updated` is greater, a missing one counting
+                // as empty.
+                let newer = best.is_none_or(|kept| {
+                    (entry.updated.as_deref())
+                        .is_some_and(|new| new > kept.updated.as_deref().unwrap_or_default())
+                });
+                if newer { Some(entry) } else { best }
+            })
     }
+}
 
-    pub fn latest_or_release(&self) -> Option<&str> {
-        self.latest.as_deref().or(self.release.as_deref())
-    }
+/// Maven's metadata reader trims element text, and an empty value counts as
+/// absent.
+fn trimmed(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn trim_snapshot(mut snapshot: Snapshot) -> Snapshot {
+    snapshot.timestamp = trimmed(snapshot.timestamp);
+    snapshot
+}
+
+fn trim_snapshot_version(mut entry: SnapshotVersion) -> SnapshotVersion {
+    entry.classifier = trimmed(entry.classifier);
+    entry.extension = entry.extension.trim().to_string();
+    entry.value = entry.value.trim().to_string();
+    entry.updated = trimmed(entry.updated);
+    entry
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Metadata, SnapshotVersion};
+    use super::{Metadata, SnapshotCandidate, SnapshotVersion};
 
     #[test]
-    fn parses_release_metadata() {
-        let xml = r"
-        <metadata>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <versioning>
-            <latest>2.0.0</latest>
-            <release>2.0.0</release>
-            <versions>
-              <version>1.0.0</version>
-              <version>2.0.0</version>
-            </versions>
-          </versioning>
-        </metadata>
-        ";
-        let metadata = Metadata::parse(xml).unwrap();
-        assert_eq!(metadata.group_id.as_deref(), Some("com.example"));
-        assert_eq!(metadata.latest.as_deref(), Some("2.0.0"));
-        assert_eq!(metadata.versions.len(), 2);
-    }
-
-    #[test]
-    fn parses_snapshot_metadata() {
-        let xml = r"
-        <metadata>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <version>1.2.3-SNAPSHOT</version>
-          <versioning>
-            <snapshot>
-              <timestamp>20240101.010101</timestamp>
-              <buildNumber>7</buildNumber>
-            </snapshot>
-          </versioning>
-        </metadata>
-        ";
-        let metadata = Metadata::parse(xml).unwrap();
-        assert_eq!(
-            metadata.snapshot_timestamped_version().as_deref(),
-            Some("1.2.3-20240101.010101-7")
-        );
+    fn markers_are_trimmed() {
+        let metadata = Metadata::parse(
+            "<metadata><versioning><latest> </latest><release>\n 2.0 \n</release>\
+             <lastUpdated>\n 20250101000000\n</lastUpdated></versioning></metadata>",
+        )
+        .unwrap();
+        assert_eq!(metadata.latest, None);
+        assert_eq!(metadata.release.as_deref(), Some("2.0"));
+        assert_eq!(metadata.last_updated.as_deref(), Some("20250101000000"));
     }
 
     #[test]
     fn parses_snapshot_versions() {
-        let xml = r"
-        <metadata>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <version>1.0-SNAPSHOT</version>
-          <versioning>
-            <snapshot>
-              <timestamp>20240101.010101</timestamp>
-              <buildNumber>7</buildNumber>
-            </snapshot>
-            <snapshotVersions>
-              <snapshotVersion>
-                <classifier>tests</classifier>
-                <extension>jar</extension>
-                <value>1.0-20240101.010101-7</value>
-                <updated>20240101010101</updated>
-              </snapshotVersion>
-              <snapshotVersion>
-                <extension>jar</extension>
-                <value>1.0-20240101.010101-7</value>
-                <updated>20240101010101</updated>
-              </snapshotVersion>
-              <snapshotVersion>
-                <extension>pom</extension>
-                <value>1.0-20240101.010101-7</value>
-                <updated>20240101010101</updated>
-              </snapshotVersion>
-            </snapshotVersions>
-          </versioning>
-        </metadata>
-        ";
+        let xml = "<metadata><version>1.0-SNAPSHOT</version><versioning><snapshotVersions>\
+                   <snapshotVersion><classifier>tests</classifier><extension>jar</extension>\
+                   <value>1.0-20240101.010101-6</value><updated>20240101010101</updated>\
+                   </snapshotVersion><snapshotVersion><extension>jar</extension>\
+                   <value>1.0-20240101.010101-7</value></snapshotVersion><snapshotVersion>\
+                   <extension>pom</extension><value>1.0-20240101.010101-7</value>\
+                   </snapshotVersion></snapshotVersions></versioning></metadata>";
         let metadata = Metadata::parse(xml).unwrap();
         assert_eq!(metadata.snapshot_versions.len(), 3);
+        let tests = SnapshotVersion {
+            classifier: Some("tests".to_string()),
+            extension: "jar".to_string(),
+            value: "1.0-20240101.010101-6".to_string(),
+            updated: Some("20240101010101".to_string()),
+        };
+        assert_eq!(metadata.snapshot_versions[0], tests);
         assert_eq!(
-            metadata.snapshot_versions[0],
-            SnapshotVersion {
-                classifier: Some("tests".to_string()),
-                extension: "jar".to_string(),
-                value: "1.0-20240101.010101-7".to_string(),
-                updated: Some("20240101010101".to_string()),
-            }
+            metadata.snapshot_updated_for(Some("tests"), "jar"),
+            Some("20240101010101")
         );
-        assert_eq!(metadata.snapshot_versions[1].classifier, None);
-        assert_eq!(metadata.snapshot_versions[1].extension, "jar");
-        assert_eq!(metadata.snapshot_versions[2].extension, "pom");
+        // As in Maven, a file the entries omit keeps the base version.
+        assert_eq!(
+            metadata
+                .snapshot_version_for(Some("linux"), "jar")
+                .as_deref(),
+            Some("1.0-SNAPSHOT")
+        );
+        let with_snapshot = xml.replace(
+            "<versioning>",
+            "<versioning><snapshot><timestamp>20240101.010101</timestamp>\
+             <buildNumber>7</buildNumber></snapshot>",
+        );
+        let without_pom = with_snapshot.replace(
+            "<snapshotVersion><extension>pom</extension><value>1.0-20240101.010101-7</value>\
+             </snapshotVersion>",
+            "",
+        );
+        assert_ne!(without_pom, with_snapshot);
+        let with_snapshot = Metadata::parse(&with_snapshot).unwrap();
+        assert_eq!(
+            with_snapshot.snapshot_version_for(None, "zip").as_deref(),
+            Some("1.0-SNAPSHOT")
+        );
+        assert_eq!(
+            with_snapshot.snapshot_candidate(None, "zip"),
+            SnapshotCandidate::Absent
+        );
+        // A POM the entries omit too, though `<snapshot>` names a build.
+        let without_pom = Metadata::parse(&without_pom).unwrap();
+        assert_eq!(
+            without_pom.snapshot_version_for(None, "pom").as_deref(),
+            Some("1.0-SNAPSHOT")
+        );
+        assert_eq!(
+            without_pom.snapshot_candidate(None, "pom"),
+            SnapshotCandidate::Absent
+        );
+        assert!(metadata.snapshot_updated_for(None, "pom").is_none());
+        let updated = |xml: &str| {
+            let xml = xml.replace(
+                "<versioning>",
+                "<versioning><lastUpdated>20240102010101</lastUpdated>",
+            );
+            Metadata::parse(&xml)
+                .unwrap()
+                .snapshot_updated_for(Some("linux"), "jar")
+                .map(str::to_string)
+        };
+        assert_eq!(updated(xml), None);
+        assert_eq!(
+            updated(&xml.replace(
+                "<versioning>",
+                "<versioning><snapshot><timestamp>20240101.010101</timestamp>\
+                 <buildNumber>7</buildNumber></snapshot>",
+            )),
+            None
+        );
+        for (classifier, extension, value) in [
+            (Some("tests"), "jar", "1.0-20240101.010101-6"),
+            (None, "jar", "1.0-20240101.010101-7"),
+            (None, "pom", "1.0-20240101.010101-7"),
+        ] {
+            assert_eq!(
+                metadata
+                    .snapshot_version_for(classifier, extension)
+                    .as_deref(),
+                Some(value)
+            );
+        }
     }
 
     #[test]
-    fn snapshot_version_for_classifier() {
-        let xml = r"
-        <metadata>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <version>1.0-SNAPSHOT</version>
-          <versioning>
-            <snapshot>
-              <timestamp>20240101.010101</timestamp>
-              <buildNumber>7</buildNumber>
-            </snapshot>
-            <snapshotVersions>
-              <snapshotVersion>
-                <classifier>tests</classifier>
-                <extension>jar</extension>
-                <value>1.0-20240101.010101-7</value>
-              </snapshotVersion>
-              <snapshotVersion>
-                <extension>jar</extension>
-                <value>1.0-20240101.010101-7</value>
-              </snapshotVersion>
-            </snapshotVersions>
-          </versioning>
-        </metadata>
-        ";
-        let metadata = Metadata::parse(xml).unwrap();
-        assert_eq!(
-            metadata.snapshot_version_for(Some("tests"), "jar"),
-            Some("1.0-20240101.010101-7")
-        );
+    fn an_empty_classifier_is_none() {
+        let metadata = Metadata::parse(
+            "<metadata><version>1.0-SNAPSHOT</version><versioning><snapshotVersions>\
+             <snapshotVersion><classifier></classifier><extension>jar</extension>\
+             <value>1.0-20240101.010101-3</value></snapshotVersion>\
+             </snapshotVersions></versioning></metadata>",
+        )
+        .unwrap();
+        for classifier in [None, Some("")] {
+            assert_eq!(
+                metadata.snapshot_version_for(classifier, "jar").as_deref(),
+                Some("1.0-20240101.010101-3")
+            );
+        }
     }
 
+    /// Maven skips a `<snapshotVersion>` without a value, and one without an
+    /// extension matches no file; the `<snapshot>` block still stays unused.
     #[test]
-    fn snapshot_version_falls_back_when_missing_snapshot_versions() {
-        let xml = r"
-        <metadata>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <version>1.2.3-SNAPSHOT</version>
-          <versioning>
-            <snapshot>
-              <timestamp>20240101.010101</timestamp>
-              <buildNumber>7</buildNumber>
-            </snapshot>
-          </versioning>
-        </metadata>
-        ";
-        let metadata = Metadata::parse(xml).unwrap();
+    fn a_snapshot_version_without_a_value_is_skipped() {
+        for entry in [
+            "<extension>jar</extension><value> </value>",
+            "<extension>jar</extension>",
+            "<value>1.0-20240101.010101-3</value>",
+        ] {
+            let metadata = Metadata::parse(&format!(
+                "<metadata><version>1.0-SNAPSHOT</version><versioning><snapshot>\
+                 <timestamp>20240101.010101</timestamp><buildNumber>4</buildNumber></snapshot>\
+                 <snapshotVersions><snapshotVersion>{entry}</snapshotVersion>\
+                 </snapshotVersions></versioning></metadata>"
+            ))
+            .unwrap_or_else(|err| panic!("{entry}: {err}"));
+            assert_eq!(
+                metadata.snapshot_version_for(None, "jar").as_deref(),
+                Some("1.0-SNAPSHOT"),
+                "{entry}"
+            );
+            assert_eq!(
+                metadata.snapshot_candidate(None, "jar"),
+                SnapshotCandidate::Absent,
+                "{entry}"
+            );
+        }
+    }
+
+    /// Without `<snapshotVersions>` the `<snapshot>` block names the build;
+    /// a non-unique snapshot keeps the base version, and a malformed
+    /// timestamp is dropped.
+    #[test]
+    fn snapshot_versions_fall_back_to_the_snapshot_block() {
+        let metadata = |snapshot: &str| {
+            Metadata::parse(&format!(
+                "<metadata><version>1.2.3-SNAPSHOT</version><versioning><snapshot>{snapshot}\
+                 </snapshot></versioning></metadata>"
+            ))
+            .unwrap()
+        };
+        let timestamped =
+            metadata("<timestamp>20240101.010101</timestamp><buildNumber>7</buildNumber>");
         assert_eq!(
-            metadata.snapshot_version_for(None, "jar"),
+            timestamped.snapshot_timestamped_version().as_deref(),
             Some("1.2.3-20240101.010101-7")
         );
+        assert_eq!(
+            timestamped.snapshot_version_for(None, "jar").as_deref(),
+            Some("1.2.3-20240101.010101-7")
+        );
+        assert_eq!(
+            metadata("<localCopy>true</localCopy>")
+                .snapshot_version_for(None, "jar")
+                .as_deref(),
+            Some("1.2.3-SNAPSHOT")
+        );
+
+        let malformed =
+            metadata("<timestamp>evil-timestamp</timestamp><buildNumber>3</buildNumber>");
+        assert!(malformed.snapshot_timestamped_version().is_none());
+
+        // Maven's lenient reader takes a <buildNumber> that is not an int as
+        // 0, and then uses the base version.
+        for build in ["", "x", "-1", "2147483648", "1.5", "&#160;3&#160;"] {
+            let odd = metadata(&format!(
+                "<timestamp>20240101.010101</timestamp><buildNumber>{build}</buildNumber>"
+            ));
+            assert_eq!(
+                odd.snapshot_version_for(None, "jar").as_deref(),
+                Some("1.2.3-SNAPSHOT"),
+                "{build:?}"
+            );
+        }
     }
 
+    /// A malformed document's text never reaches the error: it is server
+    /// text, and may hold escape sequences or a page meant for a browser.
     #[test]
-    fn snapshot_timestamp_is_validated() {
-        // A malformed `<timestamp>` field must not produce a bogus filename.
-        // The validator drops the value and the caller falls back to base
-        // version semantics (handled at the higher `snapshot_version_for`
-        // layer).
-        let xml = r"
-        <metadata>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <version>1.2.3-SNAPSHOT</version>
-          <versioning>
-            <snapshot>
-              <timestamp>not-a-timestamp</timestamp>
-              <buildNumber>7</buildNumber>
-            </snapshot>
-          </versioning>
-        </metadata>
-        ";
-        let metadata = Metadata::parse(xml).unwrap();
-        assert!(
-            metadata.snapshot_timestamped_version().is_none(),
-            "malformed timestamp should be rejected"
+    fn a_parse_error_names_only_the_size() {
+        for bytes in [
+            b"<metadata><evil\x1b[31m>1</wrong></metadata>".to_vec(),
+            b"<metadata><evilTag>1</wrongTag></metadata>".to_vec(),
+            b"\xff\xfe<html>evil</html>".to_vec(),
+        ] {
+            let message = Metadata::from_bytes(&bytes).unwrap_err().to_string();
+            assert!(!message.contains("evil"), "{message}");
+            assert!(!message.contains('\x1b'), "{message}");
+            assert!(
+                message.contains(&format!("({} bytes)", bytes.len())),
+                "{message}"
+            );
+        }
+    }
+    /// Maven reads an empty listing as no versions.
+    #[test]
+    fn empty_listings_parse() {
+        let metadata = Metadata::parse(
+            "<metadata><versioning><release>1.5</release><versions></versions>\
+             <snapshotVersions/></versioning></metadata>",
+        )
+        .unwrap();
+        assert!(metadata.versions.is_empty());
+        assert!(metadata.snapshot_versions.is_empty());
+    }
+
+    /// Maven's metadata reader trims every element. A blank `<version>` drops
+    /// out of the listing the same way a blank `<latest>` does.
+    #[test]
+    fn version_listing_elements_are_trimmed() {
+        let metadata = Metadata::parse(
+            "<metadata><versioning><versions>\
+             <version> 1.0 </version><version>\n2.0\n</version><version>  </version>\
+             </versions></versioning></metadata>",
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.versions,
+            vec!["1.0".to_string(), "2.0".to_string()]
         );
     }
 
+    /// Whitespace around a SNAPSHOT `<version>`, `<timestamp>`, extension, or
+    /// value must not change which file the metadata names.
     #[test]
-    fn snapshot_timestamp_validator_rejects_invalid_shapes() {
-        use super::is_valid_snapshot_timestamp;
-        assert!(is_valid_snapshot_timestamp("20240101.010101"));
-        assert!(!is_valid_snapshot_timestamp("20240101"));
-        assert!(!is_valid_snapshot_timestamp("20240101-010101"));
-        assert!(!is_valid_snapshot_timestamp("2024010.0101011"));
-        assert!(!is_valid_snapshot_timestamp("20240101.01010A"));
-        assert!(!is_valid_snapshot_timestamp(""));
-        assert!(!is_valid_snapshot_timestamp("20240101.0101011"));
-    }
-
-    #[test]
-    fn parses_metadata_with_utf8_bom() {
-        // Nexus 2.x and some Artifactory variants serve maven-metadata.xml
-        // with a UTF-8 BOM. Parsing must strip the BOM transparently.
-        let xml = "\u{FEFF}<metadata>\
-          <groupId>com.example</groupId>\
-          <artifactId>demo</artifactId>\
-          <versioning>\
-            <latest>2.0.0</latest>\
-            <release>2.0.0</release>\
-            <versions>\
-              <version>1.0.0</version>\
-              <version>2.0.0</version>\
-            </versions>\
-          </versioning>\
-        </metadata>";
-        let metadata = Metadata::parse(xml).expect("BOM-prefixed metadata should parse");
-        assert_eq!(metadata.group_id.as_deref(), Some("com.example"));
-        assert_eq!(metadata.latest.as_deref(), Some("2.0.0"));
-        assert_eq!(metadata.versions.len(), 2);
-    }
-
-    #[test]
-    fn snapshot_version_falls_back_to_base_version_for_non_unique_snapshots() {
-        let xml = r"
-        <metadata>
-          <groupId>com.example</groupId>
-          <artifactId>demo</artifactId>
-          <version>1.2.3-SNAPSHOT</version>
-          <versioning>
-            <snapshot>
-              <localCopy>true</localCopy>
-            </snapshot>
-          </versioning>
-        </metadata>
-        ";
-        let metadata = Metadata::parse(xml).unwrap();
+    fn snapshot_metadata_fields_are_trimmed() {
+        let metadata = Metadata::parse(
+            "<metadata><version> 1.0-SNAPSHOT </version><versioning>\
+             <snapshot><timestamp> 20240101.010101 </timestamp>\
+             <buildNumber>7</buildNumber></snapshot>\
+             <snapshotVersions><snapshotVersion>\
+             <extension> jar </extension><value> 1.0-20240101.010101-7 </value>\
+             <updated> 20240101010101 </updated>\
+             </snapshotVersion></snapshotVersions></versioning></metadata>",
+        )
+        .unwrap();
+        assert_eq!(metadata.version.as_deref(), Some("1.0-SNAPSHOT"));
         assert_eq!(
-            metadata.snapshot_version_for(None, "jar"),
-            Some("1.2.3-SNAPSHOT")
+            metadata.snapshot_version_for(None, "jar").as_deref(),
+            Some("1.0-20240101.010101-7")
+        );
+        assert_eq!(
+            metadata.snapshot_timestamped_version().as_deref(),
+            Some("1.0-20240101.010101-7")
         );
     }
 }

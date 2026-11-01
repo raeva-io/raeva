@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; settings.xml passed with -s
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id from _remote.repositories
+# A parent lookup reads <enabled> as written, so ${on}, which the parent defines, disables the repository holding that parent.
+result=failure
+parent=org.t:parent:1
+# Maven: Non-resolvable parent POM ... Could not find artifact org.t:parent:pom:1 in fallback

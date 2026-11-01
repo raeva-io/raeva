@@ -1,0 +1,21 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.golden</groupId>
+  <artifactId>bom</artifactId>
+  <version>1.0</version>
+  <packaging>pom</packaging>
+  <dependencyManagement>
+    <dependencies>
+    <dependency>
+      <groupId>org.golden</groupId>
+      <artifactId>core</artifactId>
+      <version>1.1</version>
+    </dependency>
+    <dependency>
+      <groupId>org.golden</groupId>
+      <artifactId>native</artifactId>
+      <version>1.0</version>
+    </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>

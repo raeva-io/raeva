@@ -1,0 +1,5 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64, os-maven-plugin 1.7.1
+# mvn dependency:list
+result=success
+module=org.test:os-detected-pom-property-wins:1
+classifier=custom

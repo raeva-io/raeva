@@ -1,0 +1,5 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate
+result=success
+module=org.example.app:base:1.0
+module=org.example.app:child:1.0

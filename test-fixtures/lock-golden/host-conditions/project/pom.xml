@@ -1,0 +1,26 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.golden.app</groupId>
+  <artifactId>host-conditions</artifactId>
+  <version>1.0</version>
+
+  <repositories>
+    <repository>
+      <id>fixture</id>
+      <url>file://${project.basedir}/repository/</url>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.golden</groupId>
+      <artifactId>jdk-modern</artifactId>
+      <version>1.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.golden</groupId>
+      <artifactId>jdk-legacy</artifactId>
+      <version>1.0</version>
+    </dependency>
+  </dependencies>
+</project>

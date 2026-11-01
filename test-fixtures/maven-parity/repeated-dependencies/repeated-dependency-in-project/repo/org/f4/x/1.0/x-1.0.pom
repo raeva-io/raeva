@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.f4</groupId><artifactId>x</artifactId><version>1.0</version><dependencies><dependency><groupId>org.f4</groupId><artifactId>y</artifactId><version>1.0</version></dependency></dependencies></project>

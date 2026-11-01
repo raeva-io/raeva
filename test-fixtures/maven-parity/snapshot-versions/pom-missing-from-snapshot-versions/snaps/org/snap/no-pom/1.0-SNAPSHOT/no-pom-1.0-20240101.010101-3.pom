@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.snap</groupId><artifactId>no-pom</artifactId><version>1.0-SNAPSHOT</version><dependencies><dependency><groupId>org.snap</groupId><artifactId>from-timestamped-no-pom</artifactId><version>1.0</version></dependency></dependencies></project>

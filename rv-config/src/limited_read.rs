@@ -7,30 +7,65 @@ use crate::ConfigError;
 /// Maximum size for project POM and configuration inputs.
 pub const MAX_PROJECT_INPUT_SIZE: usize = 5 * 1024 * 1024;
 
-pub fn read_project_input(path: &Path) -> Result<Vec<u8>, ConfigError> {
-    let file = File::open(path).map_err(|source| ConfigError::ProjectInputIo {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut bytes = Vec::with_capacity(MAX_PROJECT_INPUT_SIZE.min(64 * 1024));
-    file.take(MAX_PROJECT_INPUT_SIZE as u64 + 1)
+/// Why [`read_capped`] refused a file.
+pub(crate) enum CappedReadError {
+    Io(std::io::Error),
+    TooLarge,
+}
+
+/// Reads `path` up to `limit` bytes, stopping one byte past the limit so an
+/// oversized file is never held in memory whole.
+pub(crate) fn read_capped(path: &Path, limit: usize) -> Result<Vec<u8>, CappedReadError> {
+    let file = File::open(path).map_err(CappedReadError::Io)?;
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    file.take(limit as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|source| ConfigError::ProjectInputIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() > MAX_PROJECT_INPUT_SIZE {
-        return Err(ConfigError::ProjectInputTooLarge {
-            path: path.to_path_buf(),
-            limit: MAX_PROJECT_INPUT_SIZE,
-        });
+        .map_err(CappedReadError::Io)?;
+    if bytes.len() > limit {
+        return Err(CappedReadError::TooLarge);
     }
     Ok(bytes)
 }
 
+/// Reads `path` in full, refusing a file larger than
+/// [`MAX_PROJECT_INPUT_SIZE`] with [`ConfigError::ProjectInputTooLarge`].
+/// The read stops one byte past the limit, so an oversized file is never
+/// held in memory whole.
+pub fn read_project_input(path: &Path) -> Result<Vec<u8>, ConfigError> {
+    read_capped(path, MAX_PROJECT_INPUT_SIZE).map_err(|error| match error {
+        CappedReadError::Io(source) => ConfigError::ProjectInputIo {
+            path: path.to_path_buf(),
+            source,
+        },
+        CappedReadError::TooLarge => ConfigError::ProjectInputTooLarge {
+            path: path.to_path_buf(),
+            limit: MAX_PROJECT_INPUT_SIZE,
+        },
+    })
+}
+
+/// [`read_project_input`], with `None` for a file that does not exist.
 pub fn read_optional_project_input(path: &Path) -> Result<Option<Vec<u8>>, ConfigError> {
-    match read_project_input(path) {
-        Ok(bytes) => Ok(Some(bytes)),
+    not_found_none(read_project_input(path))
+}
+
+/// [`read_project_input`] as text, refusing bytes that are not UTF-8 with
+/// [`ConfigError::ProjectInputEncoding`].
+pub fn read_project_input_string(path: &Path) -> Result<String, ConfigError> {
+    String::from_utf8(read_project_input(path)?).map_err(|_| ConfigError::ProjectInputEncoding {
+        path: path.to_path_buf(),
+    })
+}
+
+/// [`read_project_input_string`], with `None` for a file that does not
+/// exist.
+pub fn read_optional_project_input_string(path: &Path) -> Result<Option<String>, ConfigError> {
+    not_found_none(read_project_input_string(path))
+}
+
+fn not_found_none<T>(result: Result<T, ConfigError>) -> Result<Option<T>, ConfigError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
         Err(ConfigError::ProjectInputIo { source, .. })
             if source.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -40,51 +75,31 @@ pub fn read_optional_project_input(path: &Path) -> Result<Option<Vec<u8>>, Confi
     }
 }
 
-pub fn read_project_input_string(path: &Path) -> Result<String, ConfigError> {
-    String::from_utf8(read_project_input(path)?).map_err(|_| ConfigError::ProjectInputEncoding {
-        path: path.to_path_buf(),
-    })
-}
-
-pub fn read_optional_project_input_string(path: &Path) -> Result<Option<String>, ConfigError> {
-    read_optional_project_input(path)?
-        .map(|bytes| {
-            String::from_utf8(bytes).map_err(|_| ConfigError::ProjectInputEncoding {
-                path: path.to_path_buf(),
-            })
-        })
-        .transpose()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
-    use tempfile::TempDir;
-
-    use super::{MAX_PROJECT_INPUT_SIZE, read_project_input, read_project_input_string};
-    use crate::ConfigError;
+    use super::*;
 
     #[test]
-    fn rejects_input_over_limit() {
-        let temp = TempDir::new().expect("tempdir");
+    fn reads_are_bounded_and_utf8_checked() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
         let path = temp.path().join("pom.xml");
-        let mut file = std::fs::File::create(&path).expect("create input");
-        file.write_all(&vec![b'x'; MAX_PROJECT_INPUT_SIZE + 1])
-            .expect("write input");
-
+        assert!(read_optional_project_input_string(&path).unwrap().is_none());
+        std::fs::write(&path, vec![b'x'; MAX_PROJECT_INPUT_SIZE + 1]).expect("write input");
         let error = read_project_input(&path).expect_err("oversized input must fail");
-        assert!(matches!(error, ConfigError::ProjectInputTooLarge { .. }));
-        assert!(error.to_string().contains("5242880-byte limit"));
-    }
-
-    #[test]
-    fn rejects_non_utf8_text_input() {
-        let temp = TempDir::new().expect("tempdir");
-        let path = temp.path().join("pom.xml");
+        assert!(error.to_string().contains("5242880-byte limit"), "{error}");
         std::fs::write(&path, [0xff]).expect("write input");
-
-        let error = read_project_input_string(&path).expect_err("non-UTF-8 input must fail");
-        assert!(matches!(error, ConfigError::ProjectInputEncoding { .. }));
+        for error in [
+            read_project_input_string(&path).unwrap_err(),
+            read_optional_project_input_string(&path).unwrap_err(),
+        ] {
+            assert!(matches!(error, ConfigError::ProjectInputEncoding { .. }));
+        }
+        std::fs::write(&path, "ok").expect("write input");
+        assert_eq!(
+            read_optional_project_input_string(&path)
+                .unwrap()
+                .as_deref(),
+            Some("ok")
+        );
     }
 }

@@ -1,0 +1,7 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories
+# The parent version range [1.0,2.0) resolves to par 1.5, the highest listed, which manages leaf 2.
+result=success
+module=p:app:1
+artifact=p:leaf:2:r1

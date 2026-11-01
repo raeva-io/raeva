@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# As idless-two-in-one-pom, with the parent p in ry only: the parent lookup searches rx, the first
+# repository without an id, and fails.
+result=failure
+parent=org.scope:p:1

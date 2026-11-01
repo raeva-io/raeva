@@ -1,0 +1,8 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id
+# from the local repository layout and _remote.repositories
+# 1.0SNAPSHOT/maven-metadata.xml names build 1.020240101.010101-1, which is not a snapshot,
+# so Maven reads its POM and jar as a release, from the 1.020240101.010101-1 directory.
+result=success
+module=org.snap:snapshot-without-hyphen-built-as-release:1.0
+artifact=org.snap:no-hyphen:1.020240101.010101-1:both

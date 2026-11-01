@@ -1,0 +1,29 @@
+# cargo nextest configuration. CI runs `cargo nextest run --profile ci`;
+# doctests run separately with `cargo test --doc`, which nextest does not
+# support.
+
+[profile.default]
+# The slowest tests wait on real sockets for timeouts and retries and finish
+# in under 5 seconds. A test still running after 2 minutes is hung: report it
+# at 30 seconds and kill it at the fourth period.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# While other tests open and close local connections at a high rate, macOS
+# now and then drops the SYN of a new connection to 127.0.0.1, which then
+# takes from half a second to several seconds. These tests time local
+# requests to a fraction of that, so they run alone there.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "macos")'
+filter = """
+test(=fetch::tests::artifact_idle_timeout_applies_between_chunks)
+| test(=osv::tests::a_failed_record_keeps_the_fetched_ones)
+| test(=osv::tests::retry_after_past_the_budget_fails_without_waiting)
+| test(=resolver::tests::workspace_resolution::effective_module_coordinates_keep_the_watchdog_quiet)
+"""
+threads-required = "num-test-threads"
+
+[profile.ci]
+# Run every test and print each failure in full at the end, so one CI run
+# shows all failures at once.
+fail-fast = false
+failure-output = "immediate-final"

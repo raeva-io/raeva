@@ -1,0 +1,26 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.sel</groupId>
+  <artifactId>default-fallback</artifactId>
+  <version>1.0</version>
+  <profiles>
+    <profile>
+      <id>default-with-failing-property</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+        <property><name>not.set</name></property>
+      </activation>
+    </profile>
+    <profile>
+      <id>default-with-empty-os</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+        <os/>
+      </activation>
+    </profile>
+    <profile>
+      <id>default-plain</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+    </profile>
+  </profiles>
+</project>

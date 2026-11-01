@@ -1,0 +1,32 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.golden.app</groupId>
+  <artifactId>snapshot-consumer</artifactId>
+  <version>1.0-SNAPSHOT</version>
+
+  <repositories>
+    <repository>
+      <id>fixture-snapshots</id>
+      <url>file://${project.basedir}/repository/</url>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+    </repository>
+  </repositories>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.golden</groupId>
+      <artifactId>snap</artifactId>
+      <version>1.0-SNAPSHOT</version>
+    </dependency>
+    <dependency>
+      <groupId>org.golden</groupId>
+      <artifactId>util-user</artifactId>
+      <version>1.0</version>
+    </dependency>
+  </dependencies>
+</project>

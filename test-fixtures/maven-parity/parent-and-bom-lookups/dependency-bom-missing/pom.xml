@@ -1,0 +1,10 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  
+  <groupId>org.f3</groupId>
+  <artifactId>dependency-bom-missing</artifactId>
+  <version>1.0</version>
+  <repositories><repository><id>repo</id><url>file://${project.basedir}/repo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+  
+  <dependencies><dependency><groupId>org.f3</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies>
+</project>

@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><parent><groupId>corp</groupId><artifactId>root</artifactId><version>${revision}</version></parent><artifactId>a</artifactId><packaging>pom</packaging></project>

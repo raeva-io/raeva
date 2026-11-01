@@ -1,0 +1,25 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.ds</groupId>
+  <artifactId>managed-scope-is-not-derived-from-the-path</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencyManagement>
+    <dependencies>
+      <dependency><groupId>org.ds</groupId><artifactId>x</artifactId><version>1.0</version><scope>runtime</scope></dependency>
+      <dependency><groupId>org.ds</groupId><artifactId>w</artifactId><version>1.0</version><scope>compile</scope></dependency>
+      <dependency><groupId>org.ds</groupId><artifactId>m</artifactId><version>1.0</version><scope>test</scope></dependency>
+      <dependency><groupId>org.ds</groupId><artifactId>k</artifactId><version>1.0</version><scope>provided</scope></dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency><groupId>org.ds</groupId><artifactId>t</artifactId><version>1.0</version><scope>test</scope></dependency>
+    <dependency><groupId>org.ds</groupId><artifactId>a</artifactId><version>1.0</version></dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,3 @@
+# Maven 3.9.11 on Temurin 21.0.12 JRE, macOS 27.0 arm64, os-maven-plugin 1.7.1
+# mvn dependency:list
+classifier=osx-aarch_64

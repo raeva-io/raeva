@@ -1,0 +1,9 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list and mvn -q -o validate; artifact= is group:artifact:version:repository id from _remote.repositories
+# The project's pom.xml has the XML declaration after one newline.
+result=success
+module=org.xml:decl-after-newline-in-project-pom:1.0
+# org.xml:a:jar:1.0:compile
+artifact=org.xml:a:1.0:repo
+# org.xml:c:jar:1.0:compile
+artifact=org.xml:c:1.0:repo

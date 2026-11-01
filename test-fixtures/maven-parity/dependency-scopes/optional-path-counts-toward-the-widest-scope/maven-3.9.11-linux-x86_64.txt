@@ -1,0 +1,22 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# t (test) reaches x first; the optional o (compile) reaches it through b. The optional
+# path counts as any other, so x and y are compile.
+result=success
+module=org.ds:optional-path-counts-toward-the-widest-scope:1.0
+# org.ds:b:jar:1.0:compile (optional)
+artifact=org.ds:b:1.0:repo
+scope=org.ds:b:1.0:compile
+# org.ds:o:jar:1.0:compile (optional)
+artifact=org.ds:o:1.0:repo
+scope=org.ds:o:1.0:compile
+# org.ds:t:jar:1.0:test
+artifact=org.ds:t:1.0:repo
+scope=org.ds:t:1.0:test
+# org.ds:x:jar:1.0:compile
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:compile
+# org.ds:y:jar:1.0:compile
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:compile

@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>corp</groupId><artifactId>parent</artifactId><version>1.0</version><packaging>pom</packaging><properties><revision>1.2.0</revision></properties></project>

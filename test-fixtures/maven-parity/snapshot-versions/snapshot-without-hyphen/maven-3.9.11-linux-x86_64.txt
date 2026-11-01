@@ -1,0 +1,5 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list: reads 1.0SNAPSHOT/maven-metadata.xml, resolves 1.020240101.010101-1,
+# which is not a snapshot, so the snapshots-only repository is not asked for it:
+# "Could not find artifact org.snap:no-hyphen:jar:1.0SNAPSHOT"
+result=failure

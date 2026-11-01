@@ -1,229 +1,77 @@
 //! SBOM generation from caller-supplied package metadata.
 //!
-//! License evidence is accepted only as one explicit SPDX expression. The crate
-//! passes that expression through and does not infer relationships between licenses.
+//! [`CycloneDxGenerator`] renders a CycloneDX 1.5 JSON document from a
+//! [`Component`] list. It validates the list first (the checks are listed on
+//! [`Component`]) and returns [`SbomError`] instead of writing a document with
+//! duplicate or dangling references.
+//!
+//! The crate does not read `raeva.lock`, resolve dependencies or fetch artifacts:
+//! the caller builds the components, including their hashes and dependency
+//! edges (`raeva` builds them from its lockfile).
 
 mod component;
 mod cyclonedx;
-mod purl;
-mod spdx;
+mod license;
 
-pub use component::{Component, Hash, HashAlgorithm, validate_components};
+pub use component::{Component, Hash, HashAlgorithm};
 pub use cyclonedx::CycloneDxGenerator;
-pub use purl::{maven_purl, maven_purl_with_qualifiers, parse_purl};
-pub use spdx::SpdxGenerator;
+pub use license::License;
 
-#[derive(Debug, thiserror::Error)]
-pub enum SbomError {
-    #[error("failed to serialize SBOM: {0}")]
-    Serialize(#[from] serde_json::Error),
-    #[error("invalid component data: {0}")]
-    InvalidComponent(String),
+/// A vulnerability assessment for some components, written as a CycloneDX
+/// `vulnerabilities` entry with its `analysis`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VulnerabilityAnalysis {
+    /// The advisory id, written as `id`.
+    pub id: String,
+    /// `analysis.state`.
+    pub state: AnalysisState,
+    /// `analysis.justification`, left out when `None`.
+    pub justification: Option<AnalysisJustification>,
+    /// `analysis.detail`, left out when `None`.
+    pub detail: Option<String>,
+    /// Purls of the components assessed, written as `affects` refs.
+    pub affects: Vec<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SbomError;
+/// CycloneDX `analysis.state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnalysisState {
+    /// The component is not affected.
+    NotAffected,
+    /// The vulnerability can be exploited in the component.
+    Exploitable,
+    /// The vulnerability is fixed in the component.
+    Resolved,
+    /// The assessment is not finished.
+    InTriage,
+}
 
-    #[test]
-    fn invalid_component_error_message() {
-        let error = SbomError::InvalidComponent("missing purl".to_string());
-        assert_eq!(error.to_string(), "invalid component data: missing purl");
-    }
+/// CycloneDX `analysis.justification`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AnalysisJustification {
+    /// The vulnerable code is not in the component.
+    CodeNotPresent,
+    /// The vulnerable code is not reachable.
+    CodeNotReachable,
+    /// Exploiting it needs an environment the product does not have.
+    RequiresEnvironment,
+    /// A mitigating control protects the component.
+    ProtectedByMitigatingControl,
+}
 
-    // SBOM schema validation tests.
-
-    fn fixture_components() -> Vec<crate::Component> {
-        vec![
-            crate::Component {
-                name: "spring-core".to_string(),
-                version: "6.1.0".to_string(),
-                group: Some("org.springframework".to_string()),
-                purl: "pkg:maven/org.springframework/spring-core@6.1.0".to_string(),
-                license_expression: Some("Apache-2.0".to_string()),
-                hashes: vec![crate::Hash {
-                    algorithm: crate::HashAlgorithm::Sha256,
-                    value: "a".repeat(64),
-                }],
-                dependencies: vec!["pkg:maven/org.springframework/spring-jcl@6.1.0".to_string()],
-            },
-            crate::Component {
-                name: "spring-jcl".to_string(),
-                version: "6.1.0".to_string(),
-                group: Some("org.springframework".to_string()),
-                purl: "pkg:maven/org.springframework/spring-jcl@6.1.0".to_string(),
-                license_expression: Some("Apache-2.0".to_string()),
-                hashes: vec![],
-                dependencies: vec![],
-            },
-        ]
-    }
-
-    /// Validate CycloneDX 1.5 SBOM structure by checking required top-level fields.
-    ///
-    /// Per the CycloneDX 1.5 JSON schema the following fields are required:
-    /// - `bomFormat`: must be `"CycloneDX"`
-    /// - `specVersion`: must be `"1.5"`
-    /// - `version`: integer (≥ 1)
-    /// - `components`: array
-    #[test]
-    fn cyclonedx_sbom_structure_validation() {
-        let generator = crate::CycloneDxGenerator::default();
-        let components = fixture_components();
-        let json = generator.generate(&components).expect("SBOM generation");
-        let value: serde_json::Value =
-            serde_json::from_str(&json).expect("SBOM output is valid JSON");
-
-        // Required top-level fields per CycloneDX 1.5 spec.
-        assert_eq!(
-            value["bomFormat"].as_str(),
-            Some("CycloneDX"),
-            "bomFormat must be 'CycloneDX'"
-        );
-        assert_eq!(
-            value["specVersion"].as_str(),
-            Some("1.5"),
-            "specVersion must be '1.5'"
-        );
-        assert!(
-            value["version"].as_u64().is_some_and(|v| v >= 1),
-            "version must be a positive integer"
-        );
-        assert!(
-            value["components"].is_array(),
-            "components must be an array"
-        );
-        assert!(
-            value["metadata"].is_object(),
-            "metadata must be present and an object"
-        );
-        assert!(
-            value["serialNumber"]
-                .as_str()
-                .is_some_and(|s| s.starts_with("urn:uuid:")),
-            "serialNumber must be a urn:uuid: URI"
-        );
-
-        // Validate component structure.
-        let comps = value["components"].as_array().unwrap();
-        assert_eq!(comps.len(), 2, "should have 2 components");
-        for comp in comps {
-            assert!(comp["name"].is_string(), "component must have name");
-            assert!(comp["version"].is_string(), "component must have version");
-            assert!(comp["purl"].is_string(), "component must have purl");
-            assert!(
-                comp["type"].as_str().is_some_and(|t| !t.is_empty()),
-                "component must have non-empty type"
-            );
-            assert!(
-                comp["bom-ref"].as_str().is_some_and(|r| !r.is_empty()),
-                "component must have non-empty bom-ref"
-            );
-        }
-
-        // Validate dependencies section.
-        assert!(
-            value["dependencies"].is_array(),
-            "dependencies must be an array"
-        );
-        let deps = value["dependencies"].as_array().unwrap();
-        assert_eq!(
-            deps.len(),
-            2,
-            "should have dependency entry for each component"
-        );
-        for dep in deps {
-            assert!(
-                dep["ref"].is_string(),
-                "each dependency entry must have a 'ref'"
-            );
-        }
-    }
-
-    /// Validate SPDX 2.3 SBOM structure by checking required top-level fields.
-    ///
-    /// Per the SPDX 2.3 spec the following fields are required at document level:
-    /// - `spdxVersion`: must be `"SPDX-2.3"`
-    /// - `SPDXID`: must be `"SPDXRef-DOCUMENT"`
-    /// - `packages`: array (one entry per software package)
-    #[test]
-    fn spdx_sbom_structure_validation() {
-        let generator = crate::SpdxGenerator::default();
-        let components = fixture_components();
-        let json = generator.generate(&components).expect("SPDX generation");
-        let value: serde_json::Value =
-            serde_json::from_str(&json).expect("SPDX output is valid JSON");
-
-        // Required top-level fields per SPDX 2.3 spec.
-        assert_eq!(
-            value["spdxVersion"].as_str(),
-            Some("SPDX-2.3"),
-            "spdxVersion must be 'SPDX-2.3'"
-        );
-        assert_eq!(
-            value["SPDXID"].as_str(),
-            Some("SPDXRef-DOCUMENT"),
-            "SPDXID must be 'SPDXRef-DOCUMENT'"
-        );
-        assert!(
-            value["dataLicense"].as_str().is_some_and(|d| !d.is_empty()),
-            "dataLicense must be present"
-        );
-        assert!(value["packages"].is_array(), "packages must be an array");
-        assert!(
-            value["documentNamespace"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
-            "documentNamespace must be present"
-        );
-
-        // Validate package structure.
-        let packages = value["packages"].as_array().unwrap();
-        assert_eq!(packages.len(), 2, "should have 2 packages");
-        for pkg in packages {
-            assert!(
-                pkg["SPDXID"]
-                    .as_str()
-                    .is_some_and(|id| id.starts_with("SPDXRef-")),
-                "package SPDXID must start with 'SPDXRef-'"
-            );
-            assert!(pkg["name"].is_string(), "package must have name");
-            assert!(
-                pkg["versionInfo"].is_string(),
-                "package must have versionInfo"
-            );
-            assert!(
-                pkg["downloadLocation"].is_string(),
-                "package must have downloadLocation"
-            );
-            assert!(
-                pkg["licenseConcluded"].is_string(),
-                "package must have licenseConcluded"
-            );
-
-            // externalRefs with PURL is required for SBOM tool output.
-            let external_refs = pkg["externalRefs"]
-                .as_array()
-                .expect("externalRefs present");
-            assert!(
-                !external_refs.is_empty(),
-                "package must have at least one externalRef"
-            );
-            let purl_ref = external_refs
-                .iter()
-                .find(|r| r["referenceType"] == "purl")
-                .expect("package must have a purl externalRef");
-            assert_eq!(
-                purl_ref["referenceCategory"].as_str(),
-                Some("PACKAGE-MANAGER"),
-                "purl externalRef must have referenceCategory PACKAGE-MANAGER"
-            );
-            assert!(
-                purl_ref["referenceLocator"]
-                    .as_str()
-                    .is_some_and(|l| l.starts_with("pkg:")),
-                "referenceLocator must be a PURL"
-            );
-        }
-    }
+/// Why an SBOM document could not be generated.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SbomError {
+    /// The document could not be serialized to JSON.
+    #[error("failed to serialize SBOM: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// A component failed one of the checks listed on [`Component`]. The
+    /// message names the component (by purl or name) and the failed check.
+    #[error("invalid component data: {0}")]
+    InvalidComponent(String),
 }

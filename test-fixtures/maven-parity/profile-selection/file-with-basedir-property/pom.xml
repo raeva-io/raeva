@@ -1,0 +1,16 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.sel</groupId>
+  <artifactId>file-with-basedir-property</artifactId>
+  <version>1.0</version>
+  <properties>
+    <basedir>${basedir}</basedir>
+  </properties>
+  <profiles>
+    <profile>
+      <id>marker-exists</id>
+      <activation><file><exists>${basedir}/marker</exists></file></activation>
+      <dependencyManagement><dependencies><dependency><groupId>org.sel</groupId><artifactId>managed</artifactId><version>1</version></dependency></dependencies></dependencyManagement>
+    </profile>
+  </profiles>
+</project>

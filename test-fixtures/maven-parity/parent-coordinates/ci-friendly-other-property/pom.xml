@@ -1,0 +1,2 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.ci</groupId><artifactId>root</artifactId><version>${myver}</version><packaging>pom</packaging>
+<properties><myver>1.2</myver></properties><modules><module>child</module></modules></project>

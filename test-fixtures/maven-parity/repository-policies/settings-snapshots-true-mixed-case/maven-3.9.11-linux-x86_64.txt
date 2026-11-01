@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; settings.xml passed with -s
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id from _remote.repositories
+# A settings.xml <enabled> is trimmed and read ignoring case.
+result=success
+module=org.t:settings-snapshots-true-mixed-case:1
+artifact=org.t:snap:1.0-SNAPSHOT:tested

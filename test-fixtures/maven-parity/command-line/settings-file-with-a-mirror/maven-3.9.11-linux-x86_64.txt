@@ -1,0 +1,7 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn -s ci-settings.xml dependency:list help:active-profiles, with the case's settings.xml as ~/.m2/settings.xml;
+# artifact= is group:artifact:version:repository id from _remote.repositories
+# corp serves nothing; the mirror in ci-settings.xml serves lib, and settings.xml is not read
+result=success
+module=org.cl:settings-file-with-a-mirror:1.0
+artifact=org.cl:lib:1.0:corp-mirror

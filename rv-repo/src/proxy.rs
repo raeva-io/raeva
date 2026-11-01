@@ -1,52 +1,183 @@
+use std::sync::Arc;
+
 use reqwest::header::HeaderValue;
-use rv_config::{ProxyAuthType, ProxyConfig};
+use rv_config::{EnvironmentProxy, ProxyAuthType, ProxyConfig};
 use secrecy::ExposeSecret;
 use url::Url;
 
 use crate::error::RepoError;
 
-pub(crate) fn build_proxy(config: &ProxyConfig) -> Result<reqwest::Proxy, RepoError> {
-    let mut proxy = build_unauthenticated_proxy(config)?;
+/// The proxies `config` names, with their credentials, in the form every
+/// Raeva HTTP client attaches them.
+///
+/// A bearer proxy whose token is given by `token_env` reads that environment
+/// variable here, each time this is called. It is the one environment
+/// variable this crate reads; rv-config reads `HTTP_PROXY` and `HTTPS_PROXY`.
+///
+/// # Errors
+///
+/// [`RepoError::Config`] for an unknown protocol, a malformed host, a
+/// settings.xml proxy port that is not a number or a proxy variable raeva
+/// cannot use, and
+/// [`RepoError::AuthSetup`] when a bearer token is missing, its variable is
+/// unset, or it is not a valid header value.
+pub fn configured_proxies(config: &rv_config::Config) -> Result<Vec<reqwest::Proxy>, RepoError> {
+    Ok(ProxySet::from_config(config)?.proxies)
+}
+
+/// The configured proxies, and the rule that picks the one a URL goes
+/// through, which each proxy's reqwest matcher applies.
+#[derive(Clone, Default)]
+pub(crate) struct ProxySet {
+    pub(crate) proxies: Vec<reqwest::Proxy>,
+    pub(crate) hosts: Vec<String>,
+    routes: Arc<Routes>,
+}
+
+impl ProxySet {
+    pub(crate) fn from_config(config: &rv_config::Config) -> Result<Self, RepoError> {
+        if let Some(error) = config.proxy_error() {
+            return Err(RepoError::Config(error.to_string()));
+        }
+        Self::new(config.proxies())
+    }
+
+    pub(crate) fn new(configs: &[ProxyConfig]) -> Result<Self, RepoError> {
+        let routes = Arc::new(Routes(
+            configs.iter().map(Route::new).collect::<Result<_, _>>()?,
+        ));
+        Ok(Self {
+            proxies: configs
+                .iter()
+                .enumerate()
+                .map(|(index, config)| build_proxy(config, Arc::clone(&routes), index))
+                .collect::<Result<_, _>>()?,
+            hosts: configs.iter().map(|proxy| proxy.host.clone()).collect(),
+            routes,
+        })
+    }
+
+    pub(crate) fn carries(&self, url: &Url) -> bool {
+        self.routes.select(url).is_some()
+    }
+}
+
+/// Leaves out the `reqwest::Proxy` values: their Debug shows credentials.
+impl std::fmt::Debug for ProxySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxySet")
+            .field("hosts", &self.hosts)
+            .field("routes", &self.routes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The URLs a proxy's `protocol` selects. It never names how raeva talks to
+/// the proxy: that is always plain HTTP, with a `CONNECT` tunnel for an
+/// `https:` URL, as in Maven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Http,
+    Https,
+    /// Not a Maven protocol: both schemes.
+    All,
+}
+
+#[derive(Debug)]
+struct Route {
+    protocol: Protocol,
+    non_proxy_hosts: Vec<String>,
+    environment: Option<EnvironmentProxy>,
+}
+
+impl Route {
+    fn new(config: &ProxyConfig) -> Result<Self, RepoError> {
+        // Maven's default when `<protocol>` is absent is `http`.
+        let protocol = config.protocol.as_deref().unwrap_or("http");
+        let protocol = match protocol.to_ascii_lowercase().as_str() {
+            "http" => Protocol::Http,
+            "https" => Protocol::Https,
+            "all" => Protocol::All,
+            _ => {
+                return Err(RepoError::Config(format!(
+                    "a proxy has protocol {protocol:?}; use http, https or all"
+                )));
+            }
+        };
+        Ok(Self {
+            protocol,
+            non_proxy_hosts: config.non_proxy_hosts.clone(),
+            environment: config.environment.clone(),
+        })
+    }
+
+    fn carries(&self, scheme: &str, url: &Url) -> bool {
+        let selected = match self.protocol {
+            Protocol::Http => scheme == "http",
+            Protocol::Https => scheme == "https",
+            Protocol::All => true,
+        };
+        selected
+            && !url
+                .host_str()
+                .is_some_and(|host| should_bypass_proxy(host, &self.non_proxy_hosts))
+            && !(self.environment.as_ref()).is_some_and(|environment| environment.bypasses(url))
+    }
+}
+
+#[derive(Debug, Default)]
+struct Routes(Vec<Route>);
+
+impl Routes {
+    /// The proxy for `url`, as Maven's `DefaultProxySelector` picks it: the
+    /// first proxy whose protocol is the URL's scheme and whose
+    /// `non_proxy_hosts` leave its host alone; for an `https:` URL without
+    /// one, the first such `http` proxy that is not `HTTP_PROXY`, which
+    /// carries `http:` URLs only, as in curl.
+    fn select(&self, url: &Url) -> Option<usize> {
+        let first = |scheme: &str| self.0.iter().position(|route| route.carries(scheme, url));
+        match url.scheme() {
+            "http" => first("http"),
+            "https" => first("https").or_else(|| {
+                (self.0.iter())
+                    .position(|route| route.environment.is_none() && route.carries("http", url))
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The reqwest proxy for `configs[index]`, which carries the URLs that
+/// `routes` gives it.
+fn build_proxy(
+    config: &ProxyConfig,
+    routes: Arc<Routes>,
+    index: usize,
+) -> Result<reqwest::Proxy, RepoError> {
+    let proxy_url = build_proxy_url(&config.host, config.port)?;
+    let mut proxy = reqwest::Proxy::custom(move |url| {
+        (routes.select(url) == Some(index)).then(|| proxy_url.clone())
+    });
 
     match config.auth_type.unwrap_or(ProxyAuthType::Basic) {
         ProxyAuthType::Basic => {
             if let Some(username) = config.username.as_deref() {
-                let password = config
-                    .password
-                    .as_ref()
-                    .map(|s| s.expose_secret().as_str())
-                    .unwrap_or("");
-                // reqwest's `Proxy::basic_auth` attaches the credentials to
-                // *every* outbound proxy request reqwest decides to route
-                // through this proxy, regardless of upstream origin. There is
-                // no per-origin scoping, so a user-agent that talks to multiple
-                // upstreams through one proxy can bleed Basic credentials to
-                // upstreams the user did not intend. Use `non_proxy_hosts` to
-                // constrain exposure when Basic must remain in play.
-                tracing::warn!(
-                    host = %config.host,
-                    port = %config.port,
-                    "proxy Basic credentials cannot be scoped per upstream origin in reqwest; \
-                     consider non_proxy_hosts to limit credential exposure"
-                );
+                let password = config.password.as_ref().map_or("", |s| s.expose_secret());
+                // reqwest sends this as `Proxy-Authorization` on every
+                // request it routes through this proxy: on the CONNECT for an
+                // HTTPS URL, and on the request to the proxy for a plain HTTP
+                // one, which the proxy consumes. raeva never sends it to the
+                // repository itself.
                 proxy = proxy.basic_auth(username, password);
             }
         }
         ProxyAuthType::Bearer => {
-            // Wire the Bearer token into the Proxy object via
-            // `custom_http_auth` so reqwest emits it as `Proxy-Authorization`
-            // during the CONNECT handshake for HTTPS upstreams (and on the
-            // request line for plain HTTP). The previous design attached it as
-            // a manual per-request header, which for an HTTPS upstream either
-            // missed the CONNECT entirely (proxy answers 407) or, worse, rode
-            // INSIDE the TLS tunnel to the origin artifact server, disclosing
-            // the proxy secret to a party that must never see it.
+            // Set on the proxy, not on each request, so reqwest sends it on
+            // the CONNECT for an HTTPS URL instead of inside the tunnel to
+            // the repository.
             let token = proxy_auth_token(config)?;
-            let mut header_bytes = Vec::with_capacity(7 + token.len());
-            header_bytes.extend_from_slice(b"Bearer ");
-            header_bytes.extend_from_slice(token.as_bytes());
-            let mut header = HeaderValue::from_bytes(&header_bytes)
-                .map_err(|err| RepoError::AuthError(err.to_string()))?;
+            let mut header = HeaderValue::from_bytes(format!("Bearer {token}").as_bytes())
+                .map_err(|err| RepoError::AuthSetup(err.to_string()))?;
             header.set_sensitive(true);
             proxy = proxy.custom_http_auth(header);
         }
@@ -55,427 +186,218 @@ pub(crate) fn build_proxy(config: &ProxyConfig) -> Result<reqwest::Proxy, RepoEr
     Ok(proxy)
 }
 
-/// Build a proxy with sync's URL validation and bypass routing, without reading
-/// credentials or emitting diagnostics. Invalid proxy URLs return an error.
-pub fn build_unauthenticated_proxy(config: &ProxyConfig) -> Result<reqwest::Proxy, RepoError> {
-    // Maven's default when <protocol> is absent is HTTP-only. Only route HTTPS
-    // (or all) traffic through the proxy when explicitly configured.
-    let protocol = config.protocol.as_deref().unwrap_or("http");
-    let proxy_url = build_proxy_url(protocol, &config.host, config.port)?;
-    let non_proxy_hosts = config.non_proxy_hosts.clone();
-
-    let proxy = if non_proxy_hosts.is_empty() {
-        match protocol.to_ascii_lowercase().as_str() {
-            "https" => reqwest::Proxy::https(proxy_url)?,
-            "all" => reqwest::Proxy::all(proxy_url)?,
-            _ => reqwest::Proxy::http(proxy_url)?,
-        }
-    } else {
-        // Custom per-URL routing: honour non_proxy_hosts regardless of protocol.
-        let proxy_url_str = proxy_url.clone();
-        let protocol_lower = protocol.to_ascii_lowercase();
-        reqwest::Proxy::custom(move |url| {
-            route_through_proxy(&protocol_lower, url, &proxy_url_str, &non_proxy_hosts)
-        })
-    };
-
-    Ok(proxy)
-}
-
+/// The bearer token for a proxy: `token` when set, else the value of the
+/// environment variable `token_env` names. This is the one place rv-repo
+/// reads the environment.
 fn proxy_auth_token(config: &ProxyConfig) -> Result<String, RepoError> {
     if let Some(token) = config.token.as_ref() {
         return Ok(token.expose_secret().to_string());
     }
-    if let Some(env) = config.token_env.as_deref() {
-        return std::env::var(env)
-            .map_err(|_| RepoError::AuthError(format!("proxy auth env var {env} not set")));
-    }
-    Err(RepoError::AuthError("proxy auth token missing".to_string()))
+    let env = (config.token_env.as_deref())
+        .ok_or_else(|| RepoError::AuthSetup("proxy auth token missing".to_string()))?;
+    std::env::var(env)
+        .map_err(|_| RepoError::AuthSetup(format!("proxy auth env var {env} not set")))
 }
 
-/// Per-URL routing decision for a proxy with non_proxy_hosts configured.
-/// Returns the proxy URL when the request should be proxied, None to go
-/// direct. Mirrors the Proxy::https/all/http split used when no
-/// non_proxy_hosts exist: the configured protocol selects WHICH request
-/// schemes the proxy handles. The arms are keyed on the configured protocol
-/// alone; a bare `_ if url.scheme() != "http"` fall-through arm would also
-/// catch the https protocol (whose guarded arm falls through when the URL
-/// scheme IS https) and turn an https proxy into a no-op.
-fn route_through_proxy(
-    protocol_lower: &str,
-    url: &Url,
-    proxy_url: &str,
-    non_proxy_hosts: &[String],
-) -> Option<String> {
-    match protocol_lower {
-        "https" => {
-            if url.scheme() != "https" {
-                return None;
-            }
-        }
-        "all" => {}
-        _ => {
-            if url.scheme() != "http" {
-                return None;
-            }
-        }
-    }
-
-    let Some(host) = url.host_str() else {
-        // No host to test against non_proxy_hosts; keep proxying, matching
-        // the behavior of the non-custom Proxy::http/https/all variants.
-        return Some(proxy_url.to_string());
-    };
-    if should_bypass_proxy(host, non_proxy_hosts) {
-        None
-    } else {
-        Some(proxy_url.to_string())
-    }
-}
-
-/// Assemble a proxy URL safely. Brackets bare IPv6 literals, rejects `@`
-/// (would smuggle a `userinfo@authority` switch) and other URL delimiters,
-/// then round-trips through `Url::parse` to surface any residual weirdness.
-pub(crate) fn build_proxy_url(protocol: &str, host: &str, port: u16) -> Result<String, RepoError> {
+/// Assemble the `http:` URL of a proxy safely. Brackets bare IPv6 literals,
+/// rejects `@` (would smuggle a `userinfo@authority` switch) and other URL
+/// delimiters, then round-trips through `Url::parse` to surface any residual
+/// weirdness.
+pub(crate) fn build_proxy_url(host: &str, port: u16) -> Result<String, RepoError> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
-        return Err(RepoError::AuthError(
+        return Err(RepoError::Config(
             "proxy host must not be empty".to_string(),
         ));
     }
     // Reject userinfo characters outright: proxy creds live in
     // ProxyConfig::username/password, not embedded in the host.
     if trimmed.contains('@') {
-        return Err(RepoError::AuthError(format!(
-            "proxy host {host:?} contains '@'; put credentials in the proxy \
-             config's username/password fields, not in the host"
-        )));
+        // Not echoed: what precedes the `@` is likely a password.
+        return Err(RepoError::Config(
+            "proxy host contains '@'; put credentials in the proxy config's \
+             username/password fields, not in the host"
+                .to_string(),
+        ));
     }
-    if trimmed.contains('/') || trimmed.contains('?') || trimmed.contains('#') {
-        return Err(RepoError::AuthError(format!(
-            "proxy host {host:?} contains a URL delimiter; expected bare host or IP literal"
-        )));
+    if trimmed.contains(['/', '?', '#']) {
+        return Err(RepoError::Config(
+            "proxy host contains '/', '?' or '#'; expected a bare host name or IP literal"
+                .to_string(),
+        ));
     }
 
     // Bracket bare IPv6 literals (more than one `:`, no surrounding brackets).
     // Hostnames and IPv4 literals contain at most one `:` if any (the port),
     // but `host` is already port-free here. So multiple `:` ⇒ IPv6.
-    let host_authority = if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        trimmed.to_string()
-    } else if trimmed.contains(':') {
-        // Validate it really parses as IPv6 before we wrap it.
+    let bracketed = trimmed.starts_with('[') && trimmed.ends_with(']');
+    let candidate = if !bracketed && trimmed.contains(':') {
         if trimmed.parse::<std::net::Ipv6Addr>().is_err() {
-            return Err(RepoError::AuthError(format!(
-                "proxy host {host:?} contains ':' but is not a valid IPv6 literal"
-            )));
+            return Err(RepoError::Config(
+                "proxy host contains ':' but is not a valid IPv6 literal".to_string(),
+            ));
         }
-        format!("[{trimmed}]")
+        format!("http://[{trimmed}]:{port}")
     } else {
-        trimmed.to_string()
+        format!("http://{trimmed}:{port}")
     };
-
-    let candidate = format!("{protocol}://{host_authority}:{port}");
     // Round-trip through url::Url so any residual malformed component is
     // surfaced as a real error rather than silently accepted by reqwest.
-    let _ = Url::parse(&candidate)
-        .map_err(|err| RepoError::AuthError(format!("invalid proxy URL {candidate:?}: {err}")))?;
+    Url::parse(&candidate)
+        .map_err(|err| RepoError::Config(format!("invalid proxy host: {err}")))?;
     Ok(candidate)
 }
 
+/// Whether `non_proxy_hosts` sends `host` direct. As in Maven, an entry
+/// matches the whole host name, ignoring case, and `*` in it matches any run
+/// of characters, so `10.*` and `*.corp.*` work. Two forms also match more
+/// than in Maven: `.example.com` matches any host under `example.com`, and
+/// `*.example.com` matches `example.com` itself. Maven reads an entry as a
+/// Java regular expression with `.` escaped; other regex syntax, such as `?`
+/// or `[...]`, is matched literally here.
 pub(crate) fn should_bypass_proxy(host: &str, non_proxy_hosts: &[String]) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-
-    // Maven's `<nonProxyHosts>` accepts a bare `*` as a match-everything
-    // wildcard; short-circuit on it so `*.suffix`-only matchers don't
-    // silently proxy every request.
-    if non_proxy_hosts.iter().any(|entry| entry.trim() == "*") {
-        return true;
-    }
-
     non_proxy_hosts.iter().any(|entry| {
-        let entry = entry.trim();
+        let entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
         if entry.is_empty() {
             return false;
         }
-
-        if let Some(suffix) = entry.strip_prefix("*.").or_else(|| entry.strip_prefix('.')) {
-            let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
-            !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
-        } else {
-            host == entry.trim_end_matches('.').to_ascii_lowercase()
-        }
+        let dotted = entry
+            .strip_prefix('.')
+            .is_some_and(|suffix| !suffix.is_empty() && (host == suffix || host.ends_with(&entry)));
+        dotted
+            || entry.strip_prefix("*.") == Some(host.as_str())
+            || glob_matches(entry.as_bytes(), host.as_bytes())
     })
+}
+
+fn glob_matches(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t) = (0, 0);
+    let mut resume: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            resume = Some((p, t));
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some((star, matched)) = resume {
+            p = star + 1;
+            t = matched + 1;
+            resume = Some((star, matched + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&b| b == b'*')
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_proxy, route_through_proxy, should_bypass_proxy};
+    use super::{ProxySet, build_proxy_url};
+    use crate::error::RepoError;
     use rv_config::ProxyConfig;
-    use secrecy::Secret;
+    use secrecy::SecretString;
 
-    /// The configured protocol selects which request schemes the proxy
-    /// handles, exactly like the Proxy::https/all/http variants used when
-    /// no non_proxy_hosts exist. An https proxy must route https requests;
-    /// the old fall-through arm keyed on the URL scheme returned None for
-    /// every https request, making the proxy a no-op.
-    #[test]
-    fn custom_routing_protocol_filter_matches_builtin_variants() {
-        let proxy = "https://proxy.example:8080";
-        let none: &[String] = &[];
-        let https_url = url::Url::parse("https://repo.example/a").unwrap();
-        let http_url = url::Url::parse("http://repo.example/a").unwrap();
-
-        assert_eq!(
-            route_through_proxy("https", &https_url, proxy, none).as_deref(),
-            Some(proxy),
-            "https proxy must route https requests"
-        );
-        assert_eq!(
-            route_through_proxy("https", &http_url, proxy, none),
-            None,
-            "https proxy must not route http requests"
-        );
-        assert_eq!(
-            route_through_proxy("http", &http_url, proxy, none).as_deref(),
-            Some(proxy)
-        );
-        assert_eq!(route_through_proxy("http", &https_url, proxy, none), None);
-        assert_eq!(
-            route_through_proxy("all", &https_url, proxy, none).as_deref(),
-            Some(proxy)
-        );
-        assert_eq!(
-            route_through_proxy("all", &http_url, proxy, none).as_deref(),
-            Some(proxy)
-        );
+    fn proxy(protocol: Option<&str>, non_proxy_hosts: &[&str]) -> ProxyConfig {
+        let mut proxy = ProxyConfig::new("proxy.example", 8080);
+        proxy.protocol = protocol.map(str::to_string);
+        proxy.non_proxy_hosts = non_proxy_hosts.iter().map(|s| s.to_string()).collect();
+        proxy
     }
 
+    const HTTP: &str = "http://repo.example/a";
+    const HTTPS: &str = "https://repo.example/a";
+
+    /// Selection as in Maven's `DefaultProxySelector`: an absent protocol
+    /// is `http`, the first proxy whose `non_proxy_hosts` leave the host
+    /// alone wins, and an `https:` URL with no usable `https` proxy goes
+    /// through an `http` one.
     #[test]
-    fn custom_routing_honours_non_proxy_hosts_per_protocol() {
-        let proxy = "https://proxy.example:8080";
-        let bypass = vec!["repo.example".to_string()];
-        let matching = url::Url::parse("https://repo.example/a").unwrap();
-        let other = url::Url::parse("https://elsewhere.example/a").unwrap();
-
-        assert_eq!(
-            route_through_proxy("https", &matching, proxy, &bypass),
-            None
-        );
-        assert_eq!(
-            route_through_proxy("https", &other, proxy, &bypass).as_deref(),
-            Some(proxy)
-        );
-    }
-
-    fn proxy_config() -> ProxyConfig {
-        ProxyConfig {
-            id: None,
-            protocol: None,
-            host: "proxy.example".to_string(),
-            port: 8080,
-            auth_type: None,
-            username: None,
-            password: None,
-            token_env: None,
-            token: None,
-            non_proxy_hosts: Vec::new(),
+    fn proxy_selection_follows_maven() {
+        type Spec<'a> = &'a [(Option<&'a str>, &'a [&'a str])];
+        #[rustfmt::skip]
+        let cases: &[(Spec<'_>, &str, Option<usize>)] = &[
+            (&[(None, &[])], HTTP, Some(0)),
+            (&[(None, &[])], HTTPS, Some(0)),
+            (&[(Some("HTTP"), &[])], HTTPS, Some(0)),
+            (&[(Some("https"), &[])], HTTP, None),
+            (&[(Some("https"), &[])], HTTPS, Some(0)),
+            (&[(Some("all"), &[])], HTTP, Some(0)),
+            (&[(Some("all"), &[])], HTTPS, Some(0)),
+            (&[(Some("all"), &[])], "file:///srv/repo", None),
+            (&[(Some("http"), &[]), (Some("https"), &[])], HTTP, Some(0)),
+            (&[(Some("http"), &[]), (Some("https"), &[])], HTTPS, Some(1)),
+            (&[(Some("https"), &[]), (Some("http"), &[])], HTTP, Some(1)),
+            (&[(Some("https"), &[]), (Some("http"), &[])], HTTPS, Some(0)),
+            (&[(Some("http"), &["repo.example"]), (Some("http"), &[])], HTTP, Some(1)),
+            (&[(Some("http"), &["repo.example"]), (Some("http"), &[])], "http://other.example/", Some(0)),
+            (&[(Some("https"), &["*.example"]), (Some("http"), &[])], HTTPS, Some(1)),
+            (&[(Some("all"), &["*"])], HTTPS, None),
+            (&[(Some("http"), &["10.*", "*.corp.*"])], "https://10.0.0.5/repo/", None),
+            (&[(Some("http"), &["10.*", "*.corp.*"])], "http://nexus.corp.example/", None),
+            (&[(Some("http"), &["10.*", "*.corp.*"])], HTTPS, Some(0)),
+        ];
+        for (spec, url, expected) in cases {
+            let proxies: Vec<_> = spec.iter().map(|(p, hosts)| proxy(*p, hosts)).collect();
+            let set = ProxySet::new(&proxies).expect("proxies");
+            let got = set.routes.select(&url::Url::parse(url).unwrap());
+            assert_eq!(got, *expected, "{spec:?} {url}");
         }
     }
 
+    /// A proxy with another protocol would carry nothing, so its traffic
+    /// would go direct without a word.
     #[test]
-    fn build_proxy_defaults_protocol() {
-        let config = proxy_config();
-        let proxy = build_proxy(&config).unwrap();
-        let rendered = format!("{proxy:?}");
-        assert!(rendered.contains("scheme: \"http\""));
-        assert!(rendered.contains("proxy.example"));
-        assert!(rendered.contains("port: Some(8080)"));
+    fn an_unknown_protocol_is_refused() {
+        let error = ProxySet::new(&[proxy(Some("socks5"), &[])]).unwrap_err();
+        assert!(matches!(error, RepoError::Config(_)), "{error}");
+        assert!(error.to_string().contains("socks5"), "{error}");
     }
 
     #[test]
-    fn build_proxy_applies_auth() {
-        let mut config = proxy_config();
-        config.protocol = Some("https".to_string());
-        config.username = Some("user".to_string());
-        config.password = Some(Secret::new("pass".to_string()));
-        let proxy = build_proxy(&config).unwrap();
-        let rendered = format!("{proxy:?}");
-        assert!(rendered.contains("username: \"user\""));
+    fn proxy_set_debug_leaves_out_credentials() {
+        let mut basic = proxy(None, &[]);
+        basic.username = Some("user".to_string());
+        basic.password = Some(SecretString::from("proxy-pass".to_string()));
+        let mut bearer = proxy(Some("https"), &[]);
+        bearer.auth_type = Some(rv_config::ProxyAuthType::Bearer);
+        bearer.token = Some(SecretString::from("super-secret-token".to_string()));
+        let set = ProxySet::new(&[basic, bearer]).unwrap();
+        let rendered = format!("{set:?} {:?}", set.proxies);
+        assert!(rendered.contains("proxy.example"), "{rendered}");
+        for secret in ["proxy-pass", "user", "super-secret-token"] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
     }
 
-    /// Bearer proxy auth must be wired into the Proxy object (so reqwest sends
-    /// it during the CONNECT for HTTPS upstreams) rather than attached as a
-    /// manual per-request header that would leak into the TLS tunnel to the
-    /// origin. The token must be marked sensitive so it never surfaces in
-    /// Debug/log output.
+    /// A host with `@` would otherwise be read as `userinfo@authority` and
+    /// steer the connection elsewhere; no rejection echoes the host, which
+    /// may hold a token.
     #[test]
-    fn build_proxy_wires_bearer_via_custom_http_auth() {
-        let mut config = proxy_config();
-        config.protocol = Some("https".to_string());
-        config.auth_type = Some(rv_config::ProxyAuthType::Bearer);
-        config.token = Some(Secret::new("super-secret-token".to_string()));
-        let proxy = build_proxy(&config).expect("bearer proxy builds");
-        let rendered = format!("{proxy:?}");
-        assert!(
-            !rendered.contains("super-secret-token"),
-            "bearer token must be sensitive and never appear in Debug: {rendered}"
-        );
-    }
-
-    #[test]
-    fn should_bypass_proxy_exact_match() {
-        let non_proxy = vec!["repo.example.com".to_string()];
-        assert!(should_bypass_proxy("repo.example.com", &non_proxy));
-        assert!(!should_bypass_proxy("sub.repo.example.com", &non_proxy));
-    }
-
-    /// Regression: a bare `*` rule (Maven's "bypass proxy for every host"
-    /// wildcard) must short-circuit the matcher for any host.
-    #[test]
-    fn should_bypass_proxy_star_matches_everything() {
-        let non_proxy = vec!["*".to_string()];
-        assert!(should_bypass_proxy("repo.example.com", &non_proxy));
-        assert!(should_bypass_proxy("internal", &non_proxy));
-        assert!(should_bypass_proxy("10.0.0.1", &non_proxy));
-        assert!(should_bypass_proxy("::1", &non_proxy));
-
-        // `*` mixed in with other rules still short-circuits.
-        let non_proxy = vec!["*.foo".to_string(), "*".to_string()];
-        assert!(should_bypass_proxy("anything.else", &non_proxy));
-
-        // Surrounded by whitespace it should still match; Maven users
-        // routinely paste `<nonProxyHosts>` with stray spaces.
-        let non_proxy = vec!["  *  ".to_string()];
-        assert!(should_bypass_proxy("anything.com", &non_proxy));
-    }
-
-    #[test]
-    fn should_bypass_proxy_suffix_match() {
-        let non_proxy = vec![".example.com".to_string(), "*.internal".to_string()];
-        assert!(should_bypass_proxy("repo.example.com", &non_proxy));
-        assert!(should_bypass_proxy("api.internal", &non_proxy));
-        assert!(should_bypass_proxy("deep.api.internal", &non_proxy));
-    }
-
-    /// Regression: hostnames and IPv4 literals must build a plain
-    /// authority. IPv6 literals must be bracketed. Hosts containing `@` or
-    /// other URL delimiters must be rejected outright.
-    #[test]
-    fn build_proxy_url_brackets_ipv6_and_rejects_at_sign() {
-        use super::build_proxy_url;
-
-        // hostname: plain authority.
-        let url = build_proxy_url("http", "example.com", 8080).unwrap();
-        assert_eq!(url, "http://example.com:8080");
-
-        // IPv4: same.
-        let url = build_proxy_url("http", "10.0.0.1", 3128).unwrap();
-        assert_eq!(url, "http://10.0.0.1:3128");
-
-        // Bare IPv6 literal: must get bracketed.
-        let url = build_proxy_url("http", "::1", 8080).unwrap();
-        assert_eq!(url, "http://[::1]:8080");
-
-        // Pre-bracketed IPv6: pass through unchanged.
-        let url = build_proxy_url("http", "[::1]", 8080).unwrap();
-        assert_eq!(url, "http://[::1]:8080");
-
-        // Longer IPv6 literal.
-        let url = build_proxy_url("http", "2001:db8::1", 8080).unwrap();
-        assert_eq!(url, "http://[2001:db8::1]:8080");
-
-        // Host with `@` is rejected; previously this would have been
-        // reinterpreted as `userinfo@authority`, steering the connection to
-        // `evil.example` instead of `proxy.example`.
-        let err = build_proxy_url("http", "user@evil.example", 8080).unwrap_err();
-        let rendered = format!("{err}");
-        assert!(
-            rendered.contains("'@'") || rendered.contains("@"),
-            "expected '@'-rejection error, got {rendered}"
-        );
-
-        // Junk hostname with `:` but not valid IPv6 is rejected, not silently
-        // forwarded.
-        let err = build_proxy_url("http", "host:with:colons", 8080).unwrap_err();
-        assert!(format!("{err}").contains("IPv6"));
-
-        assert!(build_proxy_url("http", "proxy.example/path", 8080).is_err());
-        assert!(build_proxy_url("http", "   ", 8080).is_err());
-    }
-
-    /// Regression: the full `build_proxy` path must wire these
-    /// validations in. Verifies via the `Debug` formatting that the host
-    /// landed correctly in the reqwest proxy.
-    #[test]
-    fn build_proxy_accepts_ipv6_host() {
-        let mut config = proxy_config();
-        config.host = "::1".to_string();
-        let proxy = build_proxy(&config).unwrap();
-        let rendered = format!("{proxy:?}");
-        // reqwest stores the authority with the brackets stripped, but the
-        // host string itself must be the v6 literal.
-        assert!(
-            rendered.contains("::1"),
-            "expected proxy debug to mention IPv6 host: {rendered}"
-        );
-    }
-
-    // --- proxy default protocol ---
-
-    /// When `<protocol>` is absent, the proxy must handle HTTP traffic only,
-    /// not HTTPS. Maven's default is HTTP-only.
-    #[test]
-    fn build_proxy_no_protocol_defaults_to_http_only() {
-        let config = proxy_config(); // protocol: None
-        let proxy = build_proxy(&config).unwrap();
-        let rendered = format!("{proxy:?}");
-        // The reqwest debug output for Proxy::http uses Intercept::Http.
-        assert!(
-            rendered.contains("Http("),
-            "protocol=None must produce an HTTP-only proxy, got: {rendered}"
-        );
-        assert!(
-            !rendered.contains("All("),
-            "protocol=None must NOT produce Proxy::all, got: {rendered}"
-        );
-    }
-
-    /// When `<protocol>` is `"https"`, the proxy must handle HTTPS traffic only.
-    #[test]
-    fn build_proxy_protocol_https_routes_https_only() {
-        let mut config = proxy_config();
-        config.protocol = Some("https".to_string());
-        let proxy = build_proxy(&config).unwrap();
-        let rendered = format!("{proxy:?}");
-        assert!(
-            rendered.contains("Https("),
-            "protocol=https must produce an HTTPS-only proxy, got: {rendered}"
-        );
-    }
-
-    /// When `<protocol>` is `"all"`, the proxy must handle all traffic.
-    #[test]
-    fn build_proxy_protocol_all_routes_all_traffic() {
-        let mut config = proxy_config();
-        config.protocol = Some("all".to_string());
-        let proxy = build_proxy(&config).unwrap();
-        let rendered = format!("{proxy:?}");
-        assert!(
-            rendered.contains("All("),
-            "protocol=all must produce Proxy::all, got: {rendered}"
-        );
-    }
-
-    /// When `<protocol>` is explicitly `"http"`, behaves the same as the default.
-    #[test]
-    fn build_proxy_explicit_http_protocol() {
-        let mut config = proxy_config();
-        config.protocol = Some("http".to_string());
-        let proxy = build_proxy(&config).unwrap();
-        let rendered = format!("{proxy:?}");
-        assert!(
-            rendered.contains("Http("),
-            "protocol=http must produce an HTTP-only proxy, got: {rendered}"
-        );
+    fn build_proxy_url_brackets_ipv6_and_rejects_url_delimiters() {
+        for (host, port, url) in [
+            ("example.com", 8080, "http://example.com:8080"),
+            ("10.0.0.1", 3128, "http://10.0.0.1:3128"),
+            ("::1", 8080, "http://[::1]:8080"),
+            ("[::1]", 8080, "http://[::1]:8080"),
+            ("2001:db8::1", 8080, "http://[2001:db8::1]:8080"),
+        ] {
+            assert_eq!(build_proxy_url(host, port).unwrap(), url);
+        }
+        for (host, says) in [
+            ("user:s3cret@evil.example", "'@'"),
+            ("host:with:colons", "IPv6"),
+            ("proxy.example/path", ""),
+            ("proxy.example/?token=s3cret", ""),
+            ("proxy.example#s3cret", ""),
+            ("alice:s3cret", ""),
+            ("[alice:s3cret]", ""),
+            ("   ", ""),
+        ] {
+            let rendered = build_proxy_url(host, 8080).unwrap_err().to_string();
+            assert!(rendered.contains(says), "{host}: {rendered}");
+            assert!(!rendered.contains("s3cret"), "{rendered}");
+        }
     }
 }

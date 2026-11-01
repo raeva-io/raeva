@@ -1,0 +1,75 @@
+schema_version = 8
+config_hash = "951d4fc229b58c4639aecb1317a5d49221d790fc0f7bad1bda6f64aeb2d01b2d"
+
+[resolution]
+ambient_inputs = [
+    "jdk:!1.8 is true",
+    "jdk:(,11) is false",
+    "jdk:1.8 is false",
+    "jdk:[17,) is true",
+    "jdk:[9, 12) is false",
+    "user-property:java.version",
+    "user-property:os.detection.classifierWithLikes",
+]
+
+[[platforms]]
+targets = ["linux-x86_64"]
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "03ee1a31a5e48be6ae01e75c52c889a746631bc8371a9a4dcd11f58d18beb21e"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "jdk-legacy"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "92c6b73738d4c2e1751d4539d8968d6432beaa30afdd43d5afc914a79452b170"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "040096de1b1812d03993c09b4681b6dce28952a0bc633764754f35bfbcba9611"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "jdk-modern"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "93ffeaca7fd47a7e0c9df3c4bf322d506a0a7931522ea2fe66e092ea836c982a"
+
+[[platforms.modules]]
+path = "pom.xml"
+gav = "org.golden.app:host-conditions:1.0"
+packaging = "jar"
+packages = """
+org.golden:jdk-legacy:1.0\tjar\tcompile
+org.golden:jdk-modern:1.0\tjar\tcompile"""
+edges = ""
+support_poms = "org.golden:bom:1.0"
+
+[[platforms.support_poms]]
+coordinate = "org.golden:bom:1.0"
+repo_url = "./repository/"
+sha256 = "ffe04faf64ab862e146285d6a1cf70a02ff1087dc3d51ad93380eb36add33804"
+
+[[inputs]]
+target = "linux-x86_64"
+profiles = []
+ambient_inputs = ["user-property:os.detection.classifierWithLikes"]
+
+[[inputs.poms]]
+path = "pom.xml"
+sha256 = "a5008d239de2bb91eaf6bbebcdb069478c0e00fa7f44f2131db8dc92ea529816"
+graph = "e5681d758524219666a5b1b6a685ba9ee50a2bc2d916b86e644683ea74897468"
+ambient_inputs = ["user-property:java.version"]
+
+[metadata]
+repo_ids = """
+./repository/\tfixture
+https://repo1.maven.org/maven2/\tcentral"""

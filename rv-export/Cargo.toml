@@ -1,0 +1,50 @@
+[package]
+name = "rv-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Write a raeva.lock's artifacts into a Maven local repository"
+readme = "README.md"
+documentation = "https://docs.rs/rv-export"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benches/"]
+
+[lints]
+workspace = true
+
+[dependencies]
+rv-config.workspace = true
+rv-fs.workspace = true
+rv-lock.workspace = true
+rv-maven-model.workspace = true
+rv-maven-types.workspace = true
+rv-repo.workspace = true
+rv-store.workspace = true
+
+dunce.workspace = true
+futures.workspace = true
+hex.workspace = true
+pathdiff.workspace = true
+quick-xml.workspace = true
+same-file.workspace = true
+serde.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+strum.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+
+[dev-dependencies]
+rv-config = { workspace = true, features = ["testing"] }
+rv-test-support.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

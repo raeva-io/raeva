@@ -1,28 +1,33 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use url::Url;
 
-use crate::repository::Repository;
+use crate::repository::{Repository, normalize_repo_url};
 
 /// Per-process dedup set for unrecognized `<mirrorOf>` pattern warnings.
 /// Keyed by `(pattern, mirror_id)` so each unique pair warns at most once.
-static UNKNOWN_PATTERN_WARNED: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+static UNKNOWN_PATTERN_WARNED: LazyLock<Mutex<HashSet<(String, String)>>> =
+    LazyLock::new(Mutex::default);
 
 fn warn_unknown_pattern_once(pattern: &str, mirror_id: &str) {
-    let mut guard = UNKNOWN_PATTERN_WARNED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let set = guard.get_or_insert_with(HashSet::new);
     let key = (pattern.to_string(), mirror_id.to_string());
-    if set.insert(key) {
-        tracing::warn!(
-            pattern = pattern,
-            mirror_id = mirror_id,
-            "unrecognized <mirrorOf> pseudo-pattern; Maven also does not recognize it; \
-             falling back to exact-id comparison (will not match)"
-        );
-    }
+    rv_maven_model::held::when_shown(move || {
+        let first = UNKNOWN_PATTERN_WARNED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        if first {
+            let (pattern, mirror_id) = key;
+            tracing::warn!(
+                sec_code = "SETTING_IGNORED",
+                pattern = pattern,
+                mirror_id = mirror_id,
+                "unrecognized <mirrorOf> pseudo-pattern; Maven also does not recognize it, \
+                 so it matches only a repository of that id"
+            );
+        }
+    });
 }
 
 #[derive(Debug, Clone, Default)]
@@ -45,35 +50,22 @@ impl MirrorSelector {
         Self { mirrors }
     }
 
-    /// Convenience wrapper that discards the host-change flag from
-    /// [`Self::resolve_with_host_change`]. Production code in `rv-repo::client`
-    /// threads the flag into [`crate::auth::AuthStore::for_repository_with_policy`].
-    #[cfg(test)]
-    pub(crate) fn resolve(&self, repo: &Repository) -> Repository {
-        self.resolve_with_host_change(repo).0
-    }
-
-    /// Resolve the mirror for `repo`, returning the rewritten `Repository`
-    /// alongside a flag indicating whether the mirror substitution crossed
-    /// to a different host.
-    ///
-    /// The host-change flag is used by the auth layer to decide whether the
-    /// default (no-id) `AuthConfig` should be forwarded: when a wildcard
-    /// mirror substitutes a repo URL with a third-party CDN, blindly
-    /// attaching a Nexus bearer token to that CDN request would leak the
-    /// credential. Callers in `rv-repo::client` should treat a host change
-    /// combined with a default-fallback auth as "do not attach auth"; an
-    /// id-matched `AuthConfig` is unaffected because the user opted into
-    /// that pairing.
-    pub(crate) fn resolve_with_host_change(&self, repo: &Repository) -> (Repository, bool) {
-        let (resolved, _, host_changed) = resolve_mirror_impl(&self.mirrors, repo, true);
-        (resolved, host_changed)
+    /// The repository that serves `repo`, the mirror that replaced it, and
+    /// whether the replacement changed scheme, host or effective port. Logs
+    /// the substitution, so [`crate::routing::Router::route`] is its only
+    /// production caller.
+    pub(crate) fn select(
+        &self,
+        repo: &Repository,
+    ) -> (Repository, Option<rv_config::MirrorConfig>, bool) {
+        let (resolved, mirror, host_changed) = resolve_mirror_impl(&self.mirrors, repo, true);
+        (resolved, mirror.cloned(), host_changed)
     }
 }
 
 /// Resolve silently to the effective repository, applied mirror, and whether
 /// the origin (scheme, host, or effective port) changed, preserving repository policies.
-pub fn resolve_mirror<'a>(
+pub(crate) fn resolve_mirror<'a>(
     mirrors: &'a [rv_config::MirrorConfig],
     repo: &Repository,
 ) -> (Repository, Option<&'a rv_config::MirrorConfig>, bool) {
@@ -85,149 +77,115 @@ fn resolve_mirror_impl<'a>(
     repo: &Repository,
     diagnostics: bool,
 ) -> (Repository, Option<&'a rv_config::MirrorConfig>, bool) {
-    if let Some(mirror) = matching_mirror(mirrors, repo, diagnostics) {
-        // Treat `mirror.url == repo.url` as "no mirror matched". Without
-        // this, the fallback path in `RepoClient::resolve_repo_with_fallback`
-        // would see a substitution and retry the origin against itself.
-        if mirror.url == repo.url {
-            if diagnostics {
-                tracing::warn!(
-                    sec_code = "MIRROR_SELF_REF",
-                    id = ?repo.id,
-                    "mirror points at the repo it mirrors; ignoring"
-                );
-            }
-            return (repo.clone(), None, false);
-        }
-        let host_changed = origins_differ(&repo.url, &mirror.url);
-        // Inherit the origin repo's id (so its configured credentials keep
-        // applying) ONLY when the mirror has no id of its own and we are
-        // not crossing hosts. Inheriting the origin id across a host
-        // boundary would let `lookup_auth` id-match and forward the
-        // origin's id-scoped credential to the foreign mirror host, which
-        // is the exact leak the host_changed suppression exists to prevent. A
-        // mirror with its OWN explicit id is left untouched: the user opted
-        // into that pairing.
-        let id = match mirror.id.clone() {
-            Some(mirror_id) => Some(mirror_id),
-            None if host_changed => None,
-            None => repo.id.clone(),
-        };
-        if diagnostics {
-            tracing::debug!(
-                original_url = %repo.url,
-                mirror_url = %mirror.url,
-                mirror_id = ?id,
-                "redirecting to mirror"
-            );
-            if host_changed {
-                tracing::warn!(
-                    sec_code = "CROSS_HOST_MIRROR",
-                    original_url = %repo.url,
-                    mirror_url = %mirror.url,
-                    "mirror substitution crossed hosts; default credentials will not be forwarded"
-                );
-            }
-        }
-        // A mirror changes the endpoint, not the origin's policies.
-        let mut resolved = repo.clone();
-        resolved.id = id;
-        resolved.url = crate::repository::normalize_repo_url(&mirror.url);
-        return (resolved, Some(mirror), host_changed);
+    let Some(mirror) = matching_mirror(mirrors, repo, diagnostics) else {
+        return (repo.clone(), None, false);
+    };
+    let host_changed = origins_differ(&repo.url, &mirror.url);
+    // Inherit the origin repo's id (so its configured credentials keep
+    // applying) ONLY when the mirror has no id of its own and we are not
+    // crossing hosts. Inheriting the origin id across a host boundary would
+    // let `lookup_auth` id-match and forward the origin's id-scoped
+    // credential to the foreign mirror host. A mirror with its OWN explicit
+    // id is left untouched: the user opted into that pairing.
+    let id = match mirror.id.clone() {
+        None if !host_changed => repo.id.clone(),
+        id => id,
+    };
+    if diagnostics {
+        tracing::debug!(
+            original_url = %rv_config::redact_url(&repo.url),
+            mirror_url = %rv_config::redact_url(&mirror.url),
+            mirror_id = ?id,
+            host_changed,
+            "redirecting to mirror"
+        );
     }
-
-    (repo.clone(), None, false)
+    // A mirror changes the endpoint, not the origin's policies.
+    let mut resolved = repo.clone();
+    resolved.id = id;
+    resolved.url = normalize_repo_url(&mirror.url);
+    (resolved, Some(mirror), host_changed)
 }
 
+/// Maven Resolver 1.9's `DefaultMirrorSelector.findMirror`: a mirror whose
+/// whole `<mirrorOf>` is the repository's id wins over any pattern match,
+/// regardless of list order; then the first mirror whose pattern matches.
+/// Either way the mirror's layouts must include the repository's.
 fn matching_mirror<'a>(
     mirrors: &'a [rv_config::MirrorConfig],
     repo: &Repository,
     diagnostics: bool,
 ) -> Option<&'a rv_config::MirrorConfig> {
-    // Maven's `DefaultMirrorSelector` runs two passes: an exact single-ID
-    // match wins over any wildcard or pattern match, regardless of list
-    // order. Without this, `[{mirrorOf:"*"}, {mirrorOf:"central"}]` would
-    // shadow the second entry for `central`.
+    let pattern = |mirror: &rv_config::MirrorConfig| mirror.mirror_of.join(",");
     mirrors
         .iter()
-        .find(|mirror| is_exact_id_mirror(mirror, repo))
+        .find(|mirror| {
+            repo.id.as_deref() == Some(pattern(mirror).as_str()) && serves_layout(mirror)
+        })
         .or_else(|| {
-            mirrors
-                .iter()
-                .find(|mirror| matches_mirror(mirror, repo, diagnostics))
+            mirrors.iter().find(|mirror| {
+                let mirror_id = mirror.id.as_deref().unwrap_or("<unnamed>");
+                match_pattern(repo, &pattern(mirror), mirror_id, diagnostics)
+                    && serves_layout(mirror)
+            })
         })
 }
 
-fn is_exact_id_mirror(mirror: &rv_config::MirrorConfig, repo: &Repository) -> bool {
-    let Some(repo_id) = repo.id.as_deref() else {
-        return false;
-    };
-    let patterns = expand_patterns(&mirror.mirror_of);
-    patterns.len() == 1 && patterns[0] == repo_id
-}
-
-fn matches_mirror(mirror: &rv_config::MirrorConfig, repo: &Repository, diagnostics: bool) -> bool {
-    let patterns = expand_patterns(&mirror.mirror_of);
-    if patterns.is_empty() {
-        return false;
+/// Resolver's `matchPattern`: `*`, the id itself, or a comma-separated list
+/// read in order, where the first `!id` or `id` that names the repository
+/// decides and `*`, `external:*` and `external:http:*` match unless a later
+/// entry excludes the repository. Entries are not trimmed.
+fn match_pattern(repo: &Repository, pattern: &str, mirror_id: &str, diagnostics: bool) -> bool {
+    let id = repo.id.as_deref();
+    if pattern == "*" || Some(pattern) == id {
+        return true;
     }
-
-    let mirror_id = mirror.id.as_deref().unwrap_or("<unnamed>");
     let mut matched = false;
-    for pattern in patterns {
-        if let Some(rule) = pattern.strip_prefix('!') {
-            if pattern_matches(rule, repo, mirror_id, diagnostics) {
+    // Java's `split` drops trailing empty entries.
+    for entry in pattern.trim_end_matches(',').split(',') {
+        if let Some(excluded) = entry.strip_prefix('!').filter(|rest| !rest.is_empty()) {
+            if Some(excluded) == id {
                 return false;
             }
-        } else if pattern_matches(&pattern, repo, mirror_id, diagnostics) {
+        } else if Some(entry) == id {
+            return true;
+        } else if (entry == "external:*" && is_external_repo(&repo.url))
+            || (entry == "external:http:*" && is_external_http_repo(&repo.url))
+            || entry == "*"
+        {
             matched = true;
+        } else if diagnostics && (entry.starts_with("external:") || entry.starts_with("internal:"))
+        {
+            warn_unknown_pattern_once(entry, mirror_id);
         }
     }
     matched
 }
 
-fn expand_patterns(patterns: &[String]) -> Vec<String> {
-    patterns
-        .iter()
-        .flat_map(|p| p.split(','))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-fn pattern_matches(pattern: &str, repo: &Repository, mirror_id: &str, diagnostics: bool) -> bool {
-    if pattern == "*" {
+/// Resolver's `matchesType` for a repository of the `default` layout, the
+/// one raeva reads every repository in.
+fn serves_layout(mirror: &rv_config::MirrorConfig) -> bool {
+    const LAYOUT: &str = "default";
+    let layouts = mirror
+        .mirror_of_layouts
+        .as_deref()
+        .unwrap_or("default,legacy");
+    if layouts.is_empty() || layouts == "*" || layouts == LAYOUT {
         return true;
     }
-    if pattern == "central" {
-        return repo.id.as_deref() == Some("central");
+    let mut matched = false;
+    for entry in layouts.trim_end_matches(',').split(',') {
+        if let Some(excluded) = entry.strip_prefix('!').filter(|rest| !rest.is_empty()) {
+            if excluded == LAYOUT {
+                return false;
+            }
+        } else if entry == LAYOUT {
+            return true;
+        } else if entry == "*" {
+            matched = true;
+        }
     }
-    if pattern == "external:*" {
-        return is_external_repo(&repo.url);
-    }
-    if pattern == "external:http:*" {
-        // Maven 3.8.1+ pattern matching only non-HTTPS external repos.
-        return is_external_repo(&repo.url) && repo_scheme(&repo.url).as_deref() == Some("http");
-    }
-    if pattern == "external:https:*" {
-        return is_external_repo(&repo.url) && repo_scheme(&repo.url).as_deref() == Some("https");
-    }
-    if pattern == "internal:*" {
-        return !is_external_repo(&repo.url);
-    }
-    // Unrecognized pseudo-patterns: warn once and fall through to exact-id comparison.
-    if diagnostics && (pattern.starts_with("external:") || pattern.starts_with("internal:")) {
-        warn_unknown_pattern_once(pattern, mirror_id);
-    }
-    match repo.id.as_deref() {
-        Some(id) => id == pattern,
-        None => false,
-    }
-}
-
-fn repo_scheme(url: &str) -> Option<String> {
-    Url::parse(url).ok().map(|u| u.scheme().to_string())
+    matched
 }
 
 /// Compare two URLs by origin: scheme, host (case-insensitive) and effective
@@ -239,7 +197,7 @@ fn repo_scheme(url: &str) -> Option<String> {
 /// unrelated listener. If either URL fails to parse (or has no host or
 /// derivable port), this returns `true` defensively so the caller treats it
 /// as an origin change and declines to forward default credentials.
-pub fn origins_differ(original: &str, resolved: &str) -> bool {
+pub(crate) fn origins_differ(original: &str, resolved: &str) -> bool {
     fn origin(url: &str) -> Option<(String, String, u16)> {
         let parsed = Url::parse(url).ok()?;
         let host = parsed.host_str()?.to_ascii_lowercase();
@@ -252,25 +210,43 @@ pub fn origins_differ(original: &str, resolved: &str) -> bool {
     }
 }
 
-fn is_external_repo(url: &str) -> bool {
-    let parsed = match Url::parse(url) {
-        Ok(parsed) => parsed,
-        Err(_) => return false,
+/// The protocol and host Resolver's `RemoteRepository` reads from `url`,
+/// as written: the text before the first `:`, and after `//`, any userinfo,
+/// up to the next `/` or `:`. Both are empty when the URL has no protocol.
+fn protocol_and_host(url: &str) -> (&str, &str) {
+    let Some((protocol, rest)) = url.split_once(':') else {
+        return ("", "");
     };
-    match parsed.scheme() {
-        "http" | "https" => match parsed.host() {
-            Some(url::Host::Domain(h)) => h != "localhost",
-            Some(url::Host::Ipv4(addr)) => !addr.is_loopback(),
-            Some(url::Host::Ipv6(addr)) => {
-                // `Ipv6Addr::is_loopback()` covers only `::1`. IPv4-mapped
-                // addresses such as `::ffff:127.0.0.1` are also loopback;
-                // check the mapped IPv4 address to cover those variants.
-                !addr.is_loopback() && !addr.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-            }
-            None => false,
-        },
-        _ => false,
+    if protocol.is_empty() || protocol.contains('/') {
+        return ("", "");
     }
+    let host = rest.strip_prefix("//").map_or("", |authority| {
+        let authority = match authority.find(['@', '/']) {
+            Some(at) if authority.as_bytes()[at] == b'@' => &authority[at + 1..],
+            _ => authority,
+        };
+        &authority[..authority.find(['/', ':']).unwrap_or(authority.len())]
+    });
+    (protocol, host)
+}
+
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1")
+}
+
+/// As Maven's mirror selector decides `external:*`: a `file:` URL and the
+/// hosts `localhost` and `127.0.0.1`, spelled so, are local; other loopback
+/// addresses are not.
+pub(crate) fn is_external_repo(url: &str) -> bool {
+    let (protocol, host) = protocol_and_host(url);
+    !(is_local_host(host) || protocol.eq_ignore_ascii_case("file"))
+}
+
+/// As Maven's mirror selector decides `external:http:*`, for the `http`
+/// protocol, the only plain one raeva reads.
+fn is_external_http_repo(url: &str) -> bool {
+    let (protocol, host) = protocol_and_host(url);
+    protocol.eq_ignore_ascii_case("http") && !is_local_host(host)
 }
 
 #[cfg(test)]
@@ -278,505 +254,138 @@ mod tests {
     use super::MirrorSelector;
     use crate::repository::Repository;
 
-    fn mirror_config(id: &str, url: &str, mirror_of: &[&str]) -> rv_config::MirrorConfig {
-        rv_config::MirrorConfig {
-            id: Some(id.to_string()),
-            url: url.to_string(),
-            mirror_of: mirror_of.iter().map(|value| value.to_string()).collect(),
+    fn mirror_config(id: Option<&str>, url: &str, mirror_of: &[&str]) -> rv_config::MirrorConfig {
+        let mut mirror = rv_config::MirrorConfig::new(id, url);
+        mirror.mirror_of = mirror_of.iter().map(|value| value.to_string()).collect();
+        mirror
+    }
+
+    /// Maven Resolver 1.9's mirror selection: an exact id beats an earlier
+    /// wildcard, the first entry wins within a match class, the first `id`
+    /// or `!id` in a list that names the repository decides, entries are not
+    /// trimmed, `external:http:*` matches as Maven matches it, and an
+    /// unrecognized pseudo-pattern such as `external:https:*` matches only a
+    /// repository of that id.
+    /// The resolved repository carries the mirror's id even at the same URL;
+    /// an unnamed mirror
+    /// inherits the origin's only on the same origin, so id-scoped
+    /// credentials never cross hosts.
+    #[test]
+    fn mirror_selection_follows_maven() {
+        type Repo = (Option<&'static str>, &'static str);
+        type Mirror = (Option<&'static str>, &'static str, &'static [&'static str]);
+        type Expected = (&'static str, Option<&'static str>, bool);
+        const CENTRAL: Repo = (Some("central"), "https://repo1.maven.org/maven2/");
+        const NEXUS: Repo = (Some("central"), "https://nexus.corp/repo/");
+        // (mirrors, repository, (resolved url, resolved id, host changed))
+        #[rustfmt::skip]
+        let cases: &[(&[Mirror], Repo, Expected)] = &[
+            (&[(Some("corp"), "https://mirror.example/", &["central"])], CENTRAL, ("https://mirror.example/", Some("corp"), true)),
+            (&[(Some("any"), "https://wildcard.example/", &["*"]), (Some("corp"), "https://corp.example/", &["central"])],
+                CENTRAL, ("https://corp.example/", Some("corp"), true)),
+            (&[(Some("first"), "https://first.example/", &["central"]), (Some("second"), "https://second.example/", &["central"])],
+                CENTRAL, ("https://first.example/", Some("first"), true)),
+            (&[(Some("corp"), "https://mirror.example/", &["*", "!central"])], CENTRAL, (CENTRAL.1, Some("central"), false)),
+            (&[(Some("multi"), "https://multi.example/", &["central,snapshots"])], CENTRAL, ("https://multi.example/", Some("multi"), true)),
+            (&[(Some("multi"), "https://multi.example/", &["central,snapshots"])], (Some("snapshots"), "https://snapshots.example/"),
+                ("https://multi.example/", Some("multi"), true)),
+            (&[(Some("multi"), "https://multi.example/", &["central,snapshots"])], (Some("releases"), "https://releases.example/"),
+                ("https://releases.example/", Some("releases"), false)),
+            (&[(Some("safe"), "https://mirror.example/", &["external:http:*"])], (Some("r"), "http://insecure.example/"),
+                ("https://mirror.example/", Some("safe"), true)),
+            (&[(Some("safe"), "https://mirror.example/", &["external:http:*"])], (Some("r"), "https://secure.example/"),
+                ("https://secure.example/", Some("r"), false)),
+            (&[(Some("safe"), "https://mirror.example/", &["external:https:*"])], (Some("r"), "https://secure.example/"),
+                ("https://secure.example/", Some("r"), false)),
+            (&[(Some("in"), "https://mirror.example/", &["internal:*"])], (Some("r"), "http://localhost/repo/"),
+                ("http://localhost/repo/", Some("r"), false)),
+            (&[(Some("first"), "https://first.example/", &["central,!central"])], CENTRAL, ("https://first.example/", Some("first"), true)),
+            (&[(Some("first"), "https://first.example/", &["!central,*"])], CENTRAL, (CENTRAL.1, Some("central"), false)),
+            (&[(Some("multi"), "https://multi.example/", &["central, snapshots"])], (Some("snapshots"), "https://snapshots.example/"),
+                ("https://snapshots.example/", Some("snapshots"), false)),
+            (&[(Some("multi"), "https://multi.example/", &["central,snapshots"])], (Some("central,snapshots"), "https://odd.example/"),
+                ("https://multi.example/", Some("multi"), true)),
+            (&[(Some("g"), "https://grpc.example/", &["external:grpc:*"])], (Some("some-repo"), "https://external.example/repo/"),
+                ("https://external.example/repo/", Some("some-repo"), false)),
+            (&[(Some("g"), "https://grpc.example/", &["external:grpc:*"])], (Some("external:grpc:*"), "https://external.example/repo/"),
+                ("https://grpc.example/", Some("g"), true)),
+            (&[(Some("corp"), CENTRAL.1, &["central"])], CENTRAL, (CENTRAL.1, Some("corp"), false)),
+            (&[(Some("central"), "https://repo1.maven.org/maven2", &["central"])], CENTRAL, (CENTRAL.1, Some("central"), false)),
+            (&[(Some("central"), " https://repo1.maven.org/maven2/ ", &["central"])], CENTRAL, (CENTRAL.1, Some("central"), false)),
+            (&[(Some("cdn"), "https://cdn.example/", &["*"])], NEXUS, ("https://cdn.example/", Some("cdn"), true)),
+            (&[(Some("alt"), "https://nexus.corp/alt/", &["*"])], NEXUS, ("https://nexus.corp/alt/", Some("alt"), false)),
+            (&[(None, "https://cdn.example/", &["*"])], NEXUS, ("https://cdn.example/", None, true)),
+            (&[(None, "https://nexus.corp/mirror/", &["*"])], NEXUS, ("https://nexus.corp/mirror/", Some("central"), false)),
+            (&[(None, "http://nexus.corp:8081/mirror/", &["*"])], NEXUS, ("http://nexus.corp:8081/mirror/", None, true)),
+        ];
+        for (index, (mirrors, (id, url), (expected_url, expected_id, changed))) in
+            cases.iter().enumerate()
+        {
+            let mirrors: Vec<_> = mirrors
+                .iter()
+                .map(|(id, url, of)| mirror_config(*id, url, of))
+                .collect();
+            let repo = Repository::new(id.map(str::to_string), *url, true, true);
+            let selector = MirrorSelector::from_mirrors(mirrors);
+            let (resolved, _, host_changed) = selector.select(&repo);
+            assert_eq!(resolved.url, *expected_url, "case {index}");
+            assert_eq!(resolved.id.as_deref(), *expected_id, "case {index}");
+            assert_eq!(host_changed, *changed, "case {index}");
         }
     }
 
+    /// Origins compare scheme, case-insensitive host and effective port.
+    /// `external:*` reads the host as written.
     #[test]
-    fn public_resolution_is_quiet_and_matches_sync() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tracing_subscriber::prelude::*;
-
-        struct CountEvents(Arc<AtomicUsize>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountEvents {
-            fn on_event(
-                &self,
-                _: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
+    fn origins_and_loopback_are_decided_on_the_parsed_url() {
+        for (a, b, differ) in [
+            ("https://nexus.corp/", "https://nexus.corp:443/", false),
+            ("http://nexus.corp/", "http://nexus.corp:80/", false),
+            ("https://NEXUS.corp/", "https://nexus.CORP/", false),
+            ("https://nexus.corp/", "https://nexus.corp:8443/", true),
+            ("https://nexus.corp/", "http://nexus.corp/", true),
+        ] {
+            assert_eq!(super::origins_differ(a, b), differ, "{a} {b}");
         }
-        let events = Arc::new(AtomicUsize::new(0));
-        let subscriber = tracing_subscriber::registry().with(CountEvents(events.clone()));
-        rv_test_support::with_default(subscriber, || {
-            let mut repo = Repository::new(
-                Some("central".to_string()),
-                "https://nexus.corp/repo/",
-                true,
-                true,
+        for (url, external) in [
+            ("http://[::ffff:7f00:1]/repo", true),
+            ("https://[::1]:8080/repo", true),
+            ("http://127.0.0.2/repo", true),
+            ("http://localhost/repo", false),
+            ("http://LOCALHOST/repo", true),
+            ("http://user@localhost:8080/repo", false),
+            ("file:///srv/repo/", false),
+            ("FILE:///srv/repo/", false),
+            ("https://127.0.0.1:8080/repo", false),
+            ("https://repo.example.com/maven2/", true),
+        ] {
+            assert_eq!(super::is_external_repo(url), external, "{url}");
+        }
+    }
+
+    /// A mirror serves the layouts `<mirrorOfLayouts>` names, `default` and
+    /// `legacy` when unset, read as Resolver reads `<mirrorOf>`.
+    #[test]
+    fn mirror_layouts_follow_maven() {
+        for (layouts, serves) in [
+            (None, true),
+            (Some(""), true),
+            (Some("*"), true),
+            (Some("legacy"), false),
+            (Some("legacy,default"), true),
+            (Some("*,!default"), false),
+            (Some("default,!default"), true),
+            (Some("legacy, default"), false),
+        ] {
+            let mut mirror = mirror_config(Some("m"), "https://mirror.example/", &["*"]);
+            mirror.mirror_of_layouts = layouts.map(str::to_string);
+            let repo = Repository::new(Some("central".into()), "https://repo.example/", true, true);
+            let (resolved, _, _) = MirrorSelector::from_mirrors(vec![mirror]).select(&repo);
+            assert_eq!(
+                resolved.url == "https://mirror.example/",
+                serves,
+                "{layouts:?}"
             );
-            repo.releases_checksum_policy = rv_config::ChecksumPolicy::Fail;
-            repo.snapshots_update_policy = rv_config::UpdatePolicy::Always;
-            for url in [
-                "https://nexus.corp/repo/",
-                "https://nexus.corp/mirror/",
-                "http://nexus.corp:8081/mirror/",
-            ] {
-                let mirrors = vec![mirror_config("corp", url, &["external:quiet-test", "*"])];
-                events.store(0, Ordering::Relaxed);
-                let (resolved, applied, changed) = super::resolve_mirror(&mirrors, &repo);
-                assert_eq!(events.load(Ordering::Relaxed), 0);
-                assert_eq!(
-                    resolved.releases_checksum_policy,
-                    repo.releases_checksum_policy
-                );
-                assert_eq!(
-                    resolved.snapshots_update_policy,
-                    repo.snapshots_update_policy
-                );
-                assert_eq!(applied.is_some(), url != repo.url);
-                let selector = MirrorSelector::from_mirrors(mirrors);
-                assert_eq!(
-                    (resolved, changed),
-                    selector.resolve_with_host_change(&repo)
-                );
-                assert!(events.load(Ordering::Relaxed) > 0);
-            }
-        });
-    }
-
-    #[test]
-    fn matches_by_id() {
-        let mirror = mirror_config("corp", "https://mirror.example/", &["central"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2/",
-            true,
-            false,
-        );
-        let resolved = selector.resolve(&repo);
-        assert_eq!(resolved.url, "https://mirror.example/");
-    }
-
-    #[test]
-    fn exact_id_match_wins_over_earlier_wildcard() {
-        // Maven-compat: even though the wildcard mirror is listed first, an
-        // exact-ID mirror must take priority for repos matching its id.
-        let wildcard = mirror_config("any", "https://wildcard.example/", &["*"]);
-        let exact = mirror_config("corp", "https://corp.example/", &["central"]);
-        let selector = MirrorSelector {
-            mirrors: vec![wildcard, exact],
-        };
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2/",
-            true,
-            false,
-        );
-        let resolved = selector.resolve(&repo);
-        assert_eq!(resolved.url, "https://corp.example/");
-    }
-
-    #[test]
-    fn first_entry_wins_within_same_match_class() {
-        // Selection takes the first matching mirror within a class, so the
-        // higher-precedence layer (placed first by Config's project > user >
-        // settings merge order) wins when two mirrors target the same repo
-        // with the same specificity.
-        let project = mirror_config("project-m", "https://project.example/", &["central"]);
-        let settings = mirror_config("settings-m", "https://settings.example/", &["central"]);
-        let selector = MirrorSelector {
-            mirrors: vec![project, settings],
-        };
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2/",
-            true,
-            false,
-        );
-        let resolved = selector.resolve(&repo);
-        assert_eq!(resolved.url, "https://project.example/");
-    }
-
-    #[test]
-    fn resolve_with_host_change_flags_cross_host_redirect() {
-        let mirror = mirror_config("cdn", "https://cdn.example/", &["*"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(
-            Some("internal".to_string()),
-            "https://nexus.corp/repo/",
-            true,
-            false,
-        );
-        let (resolved, host_changed) = selector.resolve_with_host_change(&repo);
-        assert_eq!(resolved.url, "https://cdn.example/");
-        assert!(host_changed, "host changed from nexus.corp to cdn.example");
-    }
-
-    /// A wildcard mirror with NO id of its own that crosses hosts must NOT
-    /// inherit the origin repo's id. Otherwise `lookup_auth` would id-match
-    /// the origin's id-scoped credential and forward it to the foreign mirror
-    /// host, defeating the cross-host credential suppression.
-    #[test]
-    fn cross_host_unnamed_mirror_does_not_inherit_origin_id() {
-        let mirror = rv_config::MirrorConfig {
-            id: None,
-            url: "https://cdn.example/".to_string(),
-            mirror_of: vec!["*".to_string()],
-        };
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://nexus.corp/repo/",
-            true,
-            false,
-        );
-        let (resolved, host_changed) = selector.resolve_with_host_change(&repo);
-        assert!(host_changed);
-        assert_eq!(
-            resolved.id, None,
-            "cross-host unnamed mirror must drop the inherited origin id"
-        );
-    }
-
-    /// A SAME-host unnamed mirror still inherits the origin id so configured
-    /// credentials keep applying; there is no cross-host leak risk.
-    #[test]
-    fn same_host_unnamed_mirror_inherits_origin_id() {
-        let mirror = rv_config::MirrorConfig {
-            id: None,
-            url: "https://nexus.corp/mirror/".to_string(),
-            mirror_of: vec!["*".to_string()],
-        };
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://nexus.corp/repo/",
-            true,
-            false,
-        );
-        let (resolved, host_changed) = selector.resolve_with_host_change(&repo);
-        assert!(!host_changed);
-        assert_eq!(resolved.id.as_deref(), Some("central"));
-    }
-
-    /// Same host but a different SCHEME is a different origin. An unnamed
-    /// mirror at `http://nexus.corp/` for origin `https://nexus.corp/` must
-    /// NOT inherit the origin id, otherwise id-matched credentials would be
-    /// forwarded to the plaintext endpoint.
-    #[test]
-    fn scheme_change_same_host_unnamed_mirror_does_not_inherit_origin_id() {
-        let mirror = rv_config::MirrorConfig {
-            id: None,
-            url: "http://nexus.corp:8081/mirror/".to_string(),
-            mirror_of: vec!["*".to_string()],
-        };
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://nexus.corp/repo/",
-            true,
-            false,
-        );
-        let (resolved, host_changed) = selector.resolve_with_host_change(&repo);
-        assert!(
-            host_changed,
-            "http://nexus.corp:8081 is a different origin than https://nexus.corp"
-        );
-        assert_eq!(
-            resolved.id, None,
-            "scheme/port change must drop the inherited origin id"
-        );
-    }
-
-    /// Effective-port comparison: an explicit default port is the same origin
-    /// as the implicit one, while a non-default port is a different origin.
-    #[test]
-    fn origins_differ_uses_effective_port() {
-        use super::origins_differ;
-        assert!(
-            !origins_differ("https://nexus.corp/", "https://nexus.corp:443/"),
-            "explicit default port equals implicit default port"
-        );
-        assert!(
-            !origins_differ("http://nexus.corp/", "http://nexus.corp:80/"),
-            "explicit default port equals implicit default port"
-        );
-        assert!(
-            origins_differ("https://nexus.corp/", "https://nexus.corp:8443/"),
-            "non-default port is a different origin"
-        );
-        assert!(
-            origins_differ("https://nexus.corp/", "http://nexus.corp/"),
-            "scheme change is a different origin even on the same host"
-        );
-        assert!(
-            !origins_differ("https://NEXUS.corp/", "https://nexus.CORP/"),
-            "host comparison stays case-insensitive"
-        );
-    }
-
-    #[test]
-    fn resolve_with_host_change_same_host_returns_false() {
-        // Same host, just a different path is NOT a host change.
-        let mirror = mirror_config("alt", "https://nexus.corp/alt/", &["*"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(
-            Some("internal".to_string()),
-            "https://nexus.corp/repo/",
-            true,
-            false,
-        );
-        let (_resolved, host_changed) = selector.resolve_with_host_change(&repo);
-        assert!(!host_changed);
-    }
-
-    #[test]
-    fn external_http_pattern_matches_only_http() {
-        let mirror = mirror_config("safe", "https://mirror.example/", &["external:http:*"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let http_repo = Repository::new(
-            Some("http-repo".to_string()),
-            "http://insecure.example/",
-            true,
-            false,
-        );
-        let https_repo = Repository::new(
-            Some("https-repo".to_string()),
-            "https://secure.example/",
-            true,
-            false,
-        );
-        assert_eq!(
-            selector.resolve(&http_repo).url,
-            "https://mirror.example/",
-            "external:http:* must redirect http repos"
-        );
-        assert_eq!(
-            selector.resolve(&https_repo).url,
-            "https://secure.example/",
-            "external:http:* must NOT redirect https repos"
-        );
-    }
-
-    #[test]
-    fn external_https_pattern_matches_only_https() {
-        let mirror = mirror_config("safe", "https://mirror.example/", &["external:https:*"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let http_repo = Repository::new(
-            Some("http-repo".to_string()),
-            "http://insecure.example/",
-            true,
-            false,
-        );
-        let https_repo = Repository::new(
-            Some("https-repo".to_string()),
-            "https://secure.example/",
-            true,
-            false,
-        );
-        assert_eq!(selector.resolve(&http_repo).url, "http://insecure.example/");
-        assert_eq!(selector.resolve(&https_repo).url, "https://mirror.example/");
-    }
-
-    /// `mirrorOf="central,snapshots"` is a comma-joined include list, not a
-    /// single repo id. It must NOT trigger the exact-ID pass (`is_exact_id_mirror`
-    /// requires a single-element pattern list), but must still match either
-    /// `central` or `snapshots` repos via the pattern-pass fallback.
-    #[test]
-    fn multi_id_mirror_of_falls_through_to_pattern_pass() {
-        let mirror = mirror_config("multi", "https://multi.example/", &["central,snapshots"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-
-        let central = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2/",
-            true,
-            false,
-        );
-        assert_eq!(selector.resolve(&central).url, "https://multi.example/");
-
-        let snapshots = Repository::new(
-            Some("snapshots".to_string()),
-            "https://snapshots.example/",
-            true,
-            true,
-        );
-        assert_eq!(selector.resolve(&snapshots).url, "https://multi.example/");
-
-        // A repo not in the list is left alone.
-        let other = Repository::new(
-            Some("releases".to_string()),
-            "https://releases.example/",
-            true,
-            false,
-        );
-        assert_eq!(selector.resolve(&other).url, "https://releases.example/");
-    }
-
-    #[test]
-    fn self_referential_mirror_is_treated_as_no_match() {
-        // A mirror entry whose URL is identical to the repo it mirrors must
-        // not produce a substitution; otherwise the fallback retries the
-        // origin against itself.
-        let url = "https://repo1.maven.org/maven2/";
-        let mirror = mirror_config("central", url, &["central"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(Some("central".to_string()), url, true, false);
-        let (resolved, host_changed) = selector.resolve_with_host_change(&repo);
-        assert_eq!(resolved.url, repo.url);
-        assert!(!host_changed);
-    }
-
-    #[test]
-    fn respects_exclusions() {
-        let mirror = mirror_config("corp", "https://mirror.example/", &["*", "!central"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2/",
-            true,
-            false,
-        );
-        let resolved = selector.resolve(&repo);
-        assert_eq!(resolved.url, repo.url);
-    }
-
-    /// When a mirror with a distinct id substitutes for the origin, the
-    /// resolved Repository must carry the *mirror's* id, not the origin's.
-    /// AuthStore::for_repository_with_policy looks up auth by id; if the
-    /// origin's id leaked through, mirror-scoped credentials would never
-    /// match.
-    #[test]
-    fn mirror_id_is_preserved_on_resolved_repo() {
-        let mirror = mirror_config("corp-mirror", "https://mirror.corp/", &["*"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        let origin = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2/",
-            true,
-            false,
-        );
-        let resolved = selector.resolve(&origin);
-        assert_eq!(resolved.url, "https://mirror.corp/");
-        assert_eq!(
-            resolved.id.as_deref(),
-            Some("corp-mirror"),
-            "resolved repo must carry the mirror's id (was {:?}), not the origin's",
-            resolved.id
-        );
-    }
-
-    // --- unrecognized pseudo-pattern warn (dedup) ---
-
-    /// An unrecognized `external:grpc:*` pattern must NOT match anything. It
-    /// falls through to exact-id comparison and must not panic.
-    #[test]
-    fn unrecognized_external_pseudo_pattern_does_not_match() {
-        let mirror = mirror_config("grpc-mirror", "https://grpc.example/", &["external:grpc:*"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        // A real external repo should NOT match the bogus pattern.
-        let repo = Repository::new(
-            Some("some-repo".to_string()),
-            "https://external.example/repo/",
-            true,
-            false,
-        );
-        let resolved = selector.resolve(&repo);
-        assert_eq!(
-            resolved.url, repo.url,
-            "unrecognized pattern must not produce a mirror substitution"
-        );
-    }
-
-    /// Confirm the exact-id fallback path: `external:grpc:*` used as the sole
-    /// pattern falls through to an id comparison, so a repo whose id literally
-    /// equals `external:grpc:*` would match. (Pathological but correct per Maven.)
-    #[test]
-    fn unrecognized_external_pseudo_pattern_falls_through_to_id_match() {
-        let mirror = mirror_config("grpc-mirror", "https://grpc.example/", &["external:grpc:*"]);
-        let selector = MirrorSelector {
-            mirrors: vec![mirror],
-        };
-        // A repo whose ID is literally the bogus pattern string.
-        let repo = Repository::new(
-            Some("external:grpc:*".to_string()),
-            "https://external.example/repo/",
-            true,
-            false,
-        );
-        // is_exact_id_mirror fires first here (single-element pattern list == repo id).
-        let resolved = selector.resolve(&repo);
-        assert_eq!(
-            resolved.url, "https://grpc.example/",
-            "exact-id fallback must still match when repo id equals the pattern string"
-        );
-    }
-
-    // --- IPv6 loopback variants for is_external_repo ---
-
-    /// IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) must NOT be treated as
-    /// an external repository.
-    #[test]
-    fn ipv4_mapped_ipv6_loopback_is_not_external() {
-        use super::is_external_repo;
-        // ::ffff:127.0.0.1, IPv4-mapped IPv6 loopback
-        assert!(
-            !is_external_repo("http://[::ffff:7f00:1]/repo"),
-            "::ffff:127.0.0.1 must not be external"
-        );
-    }
-
-    /// Plain `::1` (compact IPv6 loopback) must NOT be external.
-    #[test]
-    fn ipv6_loopback_is_not_external() {
-        use super::is_external_repo;
-        assert!(
-            !is_external_repo("http://[::1]/repo"),
-            "[::1] must not be external"
-        );
-        assert!(
-            !is_external_repo("https://[::1]:8080/repo"),
-            "[::1] on HTTPS port must not be external"
-        );
-    }
-
-    /// A regular external HTTPS URL must still be considered external.
-    #[test]
-    fn regular_https_url_is_external() {
-        use super::is_external_repo;
-        assert!(is_external_repo("https://repo.example.com/maven2/"));
-    }
-
-    /// `localhost` and `127.0.0.1` remain non-external.
-    #[test]
-    fn localhost_and_ipv4_loopback_are_not_external() {
-        use super::is_external_repo;
-        assert!(!is_external_repo("http://localhost/repo"));
-        assert!(!is_external_repo("http://127.0.0.1/repo"));
-        assert!(!is_external_repo("https://127.0.0.1:8080/repo"));
+        }
     }
 }

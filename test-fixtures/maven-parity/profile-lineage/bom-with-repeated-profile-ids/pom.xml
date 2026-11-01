@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  
+  <groupId>org.f4</groupId><artifactId>bom-with-repeated-profile-ids</artifactId><version>1.0</version>
+  <repositories><repository><id>repo</id><url>file://${project.basedir}/repo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+<dependencyManagement><dependencies><dependency><groupId>org.f4</groupId><artifactId>bom</artifactId><version>1.0</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement><dependencies><dependency><groupId>org.f4</groupId><artifactId>lib</artifactId></dependency></dependencies>
+</project>

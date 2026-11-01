@@ -1,81 +1,127 @@
 use reqwest::RequestBuilder;
-use rv_config::{
-    AuthConfig, AuthConfigLayers, AuthType, CredentialError, CredentialRecord, CredentialStore,
-    KeyringCredentialStore, NormalizedEndpoint,
-};
-use secrecy::{ExposeSecret, Secret};
-use std::collections::{HashMap, HashSet};
+use rv_config::{AuthConfig, AuthConfigLayers};
+use rv_store::metadata_cache::KeyedDigest;
+use secrecy::{ExposeSecret, SecretString};
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::{RepoError, Result};
-use crate::mirror::origins_differ;
-use crate::repository::{Repository, normalize_repo_url};
+use crate::repository::Repository;
+
+#[derive(Clone)]
+pub(crate) struct Auth {
+    pub(crate) scheme: Scheme,
+    pub(crate) sent: SentCredential,
+}
 
 /// Repository authentication methods.
 ///
 /// - `Basic`: username and password via HTTP Basic authentication.
 /// - `Bearer`: token via the Bearer scheme.
 #[derive(Clone)]
-pub(crate) enum Auth {
+pub(crate) enum Scheme {
     Basic {
         username: String,
-        password: Secret<String>,
+        password: SecretString,
     },
     Bearer {
-        token: Secret<String>,
+        token: SecretString,
     },
 }
 
 impl fmt::Debug for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Auth::Basic { username, .. } => f
+        match &self.scheme {
+            Scheme::Basic { username, .. } => f
                 .debug_struct("Basic")
                 .field("username", username)
                 .field("password", &"***")
                 .finish(),
-            Auth::Bearer { .. } => f.debug_struct("Bearer").field("token", &"***").finish(),
+            Scheme::Bearer { .. } => f.debug_struct("Bearer").field("token", &"***").finish(),
         }
     }
 }
-
-impl PartialEq for Auth {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Auth::Basic {
-                    username: u1,
-                    password: p1,
-                },
-                Auth::Basic {
-                    username: u2,
-                    password: p2,
-                },
-            ) => u1 == u2 && p1.expose_secret() == p2.expose_secret(),
-            (Auth::Bearer { token: t1 }, Auth::Bearer { token: t2 }) => {
-                t1.expose_secret() == t2.expose_secret()
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Auth {}
 
 impl Auth {
     pub(crate) fn apply(&self, request: RequestBuilder) -> RequestBuilder {
-        match self {
-            Auth::Basic { username, password } => {
+        match &self.scheme {
+            Scheme::Basic { username, password } => {
                 request.basic_auth(username, Some(password.expose_secret()))
             }
-            Auth::Bearer { token } => request.bearer_auth(token.expose_secret()),
+            Scheme::Bearer { token } => request.bearer_auth(token.expose_secret()),
+        }
+    }
+
+    /// A keyed digest of this credential as sent to `endpoint`, which tells
+    /// it from another credential, such as a replaced token, in the keys of
+    /// answers kept across runs, without holding the secret.
+    pub(crate) fn identity(&self, endpoint: &str, mut digest: KeyedDigest) -> String {
+        let mut field = |bytes: &[u8]| {
+            digest.update(&(bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        };
+        field(endpoint.as_bytes());
+        match &self.scheme {
+            Scheme::Basic { username, password } => {
+                field(b"basic");
+                field(username.as_bytes());
+                field(password.expose_secret().as_bytes());
+            }
+            Scheme::Bearer { token } => {
+                field(b"bearer");
+                field(token.expose_secret().as_bytes());
+            }
+        }
+        digest.finalize_hex()
+    }
+}
+
+/// The credential a refused request carried, by where it came from. It
+/// holds no secret, so errors carry it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentCredential {
+    /// The entry's id, `None` for the default entry.
+    pub id: Option<String>,
+    /// The file that holds the entry.
+    pub file: CredentialFile,
+    /// The variables of `${env.NAME}` references in a settings.xml entry
+    /// that are not set, so the repository received the reference as
+    /// written.
+    pub unset_variables: Vec<String>,
+}
+
+/// A file credentials are read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialFile {
+    /// The project `raeva.toml`.
+    Project,
+    /// The user `config.toml`.
+    User,
+    /// Maven's `settings.xml`.
+    Settings,
+}
+
+impl CredentialFile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Project => "project raeva.toml",
+            Self::User => "user config",
+            Self::Settings => "settings.xml",
         }
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host == "localhost" || host.starts_with("127.") || host == "::1" || host == "[::1]"
+/// Loopback by parsed host: `localhost`, any 127.0.0.0/8 address, or `::1`.
+/// A DNS name such as `127.example.com` is not loopback.
+fn is_loopback_host(host: Option<url::Host<&str>>) -> bool {
+    match host {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,6 +129,21 @@ struct ConfigAuthLayers {
     project: Vec<AuthConfig>,
     user: Vec<AuthConfig>,
     settings: Vec<AuthConfig>,
+}
+
+impl ConfigAuthLayers {
+    fn by_file(&self) -> [(CredentialFile, &[AuthConfig]); 3] {
+        [
+            (CredentialFile::Project, &self.project),
+            (CredentialFile::User, &self.user),
+            (CredentialFile::Settings, &self.settings),
+        ]
+    }
+
+    /// Whether a layer holds a default credential, one without an id.
+    fn has_default(&self) -> bool {
+        (self.by_file().iter()).any(|(_, configs)| configs.iter().any(|entry| entry.id.is_none()))
+    }
 }
 
 impl From<&AuthConfigLayers> for ConfigAuthLayers {
@@ -95,67 +156,11 @@ impl From<&AuthConfigLayers> for ConfigAuthLayers {
     }
 }
 
-#[derive(Debug, Default)]
-struct KeyringWarningState {
-    unavailable: bool,
-    entry_missing: bool,
-}
-
-/// The configured mirror URLs that must not receive the user's default
-/// (no-id) credentials.
-///
-/// Resolution records the *substituted* URL as a package's `repo_url`, so a
-/// later `rv sync` hands the mirror's own URL to the fetch path. Mirror
-/// selection then matches that URL against the very entry that produced it,
-/// short-circuits as a self-reference (`MIRROR_SELF_REF`) and reports
-/// `host_changed = false`, silently losing the cross-host suppression
-/// resolution applied. Recognising a mirror URL on its own restores the
-/// decision, so a sync reaches exactly the credentials resolution used:
-/// keyring endpoint matches and the mirror's own id-scoped entry, never the
-/// origin repository's entry (the sync path never carries the origin id) nor
-/// the id-less default.
-///
-/// A mirror sharing an origin with a configured repository is exempt: the
-/// default credential already reaches that origin through the repository
-/// itself, so routing it through the mirror leaks nothing new.
-#[derive(Debug, Clone, Default)]
-struct MirrorAuthPolicy {
-    foreign_mirror_urls: HashSet<String>,
-}
-
-impl MirrorAuthPolicy {
-    fn from_config(config: &rv_config::Config) -> Self {
-        let repositories = config.repositories();
-        Self {
-            foreign_mirror_urls: config
-                .mirrors()
-                .iter()
-                .filter(|mirror| {
-                    repositories
-                        .iter()
-                        .all(|repo| origins_differ(&repo.url, &mirror.url))
-                })
-                .map(|mirror| normalize_repo_url(&mirror.url))
-                .collect(),
-        }
-    }
-
-    fn suppresses_default_auth(&self, url: &str) -> bool {
-        self.foreign_mirror_urls.contains(&normalize_repo_url(url))
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct AuthStore {
     layers: ConfigAuthLayers,
-    credential_store: Arc<dyn CredentialStore>,
-    credential_cache: Arc<Mutex<HashMap<NormalizedEndpoint, Option<CredentialRecord>>>>,
-    keyring_warnings: Arc<Mutex<KeyringWarningState>>,
-    mirror_policy: MirrorAuthPolicy,
-    // Warn-once dedup for auth inputs rv could not use: repository URLs that
-    // are not valid credential endpoints, and config entries carrying none of
-    // the credential fields rv models. Keyed by a per-kind prefix so the two
-    // subjects cannot collide.
+    // Warn-once dedup for credential warnings, keyed by a per-kind prefix
+    // (`id-withheld:`, `default-withheld`) so the kinds cannot collide.
     unusable_warned: Arc<Mutex<HashSet<String>>>,
     // Per-instance dedup so independent AuthStores (e.g. per-test fixtures)
     // do not interfere with each other's CLEARTEXT_AUTH warning state.
@@ -163,6 +168,22 @@ pub(crate) struct AuthStore {
     // matches the previous process-wide semantics for a single logical store
     // while keeping the set scoped per-instance.
     cleartext_warned: Arc<Mutex<HashSet<(String, String)>>>,
+    /// The origins of the configured repositories, mirrors and transitive
+    /// repository allowlist, and of the repositories the project's own POMs
+    /// declare, when the store was built from a configuration. An entry with
+    /// an id goes to a repository a fetched POM declares only on one of
+    /// these: such a POM must not choose where the secret goes, but a
+    /// corporate parent may pair another id with a host the project uses.
+    named_origins: Option<NamedOrigins>,
+    /// The origins of the repositories and mirrors that the user's own
+    /// files name (see [`rv_config::Config::user_endpoint_urls`]), when the
+    /// store was built from a configuration. An entry without an id goes
+    /// only to these: nothing else ties it to an origin, and the project's
+    /// POMs and `raeva.toml` must not choose where it goes.
+    user_origins: Option<Arc<HashSet<String>>>,
+    /// Credential lookups made through this store and its clones.
+    #[cfg(test)]
+    lookups: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl fmt::Debug for AuthStore {
@@ -175,95 +196,117 @@ impl fmt::Debug for AuthStore {
 
 impl Default for AuthStore {
     fn default() -> Self {
-        Self::new(
-            ConfigAuthLayers::default(),
-            Arc::new(KeyringCredentialStore),
-        )
+        Self::new(ConfigAuthLayers::default())
     }
 }
 
 impl AuthStore {
     pub(crate) fn from_config(config: &rv_config::Config) -> Result<Self> {
-        let credential_store: Arc<dyn CredentialStore> = if config.os_credentials_enabled() {
-            Arc::new(KeyringCredentialStore)
-        } else {
-            Arc::new(NoCredentialStore)
-        };
+        let configured = (config.repositories().iter().map(|repo| repo.url.as_str()))
+            .chain(config.mirrors().iter().map(|mirror| mirror.url.as_str()))
+            .chain(config.user_endpoint_urls().iter().map(String::as_str));
+        let named = NamedOrigins::default();
+        (configured.chain(
+            config
+                .security
+                .transitive_repository_allowlist
+                .iter()
+                .map(String::as_str),
+        ))
+        .for_each(|url| named.add(url));
+        let user_origins = config
+            .user_endpoint_urls()
+            .iter()
+            .filter_map(|url| http_origin(url))
+            .collect();
         Ok(Self {
-            mirror_policy: MirrorAuthPolicy::from_config(config),
-            ..Self::new(
-                ConfigAuthLayers::from(config.auth_layers()),
-                credential_store,
-            )
+            named_origins: Some(named),
+            user_origins: Some(Arc::new(user_origins)),
+            ..Self::new(ConfigAuthLayers::from(config.auth_layers()))
         })
     }
 
+    /// Treat `urls` as the configured repositories, which the user's own
+    /// files name.
     #[cfg(test)]
-    pub(crate) fn without_os_credentials() -> Self {
-        Self::new(ConfigAuthLayers::default(), Arc::new(NoCredentialStore))
+    pub(crate) fn with_configured_urls(mut self, urls: &[&str]) -> Self {
+        let named = NamedOrigins::default();
+        urls.iter().for_each(|url| named.add(url));
+        self.user_origins = Some(Arc::new(
+            urls.iter().filter_map(|url| http_origin(url)).collect(),
+        ));
+        self.named_origins = Some(named);
+        self
+    }
+
+    /// Where [`crate::RepositoryPolicy`] records the origins of the project's
+    /// own POM repositories, when this store limits fetched POMs to named
+    /// origins.
+    pub(crate) fn named_origins(&self) -> Option<NamedOrigins> {
+        self.named_origins.clone()
+    }
+
+    /// How many times the named origins have grown, so a miss recorded
+    /// before a credential could follow is asked again.
+    pub(crate) fn generation(&self) -> u64 {
+        self.named_origins
+            .as_ref()
+            .map_or(0, |named| named.generation())
     }
 
     #[cfg(test)]
     pub(crate) fn from_auth_configs(configs: &[rv_config::AuthConfig]) -> Result<Self> {
-        Ok(Self::new(
-            ConfigAuthLayers {
-                project: configs.to_vec(),
-                ..ConfigAuthLayers::default()
-            },
-            Arc::new(NoCredentialStore),
-        ))
+        Ok(Self::new(ConfigAuthLayers {
+            project: configs.to_vec(),
+            ..ConfigAuthLayers::default()
+        }))
     }
 
-    fn new(layers: ConfigAuthLayers, credential_store: Arc<dyn CredentialStore>) -> Self {
+    fn new(layers: ConfigAuthLayers) -> Self {
         Self {
             layers,
-            credential_store,
-            credential_cache: Arc::new(Mutex::new(HashMap::new())),
-            keyring_warnings: Arc::new(Mutex::new(KeyringWarningState::default())),
-            mirror_policy: MirrorAuthPolicy::default(),
             unusable_warned: Arc::new(Mutex::new(HashSet::new())),
             cleartext_warned: Arc::new(Mutex::new(HashSet::new())),
+            named_origins: None,
+            user_origins: None,
+            #[cfg(test)]
+            lookups: Arc::default(),
         }
     }
 
     #[cfg(test)]
-    fn with_foreign_mirrors(mut self, urls: &[&str]) -> Self {
-        self.mirror_policy.foreign_mirror_urls =
-            urls.iter().map(|url| normalize_repo_url(url)).collect();
-        self
+    pub(crate) fn lookups(&self) -> usize {
+        self.lookups.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
-    fn with_sources_and_store(
+    fn with_sources(
         project: Vec<AuthConfig>,
         user: Vec<AuthConfig>,
         settings: Vec<AuthConfig>,
-        credential_store: Arc<dyn CredentialStore>,
     ) -> Self {
-        Self::new(
-            ConfigAuthLayers {
-                project,
-                user,
-                settings,
-            },
-            credential_store,
-        )
+        Self::new(ConfigAuthLayers {
+            project,
+            user,
+            settings,
+        })
     }
 
-    /// Look up auth for `repo`, optionally suppressing the default-fallback
-    /// when the repo URL is the result of a cross-host mirror substitution.
+    /// Look up auth for `repo`, the endpoint of a [`crate::routing::Route`].
     ///
-    /// `host_changed = true` is the signal from [`crate::mirror::MirrorSelector::resolve_with_host_change`]
-    /// that a wildcard mirror redirected the original repo to a different
-    /// host. In that case we must NOT forward the user's default (no-id)
-    /// credentials, since a third-party CDN should not receive a Nexus
-    /// bearer token. Id-matched entries are still honored: the user
-    /// explicitly opted into that pairing.
+    /// `host_changed` is the route's `cross_origin`: the endpoint is a mirror
+    /// on another origin than the repository it replaced. The user's default
+    /// (no-id) credential is then withheld, since a third-party CDN must not
+    /// receive a Nexus bearer token. Id-matched entries still apply: the user
+    /// paired that id with that endpoint.
     pub(crate) fn for_repository_with_policy(
         &self,
         repo: &Repository,
         host_changed: bool,
     ) -> Result<Option<Auth>> {
+        #[cfg(test)]
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(resolved) = self.lookup_auth(repo, host_changed)? else {
             return Ok(None);
         };
@@ -273,7 +316,7 @@ impl AuthStore {
         if let Ok(url) = url::Url::parse(&repo.url)
             && url.scheme() == "http"
             && let Some(host) = url.host_str()
-            && !is_loopback_host(host)
+            && !is_loopback_host(url.host())
         {
             self.warn_cleartext_auth_once(host, url.scheme());
         }
@@ -281,61 +324,31 @@ impl AuthStore {
     }
 
     fn lookup_auth(&self, repo: &Repository, host_changed: bool) -> Result<Option<Auth>> {
-        // A lockfile row records the mirror-substituted URL, so the caller's
-        // mirror pass cannot recompute the cross-host flag for it; see
-        // [`MirrorAuthPolicy`].
-        let host_changed = host_changed || self.mirror_policy.suppresses_default_auth(&repo.url);
-        // A repository URL the credential-endpoint normalizer rejects (query,
-        // userinfo, fragment, non-http(s) scheme) simply has no keyring
-        // identity. It is still a perfectly fetchable repository, so treat the
-        // rejection as "no endpoint match" and fall through to the configured
-        // sources and anonymous fetch rather than aborting the whole resolve.
-        // The strict normalizer still gates the endpoints `rv login` STORES.
-        let endpoint = match NormalizedEndpoint::parse(&repo.url) {
-            Ok(endpoint) => Some(endpoint),
-            Err(err) => {
-                self.warn_unusable_endpoint_once(&repo.url, &err.to_string());
-                None
-            }
-        };
-        let (record, entry_missing) = match endpoint.as_ref() {
-            Some(endpoint) => self.lookup_os_record(endpoint)?,
-            None => (None, false),
-        };
-        if let Some(record) = record {
-            let auth = auth_from_record(&record)?;
-            tracing::debug!(
-                endpoint = ?endpoint,
-                auth_method = %record.auth_type,
-                "using auth from OS credential store"
-            );
-            return Ok(Some(auth));
-        }
-        if entry_missing
-            && let Some(endpoint) = endpoint.as_ref()
-            && self.has_config_candidate(repo, host_changed)
-        {
-            self.warn_keyring_entry_missing_once(endpoint);
-        }
-
         if let Some(id) = repo.id.as_deref() {
-            for (source, configs) in [
-                ("project rv.toml", self.layers.project.as_slice()),
-                ("user config", self.layers.user.as_slice()),
-                ("settings.xml", self.layers.settings.as_slice()),
-            ] {
+            for (file, configs) in self.layers.by_file() {
+                let source = file.label();
                 if let Some(config) = configs.iter().find(|entry| entry.id.as_deref() == Some(id)) {
-                    // An entry carrying none of the fields rv models says
-                    // nothing about HTTP credentials for this id — a
+                    // An entry carrying none of the fields raeva models says
+                    // nothing about HTTP credentials for this id: a
                     // settings.xml `<server>` may exist purely for
                     // `<privateKey>`/`<passphrase>` scp deploys. Skipping it
                     // keeps the id usable; a PARTIALLY filled entry (say a
                     // username with no password) is still a hard error.
-                    if is_unmodeled_auth_entry(config) {
-                        self.warn_unmodeled_auth_entry_once(id, source);
+                    if config.token.is_none()
+                        && config.username.is_none()
+                        && config.password.is_none()
+                    {
+                        tracing::debug!(
+                            repo_id = id,
+                            auth_source = source,
+                            "ignoring auth entry with no username, password or token"
+                        );
                         continue;
                     }
-                    let auth = build_complete_auth(config, source)?;
+                    if self.withholds_id_credential(id, repo, source) {
+                        return Ok(None);
+                    }
+                    let auth = build_complete_auth(config, file, source)?;
                     tracing::debug!(
                         repo_id = id,
                         auth_method = auth.method(),
@@ -348,246 +361,202 @@ impl AuthStore {
         }
 
         if host_changed {
-            // `sec_code` is the JSON-envelope contract field that the CLI's
-            // `WarningCollectorLayer` picks up so this security event
-            // survives `--json` mode (where the fmt subscriber runs at
-            // `off`). The string code is the stable machine identifier
-            // documented in `rv_cli::output::WarningCollector`.
-            tracing::warn!(
-                sec_code = "CROSS_HOST_MIRROR",
-                repo_url = %repo.url,
-                "suppressing default credentials for cross-host mirror substitution"
-            );
+            // Only a default credential that exists is withheld; without one
+            // there is nothing to say.
+            if self.layers.has_default() {
+                tracing::warn!(
+                    sec_code = "CROSS_HOST_MIRROR",
+                    repo_url = %rv_config::redact_url(&repo.url),
+                    "not sending the default credential to the mirror {}, which is on another host than the repository it mirrors",
+                    rv_config::redact_url(&repo.url)
+                );
+            }
             return Ok(None);
         }
 
-        for (source, configs) in [
-            ("project rv.toml default", self.layers.project.as_slice()),
-            ("user config default", self.layers.user.as_slice()),
-            ("settings.xml default", self.layers.settings.as_slice()),
-        ] {
+        if self.withholds_default_credential(repo) {
+            return Ok(None);
+        }
+
+        for (file, configs) in self.layers.by_file() {
             if let Some(config) = configs.iter().find(|entry| entry.id.is_none()) {
-                return build_complete_auth(config, source).map(Some);
+                let source = format!("{} default", file.label());
+                return build_complete_auth(config, file, &source).map(Some);
             }
         }
         Ok(None)
     }
 
-    fn lookup_os_record(
-        &self,
-        endpoint: &NormalizedEndpoint,
-    ) -> Result<(Option<CredentialRecord>, bool)> {
-        if self
-            .keyring_warnings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .unavailable
+    /// Whether the entry for `id` is kept from `repo`, which a fetched POM
+    /// declares on an origin no configured repository or mirror and no
+    /// repository of the project's own POMs names. The project's own POMs
+    /// are trusted to pair their ids with `settings.xml` servers, as in
+    /// Maven. Reported once per id and origin.
+    fn withholds_id_credential(&self, id: &str, repo: &Repository, source: &str) -> bool {
+        if repo.provenance() != crate::Provenance::FetchedPom {
+            return false;
+        }
+        let Some(named) = self.named_origins.as_ref() else {
+            return false;
+        };
+        let origin = http_origin(&repo.url);
+        if origin
+            .as_deref()
+            .is_some_and(|origin| named.contains(origin))
         {
-            return Ok((None, false));
+            return false;
         }
-        let mut cache = self
-            .credential_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(record) = cache.get(endpoint) {
-            return Ok((record.clone(), record.is_none()));
-        }
-
-        match self.credential_store.get(endpoint) {
-            Ok(record) => {
-                cache.insert(endpoint.clone(), record.clone());
-                let missing = record.is_none();
-                Ok((record, missing))
-            }
-            Err(CredentialError::BackendUnavailable(details)) => {
-                self.warn_keyring_unavailable_once(&details);
-                Ok((None, false))
-            }
-            Err(err) => Err(RepoError::AuthError(err.to_string())),
-        }
-    }
-
-    fn warn_keyring_unavailable_once(&self, details: &str) {
-        let mut state = self
-            .keyring_warnings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.unavailable {
-            return;
-        }
-        tracing::warn!(
-            sec_code = "KEYRING_UNAVAILABLE",
-            error = %details,
-            "OS credential store is unavailable; using configured credentials"
-        );
-        // Set the flag only after the subscriber has processed the event, so
-        // a concurrent clone cannot return through the warn-once fast path
-        // while the warning is still being written.
-        state.unavailable = true;
-    }
-
-    fn warn_keyring_entry_missing_once(&self, endpoint: &NormalizedEndpoint) {
-        let mut state = self
-            .keyring_warnings
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.entry_missing {
-            return;
-        }
-        tracing::warn!(
-            sec_code = "KEYRING_ENTRY_MISSING",
-            endpoint = %endpoint,
-            "OS credential entry is missing; using configured credentials"
-        );
-        state.entry_missing = true;
-    }
-
-    fn warn_unusable_endpoint_once(&self, repo_url: &str, details: &str) {
-        let endpoint = redacted_repo_url(repo_url);
-        self.warn_unusable_once(
-            format!("endpoint:{endpoint}"),
-            || tracing::warn!(
-                sec_code = "KEYRING_ENTRY_MISSING",
-                endpoint = %endpoint,
-                error = %details,
-                "repository URL cannot be an OS credential endpoint; skipping the credential store for it"
-            ),
-        );
-    }
-
-    fn warn_unmodeled_auth_entry_once(&self, id: &str, source: &str) {
-        self.warn_unusable_once(format!("auth-entry:{source}:{id}"), || {
+        let origin = origin.unwrap_or_else(|| rv_config::redact_url(&repo.url));
+        let key = format!("id-withheld:{id}\u{1f}{origin}");
+        let (id, source) = (id.to_string(), source.to_string());
+        self.warn_unusable_once(key, move || {
             tracing::warn!(
+                sec_code = "ID_CREDENTIAL_WITHHELD",
                 repo_id = id,
+                origin = %origin,
                 auth_source = source,
-                "ignoring auth entry with no username, password or token; it carries only \
-                 fields rv does not model (e.g. privateKey/passphrase)"
+                "not sending the credential for repository id '{id}' to {origin}: a POM \
+                 fetched from a repository declared it, and neither your configuration nor \
+                 the project's POMs name that origin; declare the repository in raeva.toml, \
+                 config.toml or settings.xml if it should get the credential"
             )
+        });
+        true
+    }
+
+    /// Whether an entry without an id is kept from `repo`, whose origin no
+    /// repository or mirror in the user's own files names. A project could
+    /// otherwise collect it by declaring a repository on its own host in a
+    /// POM or `raeva.toml`, and so could any POM fetched from a repository.
+    fn withholds_default_credential(&self, repo: &Repository) -> bool {
+        let Some(user_origins) = self.user_origins.as_deref() else {
+            return false;
+        };
+        let origin = http_origin(&repo.url);
+        if origin
+            .as_ref()
+            .is_some_and(|origin| user_origins.contains(origin))
+        {
+            return false;
+        }
+        if self.layers.has_default() {
+            let origin = origin.unwrap_or_else(|| rv_config::redact_url(&repo.url));
+            self.warn_unusable_once(format!("default-withheld\u{1f}{origin}"), move || {
+                tracing::warn!(
+                    sec_code = "DEFAULT_CREDENTIAL_WITHHELD",
+                    origin = %origin,
+                    "not sending the [[auth]] entry without an id to {origin}: no repository \
+                     or mirror in config.toml or settings.xml names that origin; declare the \
+                     repository there, or give it an id and an [[auth]] entry with that id"
+                )
+            });
+        }
+        true
+    }
+
+    fn warn_unusable_once(&self, key: String, emit: impl FnOnce() + Send + Sync + 'static) {
+        let warned = Arc::clone(&self.unusable_warned);
+        rv_maven_model::held::when_shown(move || {
+            let first = (warned.lock())
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(key);
+            if first {
+                emit();
+            }
         });
     }
 
-    fn warn_unusable_once(&self, key: String, emit: impl FnOnce()) {
-        let mut guard = self
-            .unusable_warned
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.insert(key) {
-            emit();
-        }
-    }
-
-    fn has_config_candidate(&self, repo: &Repository, host_changed: bool) -> bool {
-        let layers = [
-            self.layers.project.as_slice(),
-            self.layers.user.as_slice(),
-            self.layers.settings.as_slice(),
-        ];
-        if let Some(id) = repo.id.as_deref()
-            && layers
-                .iter()
-                .any(|configs| configs.iter().any(|entry| entry.id.as_deref() == Some(id)))
-        {
-            return true;
-        }
-        !host_changed
-            && layers
-                .iter()
-                .any(|configs| configs.iter().any(|entry| entry.id.is_none()))
-    }
-
     fn warn_cleartext_auth_once(&self, host: &str, scheme: &str) {
-        let mut guard = match self.cleartext_warned.lock() {
-            Ok(g) => g,
+        let warned = Arc::clone(&self.cleartext_warned);
+        let (host, scheme) = (host.to_string(), scheme.to_string());
+        rv_maven_model::held::when_shown(move || {
             // A poisoned lock means another thread panicked while updating
             // the dedup set; surfacing the warn is still safer than dropping.
-            Err(p) => p.into_inner(),
-        };
-        if guard.insert((host.to_string(), scheme.to_string())) {
-            tracing::warn!(
-                sec_code = "CLEARTEXT_AUTH",
-                host = %host,
-                "attaching credentials to a plaintext HTTP request"
-            );
-        }
+            let first = (warned.lock())
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert((host.clone(), scheme));
+            if first {
+                tracing::warn!(
+                    sec_code = "CLEARTEXT_AUTH",
+                    host = %host,
+                    "attaching credentials to a plaintext HTTP request"
+                );
+            }
+        });
     }
 }
 
-struct NoCredentialStore;
+/// See [`AuthStore::named_origins`]. Grows while a resolution admits the
+/// project's POM repositories.
+#[derive(Clone, Default)]
+pub(crate) struct NamedOrigins(Arc<RwLock<HashSet<String>>>, Arc<AtomicU64>);
 
-impl CredentialStore for NoCredentialStore {
-    fn get(
-        &self,
-        _endpoint: &NormalizedEndpoint,
-    ) -> std::result::Result<Option<CredentialRecord>, CredentialError> {
-        Ok(None)
+impl NamedOrigins {
+    pub(crate) fn add(&self, url: &str) {
+        if let Some(origin) = http_origin(url)
+            && self
+                .0
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(origin)
+        {
+            self.1.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    fn set(
-        &self,
-        _endpoint: &NormalizedEndpoint,
-        _record: &CredentialRecord,
-    ) -> std::result::Result<(), CredentialError> {
-        Err(CredentialError::BackendUnavailable(
-            "OS credentials are disabled for this configuration".to_string(),
-        ))
+    /// How many origins have been added: an answer a request got before
+    /// the count changed may have been to a credential since allowed.
+    pub(crate) fn generation(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
     }
 
-    fn delete(&self, _endpoint: &NormalizedEndpoint) -> std::result::Result<bool, CredentialError> {
-        Err(CredentialError::BackendUnavailable(
-            "OS credentials are disabled for this configuration".to_string(),
-        ))
+    fn contains(&self, origin: &str) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(origin)
     }
+}
+
+fn http_origin(url: &str) -> Option<String> {
+    let url = url::Url::parse(url.trim()).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
 }
 
 impl Auth {
     fn method(&self) -> &'static str {
-        match self {
-            Self::Basic { .. } => "basic",
-            Self::Bearer { .. } => "bearer",
+        match self.scheme {
+            Scheme::Basic { .. } => "basic",
+            Scheme::Bearer { .. } => "bearer",
         }
     }
 }
 
-fn auth_from_record(record: &CredentialRecord) -> Result<Auth> {
-    match record.auth_type {
-        AuthType::Basic => Ok(Auth::Basic {
-            username: record.username.clone().ok_or_else(|| {
-                RepoError::AuthError(
-                    "credential record is corrupt: basic auth has no username".to_string(),
-                )
-            })?,
-            password: Secret::new(record.expose_secret().to_string()),
-        }),
-        AuthType::Bearer => Ok(Auth::Bearer {
-            token: Secret::new(record.expose_secret().to_string()),
-        }),
-    }
-}
-
-/// True when an auth entry carries none of the credential fields rv models.
-/// Such an entry cannot yield an `Auth`, and it must not be mistaken for a
-/// misconfigured one: `settings.xml` servers holding only `<privateKey>`,
-/// `<passphrase>` or `<filePermissions>` are standard for scp deploys.
-fn is_unmodeled_auth_entry(config: &AuthConfig) -> bool {
-    config.token.is_none() && config.username.is_none() && config.password.is_none()
-}
-
-/// A repository URL rendered for logging with everything secret-bearing
-/// removed: userinfo (`https://alice:secret@…`) and the query string
-/// (`?api_key=…`) both routinely carry credentials, and both are exactly what
-/// makes a URL unusable as a credential endpoint.
-fn redacted_repo_url(url: &str) -> String {
-    let Ok(mut parsed) = url::Url::parse(url.trim()) else {
-        return "<unparsable repository url>".to_string();
+fn build_complete_auth(config: &AuthConfig, file: CredentialFile, source: &str) -> Result<Auth> {
+    let scheme = complete_scheme(config, source)?;
+    let texts = match &scheme {
+        Scheme::Basic { username, password } => vec![username.as_str(), password.expose_secret()],
+        Scheme::Bearer { token } => vec![token.expose_secret()],
     };
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    parsed.to_string()
+    let mut unset_variables: Vec<String> = Vec::new();
+    // Only settings.xml interpolates, so only there does reference text
+    // stand for an unset variable.
+    if file == CredentialFile::Settings {
+        for name in texts.into_iter().flat_map(rv_config::unset_env_references) {
+            if !unset_variables.contains(&name) {
+                unset_variables.push(name);
+            }
+        }
+    }
+    let sent = SentCredential {
+        id: config.id.clone(),
+        file,
+        unset_variables,
+    };
+    Ok(Auth { scheme, sent })
 }
 
-fn build_complete_auth(config: &AuthConfig, source: &str) -> Result<Auth> {
+fn complete_scheme(config: &AuthConfig, source: &str) -> Result<Scheme> {
     if let Some(token) = config.token.as_ref() {
         if token.expose_secret().is_empty() {
             return Err(incomplete_auth_error(
@@ -596,7 +565,7 @@ fn build_complete_auth(config: &AuthConfig, source: &str) -> Result<Auth> {
                 "bearer auth requires a non-empty token",
             ));
         }
-        return Ok(Auth::Bearer {
+        return Ok(Scheme::Bearer {
             token: token.clone(),
         });
     }
@@ -605,7 +574,7 @@ fn build_complete_auth(config: &AuthConfig, source: &str) -> Result<Auth> {
         (Some(username), Some(password))
             if !username.is_empty() && !password.expose_secret().is_empty() =>
         {
-            Ok(Auth::Basic {
+            Ok(Scheme::Basic {
                 username: username.clone(),
                 password: password.clone(),
             })
@@ -624,889 +593,397 @@ fn incomplete_auth_error(config: &AuthConfig, source: &str, details: &str) -> Re
         .as_deref()
         .map(|id| format!(" for repository id {id:?}"))
         .unwrap_or_default();
-    RepoError::AuthError(format!("incomplete {source} auth entry{target}: {details}"))
+    RepoError::AuthSetup(format!("incomplete {source} auth entry{target}: {details}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
-    use super::{Auth, AuthStore};
-    use crate::mirror::MirrorSelector;
+    use super::{Auth, AuthStore, Scheme, is_loopback_host};
     use crate::repository::Repository;
-    use rv_config::{
-        AuthConfig, CredentialError, CredentialRecord, CredentialStore, NormalizedEndpoint,
-    };
-    use secrecy::{ExposeSecret, Secret};
+    use rv_config::AuthConfig;
+    use rv_test_support::capture_warnings;
+    use secrecy::{ExposeSecret, SecretString};
+
+    #[test]
+    fn loopback_is_decided_on_the_parsed_host() {
+        #[rustfmt::skip]
+        let cases = [
+            ("http://localhost/", true), ("http://LOCALHOST:8080/", true), ("http://127.255.0.9/", true),
+            ("http://[::1]/", true), ("http://127.example.com/", false), ("http://127.0.0.1.evil.test/", false),
+            ("http://localhost.evil.test/", false), ("http://10.0.0.1/", false), ("http://[::2]/", false),
+        ];
+        for (url, loopback) in cases {
+            assert_eq!(
+                is_loopback_host(url::Url::parse(url).unwrap().host()),
+                loopback,
+                "{url}"
+            );
+        }
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    #[derive(Clone, Copy)]
-    enum StoreFailure {
-        Unavailable,
-        Corrupt,
-    }
-
-    struct RecordingCredentialStore {
-        records: HashMap<NormalizedEndpoint, CredentialRecord>,
-        lookups: Mutex<Vec<NormalizedEndpoint>>,
-        failure: Option<StoreFailure>,
-    }
-
-    impl RecordingCredentialStore {
-        fn empty() -> Self {
-            Self {
-                records: HashMap::new(),
-                lookups: Mutex::new(Vec::new()),
-                failure: None,
-            }
-        }
-
-        fn with_record(endpoint: &str, record: CredentialRecord) -> Self {
-            Self {
-                records: HashMap::from([(
-                    NormalizedEndpoint::parse(endpoint).expect("endpoint"),
-                    record,
-                )]),
-                ..Self::empty()
-            }
-        }
-
-        fn failing(failure: StoreFailure) -> Self {
-            Self {
-                failure: Some(failure),
-                ..Self::empty()
-            }
-        }
-    }
-
-    impl CredentialStore for RecordingCredentialStore {
-        fn get(
-            &self,
-            endpoint: &NormalizedEndpoint,
-        ) -> std::result::Result<Option<CredentialRecord>, CredentialError> {
-            self.lookups.lock().expect("lock").push(endpoint.clone());
-            match self.failure {
-                Some(StoreFailure::Unavailable) => Err(CredentialError::BackendUnavailable(
-                    "test backend unavailable".to_string(),
-                )),
-                Some(StoreFailure::Corrupt) => Err(CredentialError::CorruptRecord(
-                    "test record has invalid JSON".to_string(),
-                )),
-                None => Ok(self.records.get(endpoint).cloned()),
-            }
-        }
-
-        fn set(
-            &self,
-            _endpoint: &NormalizedEndpoint,
-            _record: &CredentialRecord,
-        ) -> std::result::Result<(), CredentialError> {
-            unreachable!("read-only test credential store")
-        }
-
-        fn delete(
-            &self,
-            _endpoint: &NormalizedEndpoint,
-        ) -> std::result::Result<bool, CredentialError> {
-            unreachable!("read-only test credential store")
-        }
-    }
-
-    /// Run `body` under a scoped WARN-level subscriber and return everything
-    /// it logged.
-    fn capture_warnings(body: impl FnOnce()) -> String {
-        use std::io::Write;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct VecWriter(Arc<Mutex<Vec<u8>>>);
-        impl Write for VecWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("lock").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for VecWriter {
-            type Writer = VecWriter;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(VecWriter(output.clone()))
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        rv_test_support::with_default(subscriber, body);
-        String::from_utf8(output.lock().expect("lock").clone()).expect("UTF-8")
-    }
-
     fn empty_entry(id: &str) -> AuthConfig {
-        AuthConfig {
-            id: Some(id.to_string()),
-            username: None,
-            password: None,
-            token: None,
-        }
+        let mut auth = AuthConfig::new(None);
+        auth.id = Some(id.to_string());
+        auth
     }
 
     fn basic(id: Option<&str>, username: &str, password: &str) -> AuthConfig {
-        AuthConfig {
-            id: id.map(str::to_string),
-            username: Some(username.to_string()),
-            password: Some(Secret::new(password.to_string())),
-            token: None,
-        }
+        let mut auth = AuthConfig::new(id);
+        auth.username = Some(username.to_string());
+        auth.password = Some(SecretString::from(password.to_string()));
+        auth
     }
 
     fn bearer(id: Option<&str>, token: &str) -> AuthConfig {
-        AuthConfig {
-            id: id.map(str::to_string),
-            username: None,
-            password: None,
-            token: Some(Secret::new(token.to_string())),
-        }
+        let mut auth = AuthConfig::new(id);
+        auth.token = Some(SecretString::from(token.to_string()));
+        auth
     }
 
-    #[test]
-    fn resolves_auth_by_repo_id() {
-        let configs = vec![rv_config::AuthConfig {
-            id: Some("central".to_string()),
-            username: Some("user".to_string()),
-            password: Some(Secret::new("pass".to_string())),
-            token: None,
-        }];
-        let store = AuthStore::from_auth_configs(&configs).unwrap();
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2/",
-            true,
-            false,
-        );
-        let auth = store
-            .for_repository_with_policy(&repo, false)
-            .unwrap()
-            .unwrap();
+    fn repo(id: Option<&str>, url: &str) -> Repository {
+        Repository::new(id.map(str::to_string), url, true, false)
+    }
 
-        match auth {
-            Auth::Basic { username, password } => {
-                assert_eq!(username, "user");
-                assert_eq!(password.expose_secret(), "pass");
+    fn sources(
+        project: Vec<AuthConfig>,
+        user: Vec<AuthConfig>,
+        settings: Vec<AuthConfig>,
+    ) -> AuthStore {
+        AuthStore::with_sources(project, user, settings)
+    }
+
+    fn shown(auth: Option<&Auth>) -> Option<String> {
+        auth.map(|auth| match &auth.scheme {
+            Scheme::Basic { username, password } => {
+                format!("basic {username} {}", password.expose_secret())
             }
-            _ => panic!("expected basic auth"),
-        }
+            Scheme::Bearer { token } => format!("bearer {}", token.expose_secret()),
+        })
     }
 
+    /// Which entry answers for a repository id: the id-matched entry of the
+    /// highest-precedence source that carries a credential, then the id-less
+    /// default, which is withheld from a cross-host mirror. A `<server>` with
+    /// only fields raeva does not model, such as an scp private key, is skipped.
     #[test]
-    fn host_changed_suppresses_default_auth() {
-        // Default credentials must NOT be forwarded to a wildcard mirror
-        // running on a different host.
-        let configs = vec![rv_config::AuthConfig {
-            id: None,
-            username: None,
-            password: None,
-            token: Some(Secret::new("corp-bearer".to_string())),
-        }];
-        let store = AuthStore::from_auth_configs(&configs).unwrap();
-        let resolved = Repository::new(
-            Some("central".to_string()),
-            "https://cdn.example/",
-            true,
-            false,
-        );
-        // Without the policy: default token leaks (host_changed=false path).
-        assert!(
-            store
-                .for_repository_with_policy(&resolved, false)
-                .unwrap()
-                .is_some()
-        );
-        // With host_changed: default token is suppressed.
-        assert!(
-            store
-                .for_repository_with_policy(&resolved, true)
-                .unwrap()
-                .is_none(),
-            "default credentials must not be forwarded to a cross-host mirror"
-        );
-    }
-
-    #[test]
-    fn host_changed_still_honors_id_matched_auth() {
-        // An explicit id-matched AuthConfig wins regardless of host change,
-        // because the user opted into that mapping.
-        let configs = vec![rv_config::AuthConfig {
-            id: Some("mirror-id".to_string()),
-            username: None,
-            password: None,
-            token: Some(Secret::new("mirror-token".to_string())),
-        }];
-        let store = AuthStore::from_auth_configs(&configs).unwrap();
-        let resolved = Repository::new(
-            Some("mirror-id".to_string()),
-            "https://cdn.example/",
-            true,
-            false,
-        );
-        assert!(
-            store
-                .for_repository_with_policy(&resolved, true)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn cleartext_auth_warn_fires_for_http_non_loopback() {
-        // Per-instance dedup: a freshly built AuthStore has its own warn
-        // set, so test ordering can no longer leak warning state.
-        let configs = vec![rv_config::AuthConfig {
-            id: None,
-            username: None,
-            password: None,
-            token: Some(Secret::new("token".to_string())),
-        }];
-        let store = AuthStore::from_auth_configs(&configs).unwrap();
-
-        let plain_repo = Repository::new(None, "http://repo.example/", true, false);
-        let same_repo = Repository::new(None, "http://repo.example/other", true, false);
-        let loopback = Repository::new(None, "http://127.0.0.1:8080/", true, false);
-        let loopback_named = Repository::new(None, "http://localhost/", true, false);
-
-        let output = capture_warnings(|| {
-            let _ = store.for_repository_with_policy(&plain_repo, false);
-            // Second call to same host should NOT emit a duplicate warn.
-            let _ = store.for_repository_with_policy(&same_repo, false);
-            // Loopback must NOT warn.
-            let _ = store.for_repository_with_policy(&loopback, false);
-            let _ = store.for_repository_with_policy(&loopback_named, false);
-        });
-
-        assert!(
-            output.contains("CLEARTEXT_AUTH"),
-            "expected CLEARTEXT_AUTH warning, got: {output}"
-        );
-        assert!(
-            output.contains("repo.example"),
-            "expected host in warning, got: {output}"
-        );
-        assert!(
-            !output.contains("127.0.0.1") && !output.contains("localhost"),
-            "loopback must not warn: {output}"
-        );
-        let count = output.matches("CLEARTEXT_AUTH").count();
-        assert_eq!(count, 1, "dedup must collapse repeat warns, got {count}");
-    }
-
-    #[test]
-    fn resolves_default_auth() {
-        let configs = vec![rv_config::AuthConfig {
-            id: None,
-            username: None,
-            password: None,
-            token: Some(Secret::new("token".to_string())),
-        }];
-        let store = AuthStore::from_auth_configs(&configs).unwrap();
-        let repo = Repository::new(None, "https://repo.example/", true, false);
-        let auth = store
-            .for_repository_with_policy(&repo, false)
-            .unwrap()
-            .unwrap();
-
-        match auth {
-            Auth::Bearer { token } => {
-                assert_eq!(token.expose_secret(), "token");
-            }
-            _ => panic!("expected bearer auth"),
-        }
-    }
-
-    #[test]
-    fn project_basic_replaces_lower_precedence_settings_bearer() {
-        let store = AuthStore::with_sources_and_store(
-            vec![basic(Some("corp"), "project-user", "project-password")],
-            Vec::new(),
-            vec![bearer(Some("corp"), "settings-bearer-must-not-survive")],
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/maven2/",
-            true,
-            false,
-        );
-
-        let auth = store
-            .for_repository_with_policy(&repo, false)
-            .expect("lookup")
-            .expect("auth");
-        match auth {
-            Auth::Basic { username, password } => {
-                assert_eq!(username, "project-user");
-                assert_eq!(password.expose_secret(), "project-password");
-            }
-            Auth::Bearer { .. } => {
-                panic!("lower-precedence bearer token survived under project basic auth")
-            }
-        }
-    }
-
-    #[test]
-    fn loaded_project_basic_does_not_inherit_settings_bearer() {
-        let _env_guard = ENV_LOCK.lock().expect("env lock");
-        let home = tempfile::tempdir().expect("home");
-        let project = home.path().join("project");
-        std::fs::create_dir_all(&project).expect("project");
-        std::fs::write(
-            project.join("rv.toml"),
-            r#"[[auth]]
-id = "corp"
-username = "project-user"
-password = "project-password"
-"#,
-        )
-        .expect("rv.toml");
-        let m2 = home.path().join(".m2");
-        std::fs::create_dir_all(&m2).expect("m2");
-        std::fs::write(
-            m2.join("settings.xml"),
-            r#"<settings>
-  <servers>
-    <server>
-      <id>corp</id>
-      <configuration>
-        <httpHeaders>
-          <property>
-            <name>Authorization</name>
-            <value>Bearer lower-settings-token</value>
-          </property>
-        </httpHeaders>
-      </configuration>
-    </server>
-  </servers>
-</settings>"#,
-        )
-        .expect("settings.xml");
-        let home_string = home.path().to_string_lossy().into_owned();
-        let raeva_home = home.path().join("raeva");
-        let raeva_home_string = raeva_home.to_string_lossy().into_owned();
-
-        temp_env::with_vars(
-            [
-                ("HOME", Some(home_string.as_str())),
-                ("USERPROFILE", Some(home_string.as_str())),
-                ("RAEVA_HOME", Some(raeva_home_string.as_str())),
-            ],
-            || {
-                let config = rv_config::Config::load(&project).expect("config");
-                let layers = config.auth_layers();
-                let store = AuthStore::with_sources_and_store(
-                    layers.project().to_vec(),
-                    layers.user().to_vec(),
-                    layers.settings().to_vec(),
-                    Arc::new(RecordingCredentialStore::empty()),
-                );
-                let repo = Repository::new(
-                    Some("corp".to_string()),
-                    "https://repo.example/",
-                    true,
-                    false,
-                );
-
-                let auth = store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("lookup")
-                    .expect("auth");
-                match auth {
-                    Auth::Basic { username, password } => {
-                        assert_eq!(username, "project-user");
-                        assert_eq!(password.expose_secret(), "project-password");
-                    }
-                    Auth::Bearer { .. } => {
-                        panic!("settings bearer survived under loaded project basic auth")
-                    }
-                }
-            },
-        );
-    }
-
-    #[test]
-    fn user_auth_precedes_settings_auth() {
-        let store = AuthStore::with_sources_and_store(
-            Vec::new(),
-            vec![basic(Some("corp"), "user-config", "user-password")],
-            vec![bearer(Some("corp"), "settings-token")],
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let auth = store
-            .for_repository_with_policy(&repo, false)
-            .expect("lookup")
-            .expect("auth");
-        match auth {
-            Auth::Basic { username, .. } => assert_eq!(username, "user-config"),
-            Auth::Bearer { .. } => panic!("settings auth must not override user config"),
-        }
-    }
-
-    #[test]
-    fn id_scoped_settings_auth_precedes_idless_default() {
-        let store = AuthStore::with_sources_and_store(
-            vec![bearer(None, "project-default")],
-            Vec::new(),
-            vec![basic(Some("corp"), "settings-user", "settings-password")],
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let auth = store
-            .for_repository_with_policy(&repo, false)
-            .expect("lookup")
-            .expect("auth");
-        match auth {
-            Auth::Basic { username, .. } => assert_eq!(username, "settings-user"),
-            Auth::Bearer { .. } => panic!("id-less default must be the final fallback"),
+    fn credentials_follow_id_precedence_and_host_change() {
+        let (corp, cdn) = ("https://repo.example/", "https://cdn.example/");
+        let (none, empty) = (Vec::new, || vec![empty_entry("corp")]);
+        #[rustfmt::skip]
+        let cases = [
+            (sources(vec![basic(Some("corp"), "u", "p")], none(), none()), Some("corp"), corp, false, Some("basic u p")),
+            (sources(vec![bearer(None, "token")], none(), none()), None, corp, false, Some("bearer token")),
+            (sources(none(), none(), vec![bearer(None, "default")]), Some("central"), cdn, true, None),
+            (sources(none(), none(), vec![bearer(Some("corp"), "id-token")]), Some("corp"), cdn, true, Some("bearer id-token")),
+            (sources(vec![basic(Some("corp"), "project-user", "pw")], none(), vec![bearer(Some("corp"), "lower")]),
+                Some("corp"), corp, false, Some("basic project-user pw")),
+            (sources(none(), vec![basic(Some("corp"), "user-config", "pw")], vec![bearer(Some("corp"), "lower")]),
+                Some("corp"), corp, false, Some("basic user-config pw")),
+            (sources(vec![bearer(None, "project-default")], none(), vec![basic(Some("corp"), "settings-user", "pw")]),
+                Some("corp"), corp, false, Some("basic settings-user pw")),
+            (sources(none(), none(), empty()), Some("corp"), corp, false, None),
+            (sources(empty(), vec![bearer(Some("corp"), "user-token")], none()), Some("corp"), corp, false, Some("bearer user-token")),
+        ];
+        for (index, (store, id, url, host_changed, expected)) in cases.into_iter().enumerate() {
+            let auth = store
+                .for_repository_with_policy(&repo(id, url), host_changed)
+                .unwrap();
+            assert_eq!(shown(auth.as_ref()).as_deref(), expected, "case {index}");
         }
     }
 
     #[test]
     fn incomplete_higher_precedence_entry_is_a_config_error() {
-        let incomplete = AuthConfig {
-            id: Some("corp".to_string()),
-            username: Some("project-user".to_string()),
-            password: None,
-            token: None,
-        };
-        let store = AuthStore::with_sources_and_store(
+        let mut incomplete = AuthConfig::new(Some("corp"));
+        incomplete.username = Some("project-user".to_string());
+        let store = sources(
             vec![incomplete],
             vec![bearer(Some("corp"), "lower-token")],
             Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
         );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
         let err = store
-            .for_repository_with_policy(&repo, false)
+            .for_repository_with_policy(&repo(Some("corp"), "https://repo.example/"), false)
             .expect_err("incomplete project entry must block lower sources");
         let message = err.to_string();
-        assert!(message.contains("incomplete project rv.toml auth entry"));
+        assert!(message.contains("incomplete project raeva.toml auth entry"));
         assert!(message.contains("username and password"));
         assert!(!message.contains("lower-token"));
     }
 
     #[test]
-    fn exact_keyring_endpoint_overrides_config_auth() {
-        let keyring = Arc::new(RecordingCredentialStore::with_record(
-            "https://repo.example/maven2/",
-            CredentialRecord::bearer("keyring-token").expect("record"),
-        ));
-        let store = AuthStore::with_sources_and_store(
-            vec![basic(Some("corp"), "config-user", "config-password")],
-            Vec::new(),
-            Vec::new(),
-            keyring,
+    fn cleartext_auth_warns_once_per_host_and_not_for_loopback() {
+        let store = sources(vec![bearer(None, "token")], vec![], vec![]);
+        let output = capture_warnings(|| {
+            for url in [
+                "http://repo.example/",
+                "http://repo.example/other",
+                "http://127.0.0.1:8080/",
+                "http://localhost/",
+            ] {
+                let _ = store.for_repository_with_policy(&repo(None, url), false);
+            }
+        });
+        assert_eq!(output.matches("CLEARTEXT_AUTH").count(), 1, "{output}");
+        assert!(output.contains("repo.example"), "{output}");
+        assert!(
+            !output.contains("127.0.0.1") && !output.contains("localhost"),
+            "{output}"
         );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example:443/maven2",
-            true,
-            false,
-        );
-
-        let auth = store
-            .for_repository_with_policy(&repo, false)
-            .expect("lookup")
-            .expect("auth");
-        match auth {
-            Auth::Bearer { token } => assert_eq!(token.expose_secret(), "keyring-token"),
-            Auth::Basic { .. } => panic!("config auth must not override exact keyring endpoint"),
-        }
     }
 
+    /// A lookup whose events are held and never shown leaves the warning to
+    /// the next one.
     #[test]
-    fn mirror_and_origin_use_separate_endpoint_lookups() {
-        let mirror_endpoint = "https://mirror.example/repository/";
-        let origin_endpoint = "https://origin.example/maven2/";
-        let mut records = HashMap::new();
-        records.insert(
-            NormalizedEndpoint::parse(mirror_endpoint).expect("mirror endpoint"),
-            CredentialRecord::bearer("mirror-token").expect("mirror record"),
-        );
-        records.insert(
-            NormalizedEndpoint::parse(origin_endpoint).expect("origin endpoint"),
-            CredentialRecord::basic("origin-user", "origin-password").expect("origin record"),
-        );
-        let keyring = Arc::new(RecordingCredentialStore {
-            records,
-            ..RecordingCredentialStore::empty()
+    fn a_dropped_hold_leaves_the_cleartext_warning_to_the_next_lookup() {
+        let store = sources(vec![bearer(None, "token")], vec![], vec![]);
+        let output = capture_warnings(|| {
+            let holds = rv_maven_model::held::Holds::default();
+            let lookup = async {
+                store.for_repository_with_policy(&repo(None, "http://repo.example/"), false)
+            };
+            drop(futures::executor::block_on(holds.hold(lookup)));
+            let _ = store.for_repository_with_policy(&repo(None, "http://repo.example/"), false);
         });
-        let store =
-            AuthStore::with_sources_and_store(Vec::new(), Vec::new(), Vec::new(), keyring.clone());
-        let selector = MirrorSelector::from_mirrors(vec![rv_config::MirrorConfig {
-            id: Some("mirror".to_string()),
-            url: mirror_endpoint.to_string(),
-            mirror_of: vec!["central".to_string()],
-        }]);
-        let origin = Repository::new(Some("central".to_string()), origin_endpoint, true, false);
-        let (mirror, host_changed) = selector.resolve_with_host_change(&origin);
+        assert_eq!(output.matches("CLEARTEXT_AUTH").count(), 1, "{output}");
+    }
 
-        let mirror_auth = store
-            .for_repository_with_policy(&mirror, host_changed)
-            .expect("mirror lookup")
-            .expect("mirror auth");
-        let origin_auth = store
-            .for_repository_with_policy(&origin, false)
-            .expect("origin lookup")
-            .expect("origin auth");
-        assert!(matches!(mirror_auth, Auth::Bearer { .. }));
-        assert!(matches!(origin_auth, Auth::Basic { .. }));
-        let lookups = keyring.lookups.lock().expect("lock");
+    /// An id-scoped credential goes to any repository the configuration or
+    /// the project's own POMs declare with the id, as in Maven, but to one a
+    /// fetched POM declares only on an origin those name. Withholding it is
+    /// reported once, without the secret.
+    #[test]
+    fn a_fetched_pom_cannot_send_an_id_credential_to_its_own_origin() {
+        let store = AuthStore::from_auth_configs(&[bearer(Some("corp"), "corp-secret")])
+            .unwrap()
+            .with_configured_urls(&["https://nexus.corp/maven/"]);
+        let policy = crate::RepositoryPolicy::new(
+            &rv_config::Config::for_testing(
+                ".".into(),
+                rv_config::ResolvedPaths::for_testing().unwrap(),
+            ),
+            crate::transport::ClientSet::screened().grants(),
+            store.named_origins(),
+        );
+        // The project's own POM pairs a repository with a settings.xml
+        // server by id; that is the usual Maven setup.
+        let project = policy
+            .admit(
+                [repo(Some("corp"), "https://nexus2.corp/maven/")],
+                crate::Declaration::LocalPom,
+            )
+            .admitted;
+        let fetched = |url: &str| {
+            let mut repo = repo(Some("corp"), url);
+            repo.set_provenance(crate::Provenance::FetchedPom);
+            repo
+        };
+        let mut configured = repo(Some("corp"), "https://nexus.corp/other/");
+        configured.set_provenance(crate::Provenance::Configured);
+        let claimed = fetched("https://evil.example/maven/");
+
+        let output = capture_warnings(|| {
+            for (repo, sent) in [
+                (&configured, true),
+                (&project[0], true),
+                (&fetched("https://nexus.corp/snapshots/"), true),
+                (&fetched("https://nexus2.corp/snapshots/"), true),
+                (&claimed, false),
+                (&claimed, false),
+            ] {
+                let auth = store.for_repository_with_policy(repo, false).unwrap();
+                assert_eq!(auth.is_some(), sent, "{}", repo.url);
+            }
+        });
         assert_eq!(
-            lookups.as_slice(),
-            [
-                NormalizedEndpoint::parse(mirror_endpoint).expect("mirror"),
-                NormalizedEndpoint::parse(origin_endpoint).expect("origin"),
-            ]
+            output.matches("ID_CREDENTIAL_WITHHELD").count(),
+            1,
+            "{output}"
         );
-    }
-
-    #[test]
-    fn unavailable_keyring_warns_once_and_falls_through() {
-        let store = AuthStore::with_sources_and_store(
-            vec![basic(Some("corp"), "config-user", "config-password")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::failing(StoreFailure::Unavailable)),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let output = capture_warnings(|| {
-            assert!(
-                store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("first lookup")
-                    .is_some()
-            );
-            assert!(
-                store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("second lookup")
-                    .is_some()
-            );
-        });
-
-        assert_eq!(output.matches("KEYRING_UNAVAILABLE").count(), 1);
-    }
-
-    #[test]
-    fn concurrent_lookup_waits_for_keyring_warning_emission() {
-        use std::io::Write;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Barrier, mpsc};
-        use std::thread;
-        use std::time::Duration;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone)]
-        struct BlockingWriter {
-            entered: Arc<Barrier>,
-            release: Arc<Barrier>,
-            blocked_once: Arc<AtomicBool>,
+        assert!(output.contains("https://evil.example"), "{output}");
+        for absent in ["nexus.corp", "nexus2.corp", "corp-secret"] {
+            assert!(!output.contains(absent), "{output}");
         }
+    }
 
-        impl Write for BlockingWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                if !self.blocked_once.swap(true, Ordering::SeqCst) {
-                    self.entered.wait();
-                    self.release.wait();
+    /// An entry without an id goes only to an origin the user's files name.
+    /// A POM or a project `raeva.toml` cannot collect it by declaring a
+    /// repository on its own host.
+    #[test]
+    fn the_default_credential_goes_only_to_an_origin_the_user_names() {
+        let store = AuthStore::from_auth_configs(&[bearer(None, "default-secret")])
+            .unwrap()
+            .with_configured_urls(&["https://nexus.corp/maven/"]);
+        let output = capture_warnings(|| {
+            for provenance in [
+                crate::Provenance::Caller,
+                crate::Provenance::Configured,
+                crate::Provenance::LocalPom,
+                crate::Provenance::FetchedPom,
+            ] {
+                for (url, allowed) in [
+                    ("https://evil.example/maven/", false),
+                    ("http://nexus.corp/maven/", false),
+                    ("https://nexus.corp/other/", true),
+                ] {
+                    let mut repo = repo(None, url);
+                    repo.set_provenance(provenance);
+                    let auth = store.for_repository_with_policy(&repo, false).unwrap();
+                    assert_eq!(auth.is_some(), allowed, "{url} {provenance:?}");
                 }
-                Ok(buf.len())
             }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> MakeWriter<'a> for BlockingWriter {
-            type Writer = BlockingWriter;
-
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(BlockingWriter {
-                entered: Arc::clone(&entered),
-                release: Arc::clone(&release),
-                blocked_once: Arc::new(AtomicBool::new(false)),
-            })
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let store = AuthStore::with_sources_and_store(
-            vec![basic(Some("corp"), "config-user", "config-password")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::failing(StoreFailure::Unavailable)),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let first_store = store.clone();
-        let first_repo = repo.clone();
-        let first = thread::spawn(move || {
-            rv_test_support::with_default(subscriber, || {
-                first_store
-                    .for_repository_with_policy(&first_repo, false)
-                    .expect("first lookup")
-            })
         });
-        entered.wait();
-
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let second = thread::spawn(move || {
-            started_tx.send(()).expect("signal start");
-            let result = store
-                .for_repository_with_policy(&repo, false)
-                .expect("second lookup");
-            done_tx.send(result.is_some()).expect("signal completion");
-        });
-        started_rx.recv().expect("second lookup started");
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "a concurrent lookup returned before the warn-once event finished emitting"
+        assert_eq!(
+            output.matches("DEFAULT_CREDENTIAL_WITHHELD").count(),
+            2,
+            "{output}"
         );
-
-        release.wait();
-        assert!(first.join().expect("first thread").is_some());
-        assert!(done_rx.recv().expect("second lookup completed"));
-        second.join().expect("second thread");
+        assert!(output.contains("https://evil.example"), "{output}");
+        assert!(output.contains("http://nexus.corp"), "{output}");
+        assert!(!output.contains("default-secret"), "{output}");
     }
 
+    /// The user's origins come from `config.toml` and `settings.xml`, or the
+    /// built-in repositories when no file names one, never from `raeva.toml`.
     #[test]
-    fn missing_keyring_entry_warns_once_and_falls_through() {
-        let store = AuthStore::with_sources_and_store(
-            vec![basic(Some("corp"), "config-user", "config-password")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let output = capture_warnings(|| {
-            assert!(
-                store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("first lookup")
-                    .is_some()
+    fn a_project_rv_toml_repository_does_not_get_the_default_credential() {
+        let _env_guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("home");
+        let project = home.path().join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let raeva_home = home.path().join("raeva");
+        std::fs::create_dir_all(&raeva_home).expect("raeva home");
+        let lookup = |raeva_toml: &str, config_toml: &str, url: &str| {
+            std::fs::write(project.join("raeva.toml"), raeva_toml).expect("raeva.toml");
+            std::fs::write(raeva_home.join("config.toml"), config_toml).expect("config.toml");
+            temp_env::with_vars(
+                [
+                    ("HOME", Some(home.path().as_os_str())),
+                    ("USERPROFILE", Some(home.path().as_os_str())),
+                    (
+                        rv_config::MAVEN_USER_HOME_TEST_ENV,
+                        Some(home.path().as_os_str()),
+                    ),
+                    ("RAEVA_HOME", Some(raeva_home.as_os_str())),
+                ],
+                || {
+                    let config = rv_config::Config::load(&project).expect("config");
+                    let store = AuthStore::from_config(&config).expect("store");
+                    let mut repo = repo(None, url);
+                    repo.set_provenance(crate::Provenance::Configured);
+                    store
+                        .for_repository_with_policy(&repo, false)
+                        .expect("lookup")
+                        .is_some()
+                },
+            )
+        };
+        let default = "[[auth]]\ntoken = \"default-secret\"\n";
+        let user_repo = format!("{default}[[repositories]]\nurl = \"https://nexus.corp/maven/\"\n");
+        let project_repo = "[[repositories]]\nurl = \"https://evil.example/maven/\"\n";
+        let (nexus, evil) = ("https://nexus.corp/maven/", "https://evil.example/maven/");
+        let central = "https://repo1.maven.org/maven2/";
+        // The built-in Central is the user's, whatever else is listed.
+        #[rustfmt::skip]
+        let cases = [
+            (project_repo, user_repo.as_str(), nexus, true),
+            (project_repo, &user_repo, evil, false),
+            ("", default, central, true),
+            (project_repo, default, central, true),
+        ];
+        for (raeva_toml, config_toml, url, allowed) in cases {
+            assert_eq!(
+                lookup(raeva_toml, config_toml, url),
+                allowed,
+                "{raeva_toml} {url}"
             );
-            assert!(
-                store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("second lookup")
-                    .is_some()
-            );
-        });
-
-        assert_eq!(output.matches("KEYRING_ENTRY_MISSING").count(), 1);
-    }
-
-    #[test]
-    fn corrupt_keyring_record_is_a_hard_error() {
-        let store = AuthStore::with_sources_and_store(
-            vec![basic(Some("corp"), "config-user", "config-password")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::failing(StoreFailure::Corrupt)),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let err = store
-            .for_repository_with_policy(&repo, false)
-            .expect_err("corrupt keyring record must not fall through");
-        assert!(err.to_string().contains("credential record is corrupt"));
-        assert!(!err.to_string().contains("config-password"));
-    }
-
-    /// A lockfile records the mirror-SUBSTITUTED url, so a later sync hands
-    /// the mirror's own url to the fetch path and mirror selection can no
-    /// longer see the host change. The default (no-id) credential must still
-    /// be withheld from that third-party origin.
-    #[test]
-    fn mirror_url_alone_suppresses_the_default_credential() {
-        let store = AuthStore::with_sources_and_store(
-            vec![bearer(None, "corp-token")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        )
-        .with_foreign_mirrors(&["https://cdn.example/maven"]);
-        // `repository_for_package` rebuilds the repo from the mirror entry, so
-        // it carries the MIRROR's id and the caller's flag reads false.
-        let recorded = Repository::new(
-            Some("cdn".to_string()),
-            "https://cdn.example/maven/",
-            true,
-            true,
-        );
-
-        assert!(
-            store
-                .for_repository_with_policy(&recorded, false)
-                .expect("lookup")
-                .is_none(),
-            "the corp default token must not reach a cross-host mirror on re-sync"
-        );
-    }
-
-    /// Control: a mirror sharing an origin with a configured repository is not
-    /// foreign, so the default credential still flows to it.
-    #[test]
-    fn same_host_mirror_url_still_receives_the_default_credential() {
-        let store = AuthStore::with_sources_and_store(
-            vec![bearer(None, "corp-token")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        )
-        .with_foreign_mirrors(&["https://cdn.example/maven"]);
-        let recorded = Repository::new(
-            Some("internal".to_string()),
-            "https://nexus.corp/mirror/",
-            true,
-            true,
-        );
-
-        assert!(
-            store
-                .for_repository_with_policy(&recorded, false)
-                .expect("lookup")
-                .is_some()
-        );
-    }
-
-    /// The mirror's OWN id-scoped credential is still honored on a re-sync:
-    /// the user paired that id with that url deliberately.
-    #[test]
-    fn mirror_url_still_honors_the_mirror_id_credential() {
-        let store = AuthStore::with_sources_and_store(
-            vec![bearer(Some("cdn"), "cdn-token"), bearer(None, "corp-token")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        )
-        .with_foreign_mirrors(&["https://cdn.example/maven"]);
-        let recorded = Repository::new(
-            Some("cdn".to_string()),
-            "https://cdn.example/maven/",
-            true,
-            true,
-        );
-
-        match store
-            .for_repository_with_policy(&recorded, false)
-            .expect("lookup")
-            .expect("auth")
-        {
-            Auth::Bearer { token } => assert_eq!(token.expose_secret(), "cdn-token"),
-            Auth::Basic { .. } => panic!("expected the mirror's own bearer token"),
         }
     }
 
-    /// Regression: a repo url the credential-endpoint normalizer rejects must
-    /// not abort the resolve. It has no keyring identity, nothing more.
     #[test]
-    fn query_string_repo_url_fetches_anonymously_with_a_warn() {
-        let store = AuthStore::with_sources_and_store(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let repo = Repository::new(
-            None,
-            "https://repo.example/maven2?api_key=s3cr3t",
-            true,
-            false,
-        );
-
-        let output = capture_warnings(|| {
-            assert!(
-                store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("an unnormalizable repo url must not fail the lookup")
-                    .is_none(),
-                "no credentials are configured, so the fetch is anonymous"
+    fn id_collisions_do_not_hide_active_user_credential_origins() {
+        let _env_guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("project");
+        let raeva_home = home.path().join("raeva");
+        for dir in [&project, &raeva_home, &home.path().join(".m2")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let profile = |id: &str, host: &str| {
+            format!(
+                "<profile><id>{id}</id><repositories><repository><id>shared</id>\
+             <url>https://{host}/repo/</url></repository></repositories></profile>"
+            )
+        };
+        std::fs::write(
+            home.path().join(".m2/settings.xml"),
+            format!(
+                "<settings><servers><server><id>corp</id><username>u</username>\
+             <password>secret</password></server></servers><profiles>{}{}{}</profiles>\
+             <activeProfiles><activeProfile>a</activeProfile><activeProfile>b</activeProfile>\
+             </activeProfiles></settings>",
+                profile("a", "a.example"),
+                profile("b", "b.example"),
+                profile("inactive", "inactive.example")
+            ),
+        )
+        .unwrap();
+        for project_config in [
+            "",
+            "[[repositories]]\nid = \"shared\"\nurl = \"https://project.example/repo/\"\n",
+        ] {
+            std::fs::write(project.join("raeva.toml"), project_config).unwrap();
+            temp_env::with_vars(
+                [
+                    ("HOME", Some(home.path().as_os_str())),
+                    ("USERPROFILE", Some(home.path().as_os_str())),
+                    (
+                        rv_config::MAVEN_USER_HOME_TEST_ENV,
+                        Some(home.path().as_os_str()),
+                    ),
+                    ("RAEVA_HOME", Some(raeva_home.as_os_str())),
+                ],
+                || {
+                    let config = rv_config::Config::load(&project).unwrap();
+                    assert!(
+                        !config
+                            .repositories()
+                            .iter()
+                            .any(|repo| repo.url.contains("b.example"))
+                    );
+                    let store = AuthStore::from_config(&config).unwrap();
+                    for (host, allowed) in [
+                        ("a.example", true),
+                        ("b.example", true),
+                        ("inactive.example", false),
+                    ] {
+                        let mut repo = repo(Some("corp"), &format!("https://{host}/fetched/"));
+                        repo.set_provenance(crate::Provenance::FetchedPom);
+                        assert_eq!(
+                            store
+                                .for_repository_with_policy(&repo, false)
+                                .unwrap()
+                                .is_some(),
+                            allowed,
+                            "{project_config}: {host}"
+                        );
+                    }
+                },
             );
-        });
-        assert!(
-            output.contains("repo.example"),
-            "expected a warn naming the repository, got: {output}"
-        );
-        assert!(
-            !output.contains("s3cr3t"),
-            "the query string may carry a secret and must be redacted: {output}"
-        );
-        // The strict normalizer still governs endpoints being STORED.
-        assert!(NormalizedEndpoint::parse("https://repo.example/maven2?api_key=s3cr3t").is_err());
+        }
     }
 
-    /// The same for embedded userinfo, and configured credentials still apply
-    /// to the repository: only the keyring lookup is skipped.
+    /// A repository URL with embedded userinfo still gets its configured
+    /// credentials, and the userinfo stays out of the warnings.
     #[test]
     fn userinfo_repo_url_still_resolves_configured_auth() {
-        let store = AuthStore::with_sources_and_store(
+        let store = sources(
             vec![bearer(Some("corp"), "corp-token")],
             Vec::new(),
             Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
         );
         let repo = Repository::new(
             Some("corp".to_string()),
@@ -1521,128 +998,85 @@ password = "project-password"
                 .for_repository_with_policy(&repo, false)
                 .expect("lookup");
         });
-        match resolved.expect("auth") {
-            Auth::Bearer { token } => assert_eq!(token.expose_secret(), "corp-token"),
-            Auth::Basic { .. } => panic!("expected the id-matched bearer token"),
+        match resolved.expect("auth").scheme {
+            Scheme::Bearer { token } => assert_eq!(token.expose_secret(), "corp-token"),
+            Scheme::Basic { .. } => panic!("expected the id-matched bearer token"),
         }
         assert!(
             !output.contains("hunter2"),
             "userinfo must be redacted out of the warn: {output}"
         );
-        assert!(NormalizedEndpoint::parse("https://alice:hunter2@nexus.corp/repo/").is_err());
     }
 
-    /// Regression: a settings.xml `<server>` carrying only fields rv does not
-    /// model (privateKey/passphrase, standard for scp deploys) must not poison
-    /// its repository id. It is skipped, and the sync continues.
+    /// A cross-host mirror that withholds a default credential warns once,
+    /// without userinfo or query tokens from either URL; without a default
+    /// credential nothing is said.
     #[test]
-    fn auth_entry_without_any_modeled_field_is_skipped() {
-        let store = AuthStore::with_sources_and_store(
-            Vec::new(),
-            Vec::new(),
-            vec![empty_entry("corp")],
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let output = capture_warnings(|| {
-            assert!(
-                store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("an entry with no modeled credential must not fail the lookup")
-                    .is_none(),
-                "nothing else is configured, so the fetch is anonymous"
+    fn cross_host_mirror_warnings_redact_both_urls() {
+        let selector = crate::mirror::MirrorSelector::from_mirrors(vec![{
+            let mut mirror_config = rv_config::MirrorConfig::new(
+                None,
+                "https://mallory:mirror-secret@mirror.example/m2/?sig=mirror-token",
             );
-        });
-        assert!(
-            output.contains("corp"),
-            "the warn must name the id it skipped, got: {output}"
+            mirror_config.mirror_of = vec!["*".to_string()];
+            mirror_config
+        }]);
+        let repo = repo(
+            Some("corp"),
+            "https://alice:hunter2@nexus.corp/repo/?token=origin-token",
         );
-    }
-
-    /// Skipping is a fall-through, not a stop: a lower-precedence source that
-    /// does carry credentials for the id still applies.
-    #[test]
-    fn skipped_empty_entry_falls_through_to_a_lower_source() {
-        let store = AuthStore::with_sources_and_store(
-            vec![empty_entry("corp")],
-            vec![bearer(Some("corp"), "user-token")],
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        match store
-            .for_repository_with_policy(&repo, false)
-            .expect("lookup")
-            .expect("auth")
-        {
-            Auth::Bearer { token } => assert_eq!(token.expose_secret(), "user-token"),
-            Auth::Basic { .. } => panic!("expected the lower source's bearer token"),
+        for (settings, warnings) in [(vec![bearer(None, "default-token")], 1), (vec![], 0)] {
+            let store = sources(vec![], vec![], settings);
+            let output = capture_warnings(|| {
+                let (resolved, _, host_changed) = selector.select(&repo);
+                assert!(host_changed);
+                assert!(
+                    store
+                        .for_repository_with_policy(&resolved, host_changed)
+                        .expect("lookup")
+                        .is_none(),
+                    "no default credential crosses hosts"
+                );
+            });
+            assert_eq!(
+                output.matches("CROSS_HOST_MIRROR").count(),
+                warnings,
+                "{output}"
+            );
+            for secret in [
+                "hunter2",
+                "origin-token",
+                "mirror-secret",
+                "mirror-token",
+                "alice",
+                "mallory",
+            ] {
+                assert!(!output.contains(secret), "{secret} leaked: {output}");
+            }
+            if warnings > 0 {
+                assert!(output.contains("mirror.example/m2/?***"), "{output}");
+            }
         }
     }
 
-    /// The documented contract stands: a PARTIALLY filled entry is still a
-    /// hard error, and a token-only entry still works.
+    /// settings.xml `${env.X}` reaches the credential, a project `[[auth]]`
+    /// entry replaces a lower-precedence settings bearer, and no rendering
+    /// shows the secret.
     #[test]
-    fn partial_entry_still_errors_and_token_only_entry_still_works() {
-        let partial = AuthConfig {
-            id: Some("corp".to_string()),
-            username: Some("user".to_string()),
-            password: None,
-            token: None,
-        };
-        let repo = Repository::new(
-            Some("corp".to_string()),
-            "https://repo.example/",
-            true,
-            false,
-        );
-
-        let store = AuthStore::with_sources_and_store(
-            vec![partial],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        let err = store
-            .for_repository_with_policy(&repo, false)
-            .expect_err("username without password stays a hard error");
-        assert!(
-            err.to_string()
-                .contains("incomplete project rv.toml auth entry")
-        );
-
-        let store = AuthStore::with_sources_and_store(
-            vec![bearer(Some("corp"), "corp-token")],
-            Vec::new(),
-            Vec::new(),
-            Arc::new(RecordingCredentialStore::empty()),
-        );
-        assert!(
-            store
-                .for_repository_with_policy(&repo, false)
-                .expect("lookup")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn settings_env_interpolation_reaches_effective_basic_auth_and_redacts() {
+    #[cfg_attr(
+        windows,
+        ignore = "settings.xml is read from the profile directory, which HOME does not redirect on Windows"
+    )]
+    fn loaded_credentials_interpolate_layer_and_redact() {
         let _env_guard = ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("home");
         let project = home.path().join("project");
         std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(
+            project.join("raeva.toml"),
+            "[[auth]]\nid = \"proj\"\nusername = \"project-user\"\npassword = \"project-password\"\n",
+        )
+        .expect("raeva.toml");
         let m2 = home.path().join(".m2");
         std::fs::create_dir_all(&m2).expect("m2");
         std::fs::write(
@@ -1654,56 +1088,57 @@ password = "project-password"
       <username>${env.RAEVA_USER}</username>
       <password>${env.RAEVA_TOKEN}</password>
     </server>
+    <server>
+      <id>proj</id>
+      <configuration>
+        <httpHeaders>
+          <property>
+            <name>Authorization</name>
+            <value>Bearer lower-settings-token</value>
+          </property>
+        </httpHeaders>
+      </configuration>
+    </server>
   </servers>
 </settings>"#,
         )
         .expect("settings.xml");
         let home_string = home.path().to_string_lossy().into_owned();
-        let raeva_home = home.path().join("raeva");
-        let raeva_home_string = raeva_home.to_string_lossy().into_owned();
-        let ci_user = "ci-interpolated-user";
-        let ci_secret = "ci-interpolated-secret";
+        let raeva_home = home.path().join("raeva").to_string_lossy().into_owned();
+        let (ci_user, ci_secret) = ("ci-interpolated-user", "ci-interpolated-secret");
 
         temp_env::with_vars(
             [
                 ("HOME", Some(home_string.as_str())),
                 ("USERPROFILE", Some(home_string.as_str())),
-                ("RAEVA_HOME", Some(raeva_home_string.as_str())),
+                ("RAEVA_HOME", Some(raeva_home.as_str())),
                 ("RAEVA_USER", Some(ci_user)),
                 ("RAEVA_TOKEN", Some(ci_secret)),
             ],
             || {
                 let config = rv_config::Config::load(&project).expect("config");
                 let layers = config.auth_layers();
-                let store = AuthStore::with_sources_and_store(
+                let store = sources(
                     layers.project().to_vec(),
                     layers.user().to_vec(),
                     layers.settings().to_vec(),
-                    Arc::new(RecordingCredentialStore::empty()),
                 );
-                let repo = Repository::new(
-                    Some("corp".to_string()),
-                    "https://repo.example/",
-                    true,
-                    false,
-                );
-                let auth = store
-                    .for_repository_with_policy(&repo, false)
-                    .expect("lookup")
-                    .expect("auth");
-
-                match &auth {
-                    Auth::Basic { username, password } => {
-                        assert_eq!(username, ci_user);
-                        assert_eq!(password.expose_secret(), ci_secret);
-                    }
-                    Auth::Bearer { .. } => panic!("settings password must construct basic auth"),
-                }
-                for rendered in [
-                    format!("{auth:?}"),
-                    format!("{store:?}"),
-                    format!("{config:?}"),
+                for (id, user, password) in [
+                    ("corp", ci_user, ci_secret),
+                    ("proj", "project-user", "project-password"),
                 ] {
+                    let auth = store
+                        .for_repository_with_policy(&repo(Some(id), "https://repo.example/"), false)
+                        .expect("lookup");
+                    let expected = format!("basic {user} {password}");
+                    assert_eq!(
+                        shown(auth.as_ref()).as_deref(),
+                        Some(expected.as_str()),
+                        "{id}"
+                    );
+                    assert!(!format!("{auth:?}").contains(ci_secret));
+                }
+                for rendered in [format!("{store:?}"), format!("{config:?}")] {
                     assert!(!rendered.contains(ci_secret), "secret leaked: {rendered}");
                     assert!(!rendered.contains("${env.RAEVA_TOKEN}"));
                 }

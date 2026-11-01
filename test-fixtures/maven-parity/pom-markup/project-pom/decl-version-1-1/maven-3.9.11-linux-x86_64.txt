@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list and mvn -q -o validate; artifact= is group:artifact:version:repository id from _remote.repositories
+# The project's pom.xml has an XML declaration of version 1.1.
+# [ERROR] Non-parseable POM .../pom.xml: only 1.0 is supported as <?xml version not '1.1'
+# raeva words the error in its own way; error= is the part of its message that names the defect.
+result=failure
+error=is not well-formed XML

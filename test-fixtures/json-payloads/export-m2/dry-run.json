@@ -1,0 +1,22 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "exported": 14,
+      "javadocs": 0,
+      "m2_path": "<tmp>/m2",
+      "sources": 0,
+      "warnings": [
+        {
+          "code": "EXPORT_SYSTEM_SCOPED_SKIPPED",
+          "context": {
+            "coordinates": "org.golden:vendored:0.9",
+            "count": 1
+          },
+          "message": "system-scoped dependencies not exported (systemPath artifacts are not in the content-addressed store)"
+        }
+      ]
+    },
+    "success": true
+  }
+}

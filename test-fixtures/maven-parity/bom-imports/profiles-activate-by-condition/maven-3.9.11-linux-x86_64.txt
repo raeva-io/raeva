@@ -1,0 +1,13 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# bom's profiles activate by condition with the importer's user properties (-Dflag=on, and packaging=jar,
+# the importer's), on the platform's os, but not by the importer's -Pexplicit; -Dg.version=2.0 wins over
+# the bom's own g.version
+result=success
+module=org.bp:profiles-activate-by-condition:1.0
+artifact=org.bp:b:2.0:repo
+artifact=org.bp:c:2.0:repo
+artifact=org.bp:e:1.0:repo
+artifact=org.bp:f:2.0:repo
+artifact=org.bp:g:2.0:repo
+active=explicit

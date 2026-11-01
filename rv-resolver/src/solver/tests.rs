@@ -1,68 +1,31 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::{
-    Backend, ConstraintVersion, PlatformConstraint, PlatformConstraints, ResolvedProject,
-    ResolvedVersion, Solver, SolverRoot,
-};
-use crate::ResolutionStrategy;
+use super::{Backend, Management, ResolvedProject, ResolvedVersion, Solver, SolverRoot};
+use crate::context::RepoContext;
 use crate::error::ResolveError;
 use crate::graph::Graph;
-use rv_maven_model::{Dependency, DependencyManagement, Project, Relocation, Scope};
-use rv_version::{Coord, Version, VersionReq};
+use rv_maven_model::{Dependency, Exclusion, Project, Relocation, Scope};
+use rv_maven_types::{Coord, Version, VersionReq};
 
 #[derive(Default)]
 struct MockBackend {
     fetches: std::sync::Mutex<Vec<String>>,
+    prefetches: std::sync::Mutex<Vec<String>>,
+    listings: std::sync::Mutex<Vec<String>>,
     projects: HashMap<String, Project>,
     versions: HashMap<String, Vec<Version>>,
-    platform_constraints: HashMap<String, PlatformConstraints>,
+    project_repos: HashMap<String, &'static str>,
 }
 
 impl MockBackend {
     fn with_project(mut self, coord: &Coord, deps: Vec<Dependency>) -> Self {
-        let project = Project {
-            group_id: coord.group_id.to_string(),
-            artifact_id: coord.artifact_id.to_string(),
-            version: coord.version.to_string(),
-            packaging: "jar".to_string(),
-            properties: Default::default(),
-            dependency_management: DependencyManagement::default(),
-            dependencies: deps,
-            repositories: Vec::new(),
-            profiles: Vec::new(),
-            modules: Vec::new(),
-            relocation: None,
-        };
-        self.projects.insert(coord.to_string(), project);
-        self
-    }
-
-    /// Like [`with_project`] but also attaches the artifact's effective
-    /// `<dependencyManagement>`. Mirrors what the model layer produces for a
-    /// fetched POM: parent-chain and BOM management already merged in. Used to
-    /// exercise the solver's version-fill for a versionless child.
-    fn with_project_and_mgmt(
-        mut self,
-        coord: &Coord,
-        deps: Vec<Dependency>,
-        management: Vec<Dependency>,
-    ) -> Self {
-        let project = Project {
-            group_id: coord.group_id.to_string(),
-            artifact_id: coord.artifact_id.to_string(),
-            version: coord.version.to_string(),
-            packaging: "jar".to_string(),
-            properties: Default::default(),
-            dependency_management: DependencyManagement {
-                dependencies: management,
-            },
-            dependencies: deps,
-            repositories: Vec::new(),
-            profiles: Vec::new(),
-            modules: Vec::new(),
-            relocation: None,
-        };
+        let mut project = Project::new(
+            &coord.group_id,
+            &coord.artifact_id,
+            &coord.version.to_string(),
+        );
+        project.dependencies = deps;
         self.projects.insert(coord.to_string(), project);
         self
     }
@@ -73,57 +36,87 @@ impl MockBackend {
         relocation: Relocation,
         deps: Vec<Dependency>,
     ) -> Self {
-        let project = Project {
-            group_id: coord.group_id.to_string(),
-            artifact_id: coord.artifact_id.to_string(),
-            version: coord.version.to_string(),
-            packaging: "jar".to_string(),
-            properties: Default::default(),
-            dependency_management: DependencyManagement::default(),
-            dependencies: deps,
-            repositories: Vec::new(),
-            profiles: Vec::new(),
-            modules: Vec::new(),
-            relocation: Some(relocation),
-        };
-        self.projects.insert(coord.to_string(), project);
+        self = self.with_project(coord, deps);
+        self.projects
+            .get_mut(&coord.to_string())
+            .unwrap()
+            .relocation = Some(relocation);
         self
     }
 
     fn with_versions(mut self, group_id: &str, artifact_id: &str, versions: Vec<&str>) -> Self {
-        let key = format!("{group_id}:{artifact_id}");
         let parsed = versions
             .into_iter()
             .map(|v| Version::parse(v).unwrap())
             .collect();
-        self.versions.insert(key, parsed);
+        self.versions
+            .insert(format!("{group_id}:{artifact_id}"), parsed);
         self
-    }
-
-    fn with_platform_constraints(
-        mut self,
-        coord: &Coord,
-        constraints: PlatformConstraints,
-    ) -> Self {
-        self.platform_constraints
-            .insert(coord.to_string(), constraints);
-        self
-    }
-
-    fn key(group_id: &str, artifact_id: &str) -> String {
-        format!("{group_id}:{artifact_id}")
     }
 }
 
+const SNAPSHOT_BUILDS: [&str; 2] = ["20261011.010101-1", "20261012.010101-2"];
+
 impl Backend for MockBackend {
+    fn prefetch_project(&self, coord: &Coord, _repos: &RepoContext) {
+        self.prefetches.lock().unwrap().push(coord.to_string());
+    }
+
+    fn prefetch_range(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        req: &VersionReq,
+        _repos: &RepoContext,
+    ) {
+        let range = format!("{group_id}:{artifact_id}:{req}");
+        self.listings.lock().unwrap().push(range);
+    }
+
+    fn resolve_snapshot_version<'a>(
+        &'a self,
+        coord: &'a Coord,
+        _repos: &'a RepoContext,
+    ) -> super::BoxFuture<'a, super::Result<ResolvedVersion>> {
+        Box::pin(async move {
+            let build = coord
+                .version
+                .as_str()
+                .strip_suffix("SNAPSHOT")
+                .and_then(|base| {
+                    SNAPSHOT_BUILDS
+                        .iter()
+                        .rev()
+                        .map(|build| Coord {
+                            version: Version::parse(&format!("{base}{build}")).unwrap(),
+                            ..coord.clone()
+                        })
+                        .find(|build| self.projects.contains_key(&build.to_string()))
+                });
+            // The metadata comes from the repository serving the build.
+            let repo = build
+                .as_ref()
+                .and_then(|build| self.project_repos.get(&build.to_string()))
+                .map(|&repo| crate::graph::RepoRef {
+                    id: None,
+                    url: Arc::from(repo),
+                });
+            Ok(ResolvedVersion {
+                version: build.map_or_else(|| coord.version.clone(), |build| build.version),
+                repo,
+            })
+        })
+    }
+
     fn resolve_version<'a>(
         &'a self,
         group_id: &'a str,
         artifact_id: &'a str,
         req: &'a VersionReq,
+        _repos: &'a RepoContext,
     ) -> super::BoxFuture<'a, super::Result<ResolvedVersion>> {
         Box::pin(async move {
-            let key = MockBackend::key(group_id, artifact_id);
+            let key = format!("{group_id}:{artifact_id}");
             let versions =
                 self.versions
                     .get(&key)
@@ -131,38 +124,29 @@ impl Backend for MockBackend {
                         dropped_repos: Vec::new(),
                         coord: key.clone(),
                         searched: Vec::new(),
+                        classifier_like: None,
                     })?;
-            let mut selected = None;
             let dynamic = match req {
                 VersionReq::Exact(version) | VersionReq::Soft(version) => {
-                    match version.as_str().to_ascii_lowercase().as_str() {
-                        "release" | "latest.release" => Some("release"),
-                        "latest" | "latest.integration" => Some("latest"),
-                        _ => None,
-                    }
+                    crate::util::parse_dynamic_version_token(version.as_str())
                 }
                 VersionReq::Ranges(_) => None,
             };
-            for version in versions {
-                let matches = match dynamic {
-                    Some("release") => !version.as_str().ends_with("-SNAPSHOT"),
-                    Some("latest") => true,
-                    _ => req.matches(version),
-                };
-                if matches {
-                    selected = Some(match selected {
-                        Some(current) if current > version.clone() => current,
-                        _ => version.clone(),
-                    });
-                }
-            }
-            let version = selected.ok_or_else(|| ResolveError::VersionNotFound {
-                coord: key,
-                requirement: req.to_string(),
-            })?;
+            let version = versions
+                .iter()
+                .filter(|version| match dynamic {
+                    Some(token) => token.admits(version.as_str()),
+                    None => req.matches(version),
+                })
+                .max()
+                .cloned()
+                .ok_or_else(|| ResolveError::VersionNotFound {
+                    coord: key,
+                    requirement: req.to_string(),
+                })?;
             Ok(ResolvedVersion {
                 version,
-                repo_url: Some(Arc::from("mock://repo")),
+                repo: None,
             })
         })
     }
@@ -172,18 +156,20 @@ impl Backend for MockBackend {
         group_id: &'a str,
         artifact_id: &'a str,
         req: &'a VersionReq,
+        repos: &'a RepoContext,
     ) -> super::BoxFuture<'a, super::Result<Vec<ResolvedVersion>>> {
         Box::pin(async move {
-            self.resolve_version(group_id, artifact_id, req).await?;
-            let mut versions: Vec<_> = self.versions[&Self::key(group_id, artifact_id)]
+            self.resolve_version(group_id, artifact_id, req, repos)
+                .await?;
+            let mut versions: Vec<_> = self.versions[&format!("{group_id}:{artifact_id}")]
                 .iter()
                 .filter(|version| req.matches(version))
                 .map(|version| ResolvedVersion {
                     version: version.clone(),
-                    repo_url: Some(Arc::from("mock://repo")),
+                    repo: None,
                 })
                 .collect();
-            versions.sort_by(|a, b| a.version.cmp(&b.version));
+            Version::sort_by_key(&mut versions, |resolved| &resolved.version);
             Ok(versions)
         })
     }
@@ -191,25 +177,31 @@ impl Backend for MockBackend {
     fn fetch_project<'a>(
         &'a self,
         coord: &'a Coord,
-        _scope: Scope,
+        _resolve_snapshot_pom: bool,
+        _repos: &'a RepoContext,
     ) -> super::BoxFuture<'a, super::Result<ResolvedProject>> {
         Box::pin(async move {
-            self.fetches.lock().unwrap().push(coord.to_string());
-            let project = self
-                .projects
-                .get(&coord.to_string())
-                .cloned()
-                .ok_or_else(|| ResolveError::ArtifactNotFound {
-                    dropped_repos: Vec::new(),
-                    coord: coord.to_string(),
-                    searched: Vec::new(),
-                })?;
-            let platform_constraints = self.platform_constraints.get(&coord.to_string()).cloned();
+            let key = coord.to_string();
+            self.fetches.lock().unwrap().push(key.clone());
+            let project =
+                self.projects
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| ResolveError::ArtifactNotFound {
+                        dropped_repos: Vec::new(),
+                        coord: key.clone(),
+                        searched: Vec::new(),
+                        classifier_like: None,
+                    })?;
             Ok(ResolvedProject {
-                project,
-                repo_url: Some(Arc::from("mock://repo")),
+                project: Arc::new(project),
+                repo_url: Some(Arc::from(
+                    self.project_repos
+                        .get(&key)
+                        .copied()
+                        .unwrap_or("mock://repo"),
+                )),
                 workspace_module: None,
-                platform_constraints,
             })
         })
     }
@@ -229,56 +221,15 @@ fn dep(group_id: &str, artifact_id: &str, version: &str) -> Dependency {
     }
 }
 
-/// A dependency that declares no `<scope>`, so a managed scope may fill it in.
-fn dep_no_scope(group_id: &str, artifact_id: &str, version: &str) -> Dependency {
-    Dependency {
-        scope: None,
-        ..dep(group_id, artifact_id, version)
-    }
-}
-
-/// A dependency with an explicit scope but no `<version>`, so the version must
-/// be supplied by the resolving artifact's dependencyManagement.
-fn dep_versionless(group_id: &str, artifact_id: &str, scope: &str) -> Dependency {
-    Dependency {
-        group_id: group_id.to_string(),
-        artifact_id: artifact_id.to_string(),
-        version: None,
-        type_: None,
-        classifier: None,
-        scope: Some(scope.to_string()),
-        optional: None,
-        exclusions: Vec::new(),
-        system_path: None,
-    }
-}
-
-fn dep_with_classifier(
-    group_id: &str,
-    artifact_id: &str,
-    version: &str,
-    classifier: &str,
-) -> Dependency {
-    Dependency {
-        group_id: group_id.to_string(),
-        artifact_id: artifact_id.to_string(),
-        version: Some(version.to_string()),
-        type_: None,
-        classifier: Some(classifier.to_string()),
-        scope: Some("compile".to_string()),
-        optional: None,
-        exclusions: Vec::new(),
-        system_path: None,
-    }
-}
-
 fn coord(s: &str) -> Coord {
     Coord::parse(s).unwrap()
 }
 
 fn find_version(graph: &Graph, group_id: &str, artifact_id: &str) -> Option<String> {
+    let reachable = graph.reachable();
     graph
         .node_indices()
+        .filter(|idx| reachable.contains(idx))
         .filter_map(|idx| graph.node(idx))
         .find(|node| {
             node.coord.group_id.as_str() == group_id
@@ -287,3099 +238,1014 @@ fn find_version(graph: &Graph, group_id: &str, artifact_id: &str) -> Option<Stri
         .map(|node| node.coord.version.to_string())
 }
 
-fn find_scope(graph: &Graph, group_id: &str, artifact_id: &str) -> Option<Scope> {
-    graph
-        .node_indices()
-        .filter_map(|idx| graph.node(idx))
-        .find(|node| {
-            node.coord.group_id.as_str() == group_id
-                && node.coord.artifact_id.as_str() == artifact_id
-        })
-        .map(|node| node.scope)
-}
-
-#[tokio::test]
-async fn nearest_wins_ties_by_first_declared() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let c1 = coord("com.example:c:1.0");
-    let c2 = coord("com.example:c:2.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "c", "1.0")])
-        .with_project(&b, vec![dep("com.example", "c", "2.0")])
-        .with_project(&c1, Vec::new())
-        .with_project(&c2, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "c"),
-        Some("1.0".to_string())
-    );
-}
-
-#[tokio::test]
-async fn first_declared_wins_in_diamond() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let c = coord("com.example:c:1.0");
-    let d = coord("com.example:d:1.0");
-    let e1 = coord("com.example:e:1.0");
-    let e2 = coord("com.example:e:2.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "c", "1.0")])
-        .with_project(&b, vec![dep("com.example", "d", "1.0")])
-        .with_project(&c, vec![dep("com.example", "e", "1.0")])
-        .with_project(&d, vec![dep("com.example", "e", "2.0")])
-        .with_project(&e1, Vec::new())
-        .with_project(&e2, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "e"),
-        Some("1.0".to_string())
-    );
-}
-
-#[tokio::test]
-async fn applies_exclusions() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let c = coord("com.example:c:1.0");
-
-    let mut dep_b = dep("com.example", "b", "1.0");
-    dep_b.exclusions.push(rv_maven_model::Exclusion {
-        group_id: "com.example".to_string(),
-        artifact_id: "c".to_string(),
-    });
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep_b])
-        .with_project(&b, vec![dep("com.example", "c", "1.0")])
-        .with_project(&c, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "a", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(find_version(&graph, "com.example", "c"), None);
-}
-
-/// Test that cyclic dependencies are handled gracefully like Maven.
-/// When a cycle is detected, we break it by not re-resolving transitive dependencies.
-#[tokio::test]
-async fn handles_cycles_gracefully() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "b", "1.0")])
-        .with_project(&b, vec![dep("com.example", "a", "1.0")]);
-
-    let solver = Solver::new(&backend);
-    // Resolution should succeed by breaking the cycle
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "a", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Both a and b should be in the graph
-    assert_eq!(
-        find_version(&graph, "com.example", "a"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(
-        find_version(&graph, "com.example", "b"),
-        Some("1.0".to_string())
-    );
-}
-
-/// Test that the graph correctly represents cyclic dependency edges.
-#[tokio::test]
-async fn cycle_edges_are_preserved_in_graph() {
-    use petgraph::visit::EdgeRef;
-
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "b", "1.0")])
-        .with_project(&b, vec![dep("com.example", "a", "1.0")]);
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "a", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Find the node indices
-    let a_idx = graph
-        .node_indices()
-        .find(|idx| {
-            graph
-                .node(*idx)
-                .map(|n| n.coord.artifact_id.as_str() == "a")
-                .unwrap_or(false)
-        })
-        .expect("a should be in graph");
-
-    let b_idx = graph
-        .node_indices()
-        .find(|idx| {
-            graph
-                .node(*idx)
-                .map(|n| n.coord.artifact_id.as_str() == "b")
-                .unwrap_or(false)
-        })
-        .expect("b should be in graph");
-
-    // Verify edges: root -> a, a -> b, b -> a (cycle edge)
-    let has_a_to_b = graph.graph().edges(a_idx).any(|e| e.target() == b_idx);
-    let has_b_to_a = graph.graph().edges(b_idx).any(|e| e.target() == a_idx);
-
-    assert!(has_a_to_b, "a should have edge to b");
-    assert!(has_b_to_a, "b should have edge back to a (cycle edge)");
-}
-
-#[tokio::test]
-async fn follows_relocations() {
-    let root = coord("com.example:root:1.0");
-    let legacy = coord("com.legacy:lib:1.0");
-    let relocated = coord("com.new:lib-new:2.0");
-    let child = coord("com.example:child:1.0");
-
-    let relocation = Relocation {
-        group_id: Some("com.new".to_string()),
-        artifact_id: Some("lib-new".to_string()),
-        version: Some("2.0".to_string()),
-        message: None,
+/// Root management of `group:artifact` to `version`.
+fn managed(group: &str, artifact: &str, version: &str) -> Management {
+    let entry = Dependency {
+        scope: None,
+        ..dep(group, artifact, version)
     };
-
-    let backend = MockBackend::default()
-        .with_relocated_project(&legacy, relocation, Vec::new())
-        .with_project(&relocated, vec![dep("com.example", "child", "1.0")])
-        .with_project(&child, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.legacy", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.new", "lib-new"),
-        Some("2.0".to_string())
-    );
-    assert_eq!(find_version(&graph, "com.legacy", "lib"), None);
-    assert_eq!(
-        find_version(&graph, "com.example", "child"),
-        Some("1.0".to_string())
-    );
+    Management::new(vec![entry])
 }
 
-#[tokio::test]
-async fn detects_relocation_cycles() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
+const G: &str = "g";
 
-    let relocation_to_b = Relocation {
-        group_id: Some("com.example".to_string()),
-        artifact_id: Some("b".to_string()),
-        version: Some("1.0".to_string()),
-        message: None,
+/// `[group:]artifact:version`, `_` standing for an absent part.
+fn gav(text: &str) -> [Option<String>; 3] {
+    let parts: Vec<&str> = text.split(':').collect();
+    let parts = match parts.as_slice() {
+        [artifact, version] => [G, artifact, version],
+        [group, artifact, version] => [*group, artifact, version],
+        _ => panic!("bad coordinate {text}"),
     };
-    let relocation_to_a = Relocation {
-        group_id: Some("com.example".to_string()),
-        artifact_id: Some("a".to_string()),
-        version: Some("1.0".to_string()),
-        message: None,
+    parts.map(|part| (part != "_").then(|| part.to_string()))
+}
+
+/// A dependency written `[group:]artifact:version` and then any of
+/// `@scope` (`@-` for none, compile otherwise), `?` (optional),
+/// `!artifact` or `!group:artifact` (an exclusion), `#type`, `~classifier`
+/// and `=systemPath`.
+fn parse_dep(token: &str) -> Dependency {
+    const MARKERS: [char; 6] = ['@', '?', '!', '#', '~', '='];
+    let split = token.find(MARKERS).unwrap_or(token.len());
+    let (coordinate, mut rest) = token.split_at(split);
+    let [group, artifact, version] = gav(coordinate);
+    let mut dependency = Dependency {
+        version,
+        ..dep(&group.unwrap(), &artifact.unwrap(), "")
     };
-
-    let backend = MockBackend::default()
-        .with_relocated_project(&a, relocation_to_b, Vec::new())
-        .with_relocated_project(&b, relocation_to_a, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let err = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "a", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap_err();
-
-    match err {
-        ResolveError::RelocationCycle(_) => {}
-        other => panic!("unexpected error: {other:?}"),
+    while let Some(marker) = rest.chars().next() {
+        let end = rest[1..].find(MARKERS).map_or(rest.len(), |end| end + 1);
+        let value = rest[1..end].to_string();
+        match marker {
+            '@' => dependency.scope = (value != "-").then_some(value),
+            '?' => dependency.optional = Some("true".to_string()),
+            '!' => {
+                let (group_id, artifact_id) = value.split_once(':').unwrap_or((G, &value));
+                dependency.exclusions.push(Exclusion {
+                    group_id: group_id.to_string(),
+                    artifact_id: artifact_id.to_string(),
+                });
+            }
+            '#' => dependency.type_ = Some(value),
+            '~' => dependency.classifier = Some(value),
+            _ => dependency.system_path = Some(value),
+        }
+        rest = &rest[end..];
     }
+    dependency
 }
 
-#[tokio::test]
-async fn follows_partial_relocation() {
-    let root = coord("com.example:root:1.0");
-    let legacy = coord("com.old:lib:1.0");
-    let relocated = coord("com.new:lib:1.0");
+fn parse_deps(text: &str) -> Vec<Dependency> {
+    text.split_whitespace().map(parse_dep).collect()
+}
 
-    let relocation = Relocation {
-        group_id: Some("com.new".to_string()),
-        artifact_id: None,
-        version: None,
-        message: None,
-    };
-
-    let backend = MockBackend::default()
-        .with_relocated_project(&legacy, relocation, Vec::new())
-        .with_project(&relocated, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.old", "lib", "1.0")],
-            scope: Scope::Compile,
+fn management(tokens: &str) -> Management {
+    let entries: Vec<_> = tokens
+        .split_whitespace()
+        .map(|token| Dependency {
+            scope: parse_dep(token).scope.filter(|_| token.contains('@')),
+            ..parse_dep(token)
         })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.new", "lib"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(find_version(&graph, "com.old", "lib"), None);
+        .collect();
+    Management::new(entries)
 }
 
-/// A cached terminal self-mapping must not count as a relocation cycle.
-#[tokio::test]
-async fn relocation_onto_already_resolved_target_is_not_a_cycle() {
-    let root = coord("com.example:root:1.0");
-    let mid = coord("com.example:mid:1.0");
-    let ext = coord("org.bc:ext:1.0");
-    let base = coord("org.bc:base:1.0");
-
-    let relocation = Relocation {
-        group_id: None,
-        artifact_id: Some("base".to_string()),
-        version: None,
-        message: None,
-    };
-
-    let backend = MockBackend::default()
-        .with_project(&mid, vec![dep("org.bc", "ext", "1.0")])
-        .with_relocated_project(&ext, relocation, Vec::new())
-        .with_project(&base, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("org.bc", "base", "1.0"),
-                dep("com.example", "mid", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "org.bc", "base"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(find_version(&graph, "org.bc", "ext"), None);
-}
-
-fn managed_constraint(group: &str, module: &str, version: &str) -> PlatformConstraint {
-    PlatformConstraint {
-        group: group.to_string(),
-        module: module.to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some(version.to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
+/// A backend from one line per project: `coordinate[~classifier]`, then
+/// `> dependencies` and `| managed dependencies`, or `=> group:artifact:version` for a relocation. `versions
+/// [group:]artifact v...` lists versions; otherwise those of the projects.
+fn backend(lines: &[&str]) -> MockBackend {
+    let mut backend = MockBackend::default();
+    let mut listed = HashMap::<String, Vec<Version>>::new();
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("versions ") {
+            let mut words = rest.split_whitespace();
+            let [group, artifact, _] = gav(&format!("{}:_", words.next().unwrap()));
+            let key = format!("{}:{}", group.unwrap(), artifact.unwrap());
+            let versions = words.map(|v| Version::parse(v).unwrap()).collect();
+            backend.versions.insert(key, versions);
+            continue;
+        }
+        let (head, relocation) = match line.split_once("=>") {
+            Some((head, target)) => {
+                let [group_id, artifact_id, version] = gav(target.trim());
+                let relocation = Relocation {
+                    group_id,
+                    artifact_id,
+                    version,
+                    message: None,
+                };
+                (head, Some(relocation))
+            }
+            None => (*line, None),
+        };
+        let (head, managed) = head.split_once('|').unwrap_or((head, ""));
+        let (head, deps) = head.split_once('>').unwrap_or((head, ""));
+        let head = parse_dep(head.trim());
+        let version = head.version.as_deref().unwrap();
+        let coord = Coord {
+            group_id: head.group_id.as_str().into(),
+            artifact_id: head.artifact_id.as_str().into(),
+            version: Version::parse(version).unwrap(),
+            packaging: None,
+            classifier: head.classifier,
+        };
+        let mut project = Project::new(&head.group_id, &head.artifact_id, version);
+        project.dependencies = parse_deps(deps);
+        project.dependency_management.dependencies = parse_deps(managed);
+        project.relocation = relocation;
+        listed
+            .entry(format!("{}:{}", head.group_id, head.artifact_id))
+            .or_default()
+            .push(coord.version.clone());
+        backend.projects.insert(coord.to_string(), project);
     }
+    for (key, versions) in listed {
+        backend.versions.entry(key).or_insert(versions);
+    }
+    backend
 }
 
-/// Maven re-applies the root's dependencyManagement to the relocated
-/// coordinates of a transitive dependency.
-#[tokio::test]
-async fn reapplies_management_after_transitive_relocation() {
-    let root = coord("com.example:root:1.0");
-    let mid = coord("com.example:mid:1.0");
-    let old = coord("org.old:lib:6.0");
-    let new_6 = coord("org.new:lib:6.0");
-    let new_7 = coord("org.new:lib:7.0");
-
-    let relocation = Relocation {
-        group_id: Some("org.new".to_string()),
-        artifact_id: None,
-        version: None,
-        message: None,
+fn render(result: Result<Graph, ResolveError>) -> String {
+    let graph = match result {
+        Ok(graph) => graph,
+        Err(err) => {
+            let err = err.cause();
+            let debug = format!("{err:?}");
+            let variant = debug.split([' ', '(', '{']).next().unwrap_or_default();
+            return format!("ERR {variant}: {err}");
+        }
     };
-    let backend = MockBackend::default()
-        .with_project(&mid, vec![dep("org.old", "lib", "6.0")])
-        .with_relocated_project(&old, relocation, Vec::new())
-        .with_project(&new_6, Vec::new())
-        .with_project(&new_7, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_constraint("org.new", "lib", "7.0"));
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "mid", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "org.new", "lib"),
-        Some("7.0".to_string())
-    );
-}
-
-/// A direct dependency keeps the version it was declared with: Maven's
-/// resolver-level management does not apply at depth 1.
-#[tokio::test]
-async fn direct_relocated_dependency_keeps_declared_version() {
-    let root = coord("com.example:root:1.0");
-    let old = coord("org.old:lib:6.0");
-    let new_6 = coord("org.new:lib:6.0");
-    let new_7 = coord("org.new:lib:7.0");
-
-    let relocation = Relocation {
-        group_id: Some("org.new".to_string()),
-        artifact_id: None,
-        version: None,
-        message: None,
-    };
-    let backend = MockBackend::default()
-        .with_relocated_project(&old, relocation, Vec::new())
-        .with_project(&new_6, Vec::new())
-        .with_project(&new_7, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_constraint("org.new", "lib", "7.0"));
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("org.old", "lib", "6.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "org.new", "lib"),
-        Some("6.0".to_string())
-    );
-}
-
-/// maven-resolver's NearestVersionSelector takes the nearest candidate that
-/// satisfies every hard range, so a nearer version outside a deeper range loses.
-#[tokio::test]
-async fn nearest_conflict_prefers_candidate_satisfying_deeper_range() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let c = coord("com.example:c:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("org.x", "x", "1.0")])
-        .with_project(&b, vec![dep("com.example", "c", "1.0")])
-        .with_project(&c, vec![dep("org.x", "x", "[2.0,3.0)")])
-        .with_project(&coord("org.x:x:1.0"), Vec::new())
-        .with_project(&coord("org.x:x:2.5"), Vec::new())
-        .with_project(&coord("org.x:x:2.0"), Vec::new())
-        .with_versions("org.x", "x", vec!["1.0", "2.0", "2.5", "3.0"]);
-
-    let graph = Solver::new(&backend)
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(find_version(&graph, "org.x", "x"), Some("2.5".to_string()));
-}
-
-/// A nearer candidate that already satisfies the deeper range stays selected.
-#[tokio::test]
-async fn nearest_conflict_keeps_nearer_candidate_inside_deeper_range() {
-    let root = coord("com.example:root:1.0");
-    let b = coord("com.example:b:1.0");
-    let c = coord("com.example:c:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&b, vec![dep("com.example", "c", "1.0")])
-        .with_project(&c, vec![dep("org.x", "x", "[2.0,3.0)")])
-        .with_project(&coord("org.x:x:2.0"), Vec::new())
-        .with_project(&coord("org.x:x:2.5"), Vec::new())
-        .with_versions("org.x", "x", vec!["2.0", "2.5"]);
-
-    let graph = Solver::new(&backend)
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("org.x", "x", "2.0"), dep("com.example", "b", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(find_version(&graph, "org.x", "x"), Some("2.0".to_string()));
-}
-
-/// Conflicting hard ranges must fail when no candidate satisfies them all.
-#[tokio::test]
-async fn nearest_conflict_fails_when_ranges_are_disjoint() {
-    let root = coord("com.example:root:1.0");
-    let b = coord("com.example:b:1.0");
-    let c = coord("com.example:c:1.0");
-    let d = coord("com.example:d:1.0");
-    let e = coord("com.example:e:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&b, vec![dep("com.example", "c", "1.0")])
-        .with_project(&c, vec![dep("org.x", "x", "[2.0,3.0)")])
-        .with_project(&d, vec![dep("com.example", "e", "1.0")])
-        .with_project(&e, vec![dep("org.x", "x", "[1.0,1.8)")])
-        .with_project(&coord("org.x:x:1.5"), Vec::new())
-        .with_project(&coord("org.x:x:2.5"), Vec::new())
-        .with_versions("org.x", "x", vec!["1.5", "2.5"]);
-
-    let err = Solver::new(&backend)
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "b", "1.0"),
-                dep("com.example", "d", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(err, ResolveError::VersionConflict { .. }),
-        "{err:?}"
-    );
-}
-
-#[tokio::test]
-async fn resolves_version_ranges() {
-    let root = coord("com.example:root:1.0");
-    let d = coord("com.example:d:1.5");
-
-    let backend = MockBackend::default()
-        .with_project(&d, Vec::new())
-        .with_project(&coord("com.example:d:1.0"), Vec::new())
-        .with_versions("com.example", "d", vec!["1.0", "1.5", "2.0"]);
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "d", "[1.0,2.0)")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "d"),
-        Some("1.5".to_string())
-    );
-}
-
-#[tokio::test]
-async fn resolves_latest_release_expression() {
-    let root = coord("com.example:root:1.0");
-    let rel = coord("com.example:dyn:1.0.5");
-    let snap = coord("com.example:dyn:1.1.0-SNAPSHOT");
-
-    let backend = MockBackend::default()
-        .with_project(&rel, Vec::new())
-        .with_project(&snap, Vec::new())
-        .with_versions(
-            "com.example",
-            "dyn",
-            vec!["1.0.0", "1.0.5", "1.1.0-SNAPSHOT"],
-        );
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "dyn", "latest.release")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "dyn"),
-        Some("1.0.5".to_string())
-    );
-}
-
-#[tokio::test]
-async fn resolves_latest_integration_expression() {
-    let root = coord("com.example:root:1.0");
-    let rel = coord("com.example:dyn:1.0.5");
-    let snap = coord("com.example:dyn:1.1.0-SNAPSHOT");
-
-    let backend = MockBackend::default()
-        .with_project(&rel, Vec::new())
-        .with_project(&snap, Vec::new())
-        .with_versions(
-            "com.example",
-            "dyn",
-            vec!["1.0.0", "1.0.5", "1.1.0-SNAPSHOT"],
-        );
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "dyn", "LATEST")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "dyn"),
-        Some("1.1.0-SNAPSHOT".to_string())
-    );
-}
-
-#[tokio::test]
-async fn unsupported_dynamic_syntax_returns_error() {
-    let root = coord("com.example:root:1.0");
-    let rel = coord("com.example:dyn:1.0.5");
-    let snap = coord("com.example:dyn:1.1.0-SNAPSHOT");
-
-    let backend = MockBackend::default()
-        .with_project(&rel, Vec::new())
-        .with_project(&snap, Vec::new())
-        .with_versions(
-            "com.example",
-            "dyn",
-            vec!["1.0.0", "1.0.5", "1.1.0-SNAPSHOT"],
-        );
-
-    let solver = Solver::new(&backend);
-    let result = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "dyn", "1.+")],
-            scope: Scope::Compile,
-        })
-        .await;
-
-    assert!(result.is_err(), "1.+ syntax should be rejected");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("com.example:dyn"),
-        "error should mention the coordinate: {err}"
-    );
-}
-
-#[tokio::test]
-async fn classifier_creates_distinct_nodes() {
-    let root = coord("com.example:root:1.0");
-    let lib_plain = coord("com.example:lib:1.0");
-    let lib_tests = Coord {
-        group_id: "com.example".into(),
-        artifact_id: "lib".into(),
-        version: Version::parse("1.0").unwrap(),
-        packaging: None,
-        classifier: Some("tests".to_string()),
-    };
-
-    let backend = MockBackend::default()
-        .with_project(&lib_plain, Vec::new())
-        .with_project(&lib_tests, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "lib", "1.0"),
-                dep_with_classifier("com.example", "lib", "1.0", "tests"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    let mut found_plain = false;
-    let mut found_tests = false;
-    let mut matches = 0;
-    for node in graph.node_indices().filter_map(|idx| graph.node(idx)) {
-        if node.coord.group_id.as_str() == "com.example" && node.coord.artifact_id.as_str() == "lib"
-        {
-            matches += 1;
-            match node.coord.classifier.as_deref() {
-                Some("tests") => found_tests = true,
-                None => found_plain = true,
-                _ => {}
+    let mut seen = vec![graph.root()];
+    let mut queue = vec![graph.root()];
+    while let Some(node) = queue.pop() {
+        for (_, target, _) in graph.edges(node) {
+            if !seen.contains(&target) {
+                seen.push(target);
+                queue.push(target);
             }
         }
     }
-
-    assert_eq!(matches, 2);
-    assert!(found_plain);
-    assert!(found_tests);
-}
-
-#[tokio::test]
-async fn direct_optional_dependencies_are_included_and_traversed() {
-    // Per Maven spec: direct optional deps (depth=1) ARE included, and their
-    // non-optional children ARE queued/traversed normally.
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-
-    let mut dep_a = dep("com.example", "a", "1.0");
-    dep_a.optional = Some("true".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "b", "1.0")])
-        .with_project(&b, vec![]);
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_a],
-            scope: Scope::Compile,
+    let mut labels: Vec<String> = seen[1..]
+        .iter()
+        .map(|idx| {
+            let node = graph.node(*idx).unwrap();
+            let c = &node.coord;
+            let mut label = match c.group_id.as_str() {
+                G => format!("{}:{}", c.artifact_id, c.version),
+                group => format!("{group}:{}:{}", c.artifact_id, c.version),
+            };
+            for (marker, part) in [('#', &c.packaging), ('~', &c.classifier)] {
+                if let Some(part) = part {
+                    label.push_str(&format!("{marker}{part}"));
+                }
+            }
+            if node.scope != Scope::Compile {
+                label.push_str(&format!("@{}", node.scope));
+            }
+            if let Some(path) = &node.system_path {
+                label.push_str(&format!("={path}"));
+            }
+            if node.local {
+                label.push_str("+local");
+            }
+            label
         })
-        .await
-        .unwrap();
-
-    // The direct optional dep itself is included
-    assert_eq!(
-        find_version(&graph, "com.example", "a"),
-        Some("1.0".to_string())
-    );
-    // Its non-optional child IS also included (Maven spec: direct optional deps are traversed)
-    assert_eq!(
-        find_version(&graph, "com.example", "b"),
-        Some("1.0".to_string()),
-        "non-optional children of direct optional deps should be resolved"
-    );
+        .collect();
+    labels.sort();
+    labels.join(" ")
 }
 
-#[tokio::test]
-async fn transitive_optional_dependencies_are_skipped() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-
-    let mut dep_b = dep("com.example", "b", "1.0");
-    dep_b.optional = Some("true".to_string());
-
-    let backend = MockBackend::default().with_project(&a, vec![dep_b]);
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "a", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "a"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(find_version(&graph, "com.example", "b"), None);
-}
-
-#[tokio::test]
-async fn optional_dependencies_of_optional_dependencies_are_not_resolved() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-
-    let mut dep_a = dep("com.example", "a", "1.0");
-    dep_a.optional = Some("true".to_string());
-
-    let mut dep_b = dep("com.example", "b", "1.0");
-    dep_b.optional = Some("true".to_string());
-
-    let backend = MockBackend::default().with_project(&a, vec![dep_b]);
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_a],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "a"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(find_version(&graph, "com.example", "b"), None);
-}
-
-/// A direct test dep carries its compile children onto the test classpath, in
-/// both modes. The child is emitted at `test` scope (test applied to compile is
-/// test), not its declared `compile`.
-#[tokio::test]
-async fn direct_test_dep_traverses_compile_child() {
-    let root = coord("com.example:root:1.0");
-    let test = coord("com.example:test:1.0");
-    let test_child = coord("com.example:test-child:1.0");
-
-    let mut dep_test = dep("com.example", "test", "1.0");
-    dep_test.scope = Some("test".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&test, vec![dep("com.example", "test-child", "1.0")])
-        .with_project(&test_child, Vec::new());
-
-    for strict in [false, true] {
-        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
-        let graph = solver
-            .solve(SolverRoot {
-                coord: root.clone(),
-                dependencies: vec![dep_test.clone()],
-                scope: Scope::Compile,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            find_version(&graph, "com.example", "test"),
-            Some("1.0".to_string()),
-            "direct test dep must be included (strict={strict})"
-        );
-        assert_eq!(
-            find_version(&graph, "com.example", "test-child"),
-            Some("1.0".to_string()),
-            "a direct test dep's compile child must be traversed (strict={strict})"
-        );
-        let child = graph
-            .node_indices()
-            .filter_map(|idx| graph.node(idx))
-            .find(|n| n.coord.artifact_id.as_str() == "test-child")
-            .expect("test-child in graph");
-        assert_eq!(
-            child.scope,
-            Scope::Test,
-            "test dep's compile child must be classified test (strict={strict})"
-        );
-    }
-}
-
-/// Maven includes the compile/runtime children of a direct provided dep,
-/// scoped as provided. This holds in both rv.toml (default) and pom.xml
-/// (strict) modes, even though `transitive_from(Compile, Provided)` returns
-/// None and would otherwise drop them.
-#[tokio::test]
-async fn direct_provided_dep_traverses_children() {
-    let root = coord("com.example:root:1.0");
-    let provided = coord("com.example:provided:1.0");
-    let provided_child = coord("com.example:provided-child:1.0");
-
-    let mut dep_provided = dep("com.example", "provided", "1.0");
-    dep_provided.scope = Some("provided".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&provided, vec![dep("com.example", "provided-child", "1.0")])
-        .with_project(&provided_child, Vec::new());
-
-    for strict in [false, true] {
-        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
-        let graph = solver
-            .solve(SolverRoot {
-                coord: root.clone(),
-                dependencies: vec![dep_provided.clone()],
-                scope: Scope::Compile,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            find_version(&graph, "com.example", "provided"),
-            Some("1.0".to_string()),
-            "provided dep missing (strict={strict})"
-        );
-        assert_eq!(
-            find_version(&graph, "com.example", "provided-child"),
-            Some("1.0".to_string()),
-            "provided-child must be traversed (strict={strict})"
-        );
-    }
-}
-
-/// A direct test dep's compile children are included on the test classpath.
-///
-///   root -> test-lib (test)
-///   test-lib -> compile-lib (compile)
-///
-/// `mvn dependency:list` puts `compile-lib` on the test classpath. rv must
-/// match in both modes.
-#[tokio::test]
-async fn test_dep_compile_children_are_included() {
-    let root = coord("com.example:root:1.0");
-    let test_lib = coord("com.example:test-lib:1.0");
-    let compile_lib = coord("com.example:compile-lib:1.0");
-
-    let mut dep_test_lib = dep("com.example", "test-lib", "1.0");
-    dep_test_lib.scope = Some("test".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&test_lib, vec![dep("com.example", "compile-lib", "1.0")])
-        .with_project(&compile_lib, Vec::new());
-
-    for strict in [false, true] {
-        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
-        let graph = solver
-            .solve(SolverRoot {
-                coord: root.clone(),
-                dependencies: vec![dep_test_lib.clone()],
-                scope: Scope::Compile,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            find_version(&graph, "com.example", "test-lib"),
-            Some("1.0".to_string()),
-            "test-lib should be included (strict={strict})"
-        );
-        assert_eq!(
-            find_version(&graph, "com.example", "compile-lib"),
-            Some("1.0".to_string()),
-            "compile-lib (a test dep's compile child) must be included (strict={strict})"
-        );
-    }
-}
-
-/// Test that NearestWins and HighestWins strategies produce different results.
-///
-/// Dependency graph:
-///   root -> a:1.0 -> c:1.0
-///   root -> b:1.0 -> c:2.0
-///
-/// With NearestWins: c:1.0 wins (first declared at same depth)
-/// With HighestWins: c:2.0 wins (higher version)
-#[tokio::test]
-async fn resolution_strategy_affects_version_selection() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let c1 = coord("com.example:c:1.0");
-    let c2 = coord("com.example:c:2.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "c", "1.0")])
-        .with_project(&b, vec![dep("com.example", "c", "2.0")])
-        .with_project(&c1, Vec::new())
-        .with_project(&c2, Vec::new());
-
-    // Test NearestWins (Maven default) - first declared wins at same depth
-    let solver_nearest = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
-    let graph_nearest = solver_nearest
-        .solve(SolverRoot {
-            coord: root.clone(),
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Test HighestWins - highest version wins
-    let solver_highest = Solver::with_strategy(&backend, ResolutionStrategy::HighestWins, None);
-    let graph_highest = solver_highest
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // NearestWins should select c:1.0 (first declared)
-    assert_eq!(
-        find_version(&graph_nearest, "com.example", "c"),
-        Some("1.0".to_string()),
-        "NearestWins should select first declared version (1.0)"
-    );
-
-    // HighestWins should select c:2.0 (higher version)
-    assert_eq!(
-        find_version(&graph_highest, "com.example", "c"),
-        Some("2.0".to_string()),
-        "HighestWins should select highest version (2.0)"
-    );
-}
-
-/// Test HighestWins with deeper dependency bringing higher version.
-///
-/// Dependency graph:
-///   root -> a:1.0 (direct dep with c:1.0)
-///   root -> b:1.0 -> d:1.0 -> c:3.0
-///
-/// With NearestWins: c:1.0 wins (depth 2 < depth 3)
-/// With HighestWins: c:3.0 wins (3.0 > 1.0)
-#[tokio::test]
-async fn highest_wins_ignores_depth() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let d = coord("com.example:d:1.0");
-    let c1 = coord("com.example:c:1.0");
-    let c3 = coord("com.example:c:3.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "c", "1.0")])
-        .with_project(&b, vec![dep("com.example", "d", "1.0")])
-        .with_project(&d, vec![dep("com.example", "c", "3.0")])
-        .with_project(&c1, Vec::new())
-        .with_project(&c3, Vec::new());
-
-    // Test NearestWins - shallower depth wins
-    let solver_nearest = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
-    let graph_nearest = solver_nearest
-        .solve(SolverRoot {
-            coord: root.clone(),
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Test HighestWins - version wins regardless of depth
-    let solver_highest = Solver::with_strategy(&backend, ResolutionStrategy::HighestWins, None);
-    let graph_highest = solver_highest
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // NearestWins: c:1.0 at depth 2 beats c:3.0 at depth 3
-    assert_eq!(
-        find_version(&graph_nearest, "com.example", "c"),
-        Some("1.0".to_string()),
-        "NearestWins should select shallower version (1.0 at depth 2)"
-    );
-
-    // HighestWins: c:3.0 wins because 3.0 > 1.0
-    assert_eq!(
-        find_version(&graph_highest, "com.example", "c"),
-        Some("3.0".to_string()),
-        "HighestWins should select highest version (3.0) regardless of depth"
-    );
-}
-
-/// Test that HighestWins handles equal versions correctly (no unnecessary replacement).
-#[tokio::test]
-async fn highest_wins_with_equal_versions() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let c = coord("com.example:c:2.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "c", "2.0")])
-        .with_project(&b, vec![dep("com.example", "c", "2.0")])
-        .with_project(&c, Vec::new());
-
-    let solver = Solver::with_strategy(&backend, ResolutionStrategy::HighestWins, None);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Both paths have same version, should still resolve to 2.0
-    assert_eq!(
-        find_version(&graph, "com.example", "c"),
-        Some("2.0".to_string())
-    );
-}
-
-/// Test default strategy is NearestWins.
-#[tokio::test]
-async fn default_strategy_is_nearest_wins() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let c1 = coord("com.example:c:1.0");
-    let c2 = coord("com.example:c:2.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "c", "1.0")])
-        .with_project(&b, vec![dep("com.example", "c", "2.0")])
-        .with_project(&c1, Vec::new())
-        .with_project(&c2, Vec::new());
-
-    // Default solver (no explicit strategy)
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.0"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Should behave like NearestWins
-    assert_eq!(
-        find_version(&graph, "com.example", "c"),
-        Some("1.0".to_string()),
-        "Default strategy should be NearestWins"
-    );
-}
-
-fn dep_with_type(group_id: &str, artifact_id: &str, version: &str, type_: &str) -> Dependency {
-    Dependency {
-        group_id: group_id.to_string(),
-        artifact_id: artifact_id.to_string(),
-        version: Some(version.to_string()),
-        type_: Some(type_.to_string()),
-        classifier: None,
-        scope: Some("compile".to_string()),
-        optional: None,
-        exclusions: Vec::new(),
-        system_path: None,
-    }
-}
-
-/// Test that test-jar type dependencies are normalized to jar type with tests classifier.
-///
-/// Maven's test-jar type is a convention where:
-/// - type="test-jar" means the actual file extension is ".jar"
-/// - classifier should be "tests"
-///
-/// So org.slf4j:slf4j-api:2.0.17:test-jar should resolve to:
-/// - path: org/slf4j/slf4j-api/2.0.17/slf4j-api-2.0.17-tests.jar
-#[tokio::test]
-async fn test_jar_type_normalizes_to_jar_with_tests_classifier() {
-    let root = coord("com.example:root:1.0");
-    // The coord for the test-jar artifact - note it has jar packaging and tests classifier
-    let lib_tests = Coord {
-        group_id: "com.example".into(),
-        artifact_id: "lib".into(),
-        version: Version::parse("1.0").unwrap(),
-        packaging: None, // jar is default, so None
-        classifier: Some("tests".to_string()),
-    };
-
-    let backend = MockBackend::default().with_project(&lib_tests, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_with_type("com.example", "lib", "1.0", "test-jar")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Find the node for lib
-    let lib_node = graph
-        .node_indices()
-        .filter_map(|idx| graph.node(idx))
-        .find(|node| {
-            node.coord.group_id.as_str() == "com.example"
-                && node.coord.artifact_id.as_str() == "lib"
-        });
-
-    assert!(lib_node.is_some(), "lib node should be in the graph");
-    let lib_node = lib_node.unwrap();
-
-    // Verify the coord has jar packaging (None means jar) and tests classifier
-    assert_eq!(
-        lib_node.coord.packaging, None,
-        "test-jar type should normalize to jar packaging (None)"
-    );
-    assert_eq!(
-        lib_node.coord.classifier.as_deref(),
-        Some("tests"),
-        "test-jar type should have tests classifier"
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Task A: 3+ competing versions at different depths; nearest wins
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Root declares `org.foo:bar:1.0` at depth 1.
-/// Root's dep A declares `org.foo:bar:2.0` at depth 2.
-/// A's dep B declares `org.foo:bar:3.0` at depth 3.
-/// Nearest-wins (Maven default): depth 1 wins → resolves to 1.0.
-#[tokio::test]
-async fn three_level_version_conflict_nearest_wins_at_depth_one() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-    let bar_1 = coord("org.foo:bar:1.0");
-    let bar_2 = coord("org.foo:bar:2.0");
-    let bar_3 = coord("org.foo:bar:3.0");
-
-    // B declares bar:3.0 transitively
-    let backend = MockBackend::default()
-        .with_project(
-            &a,
-            vec![dep("com.example", "b", "1.0"), dep("org.foo", "bar", "2.0")],
-        )
-        .with_project(&b, vec![dep("org.foo", "bar", "3.0")])
-        .with_project(&bar_1, Vec::new())
-        .with_project(&bar_2, Vec::new())
-        .with_project(&bar_3, Vec::new());
-
-    let solver = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            // Root declares bar:1.0 at depth 1, plus a:1.0 which pulls bar:2.0/3.0 deeper
-            dependencies: vec![dep("org.foo", "bar", "1.0"), dep("com.example", "a", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "org.foo", "bar"),
-        Some("1.0".to_string()),
-        "NearestWins: root's depth-1 declaration (1.0) must beat depth-2 (2.0) and depth-3 (3.0)"
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Task B: Direct dep beats BOM (platform constraint) when BOM is non-enforced
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// When a dep is declared directly AND a (non-enforced) BOM/platform constraint
-/// says a different version, the direct declaration wins.
-/// Root imports BOM that says `org.foo:bar:2.0` (simulated via non-enforced constraint).
-/// Root also directly declares `org.foo:bar:1.0` with a HARD pin (`[1.0]`).
-/// Expected: 1.0 wins. The soft-pin variant (which wins the same way) is
-/// covered by `soft_pinned_direct_dep_beats_bom`.
-#[tokio::test]
-async fn direct_dep_beats_non_enforced_bom_constraint() {
-    let root = coord("com.example:root:1.0");
-    let bar_1 = coord("org.foo:bar:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&bar_1, Vec::new())
-        .with_versions("org.foo", "bar", vec!["1.0", "2.0"]);
-
-    // Simulate BOM with a non-enforced platform constraint saying 2.0
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "org.foo".to_string(),
-        module: "bar".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("2.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            // Hard pin `[1.0]` must beat the non-enforced BOM 2.0.
-            dependencies: vec![dep("org.foo", "bar", "[1.0]")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "org.foo", "bar"),
-        Some("1.0".to_string()),
-        "hard-pinned direct dep (1.0) must win over non-enforced BOM constraint (2.0)"
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Task C: Scope promotion in transitive chains
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Root --compile--> A --compile--> B:
-/// B should end up in the graph (with strict_maven_compat enabled, compile→compile=compile).
-/// Root --test--> C --compile--> D:
-/// D is narrowed to test scope (test→compile=test in compat mode).
-/// Verify C appears in graph but D does NOT appear without strict_maven_compat (default mode).
-#[tokio::test]
-async fn scope_promotion_compile_chain_in_compat_mode() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "b", "1.0")])
-        .with_project(&b, Vec::new());
-
-    // With strict_maven_compat: compile→compile→compile means B is resolved as compile
-    let solver = Solver::new(&backend).with_strict_maven_compat(true);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "a", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "a"),
-        Some("1.0".to_string()),
-        "A (compile dep) must be resolved"
-    );
-    assert_eq!(
-        find_version(&graph, "com.example", "b"),
-        Some("1.0".to_string()),
-        "B (compile→compile chain) must be resolved when strict_maven_compat=true"
-    );
-}
-
-/// Test→compile chain: a direct test dep C traverses into its compile child D,
-/// and D is narrowed to test scope (test → compile = test). This holds in both
-/// resolution modes.
-#[tokio::test]
-async fn scope_promotion_test_chain_narrowing() {
-    let root = coord("com.example:root:1.0");
-    let c = coord("com.example:c:1.0");
-    let d = coord("com.example:d:1.0");
-
-    let mut dep_c = dep("com.example", "c", "1.0");
-    dep_c.scope = Some("test".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&c, vec![dep("com.example", "d", "1.0")])
-        .with_project(&d, Vec::new());
-
-    for strict in [false, true] {
-        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
-        let graph = solver
-            .solve(SolverRoot {
-                coord: root.clone(),
-                dependencies: vec![dep_c.clone()],
-                scope: Scope::Compile,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            find_version(&graph, "com.example", "c"),
-            Some("1.0".to_string()),
-            "C (test dep) must be in graph (strict={strict})"
-        );
-        assert_eq!(
-            find_version(&graph, "com.example", "d"),
-            Some("1.0".to_string()),
-            "D must be in graph: test→compile=test (strict={strict})"
-        );
-
-        // D was narrowed from its declared compile scope to test via the test edge.
-        let d_node = graph
-            .node_indices()
-            .filter_map(|idx| graph.node(idx))
-            .find(|n| n.coord.artifact_id.as_str() == "d")
-            .expect("d should be in graph");
-        assert_eq!(
-            d_node.scope,
-            Scope::Test,
-            "D scope must be narrowed to test by the test→compile chain (strict={strict})"
-        );
-    }
-}
-
-/// The real jackson-databind / guava-testlib case, checked against `mvn
-/// dependency:list`: a test-scoped direct dep whose POM pulls a compile dep
-/// that has its own transitive dep.
-///
-///   jackson-databind (root)
-///     └─ com.google.guava:guava-testlib  (scope=test, direct)
-///          └─ junit:junit                (compile in testlib's POM)
-///               └─ org.hamcrest:hamcrest-core (compile in junit's POM)
-///
-/// Maven puts all three on the test classpath (test applied to compile stays
-/// test, transitively), so rv resolves all three at `test` in both modes.
-#[tokio::test]
-async fn test_direct_dep_carries_full_compile_subtree_at_test_scope() {
-    let root = coord("com.fasterxml.jackson.core:jackson-databind:2.18.2");
-    let testlib = coord("com.google.guava:guava-testlib:31.1-jre");
-    let junit = coord("junit:junit:4.13.2");
-    let hamcrest = coord("org.hamcrest:hamcrest-core:1.3");
-
-    // root depends on guava-testlib at <scope>test</scope> (direct edge).
-    let mut dep_testlib = dep("com.google.guava", "guava-testlib", "31.1-jre");
-    dep_testlib.scope = Some("test".to_string());
-    // guava-testlib's own POM carries junit at compile ("testlib must carry
-    // these transitively"); junit's POM carries hamcrest-core at compile.
-    let dep_junit = dep("junit", "junit", "4.13.2");
-    let dep_hamcrest = dep("org.hamcrest", "hamcrest-core", "1.3");
-
-    let backend = MockBackend::default()
-        .with_project(&testlib, vec![dep_junit])
-        .with_project(&junit, vec![dep_hamcrest])
-        .with_project(&hamcrest, Vec::new());
-
-    let scope_of = |graph: &Graph, artifact: &str| -> Option<Scope> {
-        graph
-            .node_indices()
-            .filter_map(|idx| graph.node(idx))
-            .find(|n| n.coord.artifact_id.as_str() == artifact)
-            .map(|n| n.scope)
-    };
-
-    for strict in [false, true] {
-        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
-        let graph = solver
-            .solve(SolverRoot {
-                coord: root.clone(),
-                dependencies: vec![dep_testlib.clone()],
-                scope: Scope::Compile,
-            })
-            .await
-            .unwrap();
-
-        for (group, artifact, version) in [
-            ("com.google.guava", "guava-testlib", "31.1-jre"),
-            ("junit", "junit", "4.13.2"),
-            ("org.hamcrest", "hamcrest-core", "1.3"),
-        ] {
-            assert_eq!(
-                find_version(&graph, group, artifact),
-                Some(version.to_string()),
-                "{artifact} must be resolved (strict={strict})"
-            );
-            assert_eq!(
-                scope_of(&graph, artifact),
-                Some(Scope::Test),
-                "{artifact} must be classified test (strict={strict})"
-            );
+/// Root dependencies written as [`parse_dep`] reads them, after an optional
+/// `@scope` of the root itself.
+fn root(text: &str) -> SolverRoot {
+    let (scope, deps) = match text.strip_prefix('@') {
+        Some(rest) => {
+            let (scope, deps) = rest.split_once(' ').unwrap();
+            (Scope::parse(scope), deps)
         }
-    }
-}
-
-/// Provided-scope analog of the above: a direct `provided` dep's compile
-/// subtree is carried on the provided classpath, transitively, in both modes.
-#[tokio::test]
-async fn provided_direct_dep_carries_full_compile_subtree_at_provided_scope() {
-    let root = coord("com.example:root:1.0");
-    let api = coord("com.example:api:1.0");
-    let impl_ = coord("com.example:impl:1.0");
-    let util = coord("com.example:util:1.0");
-
-    let mut dep_api = dep("com.example", "api", "1.0");
-    dep_api.scope = Some("provided".to_string());
-    let dep_impl = dep("com.example", "impl", "1.0");
-    let dep_util = dep("com.example", "util", "1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&api, vec![dep_impl])
-        .with_project(&impl_, vec![dep_util])
-        .with_project(&util, Vec::new());
-
-    let scope_of = |graph: &Graph, artifact: &str| -> Option<Scope> {
-        graph
-            .node_indices()
-            .filter_map(|idx| graph.node(idx))
-            .find(|n| n.coord.artifact_id.as_str() == artifact)
-            .map(|n| n.scope)
+        None => (Scope::Compile, text),
     };
-
-    for strict in [false, true] {
-        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
-        let graph = solver
-            .solve(SolverRoot {
-                coord: root.clone(),
-                dependencies: vec![dep_api.clone()],
-                scope: Scope::Compile,
-            })
-            .await
-            .unwrap();
-
-        for artifact in ["api", "impl", "util"] {
-            assert_eq!(
-                find_version(&graph, "com.example", artifact),
-                Some("1.0".to_string()),
-                "{artifact} must be resolved (strict={strict})"
-            );
-            assert_eq!(
-                scope_of(&graph, artifact),
-                Some(Scope::Provided),
-                "{artifact} must be classified provided (strict={strict})"
-            );
-        }
+    SolverRoot {
+        coord: coord("g:root:1.0"),
+        dependencies: parse_deps(deps),
+        scope,
     }
 }
 
-/// Guard against over-broadening: only the compile and runtime children of a
-/// direct test dep are carried. A test or provided grandchild (a transitive
-/// test/provided edge at depth > 1) is still dropped, like `mvn dependency:list`.
-#[tokio::test]
-async fn direct_test_dep_still_drops_test_and_provided_grandchildren() {
-    let root = coord("com.example:root:1.0");
-    let test_lib = coord("com.example:test-lib:1.0");
-    let compile_kid = coord("com.example:compile-kid:1.0");
-    let test_kid = coord("com.example:test-kid:1.0");
-    let provided_kid = coord("com.example:provided-kid:1.0");
+/// `(name, projects, root, root management, expected)`.
+type Case<'a> = (&'a str, &'a [&'a str], &'a str, &'a str, &'a str);
 
-    let mut dep_test_lib = dep("com.example", "test-lib", "1.0");
-    dep_test_lib.scope = Some("test".to_string());
-
-    let dep_compile_kid = dep("com.example", "compile-kid", "1.0");
-    let mut dep_test_kid = dep("com.example", "test-kid", "1.0");
-    dep_test_kid.scope = Some("test".to_string());
-    let mut dep_provided_kid = dep("com.example", "provided-kid", "1.0");
-    dep_provided_kid.scope = Some("provided".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(
-            &test_lib,
-            vec![dep_compile_kid, dep_test_kid, dep_provided_kid],
-        )
-        .with_project(&compile_kid, Vec::new())
-        .with_project(&test_kid, Vec::new())
-        .with_project(&provided_kid, Vec::new());
-
-    for strict in [false, true] {
-        let solver = Solver::new(&backend).with_strict_maven_compat(strict);
-        let graph = solver
-            .solve(SolverRoot {
-                coord: root.clone(),
-                dependencies: vec![dep_test_lib.clone()],
-                scope: Scope::Compile,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            find_version(&graph, "com.example", "compile-kid"),
-            Some("1.0".to_string()),
-            "compile grandchild of a direct test dep is carried (strict={strict})"
-        );
-        assert_eq!(
-            find_version(&graph, "com.example", "test-kid"),
-            None,
-            "a test transitive of a test dep must be dropped (strict={strict})"
-        );
-        assert_eq!(
-            find_version(&graph, "com.example", "provided-kid"),
-            None,
-            "a provided transitive of a test dep must be dropped (strict={strict})"
+async fn check(cases: &[Case<'_>]) {
+    for (name, projects, root_deps, managed, expected) in cases {
+        let backend = backend(projects);
+        let solved = Solver::new(&backend)
+            .with_management(management(managed))
+            .solve(root(root_deps))
+            .await;
+        let actual = render(solved);
+        assert!(
+            actual.starts_with(expected) && (expected.starts_with("ERR") || actual == *expected),
+            "{name}: got {actual}, expected {expected}"
         );
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Task D: Multi-level parent POM inheritance (three-level grandparent chain)
-//
-// At the solver level, parent POM inheritance is resolved before the solver
-// runs (the Resolver layer handles it). The solver receives flattened projects
-// with all managed versions already applied. We test this by setting up a
-// three-level chain where each ancestor contributes deps, verifying that the
-// solver correctly resolves all deps that the resolver would have provided.
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Simulates a three-level parent chain:
-///   grandparent manages: org.foo:gp-lib:1.0
-///   parent manages:      org.foo:p-lib:2.0   (inherits grandparent management)
-///   child uses both deps without specifying versions
-///
-/// At the solver level, we model this by having child's project already contain
-/// versioned deps (as the resolver would have applied after parent resolution).
 #[tokio::test]
-async fn multi_level_parent_chain_deps_resolve_correctly() {
-    let root = coord("com.example:root:1.0");
-    let child = coord("com.example:child:1.0");
-    let gp_lib = coord("org.foo:gp-lib:1.0");
-    let p_lib = coord("org.foo:p-lib:2.0");
-
-    // After resolver applies grandparent + parent management, child has both deps with versions
-    let backend = MockBackend::default()
-        .with_project(
-            &child,
-            vec![
-                dep("org.foo", "gp-lib", "1.0"), // version came from grandparent
-                dep("org.foo", "p-lib", "2.0"),  // version came from parent
-            ],
-        )
-        .with_project(&gp_lib, Vec::new())
-        .with_project(&p_lib, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "child", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "child"),
-        Some("1.0".to_string()),
-        "child must be resolved"
-    );
-    assert_eq!(
-        find_version(&graph, "org.foo", "gp-lib"),
-        Some("1.0".to_string()),
-        "gp-lib (from grandparent management) must resolve to 1.0"
-    );
-    assert_eq!(
-        find_version(&graph, "org.foo", "p-lib"),
-        Some("2.0".to_string()),
-        "p-lib (from parent management) must resolve to 2.0"
-    );
+async fn nearest_wins_mediation() {
+    let siblings: &[&str] = &["a:1 > c:1", "b:1 > c:2", "c:1", "c:2"];
+    let deeper: &[&str] = &["a:1 > c:1", "b:1 > d:1", "d:1 > c:3", "c:1", "c:3"];
+    let pins: &[&str] = &["a:1.5", "a:2.5", "b:1 > a:2.5"];
+    #[rustfmt::skip]
+    let cases: &[Case<'_>] = &[
+        ("ties go to the first declared", siblings, "a:1 b:1", "", "a:1 b:1 c:1"),
+        ("the shallower wins", deeper, "a:1 b:1", "", "a:1 b:1 c:1 d:1"),
+        ("first declared wins in a diamond",
+            &["a:1 > c:1", "b:1 > d:1", "c:1 > e:1", "d:1 > e:2", "e:1", "e:2"],
+            "a:1 b:1", "", "a:1 b:1 c:1 d:1 e:1"),
+        ("a direct declaration beats deeper ones",
+            &["a:1 > b:1 o:bar:2.0", "b:1 > o:bar:3.0", "o:bar:1.0", "o:bar:2.0", "o:bar:3.0"],
+            "o:bar:1.0 a:1", "", "a:1 b:1 o:bar:1.0"),
+        ("a nearer version outside a deeper hard range loses",
+            &["a:1 > x:1.0", "b:1 > c:1", "c:1 > x:[2.0,3.0)", "x:1.0", "x:2.5", "x:2.0",
+                "versions x 1.0 2.0 2.5 3.0"],
+            "a:1 b:1", "", "a:1 b:1 c:1 x:2.5"),
+        ("a nearer version inside a deeper range stays",
+            &["b:1 > c:1", "c:1 > x:[2.0,3.0)", "x:2.0", "x:2.5"],
+            "x:2.0 b:1", "", "b:1 c:1 x:2.0"),
+        ("disjoint hard ranges conflict",
+            &["b:1 > c:1", "c:1 > x:[2.0,3.0)", "d:1 > e:1", "e:1 > x:[1.0,1.8)", "x:1.5", "x:2.5"],
+            "b:1 d:1", "", "ERR VersionConflict"),
+        ("a nearer hard pin outside a deeper range conflicts",
+            &["a:1.5", "a:2.5", "a:2.0", "b:1 > a:[2,3)"],
+            "a:[1.5] b:1", "", "ERR VersionConflict"),
+        ("a nearer soft version inside a deeper range succeeds",
+            &["a:2.5", "b:1 > a:[2,3)"], "a:2.5 b:1", "", "a:2.5 b:1"),
+        ("a losing hard pin conflicts",
+            &["a:1.5", "a:2.5", "b:1 > a:[2.5]"], "a:[1.5] b:1", "", "ERR VersionConflict"),
+        ("a losing soft pin does not", pins, "a:1.5 b:1", "", "a:1.5 b:1"),
+        ("a two-bound pin is the version as written",
+            &["x:1.0", "x:1.0.0", "versions x 1.0.0"], "x:[1.0,1.0]", "", "x:1.0"),
+        ("a pin takes its lower bound's spelling",
+            &["x:1.0", "x:1.0.0", "versions x 1.0"], "x:[1.0.0,1.0]", "", "x:1.0.0"),
+        ("a two-bound pin mediates as the short form",
+            &["a:1 > x:[1,2]", "c:1 > x:[1,1]", "x:2 > d:1", "d:1", "x:1 => g:y:1", "y:1"],
+            "a:1 c:1", "", "a:1 c:1 y:1"),
+        ("cycles are cut", &["a:1 > b:1", "b:1 > a:1"], "a:1", "", "a:1 b:1"),
+        ("classifiers are distinct nodes", &["lib:1.0", "lib:1.0~tests"],
+            "lib:1.0 lib:1.0~tests", "", "lib:1.0 lib:1.0~tests"),
+        ("a test-jar is the tests classifier", &["lib:1.0~tests"],
+            "lib:1.0#test-jar", "", "lib:1.0~tests"),
+        ("a test-jar keeps an explicit classifier", &["lib:1.0~custom"],
+            "lib:1.0#test-jar~custom", "", "lib:1.0~custom"),
+        ("a range takes its highest match", &["d:1.5", "d:1.0", "versions d 1.0 1.5 2.0"],
+            "d:[1.0,2.0)", "", "d:1.5"),
+        ("RELEASE skips snapshots",
+            &["dyn:1.0.5", "dyn:1.1.0-SNAPSHOT", "versions dyn 1.0.0 1.0.5 1.1.0-SNAPSHOT"],
+            "dyn:RELEASE", "", "dyn:1.0.5"),
+        ("Gradle's latest.release is refused", &["dyn:1.0.5", "versions dyn 1.0.5"],
+            "dyn:latest.release", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn"),
+        ("LATEST takes snapshots",
+            &["dyn:1.0.5", "dyn:1.1.0-SNAPSHOT", "versions dyn 1.0.0 1.0.5 1.1.0-SNAPSHOT"],
+            "dyn:LATEST", "", "dyn:1.1.0-SNAPSHOT"),
+        ("Gradle's dynamic syntax is refused", &["dyn:1.0.5", "versions dyn 1.0.5"],
+            "dyn:1.+", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn"),
+        ("a trailing plus is refused", &["dyn:1.0.5"],
+            "dyn:+", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn"),
+        ("an inner plus is part of the version", &["dyn:1.0+b1"], "dyn:1.0+b1", "", "dyn:1.0+b1"),
+        ("a version with an undefined property names it and its POM", &["a:1 > x:${undefined}"],
+            "a:1", "", "ERR UndefinedProperty: property undefined is not defined: g:a:1 declares g:x:${undefined}"),
+        ("a managed version with an undefined property names the root", &["a:1 > x:1"],
+            "a:1", "x:${undefined}", "ERR UndefinedProperty: property undefined is not defined: g:root:1.0 declares g:x:${undefined}"),
+        ("a managed version names the root though the declared one is undefined too",
+            &["a:1 > x:${theirs}"], "a:1", "x:${ours}",
+            "ERR UndefinedProperty: property ours is not defined: g:root:1.0 declares g:x:${ours}"),
+        ("a group with an undefined property names it", &["a:1 > ${undefined}:x:1"],
+            "a:1", "", "ERR UndefinedProperty: property undefined is not defined: g:a:1 declares ${undefined}:x:1"),
+        ("a nested undefined property names the inner one", &["a:1 > x:${outer.${inner}}"],
+            "a:1", "", "ERR UndefinedProperty: property inner is not defined: g:a:1 declares g:x:${outer.${inner}}"),
+        ("a version-less dependency needs management", &[], "lib:_", "",
+            "ERR MissingVersion"),
+        ("a system dependency needs a version", &[], "native:_@system=/opt/n.jar", "",
+            "ERR MissingVersion"),
+        ("a system dependency resolves locally", &[], "native:1.2.3@system=/opt/n.jar", "",
+            "native:1.2.3@system=/opt/n.jar+local"),
+        ("a direct system dependency beats a transitive one", &["lib:1 > tools:2", "tools:2"],
+            "lib:1 tools:1@system=/opt/t.jar", "", "lib:1 tools:1@system=/opt/t.jar+local"),
+    ];
+    check(cases).await;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Task E: BOM importing another BOM (transitive BOM constraint resolution)
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Root imports bom-a which itself imports bom-b.
-/// bom-b constrains org.foo:bar:3.0.
-/// Root depends on org.foo:bar (no version; relies on constraint).
-///
-/// At the solver level, transitive BOM imports are resolved by the Resolver and
-/// delivered as a merged PlatformConstraints. We simulate this by providing a
-/// PlatformConstraints that contains the constraint from bom-b (via bom-a).
+/// A chain of relocations stops after 32 instead of being followed as far
+/// as a repository serves it, counting the relocations a cached chain
+/// adds.
 #[tokio::test]
-async fn transitive_bom_constraint_resolves_unversioned_dep() {
-    let root = coord("com.example:root:1.0");
-    let bar = coord("org.foo:bar:3.0");
-
-    let backend = MockBackend::default().with_project(&bar, Vec::new());
-
-    // Simulate bom-a → bom-b → bar:3.0 as a merged platform constraint
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "org.foo".to_string(),
-        module: "bar".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("3.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_no_version("org.foo", "bar")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "org.foo", "bar"),
-        Some("3.0".to_string()),
-        "transitive BOM constraint (3.0) must resolve the unversioned dep"
-    );
-}
-
-/// Test that test-jar type with explicit classifier preserves the explicit classifier.
-#[tokio::test]
-async fn test_jar_type_with_explicit_classifier_preserves_classifier() {
-    let root = coord("com.example:root:1.0");
-    let lib_custom = Coord {
-        group_id: "com.example".into(),
-        artifact_id: "lib".into(),
-        version: Version::parse("1.0").unwrap(),
-        packaging: None,
-        classifier: Some("custom".to_string()),
+async fn an_endless_relocation_chain_fails() {
+    let chain = |from: usize, to: usize| -> Vec<String> {
+        (from..to)
+            .map(|i| format!("c{i}:1 => g:c{}:1", i + 1))
+            .chain([format!("c{to}:1")])
+            .collect()
     };
-
-    let backend = MockBackend::default().with_project(&lib_custom, Vec::new());
-
-    // Create a dependency with test-jar type but explicit classifier
-    let mut dep = dep_with_type("com.example", "lib", "1.0", "test-jar");
-    dep.classifier = Some("custom".to_string());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    let lib_node = graph
-        .node_indices()
-        .filter_map(|idx| graph.node(idx))
-        .find(|node| {
-            node.coord.group_id.as_str() == "com.example"
-                && node.coord.artifact_id.as_str() == "lib"
-        });
-
-    assert!(lib_node.is_some(), "lib node should be in the graph");
-    let lib_node = lib_node.unwrap();
-
-    // Verify explicit classifier takes precedence
-    assert_eq!(
-        lib_node.coord.classifier.as_deref(),
-        Some("custom"),
-        "explicit classifier should take precedence over test-jar implied classifier"
-    );
-}
-
-/// Helper to create a dependency without version (for platform constraint testing).
-fn dep_no_version(group_id: &str, artifact_id: &str) -> Dependency {
-    Dependency {
-        group_id: group_id.to_string(),
-        artifact_id: artifact_id.to_string(),
-        version: None,
-        type_: None,
-        classifier: None,
-        scope: Some("compile".to_string()),
-        optional: None,
-        exclusions: Vec::new(),
-        system_path: None,
-    }
-}
-
-/// Test that platform constraints provide versions for dependencies without versions.
-#[tokio::test]
-async fn platform_constraints_provide_missing_version() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:2.5.0");
-
-    let backend = MockBackend::default().with_project(&lib, Vec::new());
-
-    // Create platform constraints
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("2.5.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_no_version("com.example", "lib")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // The version should come from the platform constraint
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("2.5.0".to_string()),
-        "Platform constraint should provide version for unversioned dependency"
-    );
-}
-
-/// Test that enforced platform constraints override explicit versions.
-#[tokio::test]
-async fn enforced_platform_constraints_override_version() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:3.0.0");
-
-    let backend = MockBackend::default().with_project(&lib, Vec::new());
-
-    // Create enforced platform constraints
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: None,
-            strictly: Some("3.0.0".to_string()),
-        },
-        enforced: true,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            // Dependency specifies 1.0.0, but enforced platform should override
-            dependencies: vec![dep("com.example", "lib", "1.0.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // The version should come from the enforced platform constraint
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("3.0.0".to_string()),
-        "Enforced platform constraint should override explicit version"
-    );
-}
-
-/// Test that regular platform constraints don't override a HARD-pinned
-/// explicit version (`[X]` syntax → VersionReq::Exact). A bare soft pin
-/// (`<version>X</version>` → VersionReq::Soft) wins the same way; that case
-/// is covered by `soft_pinned_direct_dep_beats_bom`.
-#[tokio::test]
-async fn regular_platform_constraints_dont_override_version() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:1.0.0");
-
-    let backend = MockBackend::default()
-        .with_project(&lib, Vec::new())
-        .with_versions("com.example", "lib", vec!["1.0.0", "2.0.0"]);
-
-    // Create regular (non-enforced) platform constraints
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("2.0.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            // Hard pin `[1.0.0]`: non-enforced constraint must NOT override it.
-            dependencies: vec![dep("com.example", "lib", "[1.0.0]")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // The explicit version should be used
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("1.0.0".to_string()),
-        "Regular platform constraint should not override explicit version"
-    );
-}
-
-/// Test that platform constraints from a resolved project apply to its dependencies.
-#[tokio::test]
-async fn platform_constraints_from_project_apply_to_children() {
-    let root = coord("com.example:root:1.0");
-    let consumer = coord("com.example:consumer:1.0");
-    let lib = coord("com.example:lib:2.0.0");
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("2.0.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let backend = MockBackend::default()
-        .with_project(&consumer, vec![dep_no_version("com.example", "lib")])
-        .with_project(&lib, Vec::new())
-        .with_platform_constraints(&consumer, constraints);
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "consumer", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("2.0.0".to_string()),
-        "Project platform constraints should apply to child dependencies"
-    );
-}
-
-/// Test that unversioned dependency without platform constraint fails.
-#[tokio::test]
-async fn unversioned_dependency_without_constraint_fails() {
-    let root = coord("com.example:root:1.0");
-
-    let backend = MockBackend::default();
-
-    // No platform constraints
-    let solver = Solver::new(&backend);
-    let result = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_no_version("com.example", "lib")],
-            scope: Scope::Compile,
-        })
-        .await;
-
-    assert!(result.is_err());
-    match result.unwrap_err() {
-        ResolveError::MissingVersion {
-            group_id,
-            artifact_id,
-        } => {
-            assert_eq!(group_id, "com.example");
-            assert_eq!(artifact_id, "lib");
-        }
-        other => panic!("Expected MissingVersion error, got: {:?}", other),
-    }
-}
-
-/// In non-strict (default) mode, `transitive_from(Test, Compile)`
-/// returns `Some(Test)`, so a compile-scoped child reached through a
-/// test-scoped parent must end up classified as `Test`.
-///
-/// Regression guard: if `inherit_scope` bounced back to the child scope
-/// via the `_ => child` fallthrough for such (parent, child) pairs, it
-/// would emit the node as `Compile` in the lock and break downstream
-/// test-classpath bookkeeping.
-#[tokio::test]
-async fn non_strict_test_chain_preserves_test_scope_on_compile_child() {
-    let root = coord("com.example:root:1.0");
-    let a = coord("com.example:a:1.0");
-    let b = coord("com.example:b:1.0");
-
-    // A is a compile dep that itself depends on B (compile). The
-    // traversal is triggered through a Test-scoped root, so every dep
-    // it reaches should appear as Test.
-    let backend = MockBackend::default()
-        .with_project(&a, vec![dep("com.example", "b", "1.0")])
-        .with_project(&b, Vec::new());
-
-    let solver = Solver::new(&backend); // strict_maven_compat defaults to false
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "a", "1.0")],
-            scope: Scope::Test,
-        })
-        .await
-        .unwrap();
-
-    let b_node = graph
-        .node_indices()
-        .filter_map(|idx| graph.node(idx))
-        .find(|n| n.coord.artifact_id.as_str() == "b")
-        .expect("b must be in graph: transitive_from(Test, Compile)=Some(Test)");
-    assert_eq!(
-        b_node.scope,
-        Scope::Test,
-        "B reached through a test-scoped chain must keep effective scope Test, \
-         not the child's declared Compile"
-    );
-}
-
-// PlatformConstraint matches by (group, artifact, type, classifier).
-// A BOM entry for the test-jar variant must not steal the version of a plain
-// jar consumer at the same coordinate, and vice versa.
-
-/// BOM manages `com.example:lib:test-jar:2.0`. The direct dep is a plain jar
-/// at `1.0`. The managed test-jar entry must not apply: the resolved version
-/// stays `1.0`.
-#[tokio::test]
-async fn platform_constraint_test_jar_does_not_match_plain_jar() {
-    let root = coord("com.example:root:1.0");
-    let lib_plain = coord("com.example:lib:1.0");
-
-    let backend = MockBackend::default().with_project(&lib_plain, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    // Managed entry for the test-jar variant: effective_type="jar", classifier="tests".
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: Some("tests".to_string()),
-        version: ConstraintVersion {
-            requires: Some("2.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("1.0".to_string()),
-        "test-jar BOM entry must not match a plain-jar direct dep"
-    );
-}
-
-/// Same scenario with both managed entries present (`jar:1.0` and
-/// `test-jar:2.0`): each variant resolves to its own managed version.
-#[tokio::test]
-async fn platform_constraint_jar_and_test_jar_resolve_independently() {
-    let root = coord("com.example:root:1.0");
-    let lib_plain = coord("com.example:lib:1.0");
-    let lib_tests = Coord {
-        group_id: "com.example".into(),
-        artifact_id: "lib".into(),
-        version: Version::parse("2.0").unwrap(),
-        packaging: None,
-        classifier: Some("tests".to_string()),
-    };
-
-    let backend = MockBackend::default()
-        .with_project(&lib_plain, Vec::new())
-        .with_project(&lib_tests, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    // Managed: plain jar at 1.0.
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("1.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-    // Managed: test-jar (effective type=jar, classifier=tests) at 2.0.
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: Some("tests".to_string()),
-        version: ConstraintVersion {
-            requires: Some("2.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    // Both direct deps are unversioned; each picks the managed version that
-    // matches its (type, classifier) key.
-    let mut dep_jar = dep_no_version("com.example", "lib");
-    dep_jar.scope = Some("compile".to_string());
-
-    let mut dep_test_jar = dep_no_version("com.example", "lib");
-    dep_test_jar.type_ = Some("test-jar".to_string());
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_jar, dep_test_jar],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    // Two distinct nodes are expected: one plain, one with classifier=tests.
-    let mut plain = None;
-    let mut tests = None;
-    for node in graph.node_indices().filter_map(|idx| graph.node(idx)) {
-        if node.coord.group_id.as_str() != "com.example" || node.coord.artifact_id.as_str() != "lib"
-        {
-            continue;
-        }
-        match node.coord.classifier.as_deref() {
-            None => plain = Some(node.coord.version.to_string()),
-            Some("tests") => tests = Some(node.coord.version.to_string()),
-            _ => {}
-        }
-    }
-
-    assert_eq!(plain, Some("1.0".to_string()), "plain jar should be 1.0");
-    assert_eq!(tests, Some("2.0".to_string()), "test-jar should be 2.0");
-}
-
-// A declared version on a direct dependency always beats <dependencyManagement>,
-// soft pin included: declaring `jackson-databind 2.15.2` in <dependencies> is
-// exactly how Maven users override a BOM-managed 2.15.0. Management only fills
-// in missing versions at depth 1.
-
-/// Direct dep `x:lib:1.0` (bare version = soft pin). BOM says `2.0`. Maven
-/// resolves to `1.0`: dep-mgmt never replaces a declared direct-dep version.
-#[tokio::test]
-async fn soft_pinned_direct_dep_beats_bom() {
-    let root = coord("com.example:root:1.0");
-    let lib_1 = coord("com.example:lib:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&lib_1, Vec::new())
-        .with_versions("com.example", "lib", vec!["1.0", "2.0"]);
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("2.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("1.0".to_string()),
-        "a soft-pinned direct dep (1.0) must beat the BOM (2.0)"
-    );
-}
-
-/// Root depMgmt manages `x:mid` with an `<exclusions>` entry (and no
-/// version): the canonical "globally exclude commons-logging" pattern.
-/// The exclusion must prune the subtree below `mid` even when `mid` is
-/// reached transitively, matching Maven's ClassicDependencyManager.
-#[tokio::test]
-async fn managed_exclusions_apply_to_transitive_nodes() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:1.0");
-    let mid = coord("com.example:mid:1.0");
-    let clogging = coord("commons-logging:commons-logging:1.2");
-
-    let backend = MockBackend::default()
-        .with_project(&lib, vec![dep("com.example", "mid", "1.0")])
-        .with_project(&mid, vec![dep("commons-logging", "commons-logging", "1.2")])
-        .with_project(&clogging, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "mid".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        exclusions: vec![rv_maven_model::Exclusion {
-            group_id: "commons-logging".to_string(),
-            artifact_id: "commons-logging".to_string(),
-        }],
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "mid"),
-        Some("1.0".to_string()),
-        "managed node itself stays in the graph"
-    );
-    assert_eq!(
-        find_version(&graph, "commons-logging", "commons-logging"),
-        None,
-        "managed exclusion must prune the transitive subtree"
-    );
-}
-
-fn managed_scope_constraint(artifact: &str, scope: &str) -> PlatformConstraint {
-    PlatformConstraint {
-        group: "com.example".to_string(),
-        module: artifact.to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        scope: Some(scope.to_string()),
-        ..Default::default()
-    }
-}
-
-/// Root depMgmt forces `<scope>test</scope>` on an unscoped transitive
-/// coordinate. Maven prunes transitive test deps on the declared scope, before
-/// management, so the dep stays in the closure as a test dep (with its subtree).
-#[tokio::test]
-async fn managed_scope_test_keeps_transitive_as_test() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:1.0");
-    let extra = coord("com.example:extra:1.0");
-    let leaf = coord("com.example:leaf:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&lib, vec![dep_no_scope("com.example", "extra", "1.0")])
-        .with_project(&extra, vec![dep("com.example", "leaf", "1.0")])
-        .with_project(&leaf, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_scope_constraint("extra", "test"));
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_scope(&graph, "com.example", "extra"),
-        Some(Scope::Test),
-        "managed test scope keeps the transitive, as a test dep"
-    );
-    assert_eq!(
-        find_scope(&graph, "com.example", "leaf"),
-        Some(Scope::Test),
-        "the managed-test dep's own compile child is kept, as test"
-    );
-}
-
-/// A dependency managed to test scope retains its subtree under a runtime parent.
-/// This applies even though `transitive_from(Runtime, Test)` returns `None`.
-#[tokio::test]
-async fn managed_scope_test_keeps_subtree_under_runtime_parent() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:1.0");
-    let extra = coord("com.example:extra:1.0");
-    let leaf = coord("com.example:leaf:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&lib, vec![dep("com.example", "extra", "1.0")])
-        .with_project(&extra, vec![dep("com.example", "leaf", "1.0")])
-        .with_project(&leaf, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_scope_constraint("extra", "test"));
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![Dependency {
-                scope: Some("runtime".to_string()),
-                ..dep("com.example", "lib", "1.0")
-            }],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_scope(&graph, "com.example", "extra"),
-        Some(Scope::Test)
-    );
-    assert!(find_version(&graph, "com.example", "leaf").is_some());
-}
-
-/// A compile dependency managed to `test` remains a child of a direct test dependency.
-#[tokio::test]
-async fn managed_test_scope_keeps_child_of_test_direct_dep() {
-    let root = coord("com.example:root:1.0");
-    let compress = coord("com.example:compress:1.0");
-    let io = coord("com.example:io:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&compress, vec![dep_no_scope("com.example", "io", "1.0")])
-        .with_project(&io, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_scope_constraint("io", "test"));
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![Dependency {
-                scope: Some("test".to_string()),
-                ..dep("com.example", "compress", "1.0")
-            }],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_scope(&graph, "com.example", "io"),
-        Some(Scope::Test),
-        "managed test scope must not drop a test direct dep's transitive"
-    );
-}
-
-/// Maven prunes declared transitive `test` dependencies even when managed to `compile`.
-#[tokio::test]
-async fn declared_test_transitive_stays_dropped_despite_managed_compile() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:1.0");
-    let extra = coord("com.example:extra:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(
-            &lib,
-            vec![Dependency {
-                scope: Some("test".to_string()),
-                ..dep("com.example", "extra", "1.0")
-            }],
-        )
-        .with_project(&extra, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_scope_constraint("extra", "compile"));
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(find_version(&graph, "com.example", "extra"), None);
-}
-
-#[tokio::test]
-async fn versionless_child_version_from_transitive_depmgmt() {
-    let root = coord("com.example:root:1.0");
-    let testlib = coord("com.example:testlib:1.0");
-    let junit = coord("com.example:junit:4.13.2");
-    let hamcrest = coord("com.example:hamcrest:1.3");
-
-    // Management entry as the model would surface it after merging P's
-    // dependencyManagement into D: version 4.13.2, scope test.
-    let managed_junit = Dependency {
-        scope: Some("test".to_string()),
-        ..dep("com.example", "junit", "4.13.2")
-    };
-
-    let backend = MockBackend::default()
-        .with_project_and_mgmt(
-            &testlib,
-            // D declares junit with an explicit compile scope and NO version.
-            vec![dep_versionless("com.example", "junit", "compile")],
-            vec![managed_junit],
-        )
-        .with_project(&junit, vec![dep("com.example", "hamcrest", "1.3")])
-        .with_project(&hamcrest, Vec::new());
-
-    // testlib is a direct test dependency, as jackson-databind declares
-    // guava-testlib.
-    let testlib_dep = Dependency {
-        scope: Some("test".to_string()),
-        ..dep("com.example", "testlib", "1.0")
-    };
-
-    // strict Maven compatibility mirrors pom.xml resolution, where a direct
-    // test dependency's compile children are traversed.
-    let solver = Solver::new(&backend).with_strict_maven_compat(true);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![testlib_dep],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "junit"),
-        Some("4.13.2".to_string()),
-        "versionless child must take its version from the artifact's dependencyManagement"
-    );
-    // The management entry's test scope was not stamped onto the declared
-    // compile scope; junit rides in on testlib's test edge instead of being
-    // pruned as a depth > 1 test dependency, matching `mvn dependency:tree`
-    // (junit:junit:4.13.2:test under a test-scoped guava-testlib).
-    assert_eq!(
-        find_scope(&graph, "com.example", "junit"),
-        Some(Scope::Test),
-        "junit must be included as a test dependency, not dropped"
-    );
-    assert_eq!(
-        find_version(&graph, "com.example", "hamcrest"),
-        Some("1.3".to_string()),
-        "the managed child's own transitive dependency must be pulled in"
-    );
-}
-
-/// The management-supplied version fills a blank only. An explicit
-/// `<version>` on the child always wins over a differing dependencyManagement
-/// entry for the same coordinate.
-#[tokio::test]
-async fn explicit_child_version_wins_over_transitive_depmgmt() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:1.0");
-    let child_2 = coord("com.example:child:2.0");
-
-    let managed_child = dep("com.example", "child", "1.0");
-
-    let backend = MockBackend::default()
-        .with_project_and_mgmt(
-            &lib,
-            // Declared with an explicit 2.0; management says 1.0.
-            vec![dep("com.example", "child", "2.0")],
-            vec![managed_child],
-        )
-        .with_project(&child_2, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "child"),
-        Some("2.0".to_string()),
-        "an explicit child version must win over the dependencyManagement entry"
-    );
-}
-
-/// Root dependencyManagement overrides an explicit transitive compile scope with `test`.
-/// Maven retains the dependency and reports "scope managed from compile".
-#[tokio::test]
-async fn managed_scope_overrides_declared_child_scope() {
-    let root = coord("com.example:root:1.0");
-    let lib = coord("com.example:lib:1.0");
-    let child = coord("com.example:child:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&lib, vec![dep("com.example", "child", "1.0")])
-        .with_project(&child, Vec::new());
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_scope_constraint("child", "test"));
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep("com.example", "lib", "1.0")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_scope(&graph, "com.example", "child"),
-        Some(Scope::Test),
-        "managed test scope overrides the declared compile scope"
-    );
-}
-
-/// Direct dep `x:lib:[1.0]` (hard pin via bracketed range). BOM says `2.0`.
-/// Maven keeps the hard-pin's `1.0`.
-#[tokio::test]
-async fn hard_pinned_direct_dep_blocks_bom_override() {
-    let root = coord("com.example:root:1.0");
-    let lib_1 = coord("com.example:lib:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&lib_1, Vec::new())
-        .with_versions("com.example", "lib", vec!["1.0", "2.0"]);
-
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: Some("2.0".to_string()),
-            strictly: None,
-        },
-        enforced: false,
-        ..Default::default()
-    });
-
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            // [1.0] is a Maven hard pin (Exact range).
-            dependencies: vec![dep("com.example", "lib", "[1.0]")],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("1.0".to_string()),
-        "hard-pinned direct dep must block non-enforced BOM override"
-    );
-}
-
-/// Regression for the requeue path: when an intra-batch constraint discovery
-/// invalidates a resolution, the requeued item must keep its original
-/// `declared_at`. Overwriting it with `next_declared_at` shoves the item to
-/// the back of every Maven first-declared-wins tiebreak.
-#[tokio::test]
-async fn requeue_preserves_declared_at_for_tiebreak() {
-    let root = coord("com.example:root:1.0");
-    let consumer = coord("com.example:consumer:1.0");
-    let lib_1 = coord("com.example:lib:1.0");
-    let lib_2 = coord("com.example:lib:2.0");
-
-    // Consumer's project surfaces an enforced constraint that flips lib
-    // from its soft-pinned 1.0 to 2.0 mid-batch.
-    let mut consumer_constraints = PlatformConstraints::new();
-    consumer_constraints.add_constraint(PlatformConstraint {
-        group: "com.example".to_string(),
-        module: "lib".to_string(),
-        type_: "jar".to_string(),
-        classifier: None,
-        version: ConstraintVersion {
-            requires: None,
-            strictly: Some("2.0".to_string()),
-        },
-        enforced: true,
-        ..Default::default()
-    });
-
-    let backend = MockBackend::default()
-        .with_project(&consumer, Vec::new())
-        .with_platform_constraints(&consumer, consumer_constraints)
-        .with_project(&lib_1, Vec::new())
-        .with_project(&lib_2, Vec::new());
-
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                // Soft-pinned lib resolves to 1.0 on the first pass; the
-                // enforced constraint discovered while processing `consumer`
-                // forces a requeue. With this bug, `lib.declared_at` would
-                // be bumped past `consumer.declared_at`, breaking ordering
-                // assumptions on the requeued resolution.
-                dep("com.example", "lib", "1.0"),
-                dep("com.example", "consumer", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "lib"),
-        Some("2.0".to_string()),
-        "enforced constraint discovered intra-batch should win after requeue"
-    );
-    assert_eq!(
-        find_version(&graph, "com.example", "consumer"),
-        Some("1.0".to_string())
-    );
-}
-
-/// Regression: only BOM imports act as a barrier, not any version-less
-/// dep. Two unversioned compile deps in one batch are fetched in parallel.
-#[tokio::test]
-async fn unversioned_compile_deps_share_a_batch() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Barrier;
-
-    struct ParallelProbe {
-        inner: MockBackend,
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
-        barrier: Arc<Barrier>,
-    }
-
-    impl Backend for ParallelProbe {
-        fn resolve_version<'a>(
-            &'a self,
-            group_id: &'a str,
-            artifact_id: &'a str,
-            req: &'a VersionReq,
-        ) -> super::BoxFuture<'a, super::Result<ResolvedVersion>> {
-            self.inner.resolve_version(group_id, artifact_id, req)
-        }
-
-        fn fetch_project<'a>(
-            &'a self,
-            coord: &'a Coord,
-            scope: Scope,
-        ) -> super::BoxFuture<'a, super::Result<ResolvedProject>> {
-            Box::pin(async move {
-                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-                self.barrier.wait().await;
-                let out = self.inner.fetch_project(coord, scope).await;
-                self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                out
-            })
-        }
-    }
-
-    let root = coord("com.example:root:1.0");
-    let lib_a = coord("com.example:lib-a:1.0");
-    let lib_b = coord("com.example:lib-b:1.0");
-
-    let inner = MockBackend::default()
-        .with_project(&lib_a, Vec::new())
-        .with_project(&lib_b, Vec::new());
-
-    let probe = ParallelProbe {
-        inner,
-        in_flight: AtomicUsize::new(0),
-        max_in_flight: AtomicUsize::new(0),
-        barrier: Arc::new(Barrier::new(2)),
-    };
-
-    let mut existing = PlatformConstraints::new();
-    for module in ["lib-a", "lib-b"] {
-        existing.add_constraint(PlatformConstraint {
-            group: "com.example".to_string(),
-            module: module.to_string(),
-            type_: "jar".to_string(),
-            classifier: None,
-            version: ConstraintVersion {
-                requires: Some("1.0".to_string()),
-                strictly: None,
-            },
-            enforced: false,
-            ..Default::default()
-        });
-    }
-
-    let solver = Solver::new(&probe).with_platform_constraints(existing);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep_no_version("com.example", "lib-a"),
-                dep_no_version("com.example", "lib-b"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "lib-a"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(
-        find_version(&graph, "com.example", "lib-b"),
-        Some("1.0".to_string())
-    );
-    assert_eq!(
-        probe.max_in_flight.load(Ordering::SeqCst),
-        2,
-        "two unversioned compile deps must fetch in parallel; barrier(2).wait() would deadlock otherwise"
-    );
-}
-
-/// Regression: in the default (non-strict / rv.toml) mode, a direct
-/// `provided` dep's compile children were silently dropped. They should be
-/// included and scoped as provided.
-#[tokio::test]
-async fn rv_toml_root_provided_dep_includes_children() {
-    let root = coord("com.example:root:1.0");
-    let provided = coord("com.example:provided:1.0");
-    let provided_child = coord("com.example:provided-child:1.0");
-
-    let mut dep_provided = dep("com.example", "provided", "1.0");
-    dep_provided.scope = Some("provided".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&provided, vec![dep("com.example", "provided-child", "1.0")])
-        .with_project(&provided_child, Vec::new());
-
-    // Default Solver::new => strict_maven_compat=false, matching rv.toml roots.
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![dep_provided],
-            scope: Scope::Compile,
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        find_version(&graph, "com.example", "provided-child"),
-        Some("1.0".to_string()),
-        "direct provided dep's children must be included for rv.toml roots"
-    );
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// VersionConflict when nearest-wins picks an out-of-range version
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Graph: root -> a:[1.5] (depth 1); root -> b:1.0 -> a:[2,3) (depth 2).
-///
-/// A soft nearer version would instead lose to the range (maven-resolver picks
-/// the nearest candidate satisfying every hard range); a hard pin cannot, so
-/// NearestWins selects a:1.5 (depth=1 wins). When b's transitive requirement
-/// `[2,3)` arrives as the loser, 1.5 ∉ [2,3) → `VersionConflict` must be raised.
-///
-/// The solver first resolves `[2,3)` to `a:2.5` (best match), fetches the
-/// project, and only THEN enters the conflict-resolution path where a:1.5 is
-/// already selected. The loser-branch check fires there.
-#[tokio::test]
-async fn nearest_wins_out_of_range_raises_version_conflict() {
-    let root = coord("com.example:root:1.0");
-    let a_15 = coord("com.example:a:1.5");
-    let a_25 = coord("com.example:a:2.5"); // what [2,3) resolves to
-    let b = coord("com.example:b:1.0");
-
-    // `b` depends on `a` with a hard range `[2,3)`.
-    let dep_a_range = Dependency {
-        group_id: "com.example".to_string(),
-        artifact_id: "a".to_string(),
-        version: Some("[2,3)".to_string()),
-        type_: None,
-        classifier: None,
-        scope: Some("compile".to_string()),
-        optional: None,
-        exclusions: Vec::new(),
-        system_path: None,
-    };
-
-    // Register both `a:1.5` (the soft-pin winner) and `a:2.5` (what the range
-    // resolves to). Without registering `a:2.5`, `fetch_project` would error
-    // before the conflict path is reached.
-    let backend = MockBackend::default()
-        .with_project(&a_15, Vec::new())
-        .with_project(&a_25, Vec::new())
-        .with_project(&b, vec![dep_a_range])
-        .with_project(&coord("com.example:a:2.0"), Vec::new())
-        .with_versions("com.example", "a", vec!["1.5", "2.0", "2.5"]);
-
-    let solver = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
-    let result = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "[1.5]"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await;
-
-    match result {
-        Err(ResolveError::VersionConflict {
-            coord,
-            requested,
-            selected,
-        }) => {
-            assert!(coord.contains("com.example:a"), "coord = {coord}");
-            assert!(
-                requested.contains("2") || requested.contains("["),
-                "requested = {requested}"
-            );
-            assert!(selected.contains("1.5"), "selected = {selected}");
-        }
-        Err(other) => panic!("expected VersionConflict, got {other:?}"),
-        Ok(graph) => panic!(
-            "expected VersionConflict but resolution succeeded; a resolved to {:?}",
-            find_version(&graph, "com.example", "a")
+    let at_most = chain(0, 32);
+    let too_long = chain(0, 33);
+    // `b` takes the cached chain of 31 from `c1`; `a` adds two in front.
+    let mut cached = chain(1, 31);
+    cached.extend(["b:1 => g:c1:1", "a:1 => g:x:1", "x:1 => g:b:1"].map(String::from));
+    for (name, projects, root, expected) in [
+        ("32 relocations", &at_most, "c0:1", "c32:1"),
+        ("33 relocations", &too_long, "c0:1", "ERR RelocationCycle"),
+        (
+            "33 relocations through a cached chain",
+            &cached,
+            "b:1 a:1",
+            "ERR RelocationCycle",
         ),
+    ] {
+        let projects: Vec<&str> = projects.iter().map(String::as_str).collect();
+        check(&[(name, &projects, root, "", expected)]).await;
     }
 }
 
-/// Converse: root → A:2.5 (soft, depth=1); root → B:1.0 → A:[2,3) (hard range, depth=2).
-/// NearestWins selects A:2.5. 2.5 ∈ [2,3), so no conflict should be raised.
+/// Each new winner is progress, however many there are: only a winner that
+/// comes back counts towards giving up. Maven 3.9.12 selects `x:300`.
 #[tokio::test]
-async fn nearest_wins_in_range_succeeds() {
-    let root = coord("com.example:root:1.0");
-    let a_ok = coord("com.example:a:2.5");
-    let b = coord("com.example:b:1.0");
-
-    let mut dep_a_range = dep("com.example", "a", "[2,3)");
-    dep_a_range.version = Some("[2,3)".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&a_ok, Vec::new())
-        .with_project(&b, vec![dep_a_range])
-        .with_versions("com.example", "a", vec!["2.5"]);
-
-    let solver = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "2.5"), // soft pin, depth=1
-                dep("com.example", "b", "1.0"), // depth=1, pulls a:[2,3) at depth=2
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .expect("2.5 is within [2,3), no conflict expected");
-
-    assert_eq!(
-        find_version(&graph, "com.example", "a"),
-        Some("2.5".to_string()),
-        "in-range nearest-wins should succeed without error"
-    );
+async fn many_winner_changes_still_converge() {
+    let projects: Vec<String> = (1..=300)
+        .flat_map(|i| [format!("a{i}:1 => g:x:{i}"), format!("x:{i}")])
+        .collect();
+    let projects: Vec<&str> = projects.iter().map(String::as_str).collect();
+    let root: Vec<String> = (1..=300).map(|i| format!("a{i}:1")).collect();
+    let root = root.join(" ");
+    check(&[(
+        "300 relocations onto rising versions",
+        &projects,
+        &root,
+        "",
+        "x:300",
+    )])
+    .await;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// A hard *pin* (`[X]` -> Exact) that loses nearest-wins must raise
-// VersionConflict, consistent with a hard *range* losing. Earlier only Ranges
-// raised; a losing Exact pin silently accepted the nearest-wins version.
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Graph: root -> a:[1.5] (hard pin, depth=1); root -> b:1.0 -> a:[2.5] (hard pin,
-/// depth=2). NearestWins selects a:1.5 (depth=1 wins). The transitive hard pin
-/// `[2.5]` arrives as the loser; 1.5 ≠ 2.5 → `VersionConflict` must be raised.
+/// The ledger's probe graphs, where a hard range evicts an expanded node, a
+/// relocation joins two conflict groups, or tree order decides a tie, with
+/// Maven 3.9.12's answers.
 #[tokio::test]
-async fn nearest_wins_loses_hard_pin_raises_version_conflict() {
-    let root = coord("com.example:root:1.0");
-    let a_15 = coord("com.example:a:1.5");
-    let a_25 = coord("com.example:a:2.5"); // what [2.5] resolves to
-    let b = coord("com.example:b:1.0");
-
-    // `b` depends on `a` with a hard pin `[2.5]` (Exact).
-    let mut dep_a_pin = dep("com.example", "a", "[2.5]");
-    dep_a_pin.version = Some("[2.5]".to_string());
-
-    let backend = MockBackend::default()
-        .with_project(&a_15, Vec::new())
-        .with_project(&a_25, Vec::new())
-        .with_project(&b, vec![dep_a_pin])
-        .with_versions("com.example", "a", vec!["1.5", "2.5"]);
-
-    let solver = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
-    let result = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "[1.5]"),
-                dep("com.example", "b", "1.0"),
-            ],
-            scope: Scope::Compile,
-        })
-        .await;
-
-    match result {
-        Err(ResolveError::VersionConflict {
-            coord,
-            requested,
-            selected,
-        }) => {
-            assert!(coord.contains("com.example:a"), "coord = {coord}");
-            assert!(requested.contains("2.5"), "requested = {requested}");
-            assert!(selected.contains("1.5"), "selected = {selected}");
-        }
-        Err(other) => panic!("expected VersionConflict, got {other:?}"),
-        Ok(graph) => panic!(
-            "expected VersionConflict but resolution succeeded; a resolved to {:?}",
-            find_version(&graph, "com.example", "a")
-        ),
-    }
+async fn mediation_after_evictions_and_relocations() {
+    #[rustfmt::skip]
+    let cases: &[Case<'_>] = &[
+        ("relocation groups merge after an eviction",
+            &["a:1 > u:1 v:1", "a:2", "u:1", "v:1", "p:1 > new:1", "q:1 > new:1",
+                "c:1 > a:[2] old:2", "old:1", "old:2 => g:new:2", "new:1", "new:2"],
+            "a:1 old:1 p:1 q:1 c:1", "", "a:2 c:1 old:1 p:1 q:1"),
+        ("a managed relocation target that relocates again joins the group",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 => g:c:1", "c:1"],
+            "b:1 p:1", "b:2", "b:1 p:1"),
+        ("a relocation target managed to a range stops at its first relocation",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 => g:c:2", "b:3 => g:c:3", "c:2", "c:3"],
+            "p:1", "b:[1,3]", "c:2 p:1"),
+        ("a system dependency outlives one of its declarations",
+            &["a:1 > s:1", "a:2 > s:1", "b:1 > s:1", "c:1 > x:1", "x:1 > a:[2]"],
+            "a:1 b:1 c:1", "s:1@system=/opt/s.jar", "a:2 b:1 c:1 s:1@system=/opt/s.jar+local x:1"),
+        ("a deeper declaration takes over from an evicted system one",
+            &["a:1 > s:1", "a:2", "c:1 > x:1", "x:1 > a:[2]", "d:1 > e:1", "e:1 > s:1", "s:1"],
+            "a:1 c:1 d:1", "s:1@system=/opt/s.jar", "a:2 c:1 d:1 e:1 s:1@system=/opt/s.jar+local x:1"),
+        ("p3-s-b1",
+            &["p:1 > m:1", "b:1 > c:1", "m:1 > x:1", "x:1", "p:2 > x:2", "x:2 > z:1", "z:1", "c:1 > d:1", "d:1 > p:[2,2]"],
+            "p:1 b:1", "", "b:1 c:1 d:1 p:2 x:2 z:1"),
+        ("p3-s-b1c",
+            &["p:1 > x:1", "b:1 > c:1", "x:1 > y:1", "y:1 > x:1", "p:2 > x:2", "x:2 > z:1", "z:1", "c:1 > p:[2,2]"],
+            "p:1 b:1", "", "b:1 c:1 p:2 x:2 z:1"),
+        ("p3-s-b2",
+            &["x:1 > y:1", "y:1", "a:1 > x:2", "x:2", "b:1 > y:2", "y:2", "c:1 > d:1", "d:1 > a:[2,2]", "a:2 > q:1", "q:1"],
+            "x:1 a:1 b:1 c:1", "", "a:2 b:1 c:1 d:1 q:1 x:1 y:1"),
+        ("p3-s-m1",
+            &["a:1 > x:1", "x:1 > g2:y:1", "g2:y:1", "b:1 > x:1!g2:*", "c:1 > a:[2,2]", "a:2 > q:1", "q:1"],
+            "a:1 b:1 c:1", "", "a:2 b:1 c:1 q:1 x:1"),
+        ("p3-s-m2",
+            &["d:1 > a:1", "a:1 > c:1", "c:1", "e:1 > f:1", "f:1 > a:[2,2]", "a:2 => g:b:2", "q:1", "b:2 > q:1"],
+            "d:1 e:1", "", "a:1 c:1 d:1 e:1 f:1"),
+        ("p3-s-n1",
+            &["a:1", "d:1 > a:2", "a:2 > c:[2,2]", "b:1 > c:1", "c:1 > a:[2,2]", "c:2 > q:1", "q:1"],
+            "a:1 d:1 b:1", "", "a:2 b:1 c:2 d:1 q:1"),
+        ("p3-s-n2a",
+            &["z:1", "x:1 > y:1", "y:1 > z:[2,2]", "d:1 > e:1", "e:1 > z:[3,3]", "a:1 > b:1", "b:1 > c:1", "c:1 > x:[2,2]", "x:2 > q:1", "q:1", "z:2 > q:1", "z:3 > q:1"],
+            "z:1 x:1 d:1 a:1", "", "a:1 b:1 c:1 d:1 e:1 q:1 x:2 z:3"),
+        ("p3-s-n2b",
+            &["x:1 > y:1", "y:1 > z:[2,2]", "a:1 > b:1", "b:1 > c:1", "c:1 > x:[2,2]", "x:2 > q:1", "q:1", "z:2 > q:1", "z:1 > q:1"],
+            "z:[1,1] x:1 a:1", "", "a:1 b:1 c:1 q:1 x:2 z:1"),
+        ("p3-s-n3",
+            &["a:1 > m:1!x", "b:1 > m:1", "m:1 > x:1", "x:1 > a:[2,2]", "a:2 > q:1", "q:1"],
+            "a:1 b:1", "", "a:2 b:1 m:1 q:1 x:1"),
+        ("p3-s-n3 with a pinned walk",
+            &["a:1 > m:1!x", "b:1 > m:1", "m:1 > x:[1]", "x:1 > a:[2,2]", "a:2 > q:1", "q:1"],
+            "a:1 b:1", "", "a:2 b:1 m:1 q:1 x:1"),
+        ("p3-s-n3 with a range in the walk",
+            &["a:1 > m:1!x", "b:1 > m:1", "m:1 > x:[1,1]", "x:1 > a:[2,2]", "a:2 > q:1", "q:1"],
+            "a:1 b:1", "", "a:2 b:1 m:1 q:1 x:1"),
+        ("p3-s-n3 with a lower relocation in the walk",
+            &["a:1 > m:1!x", "b:1 > m:1", "m:1 > x:[1,2]", "x:1 => g:y:1", "x:2", "y:1 > a:[2,2]", "a:2 > q:1", "q:1"],
+            "a:1 b:1", "", "a:2 b:1 m:1 q:1 y:1"),
+        ("p3-s-n3 with a lower plain version in the walk",
+            &["a:1 > m:1!x", "b:1 > m:1", "m:1 > x:[1,3]", "x:1 > a:[2,2]", "x:2 => g:y:1", "x:3", "y:1", "a:2 > q:1", "q:1"],
+            "a:1 b:1", "", "a:2 b:1 m:1 q:1 x:1"),
+        ("a range reads two spellings of a version in their listed order",
+            &["a:1 > c:1", "c:1", "a:1.0 => g:b:2", "b:2 > d:1", "d:1"],
+            "a:[1,2)", "", "a:1 c:1"),
+        ("p3-s-n4",
+            &["d:1 > a:2", "a:2 > k:1", "k:1", "c:1 > a:[1,2]", "e:1 > f:1", "f:1 > a:[1,1]", "b:1 > q:1", "q:1", "a:1 => g:b:1"],
+            "d:1 c:1 e:1", "", "a:2 c:1 d:1 e:1 f:1 k:1"),
+        ("p3-s-n5a",
+            &["a:2 => g:b:2", "d:1 > a:1", "a:1 > c:1", "c:1", "b:2 > q:1", "q:1"],
+            "a:2 d:1", "", "b:2 d:1 q:1"),
+        ("p3-s-n5b",
+            &["a:1 > c:1", "c:1", "d:1 > a:2", "a:2 => g:b:2", "b:2 > q:1", "q:1"],
+            "a:1 d:1", "", "a:1 c:1 d:1"),
+        ("p3-s4-grand",
+            &["a:1 > p:1", "b:1 > r:1", "p:1 > q:1", "q:1", "r:1 > a:[2,2]", "a:2 > q:2", "q:2 > s:1", "s:1"],
+            "a:1 b:1", "", "a:2 b:1 q:2 r:1 s:1"),
+        ("p3-s4-flip",
+            &["a:1 > x:1", "b:1 > x:[2,2]", "c:1 > x:1!g2:secret a:[2,2] b:[2,2]", "x:1 > g2:secret:1", "g2:secret:1", "x:2 > z:1", "z:1", "a:2 > qa:1", "qa:1", "b:2 > qb:1", "qb:1"],
+            "a:1 b:1 c:1", "", "a:2 b:2 c:1 qa:1 qb:1 x:1"),
+        ("p3-s4-detach",
+            &["a:1 > x:[1,2]", "b:1 > x:3", "c:1 > x:[1,1]", "x:3 > e:1", "x:2 > d:1", "d:1", "e:1", "x:1 => g:y:1", "dummy:1", "y:1 > yy:1", "yy:1"],
+            "a:1 b:1 c:1", "", "a:1 b:1 c:1 y:1 yy:1"),
+        ("p3-s4-allreloc",
+            &["a:1 > old:ox:[1,2]", "b:1 > c:1!child", "c:1 > new:nx:[1,1]", "new:nx:1 > child:1", "child:1", "new:nx:2 > z:1", "z:1", "old:ox:1 => new:nx:1", "dummy:1", "old:ox:2 => new:nx:2"],
+            "a:1 b:1", "", "a:1 b:1 c:1 child:1 new:nx:1"),
+        ("p3-s4-depth",
+            &["a:1 > c:1 d:1", "p:2 > z:1", "z:1", "p:1 > d:[2,2]", "c:1 > p:[1,1]", "d:1 > x:[2,2]", "d:2 > z2:1", "z2:1", "x:1 > z3:1", "z3:1", "x:2 > z4:1", "z4:1"],
+            "p:[1,2] x:[1,1] a:1", "", "a:1 c:1 d:2 p:1 x:1 z2:1 z3:1"),
+        ("p3-s4-nearer",
+            &["a:1 > old:ox:[1,2]", "b:1 > y:2", "c:1 > old:ox:[1,1]", "old:ox:1 => g:y:1", "old:ox:2 > z:1", "y:1 > y1c:1", "y:2 > y2c:1", "z:1", "y1c:1", "y2c:1"],
+            "a:1 b:1 c:1", "", "a:1 b:1 c:1 y1c:1 y:1"),
+        ("A1-1",
+            &["a:1 > b:1", "p1:1 > p2:1", "b:1 > c:1", "c:1", "a:2 > c:2", "c:2 > leaf:1", "leaf:1", "p2:1 > p3:1", "p3:1 > a:[2]"],
+            "a:1 p1:1", "", "a:2 c:2 leaf:1 p1:1 p2:1 p3:1"),
+        ("A1-2",
+            &["a:1 > b:1", "d:1 > a:[2]", "b:1 > x:2", "x:2", "a:2 > x:1", "x:1"],
+            "a:1 d:1", "", "a:2 d:1 x:1"),
+        ("A1-3",
+            &["a:1 > b:1", "d:1 > a:[2]", "b:1 > x:[2]", "a:2 > x:1", "x:1", "x:2"],
+            "a:1 d:1 x:[1]", "", "a:2 d:1 x:1"),
+        ("A1-3 without the winner's soft x",
+            &["a:1 > b:1", "b:1 > x:[2]", "d:1 > a:[2]", "a:2", "x:1", "x:2"],
+            "a:1 d:1 x:[1]", "", "a:2 d:1 x:1"),
+        ("A2",
+            &["a:1", "b:1 > a:2", "c:1 > d:1", "e:1 > a:[2]", "a:2 > x:1", "x:1", "d:1 > x:2", "x:2"],
+            "a:1 b:1 c:1 e:1", "", "a:2 b:1 c:1 d:1 e:1 x:1"),
+        ("E3a",
+            &["old:1.0", "old:2.0 => g:new:_", "new:2.0", "a:1 > old:[1.0,2.0]"],
+            "a:1!new", "", "a:1 old:1.0"),
+        ("E3b",
+            &["old:1.0", "old:2.0 => g:new:_", "new:2.0", "a:1 > old:[1.0,2.0]", "b:1 > old:[1.0]"],
+            "a:1 b:1", "", "a:1 b:1 old:1.0"),
+        ("reloc-excl",
+            &["m:mid:1 > old:lib:1", "old:lib:1 => new:lib:1", "new:lib:1 > t:trans:1", "t:trans:1"],
+            "m:mid:1", "new:lib:1!t:trans", "m:mid:1 new:lib:1"),
+        ("reloc-scope",
+            &["m:mid:1 > old:lib:1", "old:lib:1 => new:lib:1", "new:lib:1 > t:trans:1", "t:trans:1"],
+            "m:mid:1", "new:lib:1@provided", "m:mid:1 new:lib:1@provided t:trans:1@provided"),
+        ("reloc-excl-transitive",
+            &["m:mid:1 > old:lib:1", "old:lib:1 => new:lib:1", "new:lib:1 > t:trans:1", "t:trans:1"],
+            "m:mid:1!new:lib", "", "m:mid:1"),
+        ("visited-range-reloc-3",
+            &["a:1", "a:2", "a:3 => g:new:1", "new:1", "new:2"],
+            "a:[1,4) new:2", "", "a:2"),
+        ("A7-guard",
+            &["a:1 > b:[1,1]", "a:2 > b:[2,2]", "b:1 > a:[2,2]", "b:2 > a:[1,1]", "r:1 > a:[1,2]"],
+            "r:1", "", "a:2 b:2 r:1"),
+        ("managed relocation ranges that cycle fail",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 => g:c:1", "c:1", "c:2 => g:a:1"],
+            "p:1", "b:[2,3) c:[2,3)", "ERR RelocationCycle"),
+        ("managed relocations that cycle fail",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 => g:c:1", "c:1", "c:2 => g:a:1"],
+            "p:1", "b:2 c:2", "ERR RelocationCycle"),
+        ("a hard range overrides a nearer system declaration",
+            &["p:1 > s:[2]", "s:2"],
+            "s:1@system=/opt/s.jar p:1", "", "p:1 s:2@system"),
+        ("a system file a range picks outranks the direct scope",
+            &["p:1 > s:[2]@system=/opt/s.jar", "s:1"],
+            "s:1 p:1", "", "p:1 s:2@system=/opt/s.jar+local"),
+        ("a surviving system declaration keeps its own version",
+            &["a:1 > s:1", "b:1 > s:2", "c:1 > a:[2]", "a:2"],
+            "a:1 b:1 c:1", "s:_@system=/opt/s.jar", "a:2 b:1 c:1 s:2@system=/opt/s.jar+local"),
+        ("a system declaration joins a relocation group",
+            &["p:1 > old:2", "old:1", "old:2 => g:s:2", "s:2"],
+            "s:1@system=/opt/s.jar old:1 p:1", "", "p:1 s:1@system=/opt/s.jar+local"),
+        ("a relocation target managed to system is local",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1"],
+            "p:1", "b:2@system=/opt/b.jar", "b:2@system=/opt/b.jar+local p:1"),
+        ("a managed relocation keeps only the latest relocation's aliases",
+            &["a:1", "b:1", "leaf:1", "p:1 > a:2", "a:2 => g:b:1", "b:2 => g:c:1", "c:1 > leaf:1"],
+            "a:1 p:1", "b:2", "a:1 c:1 leaf:1 p:1"),
+        ("a managed pin keeps only the latest relocation's aliases",
+            &["a:1", "b:1", "leaf:1", "p:1 > a:2", "a:2 => g:b:1", "b:2 => g:c:1", "c:1 > leaf:1"],
+            "a:1 p:1", "b:[2]", "a:1 c:1 leaf:1 p:1"),
+        ("a managed range whose lowest version relocates takes no aliases",
+            &["a:1", "b:1", "leaf:1", "p:1 > a:2", "a:2 => g:b:1", "b:2 => g:c:1", "c:1 > leaf:1"],
+            "a:1 p:1", "b:[2,2]", "a:1 c:1 leaf:1 p:1"),
+        ("a managed range whose lowest version stays keeps the aliases",
+            &["a:1", "b:1", "leaf:1", "p:1 > a:2", "a:2 => g:b:1", "b:2", "b:3 => g:c:1", "c:1 > leaf:1"],
+            "a:1 p:1", "b:[2,3]", "b:2 p:1"),
+        ("a relocation onto a cyclic target is cut before its management",
+            &["c:3 > e:3", "e:3 => g:x:1", "x:1", "x:2 => g:c:3"],
+            "c:3", "x:[1,2]@test", "c:3"),
+        ("a relocation onto a cyclic target keeps the relocations before it",
+            &["y:2", "y:3 => g:c:3", "c:3 > e:3", "e:3 => g:x:1", "x:1", "x:2 => g:y:3"],
+            "y:[2,3]", "x:[1,2]@test", "c:3"),
+        ("a range goes on past a version that relocates onto its own path",
+            &["p:1 > x:[2,3]", "x:2 => g:p:1", "x:3 => g:y:3", "y:3"],
+            "p:1", "", "p:1 y:3"),
+        ("a range keeps its constraint past a lowest version that relocates onto its own path",
+            &["p:1 > x:[2,3]", "x:2 => g:p:1", "x:3"],
+            "p:1", "", "p:1 x:3"),
+        ("a relocation target managed to a system pin takes the pinned version",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1"],
+            "p:1", "b:[2]@system=/opt/b.jar", "b:2@system=/opt/b.jar+local p:1"),
+        ("a relocation target managed to a system range takes its highest version",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2", "b:3"],
+            "p:1", "b:[2,3]@system=/opt/b.jar", "b:3@system=/opt/b.jar+local p:1"),
+        ("a pinned system dependency takes the pinned version",
+            &["p:1 > s:1", "s:1"],
+            "s:[2]@system=/opt/s.jar p:1", "", "p:1 s:2@system=/opt/s.jar+local"),
+        ("a pinned system dependency conflicts with another pin",
+            &["p:1 > s:[1]", "s:1"],
+            "s:[2]@system=/opt/s.jar p:1", "", "ERR VersionConflict"),
+        ("a system range backtracks over its local versions",
+            &["p:1 > s:[1,2]", "s:1", "s:2 > leaf:1", "s:3", "leaf:1"],
+            "s:[1,3]@system=/opt/s.jar p:1", "", "p:1 s:2@system=/opt/s.jar+local"),
+        ("a relocation target managed to a system range offers its local versions",
+            &["q:1 > p:1", "p:1 > s:[1,2]", "r:1 > a:1", "a:1 => g:s:1", "s:1", "s:2 > leaf:1",
+                "s:3", "leaf:1"],
+            "r:1 q:1", "s:[1,3]@system=/opt/s.jar", "p:1 q:1 r:1 s:3@system=/opt/s.jar+local"),
+        ("a cyclic probe of a range can merge its group away",
+            &["p:1 > x:[1,2]", "x:1 => g:h:1", "h:1 => g:t:1", "t:1", "t:2 => g:p:1", "x:2 => g:z:1",
+                "z:1"],
+            "p:1", "t:2", "p:1"),
+        ("a relocation target managed to provided keeps its subtree",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 > c:1", "c:1"],
+            "p:1", "b:2@provided", "b:2@provided c:1@provided p:1"),
+        ("a relocation target managed to a provided pin keeps its subtree",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 > c:1", "c:1"],
+            "p:1", "b:[2]@provided", "b:2@provided c:1@provided p:1"),
+        ("a relocation target managed to test is pruned",
+            &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 => g:c:1", "c:1 > child:1", "child:1"],
+            "p:1", "b:2@test", "p:1"),
+    ];
+    check(cases).await;
 }
 
-/// Converse of the above: a losing *soft* pin must NOT raise. Soft pins are
-/// preferences, so a depth-2 soft `2.5` losing to a depth-1 soft `1.5` is the
-/// intended nearest-wins outcome.
+/// Maven's scope inheritance and pruning, as `mvn dependency:list` reports it.
 #[tokio::test]
-async fn nearest_wins_loses_soft_pin_does_not_conflict() {
-    let root = coord("com.example:root:1.0");
-    let a_15 = coord("com.example:a:1.5");
-    let a_25 = coord("com.example:a:2.5");
-    let b = coord("com.example:b:1.0");
-
-    let backend = MockBackend::default()
-        .with_project(&a_15, Vec::new())
-        .with_project(&a_25, Vec::new())
-        // b's a:2.5 is a bare (soft) version.
-        .with_project(&b, vec![dep("com.example", "a", "2.5")]);
-
-    let solver = Solver::with_strategy(&backend, ResolutionStrategy::NearestWins, None);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![
-                dep("com.example", "a", "1.5"), // soft pin, depth=1
-                dep("com.example", "b", "1.0"), // depth=1, pulls soft a:2.5 at depth=2
-            ],
-            scope: Scope::Compile,
-        })
-        .await
-        .expect("a losing soft pin must not raise VersionConflict");
-
-    assert_eq!(
-        find_version(&graph, "com.example", "a"),
-        Some("1.5".to_string()),
-        "depth-1 soft pin wins nearest; losing soft pin is silently overridden"
-    );
+async fn scopes_and_optional_dependencies() {
+    let child: &[&str] = &["t:1 > c:1", "c:1"];
+    let subtree: &[&str] = &["api:1 > impl:1", "impl:1 > util:1", "util:1"];
+    #[rustfmt::skip]
+    let cases: &[Case<'_>] = &[
+        ("a direct optional dependency is traversed", &["a:1 > b:1", "b:1"], "a:1?", "",
+            "a:1 b:1"),
+        ("a transitive optional dependency is skipped", &["a:1 > b:1?"], "a:1", "", "a:1"),
+        ("an optional child of an optional dependency is skipped", &["a:1 > b:1?"], "a:1?", "",
+            "a:1"),
+        ("exclusions prune", &["a:1 > b:1!c", "b:1 > c:1", "c:1"], "a:1", "", "a:1 b:1"),
+        ("a test dependency's compile child is test", child, "t:1@test", "",
+            "c:1@test t:1@test"),
+        ("a test root keeps test scope", &["a:1 > b:1", "b:1"], "@test a:1", "",
+            "a:1@test b:1@test"),
+        ("a test dependency carries its compile subtree",
+            &["testlib:1 > junit:1", "junit:1 > hamcrest:1", "hamcrest:1"], "testlib:1@test", "",
+            "hamcrest:1@test junit:1@test testlib:1@test"),
+        ("a provided dependency carries its compile subtree", subtree, "api:1@provided", "",
+            "api:1@provided impl:1@provided util:1@provided"),
+        ("test and provided grandchildren are dropped",
+            &["t:1 > ck:1 tk:1@test pk:1@provided", "ck:1", "tk:1", "pk:1"], "t:1@test", "",
+            "ck:1@test t:1@test"),
+        ("a transitive system dependency is followed", &["a:1 > s:1@system=/opt/s.jar"],
+            "a:1", "", "a:1 s:1@system=/opt/s.jar+local"),
+        ("and stays system under a test parent", &["a:1 > s:1@system=/opt/s.jar"],
+            "a:1@test", "", "a:1@test s:1@system=/opt/s.jar+local"),
+        ("an optional system one is not", &["a:1 > s:1@system=/opt/s.jar?"], "a:1", "",
+            "a:1"),
+        ("a scope in other case is unknown and followed",
+            &["a:1 > p:1@Provided s:1@SYSTEM", "p:1", "s:1"], "a:1", "", "a:1 p:1 s:1"),
+    ];
+    check(cases).await;
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// A system-scoped dependency with no version must error clearly instead
-// of being assigned a fake "SYSTEM" version.
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// A direct system-scoped dep with `version = None` must surface
-/// `MissingVersion`, not silently coin a bogus `SYSTEM` coordinate.
+/// Maven's JavaScopeSelector: a package takes its direct declaration's
+/// scope, else the widest of its paths, and its own dependencies derive
+/// from the scope it took. `test-fixtures/maven-parity/dependency-scopes`
+/// has these cases recorded from Maven.
 #[tokio::test]
-async fn system_scope_without_version_errors_missing_version() {
-    let root = coord("com.example:root:1.0");
-
-    let system_dep = Dependency {
-        group_id: "com.example".to_string(),
-        artifact_id: "native".to_string(),
-        version: None,
-        type_: None,
-        classifier: None,
-        scope: Some("system".to_string()),
-        optional: None,
-        exclusions: Vec::new(),
-        system_path: Some("/opt/native/native.jar".to_string()),
+async fn the_widest_path_scope_wins() {
+    let shared: &[&str] = &["b:1 > x:1", "x:1 > y:1", "y:1"];
+    let via = |first: &'static str, second: &'static str| -> Vec<&'static str> {
+        [first, second]
+            .into_iter()
+            .chain(shared.iter().copied())
+            .collect()
     };
-
-    let backend = MockBackend::default();
-    let solver = Solver::new(&backend);
-    let result = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![system_dep],
-            scope: Scope::Compile,
-        })
-        .await;
-
-    match result {
-        Err(ResolveError::MissingVersion {
-            group_id,
-            artifact_id,
-        }) => {
-            assert_eq!(group_id, "com.example");
-            assert_eq!(artifact_id, "native");
-        }
-        other => panic!("expected MissingVersion for version-less system dep, got {other:?}"),
-    }
+    let test_compile = via("t:1 > x:1", "a:1 > b:1");
+    let provided_runtime = via("p:1 > x:1", "r:1 > b:1");
+    let runtime_compile = via("r:1 > x:1", "a:1 > b:1");
+    let optional = via("t:1 > x:1", "o:1 > b:1");
+    #[rustfmt::skip]
+    let cases: &[Case<'_>] = &[
+        ("a nearer test path gives way to compile", &test_compile, "t:1@test a:1", "",
+            "a:1 b:1 t:1@test x:1 y:1"),
+        ("a nearer provided path gives way to runtime", &provided_runtime,
+            "p:1@provided r:1@runtime", "",
+            "b:1@runtime p:1@provided r:1@runtime x:1@runtime y:1@runtime"),
+        ("a nearer runtime path gives way to compile", &runtime_compile, "r:1@runtime a:1", "",
+            "a:1 b:1 r:1@runtime x:1 y:1"),
+        ("an optional path counts", &optional, "t:1@test o:1?", "",
+            "b:1 o:1 t:1@test x:1 y:1"),
+        ("a direct scope wins over a wider path",
+            &["a:1 > x:1 r:1", "x:1 > y:1", "r:1 > z:1", "y:1", "z:1"],
+            "a:1 x:1@test r:1@runtime", "",
+            "a:1 r:1@runtime x:1@test y:1@test z:1@runtime"),
+        ("a managed scope is taken as it is",
+            &["t:1 > x:1 w:1", "w:1 > v:1", "v:1", "a:1 > m:1 k:1", "x:1 > y:1",
+                "m:1 > n:1", "k:1 > q:1", "y:1", "n:1", "q:1"],
+            "t:1@test a:1", "x:_@runtime w:_@compile m:_@test k:_@provided",
+            "a:1 k:1@provided m:1@test n:1@test q:1@provided t:1@test v:1 w:1 x:1@runtime \
+             y:1@runtime"),
+        ("a relocation target takes its scope as managed only by its own management",
+            &["t:1 > old:1 old2:1", "old:1 => g:new:_", "old2:1 => g:new2:_", "new:1",
+                "new2:1"],
+            "t:1@test", "old:_@compile new2:_@compile", "new2:1 new:1@test t:1@test"),
+        ("the first direct declaration of a node sets its scope",
+            &["old:1 => g:new:_", "new:1 > y:1", "y:1"], "old:1 new:1@test", "", "new:1 y:1"),
+        ("a cycle does not widen the node it returns to",
+            &["t:1 > x:1", "x:1 > y:1", "y:1 > x:1"], "t:1@test", "y:_@compile",
+            "t:1@test x:1@test y:1"),
+        ("a relocation keeps the first direct declaration first",
+            &["new:1 > leaf:1", "new:2 > leaf:1", "old:1", "old:2 => g:new:_", "leaf:1",
+                "versions old 1 2"],
+            "new:1 old:[1,2]@test", "", "leaf:1 new:2"),
+        ("a cycle's gathering stops where a path returns to a node on it",
+            &["u:1 > x:1", "t:1 > a:1", "x:1 > a:1", "a:1 > b:1 x:1", "b:1 > a:1"],
+            "u:1@test t:1@test", "b:_@compile", "a:1@test b:1 t:1@test u:1@test x:1@test"),
+        ("a cycle breaks at the node a depth-first walk finds first",
+            &["t:1 > u:1 x:1", "a:1 > y:1", "u:1 > y:1", "x:1 > y:1", "y:1 > a:1 x:1"],
+            "t:1@test a:1", "", "a:1 t:1@test u:1@test x:1 y:1"),
+        ("a cycle gathers only through the groups of the cycles found through it",
+            &["t:1 > x:1", "a:1 > y:1", "x:1 > z:1 y:1", "y:1 > z:1", "z:1 > x:1"],
+            "t:1@test a:1", "", "a:1 t:1@test x:1@test y:1 z:1"),
+        ("a resolved group is gathered through only below its winner",
+            &["t:1 > x:1 y:1", "a:1 > b:1", "x:1 > a:1", "b:1 > y:1", "y:1 > b:1 x:1 z:1",
+                "z:1 > a:1"],
+            "t:1@test a:1", "", "a:1 b:1 t:1@test x:1 y:1 z:1"),
+        ("a cycle broken at one node gathers the path through the other",
+            &["t:1 > x:1", "a:1 > y:1", "x:1 > y:1", "y:1 > x:1"], "t:1@test a:1", "",
+            "a:1 t:1@test x:1 y:1"),
+        // Maven 3.9.12 (parity fixture m4): a2 excludes r, so the y below
+        // it has no r, and r keeps the runtime of the paths below a.
+        ("a cycle's gathering skips what an exclusion on the path removed",
+            &["a:1 > r:1 y:1", "a2:1 > r:1 y:1", "r:1 > y:1", "y:1 > r:1"],
+            "a:1@runtime a2:1!r", "", "a2:1 a:1@runtime r:1@runtime y:1"),
+    ];
+    check(cases).await;
 }
 
-/// A system-scoped dep WITH a version still resolves to that exact version
-/// (guards against the version-requirement change rejecting valid system deps).
+/// Each left branch of a chain of diamonds below a cycle adds its own
+/// exclusion, so the paths carry 2^levels exclusion sets. The gathering for
+/// the broken node stops at a budget instead of running for hours.
 #[tokio::test]
-async fn system_scope_with_version_resolves() {
-    let root = coord("com.example:root:1.0");
-
-    let system_dep = Dependency {
-        group_id: "com.example".to_string(),
-        artifact_id: "native".to_string(),
-        version: Some("1.2.3".to_string()),
-        type_: None,
-        classifier: None,
-        scope: Some("system".to_string()),
-        optional: None,
-        exclusions: Vec::new(),
-        system_path: Some("/opt/native/native.jar".to_string()),
-    };
-
-    let backend = MockBackend::default();
-    let solver = Solver::new(&backend);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![system_dep],
-            scope: Scope::Compile,
-        })
-        .await
-        .expect("system dep with an explicit version must resolve");
-
-    assert_eq!(
-        find_version(&graph, "com.example", "native"),
-        Some("1.2.3".to_string())
+async fn a_cycle_gathering_through_too_many_exclusion_sets_stops() {
+    const LEVELS: usize = 24;
+    let mut lines = vec!["d:1 > t:1 x:1".to_string(), "t:1 > a0:1".to_string()];
+    lines.push("x:1 > a0:1".to_string());
+    for i in 0..LEVELS {
+        let next = i + 1;
+        lines.push(format!("a{i}:1 > l{i}:1!r{i} r{i}:1"));
+        lines.push(format!("l{i}:1 > a{next}:1 t:1"));
+        lines.push(format!("r{i}:1 > a{next}:1 t:1"));
+    }
+    lines.push(format!("a{LEVELS}:1"));
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let solved = Solver::new(&backend(&lines)).solve(root("d:1")).await;
+    let actual = render(solved);
+    assert!(
+        actual.starts_with("ERR GraphLimitExceeded: dependency graph exceeds 100000 states"),
+        "got {actual}"
     );
 }
 
-/// Maven retains a provided dependency's compile child when the root manages it to `test`.
 #[tokio::test]
-async fn managed_test_scope_keeps_child_of_provided_direct_dep() {
-    let root = coord("com.example:root:1.0");
-    let core = coord("com.example:core:1.0");
-    let guava = coord("com.example:guava:1.0");
+async fn dependency_management() {
+    let relocated: &[&str] = &[
+        "mid:1 > o:lib:6.0",
+        "o:lib:6.0 => n:_:_",
+        "n:lib:6.0",
+        "n:lib:7.0",
+    ];
+    let pinned: &[&str] = &["lib:1.0", "versions lib 1.0 2.0"];
+    let managed_child: &[&str] = &["lib:1 > child:1", "child:1"];
+    #[rustfmt::skip]
+    let cases: &[Case<'_>] = &[
+        ("management fills a missing version", &["o:bar:3.0"], "o:bar:_", "o:bar:3.0",
+            "o:bar:3.0"),
+        ("a hard pin beats management", pinned, "lib:[1.0]", "lib:2.0", "lib:1.0"),
+        ("a soft direct version beats management", pinned, "lib:1.0", "lib:2.0", "lib:1.0"),
+        ("a managed two-bound pin conflicts as the short form does",
+            &["e:1 => g:f:1", "e:3 => g:x:3", "f:1", "x:3 > e:3", "d:3 > f:[1] x:[3]"],
+            "e:[3] d:3", "e:[1,1]", "ERR VersionConflict"),
+        ("a test-jar entry does not manage the jar", &["lib:1.0"], "lib:1.0", "lib:2.0~tests",
+            "lib:1.0"),
+        ("jar and test-jar entries manage independently", &["lib:1.0", "lib:2.0~tests"],
+            "lib:_ lib:_#test-jar", "lib:1.0 lib:2.0~tests", "lib:1.0 lib:2.0~tests"),
+        ("managed exclusions prune transitive nodes",
+            &["lib:1 > mid:1", "mid:1 > cl:cl:1.2", "cl:cl:1.2"], "lib:1", "mid:_!cl:cl",
+            "lib:1 mid:1"),
+        ("managed exclusions join a direct dependency's own",
+            &["lib:1 > own:1 cl:1", "own:1", "cl:1"], "lib:1!own", "lib:_!cl", "lib:1"),
+        ("entries for one key merge field by field and add up their exclusions",
+            &["q:1 > foo:3", "foo:1 > unwanted:1 third:1", "foo:2 > unwanted:1 third:1",
+                "foo:3 > unwanted:1 third:1", "unwanted:1", "third:1"],
+            "q:1", "foo:2!third foo:1@runtime!unwanted", "foo:2@runtime q:1"),
+        ("a transitive dependency managed to system takes the managed path",
+            &["lib:1 > tools:1"], "lib:1", "tools:2@system=/opt/t.jar",
+            "lib:1 tools:2@system=/opt/t.jar+local"),
+        ("a system scope without a path is an error", &["lib:1 > tools:1"], "lib:1",
+            "tools:_@system",
+            "ERR Pom: pom error: invalid model: system-scoped dependency g:tools requires a non-empty <systemPath>"),
+        ("management sets a transitive scope", managed_child, "lib:1", "child:_@test",
+            "child:1@test lib:1"),
+        ("a dependency managed to test keeps its subtree",
+            &["lib:1 > extra:1@-", "extra:1 > leaf:1", "leaf:1"], "lib:1", "extra:_@test",
+            "extra:1@test leaf:1@test lib:1"),
+        ("under a runtime parent too",
+            &["lib:1 > extra:1", "extra:1 > leaf:1", "leaf:1"], "lib:1@runtime", "extra:_@test",
+            "extra:1@test leaf:1@test lib:1@runtime"),
+        ("a test dependency's child managed to test stays",
+            &["compress:1 > io:1@-", "io:1"], "compress:1@test", "io:_@test",
+            "compress:1@test io:1@test"),
+        ("a provided dependency's child managed to test stays",
+            &["core:1 > guava:1", "guava:1"], "core:1@provided", "guava:_@test",
+            "core:1@provided guava:1@test"),
+        ("a declared test transitive stays dropped", &["lib:1 > extra:1@test", "extra:1"],
+            "lib:1", "extra:_@compile", "lib:1"),
+        ("a dependency's own management fills a version, not the scope",
+            &["testlib:1 > junit:_ | junit:4.13.2@test", "junit:4.13.2 > hamcrest:1.3",
+                "hamcrest:1.3"], "testlib:1@test", "",
+            "hamcrest:1.3@test junit:4.13.2@test testlib:1@test"),
+        ("an explicit child version beats its management",
+            &["lib:1 > child:2 | child:1", "child:2"], "lib:1", "", "child:2 lib:1"),
+        ("management applies to a relocated transitive", relocated, "mid:1", "n:lib:7.0",
+            "mid:1 n:lib:7.0"),
+        ("a direct relocated dependency keeps its version", &relocated[1..], "o:lib:6.0",
+            "n:lib:7.0", "n:lib:6.0"),
+    ];
+    check(cases).await;
+}
 
-    let backend = MockBackend::default()
-        .with_project(&core, vec![dep("com.example", "guava", "1.0")])
-        .with_project(&guava, Vec::new());
+#[tokio::test]
+async fn relocations() {
+    #[rustfmt::skip]
+    let cases: &[Case<'_>] = &[
+        ("a relocation is followed",
+            &["old:lib:1.0 => new:lib-new:2.0", "new:lib-new:2.0 > child:1", "child:1"],
+            "old:lib:1.0", "", "child:1 new:lib-new:2.0"),
+        ("a partial relocation keeps the rest", &["old:lib:1.0 => new:_:_", "new:lib:1.0"],
+            "old:lib:1.0", "", "new:lib:1.0"),
+        ("relocation cycles fail", &["a:1 => _:b:1", "b:1 => _:a:1"], "a:1", "",
+            "ERR RelocationCycle"),
+        ("a relocation onto a resolved node is no cycle",
+            &["mid:1 > bc:ext:1.0", "bc:ext:1.0 => _:base:_", "bc:base:1.0"],
+            "bc:base:1.0 mid:1", "", "bc:base:1.0 mid:1"),
+    ];
+    check(cases).await;
 
-    let mut constraints = PlatformConstraints::new();
-    constraints.add_constraint(managed_scope_constraint("guava", "test"));
+    // A relocation recorded for one spelling of a version is not replayed for
+    // another that Maven's ordering calls equal, and one onto another
+    // spelling of its own version is followed.
+    let backend = backend(&[
+        "old:lib:1.0 => new:_:2.0",
+        "old:lib:1.0.0",
+        "new:lib:2.0",
+        "old:lib:1.1 => _:_:1.1.0",
+        "old:lib:1.1.0",
+    ]);
+    let solver = Solver::new(&backend);
+    let cache = std::sync::Mutex::new(Default::default());
+    for (from, to) in [
+        ("old:lib:1.0", "new:lib:2.0"),
+        ("old:lib:1.0.0", "old:lib:1.0.0"),
+        ("old:lib:1.1", "old:lib:1.1.0"),
+    ] {
+        let (resolved, _, _, _, _) = solver
+            .fetch_project_with_relocation_cached(&coord(from), &RepoContext::default(), &cache)
+            .await
+            .unwrap();
+        assert_eq!(resolved.to_string(), to);
+    }
 
-    let solver = Solver::new(&backend).with_platform_constraints(constraints);
-    let graph = solver
-        .solve(SolverRoot {
-            coord: root,
-            dependencies: vec![Dependency {
-                scope: Some("provided".to_string()),
-                ..dep("com.example", "core", "1.0")
-            }],
-            scope: Scope::Compile,
-        })
+    // The node records the target's repository, not the one that listed
+    // the relocating artifact's versions.
+    let mut backend = self::backend(&["old:lib:1.0 => new:lib-new:2.0", "new:lib-new:2.0"]);
+    backend
+        .project_repos
+        .insert("new:lib-new:2.0".to_string(), "mock://target");
+    let graph = Solver::new(&backend)
+        .solve(root("old:lib:[1.0,2.0)"))
         .await
         .unwrap();
+    let target = graph
+        .node_indices()
+        .filter_map(|index| graph.node(index))
+        .find(|node| node.coord.artifact_id.as_str() == "lib-new")
+        .unwrap();
+    assert_eq!(target.repo_url.as_deref(), Some("mock://target"));
+}
 
+/// A relocation without a version keeps the source's SNAPSHOT build, but
+/// the target comes from the repository serving it, not from the one whose
+/// metadata named the source's build.
+#[tokio::test]
+async fn a_kept_snapshot_build_takes_the_targets_repository() {
+    let mut backend = backend(&[
+        "old:1.1-20261011.010101-1 => g:lib:_",
+        "lib:1.1-20261011.010101-1",
+    ]);
+    backend
+        .project_repos
+        .insert("g:old:1.1-20261011.010101-1".to_string(), "mock://old");
+    backend
+        .project_repos
+        .insert("g:lib:1.1-20261011.010101-1".to_string(), "mock://lib");
+    let graph = Solver::new(&backend)
+        .solve(root("old:1.1-SNAPSHOT"))
+        .await
+        .unwrap();
+    let target = graph
+        .node_indices()
+        .filter_map(|index| graph.node(index))
+        .find(|node| node.coord.artifact_id.as_str() == "lib")
+        .unwrap();
+    assert_eq!(target.repo_url.as_deref(), Some("mock://lib"));
+}
+
+/// maven-resolver's root node has no dependency, so a transitive dependency
+/// with the root's coordinates is collected and only a cycle through a
+/// collected node is cut; the cut cycle edge stays in the graph.
+/// A SNAPSHOT is mediated on its base version and locked as the build it
+/// resolved to, also when a relocation or its management leads to it.
+#[tokio::test]
+async fn snapshots_mediate_on_their_base_version() {
+    let build = "lib:1.1-20261011.010101-1";
+    #[rustfmt::skip]
+    let cases: &[Case<'_>] = &[
+        ("a pinned SNAPSHOT", &[build], "lib:[1.1-SNAPSHOT]", "", build),
+        ("a range up to a SNAPSHOT", &[build, "lib:1.0", "versions lib 1.0 1.1-SNAPSHOT"],
+            "lib:[1.0,1.1-SNAPSHOT]", "", build),
+        ("a range whose winner is a SNAPSHOT", &[build, "lib:1.0", "versions lib 1.0 1.1-SNAPSHOT"],
+            "lib:[1.0,2.0]", "", build),
+        ("a relocation to a SNAPSHOT", &["old:1 => g:lib:1.1-SNAPSHOT", build],
+            "old:1", "", build),
+        ("a relocation managed to a SNAPSHOT",
+            &["p:1 > old:1", "old:1 => g:lib:1.0", "lib:1.0", build],
+            "p:1", "lib:1.1-SNAPSHOT", "lib:1.1-20261011.010101-1 p:1"),
+        ("a relocation without a version keeps the SNAPSHOT build",
+            &["old:1.1-20261011.010101-1 => g:lib:_", build, "lib:1.1-20261012.010101-2"],
+            "old:1.1-SNAPSHOT", "", build),
+        ("a declaration of a relocation's target resolves its own build",
+            &["p:1 > old:1.1-SNAPSHOT", "q:1 > old:1.1-SNAPSHOT", "r:1 > lib:1.1-SNAPSHOT",
+                "old:1.1-20261011.010101-1 => g:lib:_", "lib:1.1-20261011.010101-1 > x:1",
+                "lib:1.1-20261012.010101-2 > y:1", "x:1", "y:1"],
+            "p:1!lib q:1!lib r:1", "", "lib:1.1-20261012.010101-2 p:1 q:1 r:1 y:1"),
+        ("management resolves a relocation's SNAPSHOT target afresh",
+            &["p:1 > old:1.1-SNAPSHOT", "old:1.1-20261011.010101-1 => g:lib:_",
+                "lib:1.1-20261011.010101-1 > x:1", "lib:1.1-20261012.010101-2 > y:1", "x:1", "y:1"],
+            "p:1", "lib:1.1-SNAPSHOT", "lib:1.1-20261012.010101-2 p:1 y:1"),
+        ("a management pin resolves a relocation's SNAPSHOT target afresh",
+            &["p:1 > old:1.1-SNAPSHOT", "old:1.1-20261011.010101-1 => g:lib:_",
+                "lib:1.1-20261011.010101-1 > x:1", "lib:1.1-20261012.010101-2 > y:1", "x:1", "y:1"],
+            "p:1", "lib:[1.1-SNAPSHOT]", "lib:1.1-20261012.010101-2 p:1 y:1"),
+        ("a hop with a version ends the kept build",
+            &["p:1 > old:1.1-SNAPSHOT", "q:1 > mid:1.1-SNAPSHOT",
+                "old:1.1-20261011.010101-1 => g:mid:_", "mid:1.1-20261011.010101-1 => g:lib:1",
+                "mid:1.1-20261012.010101-2 => g:lib:2", "lib:1", "lib:2"],
+            "p:1!lib q:1", "", "lib:2 p:1 q:1"),
+        // A relocation without a version names the resolved build, which
+        // then mediates as that version.
+        ("a kept build outranks an older sibling build",
+            &["p:1 > moved:1.1-SNAPSHOT lib:1.1-20261011.010101-1",
+                "moved:1.1-20261012.010101-2 => g:lib:_", "lib:1.1-20261011.010101-1 > x:1",
+                "lib:1.1-20261012.010101-2 > y:1", "x:1", "y:1"],
+            "p:1", "", "lib:1.1-20261012.010101-2 p:1 y:1"),
+        ("a kept build outranks the release of its base",
+            &["p:1 > lib:1.1 moved:1.1-SNAPSHOT", "lib:1.1 > z:1", "z:1",
+                "moved:1.1-20261012.010101-2 => g:lib:_", "lib:1.1-20261012.010101-2 > y:1", "y:1"],
+            "p:1", "", "lib:1.1-20261012.010101-2 p:1 y:1"),
+        ("a kept build outranks a sibling SNAPSHOT",
+            &["p:1 > lib:1.1-SNAPSHOT moved:1.1-SNAPSHOT", "moved:1.1-20261011.010101-1 => g:lib:_",
+                "lib:1.1-20261011.010101-1 > x:1", "lib:1.1-20261012.010101-2 > y:1", "x:1", "y:1"],
+            "p:1", "", "lib:1.1-20261011.010101-1 p:1 x:1"),
+        ("a kept build managed to system keeps its version",
+            &["p:1 > moved:1.1-SNAPSHOT lib:1.1", "lib:1.1 > z:1", "z:1",
+                "moved:1.1-20261012.010101-2 => g:lib:_", "lib:1.1-20261012.010101-2 > y:1", "y:1"],
+            "p:1", "lib:_@system=/opt/l.jar", "lib:1.1-20261012.010101-2@system=/opt/l.jar+local p:1"),
+        ("a pinned SNAPSHOT rejects a kept build",
+            &["p:1 > moved:1.1-SNAPSHOT q:1", "q:1 > lib:[1.1-SNAPSHOT]",
+                "moved:1.1-20261011.010101-1 => g:lib:_", "lib:1.1-20261011.010101-1 > x:1",
+                "lib:1.1-20261012.010101-2 > y:1", "x:1", "y:1"],
+            "p:1", "", "lib:1.1-20261012.010101-2 p:1 q:1 y:1"),
+        ("a range accepts a kept build",
+            &["p:1 > moved:1.1-SNAPSHOT q:1", "q:1 > lib:[1.0,1.2)", "lib:1.0",
+                "versions lib 1.0 1.1-SNAPSHOT", "moved:1.1-20261011.010101-1 => g:lib:_",
+                "lib:1.1-20261011.010101-1 > x:1", "lib:1.1-20261012.010101-2 > y:1", "x:1", "y:1"],
+            "p:1", "", "lib:1.1-20261011.010101-1 p:1 q:1 x:1"),
+        ("a SNAPSHOT build kept along a relocation stays with its chain",
+            &["old:1.1-20261011.010101-1 => g:mid:_", "mid:1.1-20261011.010101-1 => g:lib:_",
+                "mid:1.1-20261012.010101-2 => g:lib:_", build, "lib:1.1-20261012.010101-2"],
+            "mid:1.1-SNAPSHOT old:1.1-SNAPSHOT", "", "lib:1.1-20261012.010101-2"),
+    ];
+    check(cases).await;
+}
+
+#[tokio::test]
+async fn cycle_edges_and_the_root_artifact() {
+    let backend = backend(&[
+        "text:1.0 > root:0.9",
+        "root:0.9 > text:1.0 util:1.0",
+        "util:1.0",
+    ]);
+    let graph = Solver::new(&backend).solve(root("text:1.0")).await;
+    let graph = graph.unwrap();
+    assert_eq!(graph.edge_count(), 4);
+    assert_eq!(render(Ok(graph)), "root:0.9 text:1.0 util:1.0");
+}
+
+/// A chain 1000 deep resolves; one level deeper fails naming the bound.
+#[tokio::test]
+async fn depth_past_the_bound_fails() {
+    let projects: Vec<String> = (1..=1001)
+        .map(|i| format!("a{i}:1 > a{}:1", i + 1))
+        .chain(["a1002:1".to_string()])
+        .collect();
+    let mut projects: Vec<&str> = projects.iter().map(String::as_str).collect();
+    check(&[(
+        "1001 deep",
+        &projects,
+        "a1:1",
+        "",
+        "ERR GraphLimitExceeded: dependency graph exceeds 1000 levels of depth at g:a1001",
+    )])
+    .await;
+    projects[999] = "a1000:1";
+    let solved = Solver::new(&backend(&projects)).solve(root("a1:1")).await;
+    assert_eq!(solved.unwrap().node_count(), 1001);
+}
+
+/// Every project fetched was hinted first, a range by each of its versions,
+/// and nothing the solver does not fetch is hinted: not a test
+/// dependency of a dependency and not an excluded one.
+#[tokio::test]
+async fn queued_projects_are_hinted_before_they_are_fetched() {
+    let backend = backend(&[
+        "a:1.0 > c:1.0 tested:1.0@test ranged:[1.0,2.0)",
+        "b:1.0 > excluded:1.0",
+        "c:1.0",
+        "ranged:1.0",
+        "ranged:1.5",
+    ]);
+    Solver::new(&backend)
+        .solve(root("a:1.0 b:1.0!excluded"))
+        .await
+        .unwrap();
+    let prefetches: std::collections::BTreeSet<_> =
+        backend.prefetches.lock().unwrap().iter().cloned().collect();
+    let fetches = backend.fetches.lock().unwrap().clone();
     assert_eq!(
-        find_scope(&graph, "com.example", "guava"),
-        Some(Scope::Test)
+        prefetches.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "g:a:1.0",
+            "g:b:1.0",
+            "g:c:1.0",
+            "g:ranged:1.0",
+            "g:ranged:1.5"
+        ]
     );
+    for hinted in &prefetches {
+        assert!(fetches.contains(hinted), "{hinted} hinted, not fetched");
+    }
 }
 
-#[test]
-fn fetch_share_widens_as_sibling_solves_finish() {
-    let share = Arc::new(super::FetchShare::new(8));
-    assert_eq!(share.current(), 8, "a lone solve gets the whole budget");
-
-    let guards: Vec<_> = (0..4).map(|_| share.enter()).collect();
-    assert_eq!(share.current(), 2, "four running solves split it evenly");
-
-    drop(guards);
-    assert_eq!(share.current(), 8, "finished solves hand their slice back");
-
-    let guards: Vec<_> = (0..32).map(|_| share.enter()).collect();
-    assert_eq!(share.current(), 1, "every solve keeps at least one slot");
-    drop(guards);
+/// A range is hinted for listing as its declaration is queued, unless the
+/// solver skips that declaration.
+#[tokio::test]
+async fn queued_ranges_are_hinted_for_listing() {
+    let backend = backend(&[
+        "a:1.0 > ranged:[1.0,2.0) tested:[1.0,2.0)@test",
+        "ranged:1.0",
+        "ranged:1.5",
+    ]);
+    let graph = Solver::new(&backend).solve(root("a:1.0")).await;
+    assert_eq!(render(graph), "a:1.0 ranged:1.5");
+    assert_eq!(*backend.listings.lock().unwrap(), ["g:ranged:[1.0,2.0)"]);
 }
 
+mod known_gaps;
 mod nearest;
-
-mod lazy_ranges;
+mod ranges;

@@ -1,0 +1,22 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.ds</groupId>
+  <artifactId>a-path-back-into-itself-adds-no-scope</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencyManagement>
+    <dependencies>
+      <dependency><groupId>org.ds</groupId><artifactId>b</artifactId><version>1.0</version><scope>compile</scope></dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency><groupId>org.ds</groupId><artifactId>u</artifactId><version>1.0</version><scope>test</scope></dependency>
+    <dependency><groupId>org.ds</groupId><artifactId>t</artifactId><version>1.0</version><scope>test</scope></dependency>
+  </dependencies>
+</project>

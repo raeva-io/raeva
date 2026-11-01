@@ -1,0 +1,58 @@
+Raeva reads your existing pom.xml and writes raeva.lock, which pins every artifact, POM, parent and BOM by SHA-256. Maven still runs the build.
+
+Quick start:
+  raeva sync           Resolve dependencies and write raeva.lock
+  raeva sync --frozen  Fail when raeva.lock is out of date, as in CI
+
+Offline build: export the locked dependencies to a repository of their own, and fill another with Maven's plugins (plugins are not locked):
+  raeva export-m2 --m2-path /build/deps
+  mvn -Dmaven.repo.local=/build/plugins -DskipTests package
+  mvn -o -Dmaven.repo.local=/build/deps -Dmaven.repo.local.tail=/build/plugins -DskipTests package
+
+Usage: raeva [OPTIONS] <COMMAND>
+
+Commands:
+  sync              Resolve dependencies, download artifacts, and update raeva.lock
+  export-m2         Export lockfile artifacts to the Maven local repository
+  tree              Show the dependency tree from raeva.lock
+  why               Explain why raeva.lock includes a dependency
+  doctor            Check repository connectivity, TLS and authentication
+  lock              Inspect, compare or verify raeva.lock
+  export-checksums  Export the locked checksums to .mvn/checksums/ for Maven's Trusted Checksums
+  vuln              Scan locked dependencies for known vulnerabilities
+  sbom              Generate a software bill of materials from raeva.lock
+  help              Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+Global Options:
+  -C, --project-root <PATH>
+          The project directory, which holds the root pom.xml
+          
+          [default: .]
+
+  -v, --verbose...
+          Show more output for debugging (repeatable; set RUST_LOG to override verbosity entirely)
+
+  -q, --quiet
+          Show only essential output (no spinners or progress bars)
+
+      --json
+          Produce machine-readable JSON output (implies --quiet)
+
+      --offline
+          Use cached data and file repositories only; commands that need the network fail
+
+  -s, --settings <FILE>
+          Read this Maven settings file instead of ~/.m2/settings.xml, as mvn -s does
+
+  -P, --activate-profiles <IDS>
+          Activate Maven profiles, or deactivate one written !id, as mvn -P does (repeatable)
+
+  -D, --define <NAME=VALUE>
+          Set a Maven user property, as mvn -D does (repeatable)

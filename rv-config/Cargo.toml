@@ -2,42 +2,50 @@
 name = "rv-config"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Configuration and lockfile management for Raeva"
+description = "Configuration management for Raeva"
+readme = "README.md"
+documentation = "https://docs.rs/rv-config"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benches/"]
+
+[lints]
+workspace = true
 
 [dependencies]
 rv-maven-model.workspace = true
+rv-maven-types.workspace = true
 
 aes.workspace = true
-anyhow.workspace = true
 base64.workspace = true
 cbc.workspace = true
-derive_more.workspace = true
 dirs.workspace = true
-dunce.workspace = true
-fs2.workspace = true
 hex.workspace = true
-keyring.workspace = true
 quick-xml.workspace = true
-getrandom.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-strum.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 url.workspace = true
 
-[dev-dependencies]
-rv-test-support.workspace = true
-criterion.workspace = true
-temp-env.workspace = true
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
-[[bench]]
-name = "lockfile"
-harness = false
+[features]
+# Test constructors and the RAEVA_TEST_MAVEN_USER_HOME hook, for other
+# crates' tests. Enabled only from [dev-dependencies]; release builds never
+# have it.
+testing = ["rv-maven-model/testing"]
+
+[dev-dependencies]
+rv-config = { path = ".", features = ["testing"] }
+rv-test-support.workspace = true
+temp-env.workspace = true

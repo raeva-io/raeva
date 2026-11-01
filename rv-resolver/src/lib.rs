@@ -1,42 +1,40 @@
-//! Dependency resolution and graph building.
+//! Maven dependency resolution for Raeva.
+//!
+//! [`Resolver`] builds the dependency graph of a project from its `pom.xml`
+//! and mediates version conflicts as Maven does. [`Workspace`] discovers the
+//! active modules of a reactor.
+//!
+//! Resolution fetches the POMs, metadata and artifacts it needs into the
+//! content store and binds each external package to the bytes it resolved
+//! to. [`lock::assemble`] turns the resolutions of every platform into one
+//! in-memory [`rv_lock::Lockfile`], failing when modules or platforms disagree
+//! about bytes the lockfile pins once.
+//!
+//! This crate does not write `raeva.lock` (the caller serializes the assembled
+//! lockfile), does not decide whether an existing lock is still current, and
+//! does not put artifacts into a Maven local repository such as `~/.m2`
+//! (that is `rv-export`). Settings come from an [`rv_config::Config`], not
+//! from the process environment.
 
 mod context;
 mod error;
 mod graph;
+pub mod lock;
+mod metadata;
+mod output;
 mod parent_resolver;
 mod parsed_pom_cache;
 mod resolver;
 mod solver;
-mod sync_bridge;
-mod tree;
 mod util;
 mod workspace;
 
-pub use context::{ResolveContext, ResolveState};
-pub use error::{ConflictingPom, DroppedRepo, RepoSearchStatus, RepoStatus, ResolveError};
-pub use graph::{Edge, Graph, Node};
-pub use parent_resolver::{
-    accepted_local_parents, build_activation_context, local_parent_boundary, parse_maven_config,
+pub use error::{
+    ConflictingPom, CredentialTarget, DroppedRepo, RepoSearchStatus, RepoStatus, ResolveError,
 };
+pub use output::{ModuleResolution, ResolvedArtifact, ResolvedPackage};
 pub use resolver::{
-    MAX_WORKSPACE_ARTIFACT_POPULATIONS, MAX_WORKSPACE_MODULE_CONCURRENCY, ResolutionResult,
-    Resolver, RootSpec, SupportPomProvenance, WorkspaceModuleResolution, WorkspaceResolution,
+    Resolver, SupportPomProvenance, WorkspaceModuleResolution, WorkspaceResolution,
 };
-/// Depth bound shared by inheritance resolution and [`accepted_local_parents`].
-pub use rv_maven_model::MAX_PARENT_CHAIN_DEPTH;
-pub use tree::Tree;
-pub use workspace::{Workspace, WorkspaceError, WorkspaceModule};
-
-/// Strategy for resolving version conflicts when the same dependency is
-/// requested at different versions from multiple paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, strum::Display, strum::EnumString)]
-#[strum(serialize_all = "kebab-case")]
-pub enum ResolutionStrategy {
-    /// Maven default, among candidates that satisfy every hard version range:
-    /// siblings under the same parent prefer the higher version; otherwise the
-    /// shallower declaration wins, and the first one encountered wins a tie.
-    #[default]
-    NearestWins,
-    /// Highest version wins regardless of declaration depth.
-    HighestWins,
-}
+pub use rv_config::maven_config::MavenConfigError;
+pub use workspace::{ModuleContext, Workspace, WorkspaceError, WorkspaceModule};

@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# As bom-repositories-not-for-the-next-import, with the imports in the dependency org.scope:a:1:
+# "Failed to read artifact descriptor for org.scope:a:jar:1", b2 not found.
+result=failure
+missing=org.scope:b2:1

@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.interp</groupId><artifactId>root</artifactId><version>1.0</version></parent><artifactId>version-property</artifactId><version>${version}</version><properties><version>2.0</version></properties></project>

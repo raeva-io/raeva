@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.f4</groupId><artifactId>parent</artifactId><version>1.0</version><relativePath>parent/pom.xml</relativePath></parent>
+  <artifactId>parent-profile-under-child-model</artifactId>
+  <repositories><repository><id>repo</id><url>file://${project.basedir}/repo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+<properties><lib.version>1.0</lib.version></properties><dependencyManagement><dependencies><dependency><groupId>org.f4</groupId><artifactId>managed</artifactId><version>1.0</version></dependency></dependencies></dependencyManagement><dependencies><dependency><groupId>org.f4</groupId><artifactId>lib</artifactId><version>${lib.version}</version></dependency><dependency><groupId>org.f4</groupId><artifactId>managed</artifactId></dependency></dependencies>
+</project>

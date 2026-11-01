@@ -1,0 +1,124 @@
+schema_version = 8
+config_hash = "9999999999999999999999999999999999999999999999999999999999999999"
+
+[[platforms]]
+targets = [
+    "linux-x86_64",
+    "windows-x86_64",
+]
+
+[[platforms.artifacts]]
+repo_url = "https://repo.example/maven2/"
+other_repo_urls = ["./repository/"]
+pom_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "legacy"
+version = "0.1"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha1"
+digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[[platforms.artifacts]]
+repo_url = "https://repo.example/maven2/"
+pom_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "lib"
+version = "1.0"
+packaging = "jar"
+classifier = "jdk11"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha1"
+digest = "ffffffffffffffffffffffffffffffffffffffff"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "snap"
+version = "1.0-SNAPSHOT"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+
+[platforms.artifacts.snapshot]
+timestamp = "20240101.010101"
+build_number = 7
+
+[[platforms.modules]]
+path = "api/pom.xml"
+gav = "org.golden.app:api:1.0"
+packaging = "jar"
+packages = ""
+edges = ""
+
+[[platforms.modules]]
+path = "app/pom.xml"
+gav = "org.golden.app:app:1.0"
+packaging = "jar"
+packages = """
+org.golden:legacy:0.1\tjar\t\truntime
+org.golden:lib:1.0\tjar:jdk11\tcompile
+org.golden:snap:1.0-SNAPSHOT\tjar\ttest
+org.golden:vendored:0.9\tjar\tsystem\t\t\tlib/vendored-0.9.jar\t5555555555555555555555555555555555555555555555555555555555555555
+org.golden.app:api:1.0\tjar\tcompile\t\tapi/pom.xml"""
+edges = "1 0 runtime"
+
+[[platforms.support_poms]]
+coordinate = "org.golden:bom:1.0"
+repo_url = "https://repo.example/maven2/"
+sha256 = "4444444444444444444444444444444444444444444444444444444444444444"
+
+[[inputs]]
+target = "linux-x86_64"
+profiles = [
+    "release",
+    "linux",
+]
+
+[[inputs.poms]]
+path = "api/pom.xml"
+sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+graph = "e7934dcdf4cd006573b13364316623a6dcccc46c0466b2ac256700ae22944f30"
+
+[[inputs.poms]]
+path = "app/pom.xml"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+graph = "dc642581aa809bd9ea7a14f5c4f0589396d6851b3a3a35c938ab9330d73e824f"
+
+[[inputs]]
+target = "windows-x86_64"
+profiles = [
+    "release",
+    "linux",
+]
+
+[[inputs.poms]]
+path = "api/pom.xml"
+sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+graph = "e7934dcdf4cd006573b13364316623a6dcccc46c0466b2ac256700ae22944f30"
+
+[[inputs.poms]]
+path = "app/pom.xml"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+graph = "dc642581aa809bd9ea7a14f5c4f0589396d6851b3a3a35c938ab9330d73e824f"
+
+[metadata]
+repo_ids = """
+./repository/\tfixture
+https://repo.example/maven2/\tcorp
+https://repo.example/maven2/\tcorp-snapshots"""

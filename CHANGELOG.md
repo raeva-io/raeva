@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-01
+
+Most of raeva is rewritten for 0.5.0. This is how it works now.
+
+- **Resolution follows Maven 3.9.11**: POM models, profiles, interpolation,
+  `.mvn/maven.config`, repository order and policies, mirrors, proxies,
+  SNAPSHOT handling, and nearest-wins mediation. `docs/verification.md`
+  lists the known differences.
+- **`raeva.lock` pins everything by SHA-256**: every artifact, its POM, and
+  every parent and BOM, with its SNAPSHOT build. It records the repository a
+  POM or configuration declares, never the mirror that served it, and the
+  host conditions resolution read, as outcomes rather than host values.
+- **`--frozen` checks the lock**: `raeva sync --frozen` fails when the POMs
+  or configuration no longer resolve to the locked pins, and restores the
+  locked SNAPSHOT builds; `raeva sync --update` finds newer ones, as
+  `mvn -U` does. POM edits that
+  keep the same pins pass, and each module has its own freshness record, so
+  independent POM edits merge with plain Git.
+- **Speed**: with a warm cache raeva resolves 7 to 19 times faster than
+  Maven. Checking an up-to-date lock takes under a second.
+- **Any platform from any host**: lock for Linux, macOS, and Windows on
+  x86_64 and aarch64 with `--platforms`, and for each JDK of a CI matrix
+  with `[lock] jdks`. Without `--platforms`, `--frozen` on a host the lock
+  has no section for fails and names `--platforms`.
+- **Maven options**: every command takes `mvn`'s `-s`, `-P` and `-D`,
+  merged with `.mvn/maven.config` as Maven merges them, but a `-s` there is
+  ignored with a warning. The lock records property names, never values.
+- **Offline builds**: `raeva export-m2 --m2-path <dir>` writes an isolated
+  local repository that `mvn -o` builds from, SNAPSHOTs included, where
+  ranges take the locked version; in a shared `~/.m2` it warns that the
+  build is not locked. `raeva export-checksums` writes Maven's
+  trusted-checksums files.
+  The lock does not record plugins; `docs/offline-builds.md` covers them.
+- **Trust follows who wrote the file**: mirrors, proxies and security
+  allowances come only from the user's files. Credentials go only to
+  repositories with their id that the configuration or the project's POMs
+  declare, private addresses are screened, and plain `http:` repositories a
+  POM declares are refused. Downloads are checked against the repository
+  checksum and the pin, and a shared store hands a project a file only when
+  a repository that project allows served it.
+- **Output for people and scripts**: one progress line and one summary per
+  sync, exit codes by cause, and `--json` errors with `code` and `hints`.
+  Every warning has a code, listed in `docs/json-output.md`.
+- **CI caches**: a damaged store index or metadata cache, as a partial cache
+  restore can leave, is recreated with a `DATABASE_RECREATED` warning. Keep
+  the `cache-key` file beside `metadata.db` out of shared caches.
+- **Inspection and reports**: `raeva tree`, `why`, `doctor`, `lock diff`,
+  `vuln` (OSV, with `--baseline` to gate only new findings and OpenVEX
+  `--vex` to suppress assessed ones), and `sbom` (CycloneDX).
+- **Installers**: the command is `raeva`; `rv` is an opt-in alias that
+  `README.md` shows how to set up. Linux archives include static musl builds
+  for x86_64 and aarch64. Building needs Rust 1.89.
+
+`rv.toml`, `rv.lock` and the `RV_*` variables are now `raeva.toml`,
+`raeva.lock` and `RAEVA_*`, and the old files are ignored: rename `rv.toml`,
+run `raeva sync`, and commit `raeva.lock` before CI runs `--frozen`. `rv login`, the OS credential store,
+`sync --strategy` and SPDX SBOMs are gone; credentials come from
+`settings.xml` or `[[auth]]`. The library crates were reorganized; see
+docs.rs.
+
 ## [0.4.1] - 2026-10-13
 
 ### Fixed
@@ -239,8 +299,8 @@ results can differ from 0.3.0, so the first `rv sync` may rewrite `rv.lock`.
   passing. It accepts unchanged timestamped snapshots, and reports newer
   snapshot timestamp and build identities with their affected module
   coordinates. `--frozen --offline` cannot reach a repository, so it verifies
-  only the local inputs — configuration, reactor model, and resolution
-  strategy — and does not detect upstream drift, with one exception: a
+  only the local inputs (configuration, reactor model, and resolution
+  strategy) and does not detect upstream drift, with one exception: a
   lockfile that records an artifact origin the current configuration no longer
   declares is resolved again offline, from the local model and cached
   repository data, so the POMs themselves decide whether that origin is still
@@ -351,7 +411,8 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
-[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/raeva-io/raeva/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/raeva-io/raeva/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/raeva-io/raeva/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/raeva-io/raeva/compare/v0.2.0...v0.3.0

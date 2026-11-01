@@ -1,0 +1,13 @@
+{
+  "exit_code": 2,
+  "stdout": {
+    "code": "USAGE",
+    "data": {
+      "warnings": []
+    },
+    "error": "module selector 'org.golden:missing' matches no module of the 1 in raeva.lock; modules: pom.xml (org.golden.app:single:1.0)",
+    "exit_code": 2,
+    "hints": [],
+    "success": false
+  }
+}

@@ -1,0 +1,3 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64, os-maven-plugin 1.7.1
+# mvn dependency:list
+classifier=linux-x86_64

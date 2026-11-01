@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="346" viewBox="0 0 720 346" role="img" aria-labelledby="t d" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif">
+<title id="t">Resolving with a warm cache, no lock: raeva and Maven 3.9.12, seconds</title>
+<desc id="d">Spring AI: raeva 0.40 s, Maven 2.73 s; Maven Resolver: raeva 0.10 s, Maven 1.31 s; Liquibase: raeva 0.08 s, Maven 1.05 s; Guava: raeva 0.08 s, Maven 1.27 s; Commons IO: raeva 0.05 s, Maven 0.91 s; Commons Lang: raeva 0.05 s, Maven 0.89 s</desc>
+<rect x="150" y="8" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="168" y="18.5" font-size="13" fill="#1f2328">raeva</text>
+<rect x="232" y="8" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="250" y="18.5" font-size="13" fill="#1f2328">Maven 3.9.12</text>
+<line x1="150.0" y1="34" x2="150.0" y2="316" stroke="#d1d9e0" stroke-width="1"/>
+<text x="150.0" y="330" font-size="12" text-anchor="middle" fill="#59636e">0 s</text>
+<line x1="234.3" y1="34" x2="234.3" y2="316" stroke="#d1d9e0" stroke-width="1"/>
+<text x="234.3" y="330" font-size="12" text-anchor="middle" fill="#59636e">0.5 s</text>
+<line x1="318.7" y1="34" x2="318.7" y2="316" stroke="#d1d9e0" stroke-width="1"/>
+<text x="318.7" y="330" font-size="12" text-anchor="middle" fill="#59636e">1 s</text>
+<line x1="403.0" y1="34" x2="403.0" y2="316" stroke="#d1d9e0" stroke-width="1"/>
+<text x="403.0" y="330" font-size="12" text-anchor="middle" fill="#59636e">1.5 s</text>
+<line x1="487.3" y1="34" x2="487.3" y2="316" stroke="#d1d9e0" stroke-width="1"/>
+<text x="487.3" y="330" font-size="12" text-anchor="middle" fill="#59636e">2 s</text>
+<line x1="571.7" y1="34" x2="571.7" y2="316" stroke="#d1d9e0" stroke-width="1"/>
+<text x="571.7" y="330" font-size="12" text-anchor="middle" fill="#59636e">2.5 s</text>
+<line x1="656.0" y1="34" x2="656.0" y2="316" stroke="#d1d9e0" stroke-width="1"/>
+<text x="656.0" y="330" font-size="12" text-anchor="middle" fill="#59636e">3 s</text>
+<text x="138" y="55" font-size="14" text-anchor="end" fill="#1f2328">Spring AI</text>
+<text x="138" y="71" font-size="12" text-anchor="end" fill="#59636e">169 modules</text>
+<path d="M150,40h63.2a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-63.2z" fill="#2a78d6"/>
+<text x="223.2" y="51" font-size="12" fill="#1f2328">0.40 s</text>
+<path d="M150,56h456.3a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-456.3z" fill="#eb6834"/>
+<text x="616.3" y="67" font-size="12" fill="#1f2328">2.73 s</text>
+<text x="138" y="103" font-size="14" text-anchor="end" fill="#1f2328">Maven Resolver</text>
+<text x="138" y="119" font-size="12" text-anchor="end" fill="#59636e">31 modules</text>
+<path d="M150,88h12.8a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-12.8z" fill="#2a78d6"/>
+<text x="172.8" y="99" font-size="12" fill="#1f2328">0.10 s</text>
+<path d="M150,104h216.4a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-216.4z" fill="#eb6834"/>
+<text x="376.4" y="115" font-size="12" fill="#1f2328">1.31 s</text>
+<text x="138" y="151" font-size="14" text-anchor="end" fill="#1f2328">Liquibase</text>
+<text x="138" y="167" font-size="12" text-anchor="end" fill="#59636e">9 modules</text>
+<path d="M150,136h9.4a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-9.4z" fill="#2a78d6"/>
+<text x="169.4" y="147" font-size="12" fill="#1f2328">0.08 s</text>
+<path d="M150,152h173.2a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-173.2z" fill="#eb6834"/>
+<text x="333.2" y="163" font-size="12" fill="#1f2328">1.05 s</text>
+<text x="138" y="199" font-size="14" text-anchor="end" fill="#1f2328">Guava</text>
+<text x="138" y="215" font-size="12" text-anchor="end" fill="#59636e">6 modules</text>
+<path d="M150,184h9.0a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-9.0z" fill="#2a78d6"/>
+<text x="169.0" y="195" font-size="12" fill="#1f2328">0.08 s</text>
+<path d="M150,200h209.5a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-209.5z" fill="#eb6834"/>
+<text x="369.5" y="211" font-size="12" fill="#1f2328">1.27 s</text>
+<text x="138" y="247" font-size="14" text-anchor="end" fill="#1f2328">Commons IO</text>
+<text x="138" y="263" font-size="12" text-anchor="end" fill="#59636e">1 module</text>
+<path d="M150,232h4.4a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-4.4z" fill="#2a78d6"/>
+<text x="164.4" y="243" font-size="12" fill="#1f2328">0.05 s</text>
+<path d="M150,248h148.8a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-148.8z" fill="#eb6834"/>
+<text x="308.8" y="259" font-size="12" fill="#1f2328">0.91 s</text>
+<text x="138" y="295" font-size="14" text-anchor="end" fill="#1f2328">Commons Lang</text>
+<text x="138" y="311" font-size="12" text-anchor="end" fill="#59636e">1 module</text>
+<path d="M150,280h3.7a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-3.7z" fill="#2a78d6"/>
+<text x="163.7" y="291" font-size="12" fill="#1f2328">0.05 s</text>
+<path d="M150,296h146.6a4,4 0 0 1 4,4v6a4,4 0 0 1 -4,4h-146.6z" fill="#eb6834"/>
+<text x="306.6" y="307" font-size="12" fill="#1f2328">0.89 s</text>
+</svg>

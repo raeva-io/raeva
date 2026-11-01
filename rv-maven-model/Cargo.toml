@@ -2,24 +2,38 @@
 name = "rv-maven-model"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Maven POM parsing and effective model computation for Raeva"
+readme = "README.md"
+documentation = "https://docs.rs/rv-maven-model"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/"]
+
+[lints]
+workspace = true
 
 [dependencies]
+rv-maven-types.workspace = true
 
+foldhash.workspace = true
 indexmap.workspace = true
 quick-xml.workspace = true
+fancy-regex.workspace = true
 serde.workspace = true
 strum.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# Test constructors for other crates' tests. Enabled only from
+# [dev-dependencies]; release builds never have it.
+testing = []
+
 [dev-dependencies]
-criterion.workspace = true
+rv-test-support.workspace = true
 temp-env.workspace = true
 tempfile.workspace = true
-
-[[bench]]
-name = "pom_parse"
-harness = false

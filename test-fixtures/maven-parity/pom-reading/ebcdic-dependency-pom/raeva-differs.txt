@@ -1,0 +1,5 @@
+# raeva does not decode EBCDIC. It refuses the POM by name and fails the sync,
+# rather than reading the bytes as UTF-8 and dropping org.enc:c:1.0 as
+# Maven never would.
+result=failure
+error=the POM is in EBCDIC, declared as IBM037, which raeva does not read

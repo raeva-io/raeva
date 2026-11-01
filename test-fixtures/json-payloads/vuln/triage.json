@@ -1,0 +1,17 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "justification": "vulnerable_code_not_present",
+      "module": "pom.xml",
+      "path": "<tmp>/project/vex.json",
+      "product": "pkg:maven/org.golden.app/single",
+      "subcomponent": "pkg:maven/org.golden/util@1.0",
+      "version": 1,
+      "vulnerability": "GOLDEN-2024-1",
+      "warnings": [],
+      "written": true
+    },
+    "success": true
+  }
+}

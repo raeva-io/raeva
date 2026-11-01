@@ -1,0 +1,46 @@
+{
+  "exit_code": 4,
+  "stdout": {
+    "code": "DOCTOR_CHECKS_FAILED",
+    "data": {
+      "checks": [
+        {
+          "check": "TLS trust roots",
+          "class": null,
+          "details": "operating system trust store",
+          "status": "info"
+        },
+        {
+          "check": "store directory",
+          "class": null,
+          "details": "<tmp>/home/store",
+          "status": "info"
+        },
+        {
+          "check": "unreachable",
+          "class": "network",
+          "details": "error sending request: connection refused (cannot establish connection; verify URL, network, and firewall)",
+          "status": "fail"
+        },
+        {
+          "check": "central",
+          "class": "network",
+          "details": "error sending request: connection refused (cannot establish connection; verify URL, network, and firewall)",
+          "status": "fail"
+        },
+        {
+          "check": "project repositories",
+          "class": null,
+          "details": "no pom.xml in the project directory; only configured repositories were probed",
+          "status": "info"
+        }
+      ],
+      "issues": 2,
+      "warnings": []
+    },
+    "error": "2 check(s) failed",
+    "exit_code": 4,
+    "hints": [],
+    "success": false
+  }
+}

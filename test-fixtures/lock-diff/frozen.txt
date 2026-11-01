@@ -1,0 +1,23 @@
+lock-golden/round-trip/raeva.lock -> lock-diff/round-trip.lock
+  core  1.1 -> 1.2 (in app, on linux-x86_64)
+  lib   1.0, checksum changed (in app)
+  util  2.0, scope compile -> test (in api, on linux-x86_64)
+  POM changed for org.golden:lib:1.0:jar: e55f3739f1c8 -> 222222222222
+  support POM changed for org.golden:bom:1.0: ffe04faf64ab -> 333333333333
+
+lock-golden/snapshot/raeva.lock -> lock-diff/snapshot.lock
+  snap  1.0-20240101.010101-7 -> 1.0-20240202.020202-9
+
+lock-golden/single-module/raeva.lock -> lock-golden/round-trip/raeva.lock
+  module api/pom.xml added: org.golden.reactor:api:2.0
+  module app/pom.xml added: org.golden.reactor:app:2.0
+  module pom.xml: org.golden.app:single:1.0 -> org.golden.reactor:reactor-root:2.0 (jar -> pom)
+  api-spec       1.0 (removed, in the root module)
+  core           1.1 (added, in app)
+  core           1.1 (removed, in the root module)
+  lib            1.0 (added, in app)
+  lib            1.0 (removed, in the root module)
+  lib:jar:jdk11  1.0 (removed, in the root module)
+  lib:jar:tests  1.0 (removed, in the root module)
+  ... and 8 more; 'raeva sync' lists every change
+

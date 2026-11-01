@@ -1,0 +1,8 @@
+# Maven reads the first -s in .mvn/maven.config, .mvn/ci.xml, in place of
+# settings.xml, and its profile pin sets lib.version to 2.0. raeva ignores a
+# settings file the project names (SETTING_IGNORED): it can hold mirrors,
+# proxies and credentials, so only the command line chooses it. The user's
+# settings.xml applies, whose profile pin sets 3.0.
+result=success
+module=org.cl:settings-file-in-maven-config:1.0
+artifact=org.cl:lib:3.0:repo

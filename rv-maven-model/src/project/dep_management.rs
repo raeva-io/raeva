@@ -1,82 +1,115 @@
-//! Dependency-management merging and concrete dependency resolution.
-
-use crate::PomError;
 use crate::dependency::{Dependency, DependencyManagement, Exclusion};
 use crate::properties::{ProjectInfo, PropertyMap};
-use std::collections::HashMap;
+use crate::{HostInput, PomError};
+use rv_maven_types::bounded;
+use std::collections::hash_map;
 
+/// `management` interpolated, and validated when `validate`: an inactive
+/// profile's copy is not, as Maven validates the effective model only.
 pub(super) fn resolve_dependency_management(
     management: DependencyManagement,
     properties: &PropertyMap,
     project: &ProjectInfo,
+    validate: bool,
 ) -> Result<DependencyManagement, PomError> {
     let dependencies = management
         .dependencies
         .into_iter()
-        .map(|dep| resolve_dependency(dep, properties, project))
+        .map(|dep| match validate {
+            true => resolve_dependency(dep, properties, project),
+            false => interpolate_dependency(dep, properties, project, None),
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(DependencyManagement { dependencies })
 }
 
+/// The dependencies of a model, managed and interpolated. A host value
+/// that only the version or the exclusions of a dependency read counts as
+/// read only when resolution can follow that dependency: always for a
+/// project's own, and for a dependency's POM, when
+/// [`Dependency::is_followed_transitively`] says so. The others never reach
+/// the resolution, except an environment variable in a version, which can
+/// make the POM invalid. With `transitive`, the versions and exclusions are
+/// read through a detached environment, and what they read passes to
+/// `project` only for a dependency resolution follows.
 pub(super) fn resolve_dependencies(
     deps: Vec<Dependency>,
     management: &DependencyManagement,
     properties: &PropertyMap,
     project: &ProjectInfo,
-) -> Result<Vec<Dependency>, PomError> {
-    resolve_dependencies_impl(deps, management, properties, project, true)
-}
-
-fn resolve_dependencies_impl(
-    deps: Vec<Dependency>,
-    management: &DependencyManagement,
-    properties: &PropertyMap,
-    project: &ProjectInfo,
-    validate: bool,
+    transitive: bool,
 ) -> Result<Vec<Dependency>, PomError> {
     if deps.is_empty() {
         return Ok(Vec::new());
     }
     let index = build_managed_dep_index(management);
-    resolve_dependencies_with(
-        deps,
-        |dep| find_managed_dependency_indexed(dep, &index),
-        properties,
-        project,
-        validate,
-    )
-}
-
-/// Resolve `deps`, taking managed entries from `managed`. Callers that look
-/// up several management lists pass their own lookup instead of merging them.
-pub(super) fn resolve_dependencies_with<'m>(
-    deps: Vec<Dependency>,
-    managed: impl Fn(&Dependency) -> Option<&'m Dependency>,
-    properties: &PropertyMap,
-    project: &ProjectInfo,
-    validate: bool,
-) -> Result<Vec<Dependency>, PomError> {
+    let deferred = transitive.then(|| ProjectInfo {
+        environment: project.environment.detached(),
+        ..project.clone()
+    });
     let mut resolved = Vec::with_capacity(deps.len());
     for dep in deps {
-        let mut dep = interpolate_dependency(dep, properties, project)?;
-        if let Some(managed) = managed(&dep) {
+        let mut dep = interpolate_dependency(dep, properties, project, deferred.as_ref())?;
+        if let Some(managed) = find_managed_dependency_indexed(&dep, &index) {
             apply_managed_dependency(&mut dep, managed);
         }
-        if dep.version.is_none() {
-            tracing::debug!(
-                group_id = %dep.group_id,
-                artifact_id = %dep.artifact_id,
-                "dependency has no version after applying dependency management; \
-                 the resolver will attempt to supply a version from outer management"
-            );
+        if let Some(deferred) = &deferred {
+            let reads = deferred.environment.take_reads();
+            if dep.is_followed_transitively() {
+                for input in reads {
+                    project.environment.record(input);
+                }
+            }
         }
-        if validate {
-            dep.validate_system_scope()?;
-        }
+        dep.validate_coordinates(false)?;
+        dep.validate_system_scope()?;
         resolved.push(dep);
     }
-
+    // A dependency's POM is a complete model: no outer management supplies
+    // a version Maven's validation finds missing there, or empty.
+    if transitive
+        && let Some(dep) = resolved
+            .iter()
+            .find(|dep| dep.version.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(dep.missing(false, "version"));
+    }
+    // Maven's project validation only warns of an incomplete exclusion,
+    // which excludes nothing.
+    if !transitive {
+        for dep in &resolved {
+            for exclusion in &dep.exclusions {
+                let field = if exclusion.group_id.is_empty() {
+                    "groupId"
+                } else if exclusion.artifact_id.is_empty() {
+                    "artifactId"
+                } else {
+                    continue;
+                };
+                let (group_id, artifact_id, type_, _) = dep.management_key();
+                tracing::warn!(
+                    sec_code = "POM_PROBLEM",
+                    "'dependencies.dependency.exclusions.exclusion.{field}' for {}:{}:{} is missing",
+                    bounded(group_id),
+                    bounded(artifact_id),
+                    bounded(type_)
+                );
+            }
+        }
+    }
     Ok(resolved)
+}
+
+/// Maven's validation of `deps`, the dependencies of a model whose
+/// management alone is used, as an imported BOM's: managed by
+/// `management`, they need their coordinates and a version.
+pub(super) fn validate_dependencies(
+    deps: &[Dependency],
+    management: &DependencyManagement,
+    properties: &PropertyMap,
+    project: &ProjectInfo,
+) -> Result<(), PomError> {
+    resolve_dependencies(deps.to_vec(), management, properties, project, true).map(drop)
 }
 
 pub(super) fn resolve_dependency(
@@ -84,17 +117,35 @@ pub(super) fn resolve_dependency(
     properties: &PropertyMap,
     project: &ProjectInfo,
 ) -> Result<Dependency, PomError> {
-    let resolved = interpolate_dependency(dep, properties, project)?;
+    let resolved = interpolate_dependency(dep, properties, project, None)?;
+    resolved.validate_coordinates(true)?;
     // Validate `<systemPath>` after interpolation so exporters cannot emit invalid entries.
     resolved.validate_system_scope()?;
     Ok(resolved)
 }
 
-fn interpolate_dependency(
+/// `dep` interpolated, its version and exclusions through `deferred` when
+/// given.
+pub(super) fn interpolate_dependency(
     dep: Dependency,
     properties: &PropertyMap,
     project: &ProjectInfo,
+    deferred: Option<&ProjectInfo>,
 ) -> Result<Dependency, PomError> {
+    let version =
+        properties.interpolate_opt(dep.version.as_deref(), deferred.unwrap_or(project))?;
+    // An environment variable may be empty, which leaves the version missing
+    // and a dependency's POM invalid, so it counts whether or not
+    // resolution follows the dependency. No other host value is empty.
+    if let Some(deferred) = deferred {
+        for input in deferred.environment.take_reads() {
+            match input {
+                HostInput::Env(_) => project.environment.record(input),
+                _ => deferred.environment.record(input),
+            }
+        }
+    }
+    let deferred = deferred.unwrap_or(project);
     // Trim whitespace from coordinate fields to match Maven's lenient parsing.
     // Some POMs have stray whitespace in <groupId>, <artifactId>, or <version>
     // (e.g. Quarkus `<groupId> jakarta.servlet</groupId>`).
@@ -110,7 +161,7 @@ fn interpolate_dependency(
     Ok(Dependency {
         group_id: trim_string(properties.interpolate_str(&dep.group_id, project)?),
         artifact_id: trim_string(properties.interpolate_str(&dep.artifact_id, project)?),
-        version: trim_opt(properties.interpolate_opt(dep.version.as_deref(), project)?),
+        version: trim_opt(version),
         type_: properties.interpolate_opt(dep.type_.as_deref(), project)?,
         classifier: properties.interpolate_opt(dep.classifier.as_deref(), project)?,
         scope: properties.interpolate_opt(dep.scope.as_deref(), project)?,
@@ -118,7 +169,7 @@ fn interpolate_dependency(
         exclusions: dep
             .exclusions
             .into_iter()
-            .map(|e| resolve_exclusion(e, properties, project))
+            .map(|e| resolve_exclusion(e, properties, deferred))
             .collect::<Result<Vec<_>, _>>()?,
         system_path: properties.interpolate_opt(dep.system_path.as_deref(), project)?,
     })
@@ -138,45 +189,58 @@ fn resolve_exclusion(
 /// Key for managed dependency lookup: (groupId, artifactId, effective_type, normalized_classifier)
 type ManagedDepKey<'a> = (&'a str, &'a str, &'a str, Option<&'a str>);
 
-/// Build an index from dependency management for O(1) lookup.
-/// The index maps (groupId, artifactId, type, classifier) -> &Dependency.
-///
-/// Uses "first wins" semantics: the first entry for a given key is kept,
-/// later duplicates are ignored. This matches Maven's behavior where the
-/// first `<dependencyManagement>` declaration for a given coordinate takes
-/// precedence. Callers control precedence via list ordering (e.g., locals
-/// before BOM imports so that local declarations override imported ones).
-pub(super) fn build_managed_dep_index(
-    management: &DependencyManagement,
-) -> HashMap<ManagedDepKey<'_>, &Dependency> {
-    let mut index = HashMap::with_capacity(management.dependencies.len());
-    for dep in &management.dependencies {
-        let key = (
-            dep.group_id.as_str(),
-            dep.artifact_id.as_str(),
-            dep.effective_type(),
-            dep.effective_classifier(),
-        );
-        index.entry(key).or_insert(dep);
-    }
-    index
+/// Dependency management indexed by (groupId, artifactId, type, classifier).
+/// Entries whose keys collide only after interpolation (a parent's
+/// `${lib.name}` and a child's `foo`) merge as Maven's
+/// DefaultDependencyManagementInjector applies them in turn: each field
+/// comes from the first entry that sets it, and the exclusions from the
+/// first entry that has any.
+pub(super) struct ManagedIndex<'a> {
+    index: foldhash::HashMap<ManagedDepKey<'a>, Slot<'a>>,
+    merged: Vec<Dependency>,
 }
 
-pub(super) fn find_managed_dependency_indexed<'a>(
-    dep: &Dependency,
-    index: &HashMap<ManagedDepKey<'a>, &'a Dependency>,
-) -> Option<&'a Dependency> {
-    let key = (
-        dep.group_id.as_str(),
-        dep.artifact_id.as_str(),
-        dep.effective_type(),
-        dep.effective_classifier(),
+#[derive(Clone, Copy)]
+enum Slot<'a> {
+    Entry(&'a Dependency),
+    Merged(usize),
+}
+
+pub(super) fn build_managed_dep_index(management: &DependencyManagement) -> ManagedIndex<'_> {
+    let mut index = foldhash::HashMap::with_capacity_and_hasher(
+        management.dependencies.len(),
+        Default::default(),
     );
-    index.get(&key).copied()
+    let mut merged = Vec::new();
+    for dep in &management.dependencies {
+        match index.entry(dep.management_key()) {
+            hash_map::Entry::Vacant(slot) => {
+                slot.insert(Slot::Entry(dep));
+            }
+            hash_map::Entry::Occupied(mut slot) => {
+                let at = match *slot.get() {
+                    Slot::Merged(at) => at,
+                    Slot::Entry(first) => {
+                        merged.push(first.clone());
+                        slot.insert(Slot::Merged(merged.len() - 1));
+                        merged.len() - 1
+                    }
+                };
+                apply_managed_dependency(&mut merged[at], dep);
+            }
+        }
+    }
+    ManagedIndex { index, merged }
 }
 
-pub(super) fn normalize_classifier(classifier: &Option<String>) -> Option<&str> {
-    classifier.as_deref().filter(|value| !value.is_empty())
+pub(super) fn find_managed_dependency_indexed<'i>(
+    dep: &Dependency,
+    index: &'i ManagedIndex<'_>,
+) -> Option<&'i Dependency> {
+    match *index.index.get(&dep.management_key())? {
+        Slot::Entry(managed) => Some(managed),
+        Slot::Merged(at) => Some(&index.merged[at]),
+    }
 }
 
 pub(super) fn apply_managed_dependency(dep: &mut Dependency, managed: &Dependency) {
@@ -202,23 +266,11 @@ pub(super) fn apply_managed_dependency(dep: &mut Dependency, managed: &Dependenc
     if dep.system_path.is_none() {
         dep.system_path.clone_from(&managed.system_path);
     }
-    // Maven semantics: a managed entry's exclusions UNION with any exclusions
-    // declared on the concrete dependency, so exclusions the BOM author intended
-    // to enforce are kept even when the dep declares its own. Dedup by the
-    // (groupId, artifactId) pair so duplicate declarations collapse cleanly.
-    if !managed.exclusions.is_empty() {
-        use std::collections::HashSet;
-        let mut seen: HashSet<(String, String)> = dep
-            .exclusions
-            .iter()
-            .map(|ex| (ex.group_id.clone(), ex.artifact_id.clone()))
-            .collect();
-        for ex in &managed.exclusions {
-            let key = (ex.group_id.clone(), ex.artifact_id.clone());
-            if seen.insert(key) {
-                dep.exclusions.push(ex.clone());
-            }
-        }
+    // Maven 3.9's DefaultDependencyManagementInjector copies the managed
+    // exclusions only onto a dependency that declares none. The resolver
+    // adds the root project's managed exclusions to every dependency.
+    if dep.exclusions.is_empty() {
+        dep.exclusions.clone_from(&managed.exclusions);
     }
 }
 
@@ -226,114 +278,47 @@ pub(super) fn apply_managed_dependency(dep: &mut Dependency, managed: &Dependenc
 mod tests {
     use super::*;
 
-    fn dep(group: &str, artifact: &str, version: Option<&str>, scope: Option<&str>) -> Dependency {
-        Dependency {
-            group_id: group.to_string(),
-            artifact_id: artifact.to_string(),
+    /// Management only fills in: a declared version, scope or exclusion list
+    /// wins.
+    #[test]
+    fn managed_fields_only_fill_in_a_declaration() {
+        let dep = |version: Option<&str>, scope: Option<&str>, excluded: &[&str]| Dependency {
+            group_id: "g".to_string(),
+            artifact_id: "a".to_string(),
             version: version.map(str::to_string),
             type_: None,
             classifier: None,
             scope: scope.map(str::to_string),
             optional: None,
-            exclusions: Vec::new(),
+            exclusions: excluded
+                .iter()
+                .map(|group| Exclusion {
+                    group_id: group.to_string(),
+                    artifact_id: "lib".to_string(),
+                })
+                .collect(),
             system_path: None,
+        };
+        for (declared, managed, expected) in [
+            (
+                dep(Some("1"), Some("compile"), &[]),
+                dep(Some("2"), Some("runtime"), &[]),
+                dep(Some("1"), Some("compile"), &[]),
+            ),
+            (
+                dep(None, None, &[]),
+                dep(Some("2"), Some("runtime"), &["x"]),
+                dep(Some("2"), Some("runtime"), &["x"]),
+            ),
+            (
+                dep(Some("1"), Some("test"), &["own"]),
+                dep(None, None, &["managed", "own"]),
+                dep(Some("1"), Some("test"), &["own"]),
+            ),
+        ] {
+            let mut concrete = declared;
+            apply_managed_dependency(&mut concrete, &managed);
+            assert_eq!(concrete, expected);
         }
-    }
-
-    // Per Maven semantics, dependency-management scope is fill-in only: a
-    // declared scope on the concrete dep wins; the managed scope only
-    // applies when the concrete dep has no scope of its own.
-    #[test]
-    fn declared_scope_wins_over_managed_scope() {
-        // BOM pins `runtime`; concrete declares `compile`. Concrete wins.
-        let mut concrete = dep("g", "a", Some("1.0"), Some("compile"));
-        let managed = dep("g", "a", Some("1.0"), Some("runtime"));
-        apply_managed_dependency(&mut concrete, &managed);
-        assert_eq!(
-            concrete.scope.as_deref(),
-            Some("compile"),
-            "a declared scope on the concrete dependency must win over the managed scope"
-        );
-    }
-
-    #[test]
-    fn managed_scope_fills_in_when_concrete_has_none() {
-        // Concrete dep has no scope, BOM pins `runtime`. Managed wins.
-        let mut concrete = dep("g", "a", Some("1.0"), None);
-        let managed = dep("g", "a", Some("1.0"), Some("runtime"));
-        apply_managed_dependency(&mut concrete, &managed);
-        assert_eq!(
-            concrete.scope.as_deref(),
-            Some("runtime"),
-            "managed scope must fill in when the concrete dependency declares no scope"
-        );
-    }
-
-    // Regression guard: when managed has no scope, declared scope is preserved.
-    #[test]
-    fn managed_scope_absent_preserves_declared_scope() {
-        let mut concrete = dep("g", "a", Some("1.0"), Some("compile"));
-        let managed = dep("g", "a", Some("1.0"), None);
-        apply_managed_dependency(&mut concrete, &managed);
-        assert_eq!(concrete.scope.as_deref(), Some("compile"));
-    }
-
-    fn exclusion(group: &str, artifact: &str) -> Exclusion {
-        Exclusion {
-            group_id: group.to_string(),
-            artifact_id: artifact.to_string(),
-        }
-    }
-
-    #[test]
-    fn managed_exclusions_union_with_dep_exclusions() {
-        // Maven unions managed and dep-level exclusions, so exclusions the BOM
-        // author committed to survive even when the dep declares its own.
-        let mut concrete = dep("g", "a", Some("1.0"), None);
-        concrete.exclusions.push(exclusion("dep.only", "lib"));
-
-        let mut managed = dep("g", "a", Some("1.0"), None);
-        managed.exclusions.push(exclusion("managed.only", "lib"));
-        // Overlap: should not be duplicated after the union.
-        managed.exclusions.push(exclusion("dep.only", "lib"));
-
-        apply_managed_dependency(&mut concrete, &managed);
-        let pairs: Vec<(String, String)> = concrete
-            .exclusions
-            .iter()
-            .map(|ex| (ex.group_id.clone(), ex.artifact_id.clone()))
-            .collect();
-        assert_eq!(
-            pairs,
-            vec![
-                ("dep.only".to_string(), "lib".to_string()),
-                ("managed.only".to_string(), "lib".to_string()),
-            ],
-            "managed exclusions must be appended after dep exclusions, deduped"
-        );
-    }
-
-    #[test]
-    fn managed_exclusions_populate_when_dep_has_none() {
-        let mut concrete = dep("g", "a", Some("1.0"), None);
-        let mut managed = dep("g", "a", Some("1.0"), None);
-        managed.exclusions.push(exclusion("x", "y"));
-
-        apply_managed_dependency(&mut concrete, &managed);
-        assert_eq!(concrete.exclusions.len(), 1);
-        assert_eq!(concrete.exclusions[0].group_id, "x");
-    }
-
-    // Regression guard: declared version is NOT overridden by managed version.
-    #[test]
-    fn managed_version_does_not_override_declared_version() {
-        let mut concrete = dep("g", "a", Some("1.0"), None);
-        let managed = dep("g", "a", Some("2.0"), None);
-        apply_managed_dependency(&mut concrete, &managed);
-        assert_eq!(
-            concrete.version.as_deref(),
-            Some("1.0"),
-            "declared version must be preserved; managed version only fills missing version"
-        );
     }
 }

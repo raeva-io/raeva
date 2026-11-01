@@ -1,0 +1,10 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories
+# org.xml:a:1.0's POM has a comment with -- inside it after the root element.
+# [WARNING] The POM for org.xml:a:jar:1.0 is invalid, transitive dependencies (if any) will not be available: 1 problem was encountered while building the effective model
+# [FATAL] Non-parseable POM .../org/xml/a/1.0/a-1.0.pom: in comment after two dashes (--) next character must be > not
+result=success
+module=org.xml:double-hyphen-comment-after-root-in-dependency-pom:1.0
+# org.xml:a:jar:1.0:compile
+artifact=org.xml:a:1.0:repo

@@ -1,0 +1,5 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.act</groupId><artifactId>root</artifactId><version>1</version><packaging>pom</packaging>
+<properties><pv>val</pv><pk>pom</pk></properties><modules><module>child</module></modules>
+<profiles>
+ <profile><id>root-pk</id><activation><property><name>packaging</name><value>jar</value></property></activation></profile>
+</profiles></project>

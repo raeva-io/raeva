@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list and mvn -q -o validate; artifact= is group:artifact:version:repository id from _remote.repositories
+# The project's pom.xml has the XML declaration after a CR LF line break.
+# [ERROR] Non-parseable POM .../pom.xml: processing instruction can not have PITarget with reserved xml name
+# raeva words the error in its own way; error= is the part of its message that names the defect.
+result=failure
+error=is not well-formed XML

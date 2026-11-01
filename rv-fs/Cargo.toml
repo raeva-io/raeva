@@ -1,0 +1,24 @@
+[package]
+name = "rv-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Atomic writes, file locks and path helpers for Raeva"
+readme = "README.md"
+documentation = "https://docs.rs/rv-fs"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benches/"]
+
+[lints]
+workspace = true
+
+[dependencies]
+dunce.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

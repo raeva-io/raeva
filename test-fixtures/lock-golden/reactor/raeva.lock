@@ -1,0 +1,152 @@
+schema_version = 8
+config_hash = "c0ec4de46cce1cc336386a86ba9b89d893e4aab61fd7cf166d3875ccd0ea97e1"
+
+[resolution]
+ambient_inputs = [
+    "user-property:os.detection.classifierWithLikes",
+    "user-property:util.version",
+]
+
+[[platforms]]
+targets = [
+    "linux-x86_64",
+    "windows-x86_64",
+]
+
+[[platforms.artifacts]]
+repo_url = "./app/repository/"
+pom_sha256 = "8bdc0eb0181d3bb1335c2b67cea552bfe0040899b34ad7ceb75b0bf12b2b2612"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "core"
+version = "1.1"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "da046b16d5e771f0135be2a01a91443d90debda6c64fe2042da4acb2d26650da"
+
+[[platforms.artifacts]]
+repo_url = "./app/repository/"
+pom_sha256 = "e55f3739f1c8ae638a7b08793bd3a4e6c1bd8c4cc15572965b4a892c5df22323"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "lib"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "4ffa4d7c06816bb0e0dc7f963d299d53c3a089479ebac9287352a57ba413f533"
+
+[[platforms.artifacts]]
+repo_url = "./api/repository/"
+other_repo_urls = ["./app/repository/"]
+pom_sha256 = "d0d9e8b0fe2a4483451e2f3e1c3980d13ba7fc9a1de47e9ccbab6f192c4c016e"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "util"
+version = "2.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "3456df58290b25826033531eceebf7855222c7267574c739d1e95aa9e7889ae5"
+
+[[platforms.modules]]
+path = "api/pom.xml"
+gav = "org.golden.reactor:api:2.0"
+packaging = "jar"
+packages = "org.golden:util:2.0\tjar\tcompile"
+edges = ""
+support_poms = "org.golden:bom:1.0"
+
+[[platforms.modules]]
+path = "app/pom.xml"
+gav = "org.golden.reactor:app:2.0"
+packaging = "jar"
+packages = """
+org.golden:core:1.1\tjar\tcompile
+org.golden:lib:1.0\tjar\tcompile
+org.golden:util:2.0\tjar
+org.golden.reactor:api:2.0\tjar\tcompile\t\tapi/pom.xml"""
+edges = """
+0 2 compile
+3 2 compile"""
+support_poms = "org.golden:bom:1.0"
+
+[[platforms.modules]]
+path = "pom.xml"
+gav = "org.golden.reactor:reactor-root:2.0"
+packaging = "pom"
+packages = ""
+edges = ""
+support_poms = "org.golden:bom:1.0"
+
+[[platforms.support_poms]]
+coordinate = "org.golden:bom:1.0"
+repo_url = "./repository/"
+sha256 = "ffe04faf64ab862e146285d6a1cf70a02ff1087dc3d51ad93380eb36add33804"
+
+[[inputs]]
+target = "linux-x86_64"
+profiles = []
+ambient_inputs = [
+    "user-property:os.detection.classifierWithLikes",
+    "user-property:util.version",
+]
+
+[[inputs.poms]]
+path = "api/pom.xml"
+sha256 = "b92b8853e7618cd7e1d79e624ddca263338eb1a58e1de06c742209fc726b0d6d"
+graph = "0d7a6eb9b01a774096325ac12a63073a504b968214f76bd7a4143fdbe7129855"
+
+[[inputs.poms]]
+path = "app/pom.xml"
+sha256 = "8a479789200c6126fa423ff24c0eb9c38a062ae34fa84a64e5208387dea77ebd"
+graph = "b915f0fa9b7e91f21b63de0b1e06ba3b3df711ef8ae4d958f69b50338c355272"
+
+[[inputs.poms]]
+path = "build-parent/pom.xml"
+sha256 = "aa28f93633ffda2b4e6df88000df8a2b6e520cb34500ac337f275527f65b3d2b"
+
+[[inputs.poms]]
+path = "pom.xml"
+sha256 = "7c2a2059f91fc4e5447634f4526981a85b6e274aea9a52342bf7eede632f1768"
+graph = "ab1f505847bf7bbe4223c76f380aae7f802163d1c8ff6f3c17151235ee3f45cc"
+
+[[inputs]]
+target = "windows-x86_64"
+profiles = []
+
+[[inputs.poms]]
+path = "api/pom.xml"
+sha256 = "b92b8853e7618cd7e1d79e624ddca263338eb1a58e1de06c742209fc726b0d6d"
+graph = "7f42ce1a7ae29146d48d3af98f9c106d10a7ab849ddfb53efe4c903ec9db615e"
+ambient_inputs = ["user-property:util.version"]
+
+[[inputs.poms]]
+path = "app/pom.xml"
+sha256 = "8a479789200c6126fa423ff24c0eb9c38a062ae34fa84a64e5208387dea77ebd"
+graph = "d3bec3e52ec9c16bef4786636be71e2c589d9949b1a517adb558255b991ebc26"
+ambient_inputs = ["user-property:util.version"]
+
+[[inputs.poms]]
+path = "build-parent/pom.xml"
+sha256 = "aa28f93633ffda2b4e6df88000df8a2b6e520cb34500ac337f275527f65b3d2b"
+
+[[inputs.poms]]
+path = "pom.xml"
+sha256 = "7c2a2059f91fc4e5447634f4526981a85b6e274aea9a52342bf7eede632f1768"
+graph = "026c6105973fb79dece19a384a20d1ea5fdddc88f39a9e033a324f2e2f7ab50f"
+ambient_inputs = ["user-property:util.version"]
+
+[metadata]
+repo_ids = """
+./api/repository/\tfixture
+./app/repository/\tfixture
+./repository/\tfixture
+https://repo1.maven.org/maven2/\tcentral"""

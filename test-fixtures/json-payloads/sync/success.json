@@ -1,0 +1,31 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "duration_ms": "<number>",
+      "platforms": [
+        "linux-x86_64"
+      ],
+      "resolved": 8,
+      "warnings": [
+        {
+          "code": "SYSTEM_SCOPE",
+          "context": {
+            "coordinate": "org.golden:vendored:0.9",
+            "path": "lib/vendored-0.9.jar"
+          },
+          "message": "system-scoped dependency org.golden:vendored:0.9 is non-portable"
+        },
+        {
+          "code": "WEAK_HASH_FALLBACK",
+          "context": {
+            "count": 2,
+            "path": "org/golden/util/1.0/util-1.0.jar"
+          },
+          "message": "2 files were verified with a SHA-1 or MD5 checksum (weak hash algorithms), such as org/golden/util/1.0/util-1.0.jar; the repositories should provide SHA-256 checksums"
+        }
+      ]
+    },
+    "success": true
+  }
+}

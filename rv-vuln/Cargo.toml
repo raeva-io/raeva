@@ -2,23 +2,34 @@
 name = "rv-vuln"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Vulnerability scanning for Raeva using OSV API"
+readme = "README.md"
+documentation = "https://docs.rs/rv-vuln"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benches/"]
+
+[lints]
+workspace = true
 
 [dependencies]
+rv-http.workspace = true
+rv-maven-types.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 futures.workspace = true
-backon.workspace = true
-httpdate.workspace = true
-moka.workspace = true
 cvss.workspace = true
-packageurl.workspace = true
+indexmap.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 rv-test-support.workspace = true

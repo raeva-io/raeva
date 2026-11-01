@@ -1,0 +1,2 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.xml</groupId><artifactId>entity-after-root-in-project-pom</artifactId><version>1.0</version><repositories><repository><id>repo</id><url>file://${project.basedir}/repo/</url><snapshots><enabled>false</enabled></snapshots></repository></repositories><dependencies><dependency><groupId>org.xml</groupId><artifactId>a</artifactId><version>1.0</version></dependency></dependencies></project>
+&amp;

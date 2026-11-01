@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# The project imports b1 and then b2; b1's parent bp declares rb, and b2 is in rb only.
+# "Non-resolvable import POM" for b2: what b1's lineage declares does not serve the importer's next import.
+result=failure
+missing=org.scope:b2:1

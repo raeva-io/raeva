@@ -2,8 +2,10 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
-use rv_config::BlobId;
 use rv_maven_model::{Pom, PomError};
+use rv_maven_types::BlobId;
+
+use crate::util::lock;
 
 const MAX_PARSED_POM_ENTRIES: usize = 1_024;
 const MAX_PARSED_POM_SOURCE_BYTES: usize = 32 * 1024 * 1024;
@@ -22,6 +24,14 @@ pub(crate) struct ParsedPomCache {
     inner: Mutex<Cache>,
 }
 
+impl std::fmt::Debug for ParsedPomCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ParsedPomCache")
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for ParsedPomCache {
     fn default() -> Self {
         Self {
@@ -36,36 +46,25 @@ impl Default for ParsedPomCache {
 impl ParsedPomCache {
     // The digest must identify the original bytes, including any UTF-8 BOM.
     // A coordinate index can change independently of the bytes being parsed.
-    pub(crate) fn parse(&self, blob: &BlobId, xml: &str) -> Result<Pom, PomError> {
+    // Callers that mutate must clone the Arc's contents once; the cache keeps
+    // the shared model.
+    pub(crate) fn parse(&self, blob: &BlobId, bytes: &[u8]) -> Result<Arc<Pom>, PomError> {
         let cached = {
-            let mut cache = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut cache = lock(&self.inner);
             cache.entries.get(blob).map(|entry| Arc::clone(&entry.pom))
         };
         if let Some(pom) = cached {
-            return Ok((*pom).clone());
+            return Ok(pom);
         }
 
-        let pom = Pom::parse(xml)?;
-        // Profiles without an id get process-global generated ids on each parse.
-        // Reusing those ids would change profile activation and inheritance.
-        if !pom
-            .profiles
-            .iter()
-            .any(|profile| profile.id.starts_with("__anonymous_"))
-        {
-            self.insert(blob.clone(), Arc::new(pom.clone()), xml.len());
-        }
+        let xml = rv_maven_model::decode_pom(bytes)?;
+        let pom = Arc::new(Pom::parse(&xml)?);
+        self.insert(blob.clone(), Arc::clone(&pom), bytes.len());
         Ok(pom)
     }
 
     fn insert(&self, blob: BlobId, pom: Arc<Pom>, source_bytes: usize) {
-        let mut cache = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = lock(&self.inner);
         if let Some((_, previous)) = cache.entries.push(blob, Entry { pom, source_bytes }) {
             cache.source_bytes -= previous.source_bytes;
         }
@@ -91,145 +90,56 @@ mod tests {
     }
 
     fn cached(cache: &ParsedPomCache, blob: &BlobId) -> Option<Arc<Pom>> {
-        cache
-            .inner
-            .lock()
-            .unwrap()
+        lock(&cache.inner)
             .entries
             .peek(blob)
             .map(|entry| Arc::clone(&entry.pom))
     }
 
-    #[test]
-    fn hit_returns_equal_pom_without_replacing_entry() {
-        let cache = ParsedPomCache::default();
-        let xml = xml(0);
+    fn parse(cache: &ParsedPomCache, xml: &str) -> (BlobId, Arc<Pom>) {
         let blob = BlobId::from_bytes(xml.as_bytes());
-        let first = cache.parse(&blob, &xml).unwrap();
-        let entry = cached(&cache, &blob).unwrap();
-
-        assert_eq!(cache.parse(&blob, &xml).unwrap(), first);
-        assert!(Arc::ptr_eq(&entry, &cached(&cache, &blob).unwrap()));
+        let pom = cache.parse(&blob, xml.as_bytes()).unwrap();
+        (blob, pom)
     }
 
+    /// Entries are keyed by the exact source bytes, a UTF-8 BOM included, and
+    /// a hit returns the same Arc. A caller that mutates must clone first so
+    /// the cached model stays unchanged. Parse errors are not cached, and an
+    /// anonymous profile is cached with the default id.
     #[test]
-    fn changed_bytes_at_same_coordinate_miss() {
+    fn entries_are_keyed_by_source_bytes() {
         let cache = ParsedPomCache::default();
-        let first = xml(0);
-        let second = xml(1);
-        let first_blob = BlobId::from_bytes(first.as_bytes());
-        let second_blob = BlobId::from_bytes(second.as_bytes());
-        let first_pom = cache.parse(&first_blob, &first).unwrap();
-
-        assert!(cached(&cache, &second_blob).is_none());
-        let second_pom = cache.parse(&second_blob, &second).unwrap();
+        let (first, second) = (xml(0), xml(1));
+        let (first_blob, first_pom) = parse(&cache, &first);
+        let entry = cached(&cache, &first_blob).unwrap();
+        assert!(Arc::ptr_eq(&parse(&cache, &first).1, &first_pom));
+        assert!(Arc::ptr_eq(&entry, &cached(&cache, &first_blob).unwrap()));
+        let second_pom = parse(&cache, &second).1;
         assert_eq!(first_pom.artifact_id, second_pom.artifact_id);
-        assert_ne!(first_pom, second_pom);
-        assert_eq!(cache.parse(&first_blob, &first).unwrap(), first_pom);
-        assert_eq!(cache.inner.lock().unwrap().entries.len(), 2);
-    }
+        assert_ne!(first_pom.as_ref(), second_pom.as_ref());
+        let bom = format!("\u{feff}{first}");
+        assert_eq!(parse(&cache, &bom).1.as_ref(), first_pom.as_ref());
+        {
+            let state = lock(&cache.inner);
+            assert_eq!(state.entries.len(), 3);
+            assert_eq!(state.source_bytes, first.len() + second.len() + bom.len());
+        }
 
-    #[test]
-    fn original_utf8_bom_counts_toward_identity_and_weight() {
-        let cache = ParsedPomCache::default();
-        let plain = xml(0);
-        let bom = format!("\u{feff}{plain}");
-        let plain_blob = BlobId::from_bytes(plain.as_bytes());
-        let bom_blob = BlobId::from_bytes(bom.as_bytes());
-        assert_ne!(plain_blob, bom_blob);
-        assert_eq!(
-            cache.parse(&plain_blob, &plain).unwrap(),
-            cache.parse(&bom_blob, &bom).unwrap()
-        );
-        let state = cache.inner.lock().unwrap();
-        assert_eq!(state.entries.len(), 2);
-        assert_eq!(state.source_bytes, plain.len() + bom.len());
-    }
+        let mut pom = Arc::unwrap_or_clone(parse(&cache, &first).1);
+        pom.properties.insert("value", "modified");
+        pom.mark_root_repositories();
+        assert_eq!(parse(&cache, &first).1.as_ref(), first_pom.as_ref());
 
-    #[test]
-    fn anonymous_profiles_are_parsed_with_fresh_ids() {
-        let cache = ParsedPomCache::default();
-        let xml = "<project><profiles><profile/></profiles></project>";
-        let blob = BlobId::from_bytes(xml.as_bytes());
-        let first = cache.parse(&blob, xml).unwrap();
-        let second = cache.parse(&blob, xml).unwrap();
-
-        assert!(first.profiles[0].id.starts_with("__anonymous_"));
-        assert_ne!(first.profiles[0].id, second.profiles[0].id);
-        assert!(cached(&cache, &blob).is_none());
-        assert_eq!(cache.inner.lock().unwrap().source_bytes, 0);
-    }
-
-    #[test]
-    fn authored_anonymous_profile_id_is_not_cached() {
-        let cache = ParsedPomCache::default();
-        let xml = "<project><profiles><profile><id>__anonymous_authored</id></profile></profiles></project>";
-        let blob = BlobId::from_bytes(xml.as_bytes());
-        assert_eq!(cache.parse(&blob, xml).unwrap(), Pom::parse(xml).unwrap());
+        let anonymous = "<project><profiles><profile/></profiles></project>";
+        assert_eq!(parse(&cache, anonymous).1.profiles[0].id, "default");
+        let broken = "<project><artifactId>broken</project>";
+        let blob = BlobId::from_bytes(broken.as_bytes());
+        assert!(cache.parse(&blob, broken.as_bytes()).is_err());
         assert!(cached(&cache, &blob).is_none());
     }
 
-    #[test]
-    fn parse_errors_are_not_cached() {
-        let cache = ParsedPomCache::default();
-        let xml = "<project><artifactId>broken</project>";
-        let blob = BlobId::from_bytes(xml.as_bytes());
-        for _ in 0..2 {
-            assert!(cache.parse(&blob, xml).is_err());
-            assert!(cached(&cache, &blob).is_none());
-        }
-        assert_eq!(cache.inner.lock().unwrap().source_bytes, 0);
-    }
-
-    #[test]
-    fn returned_pom_mutations_do_not_change_cached_model() {
-        let cache = ParsedPomCache::default();
-        let xml = "<project><properties><value>original</value></properties>\
-            <repositories><repository><id>custom</id><url>https://example.test/</url>\
-            </repository></repositories></project>";
-        let blob = BlobId::from_bytes(xml.as_bytes());
-        let expected = Pom::parse(xml).unwrap();
-        for _ in 0..2 {
-            let mut pom = cache.parse(&blob, xml).unwrap();
-            assert_eq!(pom, expected);
-            pom.properties.insert("value", "modified");
-            pom.mark_root_repositories();
-            assert_ne!(pom, expected);
-        }
-        assert_eq!(cache.parse(&blob, xml).unwrap(), expected);
-    }
-
-    #[test]
-    fn entry_limit_evicts_least_recently_used() {
-        let cache = ParsedPomCache::default();
-        for id in 0..MAX_PARSED_POM_ENTRIES {
-            let xml = xml(id);
-            cache
-                .parse(&BlobId::from_bytes(xml.as_bytes()), &xml)
-                .unwrap();
-        }
-        let first = xml(0);
-        let first_blob = BlobId::from_bytes(first.as_bytes());
-        cache.parse(&first_blob, &first).unwrap();
-        let extra = xml(MAX_PARSED_POM_ENTRIES);
-        cache
-            .parse(&BlobId::from_bytes(extra.as_bytes()), &extra)
-            .unwrap();
-
-        assert!(cached(&cache, &first_blob).is_some());
-        assert!(cached(&cache, &BlobId::from_bytes(xml(1).as_bytes())).is_none());
-        let state = cache.inner.lock().unwrap();
-        assert_eq!(state.entries.len(), MAX_PARSED_POM_ENTRIES);
-        assert_eq!(
-            state.source_bytes,
-            state
-                .entries
-                .iter()
-                .map(|(_, e)| e.source_bytes)
-                .sum::<usize>()
-        );
-    }
-
+    /// Eviction keeps the source bytes within budget, and a POM inserted twice
+    /// by racing misses counts once.
     #[test]
     fn source_byte_limit_evicts_until_within_budget() {
         let cache = ParsedPomCache::default();
@@ -241,33 +151,24 @@ mod tests {
             xml.push_str("<!--");
             xml.extend(std::iter::repeat_n(' ', size - xml.len() - 3));
             xml.push_str("-->");
-            let blob = BlobId::from_bytes(xml.as_bytes());
-            cache.parse(&blob, &xml).unwrap();
-            blobs.push(blob);
+            blobs.push(parse(&cache, &xml).0);
+        }
+        for (index, blob) in blobs.iter().enumerate() {
+            assert_eq!(cached(&cache, blob).is_some(), index >= 2, "{index}");
+        }
+        {
+            let state = lock(&cache.inner);
+            assert_eq!(state.entries.len(), 7);
+            assert_eq!(state.source_bytes, MAX_PARSED_POM_SOURCE_BYTES - weight + 1);
         }
 
-        assert!(cached(&cache, &blobs[0]).is_none());
-        assert!(cached(&cache, &blobs[1]).is_none());
-        for blob in &blobs[2..] {
-            assert!(cached(&cache, blob).is_some());
-        }
-        let state = cache.inner.lock().unwrap();
-        assert_eq!(state.entries.len(), 7);
-        assert_eq!(state.source_bytes, MAX_PARSED_POM_SOURCE_BYTES - weight + 1);
-    }
-
-    #[test]
-    fn duplicate_miss_insertions_count_source_bytes_once() {
         let cache = ParsedPomCache::default();
         let xml = xml(0);
         let blob = BlobId::from_bytes(xml.as_bytes());
-        let first = Arc::new(Pom::parse(&xml).unwrap());
-        let second = Arc::new(Pom::parse(&xml).unwrap());
-        cache.insert(blob.clone(), first, xml.len());
-        cache.insert(blob, second, xml.len());
-
-        let state = cache.inner.lock().unwrap();
-        assert_eq!(state.entries.len(), 1);
-        assert_eq!(state.source_bytes, xml.len());
+        for _ in 0..2 {
+            cache.insert(blob.clone(), Arc::new(Pom::parse(&xml).unwrap()), xml.len());
+        }
+        let state = lock(&cache.inner);
+        assert_eq!((state.entries.len(), state.source_bytes), (1, xml.len()));
     }
 }

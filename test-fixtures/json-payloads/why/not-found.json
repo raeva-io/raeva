@@ -1,0 +1,26 @@
+{
+  "exit_code": 1,
+  "stdout": {
+    "code": "NOT_FOUND",
+    "data": {
+      "found": false,
+      "modules": [
+        {
+          "found": false,
+          "gav": "org.golden.app:single:1.0",
+          "module": "pom.xml",
+          "paths": [],
+          "truncated": false
+        }
+      ],
+      "platform": "<host-platform>",
+      "target": "org.golden:absent",
+      "truncated": false,
+      "warnings": []
+    },
+    "error": "no path found for org.golden:absent (not a dependency in the selected module graph(s))",
+    "exit_code": 1,
+    "hints": [],
+    "success": false
+  }
+}

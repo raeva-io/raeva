@@ -1,0 +1,22 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# r (runtime) and a (compile) both reach x, r first and nearer. Compile is wider than
+# runtime, so x and y are compile.
+result=success
+module=org.ds:nearer-runtime-path-gives-way-to-compile:1.0
+# org.ds:a:jar:1.0:compile
+artifact=org.ds:a:1.0:repo
+scope=org.ds:a:1.0:compile
+# org.ds:b:jar:1.0:compile
+artifact=org.ds:b:1.0:repo
+scope=org.ds:b:1.0:compile
+# org.ds:r:jar:1.0:runtime
+artifact=org.ds:r:1.0:repo
+scope=org.ds:r:1.0:runtime
+# org.ds:x:jar:1.0:compile
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:compile
+# org.ds:y:jar:1.0:compile
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:compile

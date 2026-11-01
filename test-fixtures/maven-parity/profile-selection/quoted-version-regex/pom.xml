@@ -1,0 +1,36 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.sel</groupId>
+  <artifactId>quoted-version-regex</artifactId>
+  <version>1.0</version>
+  <profiles>
+    <profile>
+      <id>quoted-literal</id>
+      <activation><os><version>regex:\Q10.0\E</version></os></activation>
+    </profile>
+    <profile>
+      <id>quoted-dot-is-literal</id>
+      <activation><os><version>regex:\Q10x0\E</version></os></activation>
+    </profile>
+    <profile>
+      <id>quote-runs-to-the-end</id>
+      <activation><os><version>regex:1\Q0.0</version></os></activation>
+    </profile>
+    <profile>
+      <id>escaped-backslash-is-not-a-quote</id>
+      <activation><os><version>regex:\\Q10.0</version></os></activation>
+    </profile>
+    <profile>
+      <id>quoted-range-is-literal</id>
+      <activation><os><version>regex:1[\Q/-9\E].0</version></os></activation>
+    </profile>
+    <profile>
+      <id>quoted-space-under-comments-mode</id>
+      <activation><os><version>regex:(?x)10\Q \E\.0</version></os></activation>
+    </profile>
+    <profile>
+      <id>quoted-digit-after-backreference</id>
+      <activation><os><version>regex:(1)\1\Q2\E</version></os></activation>
+    </profile>
+  </profiles>
+</project>

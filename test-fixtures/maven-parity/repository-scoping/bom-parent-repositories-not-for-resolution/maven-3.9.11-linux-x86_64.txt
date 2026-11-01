@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# The project imports BOM b, whose parent bp declares rb; x is in rb only. Maven builds an imported BOM with a
+# copy of the model resolver, so rb never reaches the resolution and x is not found.
+result=failure
+missing=org.scope:x:1

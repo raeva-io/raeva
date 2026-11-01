@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.example.parity</groupId>
+  <artifactId>os-activation</artifactId>
+  <version>1.0</version>
+  <packaging>pom</packaging>
+  <properties>
+    <fam>unix</fam>
+    <n>${os.name}</n>
+    <a>${os.arch}</a>
+    <v>${os.version}</v>
+    <f>${os.family}</f>
+  </properties>
+  <profiles>
+    <profile><id>name-Linux</id><activation><os><name>Linux</name></os></activation></profile>
+    <profile><id>name-linux</id><activation><os><name>linux</name></os></activation></profile>
+    <profile><id>name-LINUX</id><activation><os><name>LINUX</name></os></activation></profile>
+    <profile><id>name-not-linux</id><activation><os><name>!linux</name></os></activation></profile>
+    <profile><id>name-not-windows</id><activation><os><name>!windows</name></os></activation></profile>
+    <profile><id>name-empty</id><activation><os><name></name></os></activation></profile>
+    <profile><id>name-bang</id><activation><os><name>!</name></os></activation></profile>
+    <profile><id>name-padded</id><activation><os><name> Linux </name></os></activation></profile>
+    <profile><id>name-bang-space</id><activation><os><name>! linux</name></os></activation></profile>
+    <profile><id>name-mac-os-x</id><activation><os><name>Mac OS X</name></os></activation></profile>
+    <profile><id>name-macosx</id><activation><os><name>macosx</name></os></activation></profile>
+    <profile><id>name-not-mac-os-x</id><activation><os><name>!mac os x</name></os></activation></profile>
+    <profile><id>name-windows</id><activation><os><name>windows</name></os></activation></profile>
+    <profile><id>arch-amd64</id><activation><os><arch>amd64</arch></os></activation></profile>
+    <profile><id>arch-AMD64</id><activation><os><arch>AMD64</arch></os></activation></profile>
+    <profile><id>arch-x86_64</id><activation><os><arch>x86_64</arch></os></activation></profile>
+    <profile><id>arch-not-x86_64</id><activation><os><arch>!x86_64</arch></os></activation></profile>
+    <profile><id>arch-aarch64</id><activation><os><arch>aarch64</arch></os></activation></profile>
+    <profile><id>arch-not-aarch64</id><activation><os><arch>!aarch64</arch></os></activation></profile>
+    <profile><id>arch-empty</id><activation><os><arch></arch></os></activation></profile>
+    <profile><id>arch-bang</id><activation><os><arch>!</arch></os></activation></profile>
+    <profile><id>family-dos</id><activation><os><family>dos</family></os></activation></profile>
+    <profile><id>family-mac</id><activation><os><family>mac</family></os></activation></profile>
+    <profile><id>family-netware</id><activation><os><family>netware</family></os></activation></profile>
+    <profile><id>family-winnt</id><activation><os><family>winnt</family></os></activation></profile>
+    <profile><id>family-openvms</id><activation><os><family>openvms</family></os></activation></profile>
+    <profile><id>family-os_2</id><activation><os><family>os/2</family></os></activation></profile>
+    <profile><id>family-os_400</id><activation><os><family>os/400</family></os></activation></profile>
+    <profile><id>family-tandem</id><activation><os><family>tandem</family></os></activation></profile>
+    <profile><id>family-unix</id><activation><os><family>unix</family></os></activation></profile>
+    <profile><id>family-win9x</id><activation><os><family>win9x</family></os></activation></profile>
+    <profile><id>family-windows</id><activation><os><family>windows</family></os></activation></profile>
+    <profile><id>family-z_os</id><activation><os><family>z/os</family></os></activation></profile>
+    <profile><id>family-UNIX</id><activation><os><family>UNIX</family></os></activation></profile>
+    <profile><id>family-padded-unix</id><activation><os><family> unix </family></os></activation></profile>
+    <profile><id>family-not-windows</id><activation><os><family>!windows</family></os></activation></profile>
+    <profile><id>family-not-unix</id><activation><os><family>!unix</family></os></activation></profile>
+    <profile><id>family-not-mac</id><activation><os><family>!mac</family></os></activation></profile>
+    <profile><id>family-not-not-windows</id><activation><os><family>!!windows</family></os></activation></profile>
+    <profile><id>family-bang</id><activation><os><family>!</family></os></activation></profile>
+    <profile><id>family-empty</id><activation><os><family></family></os></activation></profile>
+    <profile><id>family-linux</id><activation><os><family>linux</family></os></activation></profile>
+    <profile><id>family-Linux</id><activation><os><family>Linux</family></os></activation></profile>
+    <profile><id>family-lin</id><activation><os><family>lin</family></os></activation></profile>
+    <profile><id>family-nux</id><activation><os><family>nux</family></os></activation></profile>
+    <profile><id>family-bsd</id><activation><os><family>bsd</family></os></activation></profile>
+    <profile><id>family-win</id><activation><os><family>win</family></os></activation></profile>
+    <profile><id>family-darwin</id><activation><os><family>darwin</family></os></activation></profile>
+    <profile><id>family-osx</id><activation><os><family>osx</family></os></activation></profile>
+    <profile><id>version-exact</id><activation><os><version>10.0</version></os></activation></profile>
+    <profile><id>version-padded</id><activation><os><version> 10.0 </version></os></activation></profile>
+    <profile><id>version-regex</id><activation><os><version>regex:10\..*</version></os></activation></profile>
+    <profile><id>version-regex-prefix</id><activation><os><version>regex:1</version></os></activation></profile>
+    <profile><id>version-regex-any</id><activation><os><version>regex:1.*</version></os></activation></profile>
+    <profile><id>version-not</id><activation><os><version>!10.0</version></os></activation></profile>
+    <profile><id>version-not-other</id><activation><os><version>!1.0</version></os></activation></profile>
+    <profile><id>version-not-regex</id><activation><os><version>!regex:1.*</version></os></activation></profile>
+    <profile><id>version-empty</id><activation><os><version></version></os></activation></profile>
+    <profile><id>version-bang</id><activation><os><version>!</version></os></activation></profile>
+    <profile><id>unix-amd64</id><activation><os><family>unix</family><arch>amd64</arch></os></activation></profile>
+    <profile><id>mac-aarch64</id><activation><os><family>mac</family><arch>aarch64</arch></os></activation></profile>
+    <profile><id>windows-amd64</id><activation><os><family>windows</family><arch>amd64</arch></os></activation></profile>
+    <profile><id>linux-name-windows-family</id><activation><os><name>Linux</name><family>windows</family></os></activation></profile>
+    <profile><id>empty-os</id><activation><os></os></activation></profile>
+    <profile><id>family-interpolated</id><activation><os><family>${fam}</family></os></activation></profile>
+    <profile><id>property-os-name-Linux</id><activation><property><name>os.name</name><value>Linux</value></property></activation></profile>
+    <profile><id>property-os-name-linux</id><activation><property><name>os.name</name><value>linux</value></property></activation></profile>
+    <profile><id>property-os-name-mac</id><activation><property><name>os.name</name><value>Mac OS X</value></property></activation></profile>
+    <profile><id>property-os-arch-amd64</id><activation><property><name>os.arch</name><value>amd64</value></property></activation></profile>
+    <profile><id>property-os-arch-aarch64</id><activation><property><name>os.arch</name><value>aarch64</value></property></activation></profile>
+    <profile><id>property-os-family</id><activation><property><name>os.family</name></property></activation></profile>
+    <profile><id>property-os-version</id><activation><property><name>os.version</name></property></activation></profile>
+    <profile><id>property-os-version-value</id><activation><property><name>os.version</name><value>10.0</value></property></activation></profile>
+    <profile><id>property-no-os-name</id><activation><property><name>!os.name</name></property></activation></profile>
+  </profiles>
+</project>

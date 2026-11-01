@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example.build</groupId>
+    <artifactId>corp-parent</artifactId>
+    <version>7</version>
+    <relativePath>build-parent/pom.xml</relativePath>
+  </parent>
+  <groupId>com.example</groupId>
+  <artifactId>app-root</artifactId>
+  <version>3.1.0</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>core</module>
+    <module>web</module>
+  </modules>
+</project>

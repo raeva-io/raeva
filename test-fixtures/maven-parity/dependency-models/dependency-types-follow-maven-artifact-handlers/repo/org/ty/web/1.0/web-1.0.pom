@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.ty</groupId><artifactId>web</artifactId><version>1.0</version><packaging>war</packaging><dependencies><dependency><groupId>org.ty</groupId><artifactId>webdep</artifactId><version>1.0</version></dependency></dependencies></project>

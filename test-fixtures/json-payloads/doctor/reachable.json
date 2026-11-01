@@ -1,0 +1,36 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "checks": [
+        {
+          "check": "TLS trust roots",
+          "class": null,
+          "details": "operating system trust store",
+          "status": "info"
+        },
+        {
+          "check": "store directory",
+          "class": null,
+          "details": "<tmp>/home/store",
+          "status": "info"
+        },
+        {
+          "check": "stub",
+          "class": null,
+          "details": "served org/apache/maven/maven-metadata.xml",
+          "status": "ok"
+        },
+        {
+          "check": "central",
+          "class": null,
+          "details": "served org/apache/maven/maven-metadata.xml",
+          "status": "ok"
+        }
+      ],
+      "issues": 0,
+      "warnings": []
+    },
+    "success": true
+  }
+}

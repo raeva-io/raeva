@@ -1,0 +1,17 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# t (test) reaches x, x reaches y, which the project manages to compile, and y reaches x
+# back. Maven gathers x's paths only up to x itself, so y's compile scope does not widen
+# x, which stays test.
+result=success
+module=org.ds:a-cycle-does-not-widen-an-ancestor:1.0
+# org.ds:t:jar:1.0:test
+artifact=org.ds:t:1.0:repo
+scope=org.ds:t:1.0:test
+# org.ds:x:jar:1.0:test
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:test
+# org.ds:y:jar:1.0:compile
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:compile

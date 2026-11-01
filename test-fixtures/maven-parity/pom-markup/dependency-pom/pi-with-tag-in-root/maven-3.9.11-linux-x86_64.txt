@@ -1,0 +1,10 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories
+# org.xml:a:1.0's POM has the processing instruction <?pi <a> ?>, with a tag inside it, in the root element.
+result=success
+module=org.xml:pi-with-tag-in-root-in-dependency-pom:1.0
+# org.xml:a:jar:1.0:compile
+artifact=org.xml:a:1.0:repo
+# org.xml:c:jar:1.0:compile
+artifact=org.xml:c:1.0:repo

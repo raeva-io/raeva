@@ -1,0 +1,21 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id
+# from the local repository layout and _remote.repositories
+# The root's <build> directory ../shared/repo is aligned to each module's
+# directory, so c1 reads shared/repo and its default outputDirectory
+# shared/repo/classes; c2's own sub/./repo/ is c2/sub/repo; c3's profile
+# ../alt//repo is alt/repo. The classifiers are the finalName each module
+# sees: c1-fn inherited, x its own, pfn from the profile, and prop where c2's
+# build.finalName property wins over ${build.finalName}. goal's version is
+# the inherited defaultGoal.
+result=success
+module=org.b:root:1
+module=org.b:c1:1
+module=org.b:c2:1
+module=org.b:c3:1
+artifact=org.b:lib-c1:1:repo
+artifact=org.b:goal:verify:repo
+artifact=org.b:out-c1:1:classes
+artifact=org.b:lib-c2:1:repo
+artifact=org.b:prop-c2:1:repo
+artifact=org.b:lib-c3:1:repo

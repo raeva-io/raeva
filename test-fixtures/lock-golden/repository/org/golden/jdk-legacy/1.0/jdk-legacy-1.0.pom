@@ -1,0 +1,23 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.golden</groupId>
+  <artifactId>jdk-legacy</artifactId>
+  <version>1.0</version>
+  <profiles>
+    <profile>
+      <id>range</id>
+      <activation><jdk>[9, 12)</jdk></activation>
+      <dependencyManagement><dependencies><dependency><groupId>org.golden</groupId><artifactId>bom</artifactId><version>1.0</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>
+    </profile>
+    <profile>
+      <id>eight</id>
+      <activation><jdk>1.8</jdk></activation>
+      <dependencyManagement><dependencies><dependency><groupId>org.golden</groupId><artifactId>bom</artifactId><version>1.0</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>
+    </profile>
+    <profile>
+      <id>modern</id>
+      <activation><jdk>[17,)</jdk></activation>
+      <dependencyManagement><dependencies><dependency><groupId>org.golden</groupId><artifactId>bom</artifactId><version>1.0</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>
+    </profile>
+  </profiles>
+</project>

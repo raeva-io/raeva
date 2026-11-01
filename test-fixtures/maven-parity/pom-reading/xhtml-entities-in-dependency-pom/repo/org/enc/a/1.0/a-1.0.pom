@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.enc</groupId><artifactId>a</artifactId><version>1.0</version><description>&copy; &nbsp; &eacute; &mdash; &euro; &hellip;</description><dependencies><dependency><groupId>org.enc</groupId><artifactId>c</artifactId><version>1.0</version></dependency></dependencies></project>

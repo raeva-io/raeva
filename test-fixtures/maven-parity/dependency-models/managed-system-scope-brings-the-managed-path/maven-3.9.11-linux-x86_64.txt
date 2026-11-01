@@ -1,0 +1,12 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories,
+# system= is group:artifact:version of a dependency Maven lists with scope system
+# org.ms:lib:1.0 asks for org.ms:tools:1.0. The project's dependencyManagement manages tools to 2.0 with
+# scope system and ${project.basedir}/lib/tools.jar, and Maven's dependency manager applies all three
+# to the transitive dependency. Maven warns that the systemPath points into the project directory.
+result=success
+module=org.ms:managed-system-scope-brings-the-managed-path:1.0
+# org.ms:lib:jar:1.0:compile
+artifact=org.ms:lib:1.0:repo
+# org.ms:tools:jar:2.0:system
+system=org.ms:tools:2.0

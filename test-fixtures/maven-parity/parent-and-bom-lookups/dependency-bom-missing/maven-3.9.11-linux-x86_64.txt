@@ -1,0 +1,6 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories
+# [ERROR] Failed to read artifact descriptor for org.f3:lib:jar:1.0
+# [ERROR] Caused by: The following artifacts could not be resolved: org.f3:bom:pom:1.0 (absent): Could not find artifact org.f3:bom:pom:1.0 in repo
+result=failure
+missing=org.f3:bom:1.0

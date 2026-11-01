@@ -1,0 +1,4 @@
+[[repositories]]
+id = "corp"
+url = "https://repo.example.com/maven2/"
+snapshots = false

@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; settings.xml passed with -s
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id from _remote.repositories
+# A repository that enables only snapshots contributes no release from its version listing to a range, even one above the snapshot it picks.
+result=success
+module=org.t:pom-snapshots-only-range-release-listed:1
+artifact=org.t:dep:1.5-SNAPSHOT:tested

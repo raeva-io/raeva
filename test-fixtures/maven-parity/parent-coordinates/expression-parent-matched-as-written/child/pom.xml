@@ -1,0 +1,5 @@
+<project><modelVersion>4.0.0</modelVersion>
+<parent><groupId>${base.group}.app</groupId><artifactId>base</artifactId><version>1.0</version></parent>
+<artifactId>child</artifactId>
+<properties><pg>${project.parent.groupId}</pg><g>${project.groupId}</g><pgv>${project.parent.version}</pgv></properties>
+</project>

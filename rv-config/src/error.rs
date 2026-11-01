@@ -1,83 +1,136 @@
 use std::path::PathBuf;
 
-use anyhow::Error as AnyhowError;
 use thiserror::Error;
 
+use crate::paths::{PlatformDir, platform_dir_unavailable};
+
+/// Why loading or validating configuration failed.
+///
+/// Most rejected values arrive as [`ConfigError::Invalid`], which names the
+/// [`ConfigOrigin`] they came from.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ConfigError {
+    /// An I/O error with no file named.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("toml serialize error: {0}")]
-    TomlSerialize(#[from] toml::ser::Error),
-    #[error("toml deserialize error: {0}")]
-    TomlDeserialize(#[from] toml::de::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("xml error: {0}")]
-    Xml(#[from] quick_xml::Error),
-    #[error("xml escape error: {0}")]
-    Escape(#[from] quick_xml::escape::EscapeError),
-    #[error("invalid utf-8: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
+    /// A `settings.xml` or `settings-security.xml` that is malformed or
+    /// fails the XML hardening checks, before the file path is known.
+    /// [`Config::load`](crate::Config::load) reports it as
+    /// [`ConfigError::Invalid`] with the path.
     #[error("invalid settings.xml: {0}")]
     InvalidSettings(String),
+    /// A value or file that was read but rejected.
+    #[error("invalid {origin}: {message}")]
+    Invalid {
+        /// Where the value or file came from.
+        origin: ConfigOrigin,
+        /// What is wrong with it, in the terms its origin uses.
+        message: String,
+    },
+    /// A project input (a POM, `raeva.toml` or other file read with the size
+    /// limit) that could not be opened or read.
     #[error("failed to read project input {path}: {source}")]
     ProjectInputIo {
+        /// The file being read.
         path: PathBuf,
+        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
+    /// A project input larger than [`MAX_PROJECT_INPUT_SIZE`](crate::MAX_PROJECT_INPUT_SIZE).
     #[error("project input {path} exceeds {limit}-byte limit")]
-    ProjectInputTooLarge { path: PathBuf, limit: usize },
+    ProjectInputTooLarge {
+        /// The file being read.
+        path: PathBuf,
+        /// The limit it exceeded, in bytes.
+        limit: usize,
+    },
+    /// A project input read as text that is not UTF-8.
     #[error("project input {path} is not valid UTF-8")]
-    ProjectInputEncoding { path: PathBuf },
-    // Append a hint pointing at the env vars that drive the lookup so the
-    // user has somewhere to start. We deliberately do not call
-    // `dirs::config_dir()` from `Display` because the env can change
-    // between failure and rendering, and a stale path would confuse more
-    // than it helps.
-    #[error("config directory is unavailable (check $HOME or $XDG_CONFIG_HOME)")]
+    ProjectInputEncoding {
+        /// The file being read.
+        path: PathBuf,
+    },
+    // These name what the lookup reads on this platform, not the path it
+    // would have produced: the environment can change between the failure
+    // and rendering, and a stale path would confuse more than it helps.
+    /// The platform has no config directory and `RAEVA_HOME` is unset.
+    #[error(
+        "{}",
+        platform_dir_unavailable(PlatformDir::Config, std::env::consts::OS)
+    )]
     ConfigDirUnavailable,
-    #[error("data directory is unavailable (check $HOME or $XDG_DATA_HOME)")]
+    #[error(
+        "{}",
+        platform_dir_unavailable(PlatformDir::Data, std::env::consts::OS)
+    )]
+    /// The platform has no local data directory and `RAEVA_HOME` is unset.
+    /// Also returned when the temporary directory for a test configuration
+    /// cannot be created.
     DataDirUnavailable,
-    #[error("cache directory is unavailable (check $HOME or $XDG_CACHE_HOME)")]
+    /// The platform has no cache directory and `RAEVA_HOME` is unset.
+    #[error(
+        "{}",
+        platform_dir_unavailable(PlatformDir::Cache, std::env::consts::OS)
+    )]
     CacheDirUnavailable,
-    #[error("invalid platform: {0}")]
-    InvalidPlatform(String),
     #[error(
         "RAEVA_HOME must be an absolute path, got {0:?}; set an absolute path or unset the variable"
     )]
+    /// `RAEVA_HOME` is set to a relative path.
     RaevaHomeNotAbsolute(PathBuf),
+    /// `RAEVA_HOME` names something that exists and is not a directory.
     #[error(
-        "unsupported lockfile schema version {found}, expected {expected}; this lockfile was likely written by a newer rv. Upgrade rv, or delete rv.lock and run 'rv sync' to regenerate it"
+        "RAEVA_HOME names {}, which is not a directory; set it to a directory or unset the variable",
+        .0.display()
     )]
-    UnsupportedSchema { found: u32, expected: u32 },
+    RaevaHomeNotADirectory(PathBuf),
+    /// The project root passed to [`Config::load`](crate::Config::load)
+    /// does not exist.
     #[error("project root not found: {0}")]
     ProjectRootMissing(PathBuf),
+    /// The command line's `-s` file is not a file. The message is Maven's.
+    #[error("The specified user settings file does not exist: {}", .0.display())]
+    SettingsFileMissing(PathBuf),
+    /// A `settings-security.xml` `<relocation>` chain longer than the limit,
+    /// which usually means a cycle.
     #[error("relocation depth exceeded maximum (possible circular reference)")]
     RelocationDepthExceeded,
-    #[error("invalid lockfile: {0}")]
-    InvalidLockfile(String),
 }
 
-/// Convert an `anyhow::Error` into a `std::io::Error`, preserving the
-/// original `ErrorKind` when the chain contains an `io::Error`.
-///
-/// This is used by multiple crates (rv-config, rv-repo, rv-store) to
-/// bridge `anyhow` context errors back into typed error enums that
-/// wrap `std::io::Error`.
-pub fn io_error_with_context(err: AnyhowError) -> std::io::Error {
-    let kind = err
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<std::io::Error>().map(|io| io.kind()))
-        .unwrap_or(std::io::ErrorKind::Other);
-    std::io::Error::new(kind, err)
+/// Where a rejected configuration value or file came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfigOrigin {
+    /// An environment variable, by name.
+    Env(&'static str),
+    /// The project's `raeva.toml`.
+    ProjectConfig(PathBuf),
+    /// The user's `config.toml`.
+    UserConfig(PathBuf),
+    /// Maven's `settings.xml`.
+    MavenSettings(PathBuf),
+    /// Maven's `settings-security.xml`.
+    MavenSettingsSecurity(PathBuf),
+    /// The project's `.mvn/maven.config`.
+    MavenConfig(PathBuf),
+    /// The `-D` and `-P` options given to `raeva`.
+    CommandLine,
 }
 
-pub(crate) fn toml_de_error_with_context(err: AnyhowError) -> toml::de::Error {
-    <toml::de::Error as serde::de::Error>::custom(err)
-}
-
-pub(crate) fn toml_ser_error_with_context(err: AnyhowError) -> toml::ser::Error {
-    <toml::ser::Error as serde::ser::Error>::custom(err)
+impl std::fmt::Display for ConfigOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Env(name) => write!(f, "environment variable {name}"),
+            Self::ProjectConfig(path) => write!(f, "project config {}", path.display()),
+            Self::UserConfig(path) => write!(f, "user config {}", path.display()),
+            Self::MavenSettings(path) => write!(f, "Maven settings {}", path.display()),
+            Self::MavenSettingsSecurity(path) => {
+                write!(f, "Maven settings security file {}", path.display())
+            }
+            Self::MavenConfig(path) => write!(f, "{}", path.display()),
+            Self::CommandLine => write!(f, "-D or -P option"),
+        }
+    }
 }

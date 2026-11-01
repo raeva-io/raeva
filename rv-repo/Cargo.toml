@@ -2,47 +2,59 @@
 name = "rv-repo"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Repository and metadata fetching for Raeva"
+readme = "README.md"
+documentation = "https://docs.rs/rv-repo"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benches/"]
+
+[lints]
+workspace = true
 
 [dependencies]
 rv-config.workspace = true
+rv-http.workspace = true
+rv-lock.workspace = true
 rv-maven-model.workspace = true
+rv-maven-types.workspace = true
 rv-store.workspace = true
-rv-version.workspace = true
 
-anyhow.workspace = true
-backon.workspace = true
-httpdate.workspace = true
 bytes.workspace = true
-fs2.workspace = true
+chrono.workspace = true
 futures.workspace = true
 futures-core.workspace = true
 hex.workspace = true
 quick-xml.workspace = true
-r2d2.workspace = true
-r2d2_sqlite.workspace = true
-regex.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
+rustls.workspace = true
 secrecy.workspace = true
 serde.workspace = true
-sha1.workspace = true
 sha2.workspace = true
-strum.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 
+[features]
+# Test-only inspection of the client's trust decisions, for other crates'
+# tests. Enabled only from [dev-dependencies]; release builds never have it.
+testing = []
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+h2.workspace = true
+http.workspace = true
+rv-config = { workspace = true, features = ["testing"] }
+sha1.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+rusqlite.workspace = true
 rv-test-support.workspace = true
-rustls.workspace = true
 tempfile.workspace = true
 temp-env.workspace = true
-tracing-subscriber.workspace = true

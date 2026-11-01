@@ -1,0 +1,22 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# p (provided) and r (runtime) both reach x, p first and nearer. Runtime is wider than
+# provided, so x and y are runtime.
+result=success
+module=org.ds:nearer-provided-path-gives-way-to-runtime:1.0
+# org.ds:b:jar:1.0:runtime
+artifact=org.ds:b:1.0:repo
+scope=org.ds:b:1.0:runtime
+# org.ds:p:jar:1.0:provided
+artifact=org.ds:p:1.0:repo
+scope=org.ds:p:1.0:provided
+# org.ds:r:jar:1.0:runtime
+artifact=org.ds:r:1.0:repo
+scope=org.ds:r:1.0:runtime
+# org.ds:x:jar:1.0:runtime
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:runtime
+# org.ds:y:jar:1.0:runtime
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:runtime

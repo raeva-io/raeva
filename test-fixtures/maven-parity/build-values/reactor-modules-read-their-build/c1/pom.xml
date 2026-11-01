@@ -1,0 +1,10 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.b</groupId><artifactId>root</artifactId><version>1</version></parent>
+  <artifactId>c1</artifactId>
+  <dependencies>
+    <dependency><groupId>org.b</groupId><artifactId>lib-c1</artifactId><version>1</version><classifier>${project.build.finalName}</classifier></dependency>
+    <dependency><groupId>org.b</groupId><artifactId>goal</artifactId><version>${build.defaultGoal}</version></dependency>
+    <dependency><groupId>org.b</groupId><artifactId>out-c1</artifactId><version>1</version></dependency>
+  </dependencies>
+</project>

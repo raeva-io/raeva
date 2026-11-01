@@ -1,61 +1,98 @@
-//! Tests for the resolver module.
-
-use super::fetcher::RepoTrust;
-use super::{RepoBackend, RepoParentResolver, ResolutionResult, SupportPomProvenance};
 use crate::Workspace;
 use crate::context::ResolveContext;
-use crate::graph::{Edge, Graph, Node};
-use rv_config::{Checksum, Config, Platform, ResolvedPaths};
-use rv_maven_model::{Parent, Pom, Scope};
+use rv_config::{Config, ResolvedPaths};
+use rv_lock::Platform;
+use rv_maven_types::{ArtifactCoord, BlobId, Coord};
 use rv_store::Store;
-use rv_version::Coord;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-fn write_pom(path: &Path, group_id: &str, artifact_id: &str, version: &str) {
-    let contents = format!(
-        r"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>{group_id}</groupId>
-  <artifactId>{artifact_id}</artifactId>
-  <version>{version}</version>
-</project>
-"
-    );
-    fs::write(path, contents).unwrap();
+/// The one-module reactor of the POM at `pom_path`, or, when discovery
+/// refuses that POM, a reactor rooted at its directory with no modules, so
+/// the resolver's own checks report the problem.
+fn lone_module(pom_path: &Path) -> Arc<Workspace> {
+    let directory = pom_path.parent().expect("POM directory");
+    Arc::new(
+        Workspace::discover(directory).unwrap_or_else(|_| Workspace::without_modules(directory)),
+    )
 }
 
-fn test_context(project_root: &Path, store_dir: &Path) -> ResolveContext {
+fn offline_resolver(project_root: &Path, store_dir: &Path) -> super::PlatformResolver {
     let paths = ResolvedPaths::for_testing().expect("paths");
     let config = Config::for_testing_with_repos(project_root.to_path_buf(), paths, Vec::new());
     let store = Arc::new(Store::open(store_dir).expect("store"));
     let platform = Platform::new("linux", "x86_64").unwrap();
-    ResolveContext::new(config, Vec::new(), store, platform, None)
+    let ctx = ResolveContext::new(config, Vec::new(), store, platform, None);
+    super::PlatformResolver::new(ctx)
+}
+
+async fn load_root(
+    pom: &str,
+    files: &[(&str, &str)],
+) -> (
+    tempfile::TempDir,
+    crate::error::Result<(Coord, rv_maven_model::Project, Vec<rv_repo::Repository>)>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    for (path, contents) in files {
+        let path = dir.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    let pom_path = dir.path().join("pom.xml");
+    fs::write(&pom_path, pom).unwrap();
+    let resolver = offline_resolver(dir.path(), &dir.path().join("store"));
+    let loaded = resolver
+        .load_root_project(&pom_path, &[], lone_module(&pom_path), None, None)
+        .await
+        .map(|(coord, project, repos, _)| (coord, project, repos));
+    (dir, loaded)
 }
 
 mod workspace_resolution {
     use std::collections::HashMap;
-    use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex, Once};
+    use std::sync::{Arc, Once};
 
-    use rv_config::{Config, Platform, RepoConfig, ResolvedPaths};
+    use rv_config::{Config, RepoConfig, ResolvedPaths};
+    use rv_lock::Platform;
+    use rv_maven_types::BlobId;
     use rv_repo::{RepoClient, Repository};
     use rv_store::Store;
+    use rv_test_support::fixtures;
     use rv_test_support::http::{Response, StubServer};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     use super::ResolveContext;
-    use crate::{ResolutionStrategy, ResolveError, Resolver, Workspace};
+    use crate::resolver::PlatformResolver;
+    use crate::resolver::pom_source::MemoryPomSource;
+    use crate::{ResolveError, Workspace};
 
     fn fixture(name: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("test-fixtures")
-            .join("reactor-resolution")
-            .join(name)
+        fixtures::path("reactor-resolution").join(name)
+    }
+
+    /// Directories a `fixture` call below opens. A new directory must fail
+    /// here until a test names it.
+    fn reactor_resolution_dirs() -> Vec<String> {
+        let mut names = fixtures::quoted_after(include_str!("tests.rs"), concat!("fixture", "("));
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    #[test]
+    fn every_reactor_resolution_directory_is_used() {
+        let names = reactor_resolution_dirs();
+        let dirs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let root = fixtures::path("reactor-resolution");
+        fixtures::assert_children(&root, &dirs, &[]);
+        for name in &names {
+            assert!(
+                root.join(name).join("pom.xml").is_file(),
+                "{name}: pom.xml is missing"
+            );
+        }
     }
 
     fn ensure_crypto_provider() {
@@ -63,20 +100,6 @@ mod workspace_resolution {
         INIT.call_once(|| {
             let _ = rustls::crypto::ring::default_provider().install_default();
         });
-    }
-
-    fn response(status: &str, body: &[u8]) -> Vec<u8> {
-        let mut response = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        response.extend_from_slice(body);
-        response
-    }
-
-    fn spawn_repository() -> (String, StubServer) {
-        spawn_repository_with_routes(repository_routes())
     }
 
     fn spawn_repository_with_routes(routes: HashMap<String, Vec<u8>>) -> (String, StubServer) {
@@ -89,168 +112,59 @@ mod workspace_resolution {
         (format!("http://{}/", server.addr()), server)
     }
 
-    /// Like [`spawn_repository_with_routes`], but every `.jar` request is
-    /// accepted and then never answered: the socket stays open and the client
-    /// waits. That is a genuinely wedged artifact download, which is what the
-    /// stall watchdog exists to name.
-    async fn spawn_repository_hanging_on_jars(
-        routes: HashMap<String, Vec<u8>>,
-    ) -> (String, Arc<Mutex<Vec<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let address = listener.local_addr().expect("address");
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let request_log = Arc::clone(&requests);
-        let routes = Arc::new(routes);
+    fn pom(group_id: &str, artifact_id: &str, version: &str, rest: &str) -> Vec<u8> {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>{group_id}</groupId>\
+             <artifactId>{artifact_id}</artifactId><version>{version}</version>{rest}</project>"
+        )
+        .into_bytes()
+    }
 
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let routes = Arc::clone(&routes);
-                let request_log = Arc::clone(&request_log);
-                tokio::spawn(async move {
-                    let mut bytes = Vec::new();
-                    let mut buffer = [0_u8; 4096];
-                    loop {
-                        let Ok(read) = socket.read(&mut buffer).await else {
-                            return;
-                        };
-                        if read == 0 {
-                            return;
-                        }
-                        bytes.extend_from_slice(&buffer[..read]);
-                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-                            break;
-                        }
-                    }
-                    let path = std::str::from_utf8(&bytes)
-                        .ok()
-                        .and_then(|request| request.lines().next())
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/")
-                        .to_string();
-                    request_log
-                        .lock()
-                        .expect("request log poisoned")
-                        .push(path.clone());
-                    if path.ends_with(".jar") {
-                        // Hold the connection open and never reply. The test
-                        // ends long before this elapses.
-                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                        return;
-                    }
-                    let payload = routes
-                        .get(&path)
-                        .map(|body| response("200 OK", body))
-                        .unwrap_or_else(|| response("404 Not Found", b""));
-                    let _ = socket.write_all(&payload).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-
-        (format!("http://{address}/"), requests)
+    fn metadata(artifact_id: &str) -> Vec<u8> {
+        format!(
+            "<metadata><groupId>com.example</groupId><artifactId>{artifact_id}</artifactId>\
+             <versioning><latest>2</latest><release>2</release>\
+             <versions><version>2</version></versions></versioning></metadata>"
+        )
+        .into_bytes()
     }
 
     fn repository_routes() -> HashMap<String, Vec<u8>> {
-        let metadata = br#"<?xml version="1.0" encoding="UTF-8"?>
-<metadata>
-  <groupId>com.example</groupId>
-  <artifactId>lib</artifactId>
-  <versioning>
-    <latest>2</latest>
-    <release>2</release>
-    <versions><version>2</version></versions>
-  </versioning>
-</metadata>"#;
-        let dynamic_metadata = br#"<?xml version="1.0" encoding="UTF-8"?>
-<metadata>
-  <groupId>com.example</groupId>
-  <artifactId>dynamic-lib</artifactId>
-  <versioning>
-    <latest>2</latest>
-    <release>2</release>
-    <versions><version>2</version></versions>
-  </versioning>
-</metadata>"#;
-        let leaf_pom = br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>org.external</groupId>
-  <artifactId>leaf</artifactId>
-  <version>1</version>
-</project>"#;
-        let lib_pom = br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>lib</artifactId>
-  <version>2</version>
-</project>"#;
-        let dynamic_lib_pom = br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>dynamic-lib</artifactId>
-  <version>2</version>
-</project>"#;
-        let vendor_pom = br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>org.vendor</groupId>
-  <artifactId>only-here</artifactId>
-  <version>1</version>
-</project>"#;
+        let mut routes = HashMap::new();
+        for (group, artifact, version) in [
+            ("org.external", "leaf", "1"),
+            ("com.example", "lib", "2"),
+            ("com.example", "dynamic-lib", "2"),
+            ("org.vendor", "only-here", "1"),
+        ] {
+            let base = format!(
+                "/{}/{artifact}/{version}/{artifact}-{version}",
+                group.replace('.', "/")
+            );
+            routes.insert(format!("{base}.pom"), pom(group, artifact, version, ""));
+            routes.insert(
+                format!("{base}.jar"),
+                format!("{artifact} jar").into_bytes(),
+            );
+        }
+        for artifact in ["lib", "dynamic-lib"] {
+            routes.insert(
+                format!("/com/example/{artifact}/maven-metadata.xml"),
+                metadata(artifact),
+            );
+        }
+        routes
+    }
 
-        HashMap::from([
-            (
-                "/com/example/lib/maven-metadata.xml".to_string(),
-                metadata.to_vec(),
-            ),
-            (
-                "/com/example/dynamic-lib/maven-metadata.xml".to_string(),
-                dynamic_metadata.to_vec(),
-            ),
-            (
-                "/org/external/leaf/1/leaf-1.pom".to_string(),
-                leaf_pom.to_vec(),
-            ),
-            (
-                "/org/external/leaf/1/leaf-1.jar".to_string(),
-                b"external-leaf".to_vec(),
-            ),
-            ("/com/example/lib/2/lib-2.pom".to_string(), lib_pom.to_vec()),
-            (
-                "/com/example/lib/2/lib-2.jar".to_string(),
-                b"repository-lib".to_vec(),
-            ),
-            (
-                "/com/example/dynamic-lib/2/dynamic-lib-2.pom".to_string(),
-                dynamic_lib_pom.to_vec(),
-            ),
-            (
-                "/com/example/dynamic-lib/2/dynamic-lib-2.jar".to_string(),
-                b"repository-dynamic-lib".to_vec(),
-            ),
-            (
-                "/org/vendor/only-here/1/only-here-1.pom".to_string(),
-                vendor_pom.to_vec(),
-            ),
-            (
-                "/org/vendor/only-here/1/only-here-1.jar".to_string(),
-                b"vendor-only".to_vec(),
-            ),
-        ])
+    fn spawn_repository() -> (String, StubServer) {
+        spawn_repository_with_routes(repository_routes())
     }
 
     fn repo_config(url: &str) -> RepoConfig {
-        RepoConfig {
-            id: Some("fixture".to_string()),
-            url: url.to_string(),
-            releases: Some(true),
-            snapshots: Some(true),
-            snapshots_update_policy: None,
-            releases_update_policy: None,
-            releases_checksum_policy: None,
-            snapshots_checksum_policy: None,
-        }
+        let mut repo = RepoConfig::new(Some("fixture"), url);
+        repo.releases = Some(true);
+        repo.snapshots = Some(true);
+        repo
     }
 
     async fn resolver(
@@ -258,7 +172,7 @@ mod workspace_resolution {
         repo_url: Option<&str>,
         offline: bool,
         initial_repositories: bool,
-    ) -> (Resolver, tempfile::TempDir) {
+    ) -> (PlatformResolver, tempfile::TempDir) {
         ensure_crypto_provider();
         let paths = ResolvedPaths::for_testing().expect("paths");
         let repositories = repo_url
@@ -286,45 +200,177 @@ mod workspace_resolution {
         let store = Arc::new(Store::open(store_dir.path()).expect("store"));
         let platform = Platform::new("linux", "x86_64").expect("platform");
         let context = ResolveContext::new(config, repos, store, platform, client);
-        (
-            Resolver::with_strategy(context, ResolutionStrategy::NearestWins),
-            store_dir,
-        )
+        (PlatformResolver::new(context), store_dir)
+    }
+
+    const MEMORY_REPO: &str = "https://repo.example/maven2/";
+
+    fn memory_resolver(
+        project_root: &Path,
+        files: &HashMap<String, Vec<u8>>,
+    ) -> (PlatformResolver, tempfile::TempDir) {
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let config = Config::for_testing_with_repos(
+            project_root.to_path_buf(),
+            paths,
+            vec![repo_config(MEMORY_REPO)],
+        );
+        let source = MemoryPomSource::new(config.security.clone()).with_files(MEMORY_REPO, files);
+        let repos = config.repositories().iter().map(Repository::from).collect();
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let store = Arc::new(Store::open(store_dir.path()).expect("store"));
+        let platform = Platform::new("linux", "x86_64").expect("platform");
+        let context = ResolveContext::new(config, repos, store, platform, None)
+            .with_pom_source(Arc::new(source));
+        (PlatformResolver::new(context), store_dir)
+    }
+
+    async fn resolve_graph(
+        resolver: &PlatformResolver,
+        workspace: &Workspace,
+        pom_path: &str,
+    ) -> Result<crate::graph::Graph, ResolveError> {
+        resolver
+            .resolve_graph_internal(
+                &workspace.root().join(pom_path),
+                Arc::new(workspace.clone()),
+                None,
+            )
+            .await
+            .map(|pending| pending.graph)
     }
 
     async fn resolve_module(
-        resolver: &Resolver,
+        resolver: &PlatformResolver,
         workspace: &Workspace,
         pom_path: &str,
-    ) -> Result<super::ResolutionResult, ResolveError> {
+    ) -> Result<crate::ModuleResolution, ResolveError> {
         resolver
             .resolve_internal(
                 &workspace.root().join(pom_path),
-                Some(Arc::new(workspace.clone())),
+                Arc::new(workspace.clone()),
                 None,
             )
             .await
     }
 
-    fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(destination)?;
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            let source_path = entry.path();
-            let destination_path = destination.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                copy_tree(&source_path, &destination_path)?;
-            } else {
-                std::fs::copy(source_path, destination_path)?;
+    #[tokio::test]
+    async fn classified_snapshot_resolves_and_restores_its_own_pom_build() {
+        use crate::lock::{PlatformModel, assemble};
+        use rv_lock::{LockResolution, Lockfile};
+        use rv_maven_types::{ArtifactCoord, SnapshotStamp};
+
+        for extra_pom in [false, true] {
+            let (dir, workspace) = reactor(&[(
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId><artifactId>root</artifactId><version>1</version><dependencies>\
+                <dependency><groupId>p</groupId><artifactId>nat</artifactId><version>1.0-SNAPSHOT</version></dependency>\
+                <dependency><groupId>p</groupId><artifactId>nat</artifactId><version>1.0-SNAPSHOT</version><classifier>linux</classifier></dependency>\
+                </dependencies></project>",
+            )]);
+            let repo = dir.path().join("repo/p/nat/1.0-SNAPSHOT");
+            std::fs::create_dir_all(&repo).unwrap();
+            let build1 = "1.0-20261012.010101-1";
+            let build2 = "1.0-20261012.010101-2";
+            let pom = pom("p", "nat", "1.0-SNAPSHOT", "");
+            std::fs::write(repo.join(format!("nat-{build1}.pom")), &pom).unwrap();
+            std::fs::write(repo.join(format!("nat-{build1}.jar")), b"main jar").unwrap();
+            std::fs::write(repo.join(format!("nat-{build2}-linux.jar")), b"linux jar").unwrap();
+            if extra_pom {
+                std::fs::write(repo.join(format!("nat-{build2}.pom")), b"<project/>").unwrap();
             }
+            std::fs::write(repo.join("maven-metadata.xml"), format!(
+                "<metadata><version>1.0-SNAPSHOT</version><versioning><snapshotVersions>\
+                 <snapshotVersion><extension>pom</extension><value>{build1}</value></snapshotVersion>\
+                 <snapshotVersion><extension>jar</extension><value>{build1}</value></snapshotVersion>\
+                 <snapshotVersion><extension>jar</extension><classifier>linux</classifier><value>{build2}</value></snapshotVersion>\
+                 </snapshotVersions></versioning></metadata>"
+            )).unwrap();
+            // The workspace root is canonical, as the URL a project declares
+            // through `${project.basedir}` is.
+            let url = reqwest::Url::from_directory_path(workspace.root().join("repo"))
+                .unwrap()
+                .to_string();
+            let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+            let result = resolver.resolve_workspace(&workspace).await.unwrap();
+            let hashes = Default::default();
+            let mut lock = assemble(
+                &resolver.ctx.config,
+                vec![(
+                    PlatformModel {
+                        active_profiles: &[],
+                        pom_hashes: &hashes,
+                        whole_reactor_pom_hashes: &hashes,
+                    },
+                    result,
+                )],
+            )
+            .unwrap()
+            .lock;
+            lock.config_hash = Some("b".repeat(64));
+            lock.resolution = LockResolution::default();
+            lock.relativize_origins(&rv_lock::LockOrigins::for_root(dir.path()))
+                .unwrap();
+            let path = dir.path().join("raeva.lock");
+            lock.write_atomic(&path).unwrap();
+            let lock = Lockfile::read(&path).unwrap();
+            let rows = &lock.platforms[0].artifacts;
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert_eq!(row.pom_gav().version(), build1);
+                assert_eq!(row.pom_sha256, Some(BlobId::from_bytes(&pom)));
+                if row.coordinate.classifier().is_some() {
+                    assert_eq!(row.file_version(), build2);
+                    assert_eq!(row.pom_snapshot, SnapshotStamp::of_version(build1));
+                } else {
+                    assert_eq!(row.file_version(), build1);
+                    assert!(row.pom_snapshot.is_none());
+                }
+            }
+            let pins = lock.pinned_paths();
+            assert_eq!(
+                pins.get(&format!("p/nat/1.0-SNAPSHOT/nat-{build1}.pom"))
+                    .map(|(pin, _)| pin),
+                Some(&BlobId::from_bytes(&pom))
+            );
+            assert!(!pins.contains_key(&format!("p/nat/1.0-SNAPSHOT/nat-{build2}.pom")));
+            let empty = Store::open(&dir.path().join("restored")).unwrap();
+            let client = RepoClient::new(&resolver.ctx.config).await.unwrap();
+            let contexts = [rv_repo::RestoreContext {
+                config: &resolver.ctx.config,
+                client: &client,
+                platforms: std::slice::from_ref(&lock.platforms[0].platform),
+                trusted_repositories: &[],
+            }];
+            let restored = rv_repo::ensure_artifacts(&empty, &lock, &contexts)
+                .await
+                .unwrap();
+            assert_eq!(restored.len(), 2);
+            for result in restored {
+                result.result.unwrap();
+            }
+            for (version, classifier, bytes) in [
+                (build1, None, b"main jar".as_slice()),
+                (build2, Some("linux"), b"linux jar".as_slice()),
+            ] {
+                let key = ArtifactCoord::new("p", "nat", version, "jar", classifier);
+                assert_eq!(
+                    empty.lookup_artifact(&key).await.unwrap(),
+                    Some(BlobId::from_bytes(bytes))
+                );
+            }
+            let key = ArtifactCoord::new("p", "nat", build1, "pom", None);
+            assert_eq!(
+                empty.lookup_artifact(&key).await.unwrap(),
+                Some(BlobId::from_bytes(&pom))
+            );
         }
-        Ok(())
     }
 
     fn node_by_artifact<'a>(
-        graph: &'a crate::Graph,
+        graph: &'a crate::graph::Graph,
         artifact_id: &str,
-    ) -> (petgraph::graph::NodeIndex, &'a crate::Node) {
+    ) -> (petgraph::graph::NodeIndex, &'a crate::graph::Node) {
         graph
             .node_indices()
             .find_map(|index| {
@@ -336,323 +382,571 @@ mod workspace_resolution {
             .unwrap_or_else(|| panic!("missing graph node {artifact_id}"))
     }
 
-    #[tokio::test]
-    async fn workspace_parent_short_circuits_repository_fetch() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), None, false, false).await;
-
-        let result = resolve_module(&resolver, &workspace, "remote-parent-child/pom.xml")
-            .await
-            .expect("workspace parent must resolve without a repo client");
-
-        assert_eq!(result.module_gav.version, "1");
+    fn has_artifact(graph: &crate::graph::Graph, artifact_id: &str) -> bool {
+        graph.node_indices().any(|index| {
+            graph
+                .node(index)
+                .is_some_and(|node| node.coord.artifact_id.as_str() == artifact_id)
+        })
     }
 
-    /// A dependency download and a root's parent/BOM build are polled by the
-    /// same reactor task. The server releases the dependency only once the
-    /// root has crossed the synchronous parent-fetch bridge. Building the root
-    /// inline then waits on the sibling's OnceCell, preventing its initializer
-    /// from ever being polled again, even after the HTTP response arrives.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn root_model_does_not_block_sibling_pom_initializer() {
-        use futures::FutureExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::task::Poll;
-        use std::time::Duration;
-        use tokio::sync::{Notify, oneshot, watch};
+    fn reactor(files: &[(&str, &str)]) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (path, contents) in files {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(path, contents).expect("write file");
+        }
+        let workspace = Workspace::discover(dir.path()).expect("workspace");
+        (dir, workspace)
+    }
 
-        const BOM: &[u8] = br"<project><modelVersion>4.0.0</modelVersion>
-          <groupId>test</groupId><artifactId>shared</artifactId><version>1</version>
-          <packaging>pom</packaging><dependencyManagement><dependencies><dependency>
-          <groupId>test</groupId><artifactId>managed</artifactId><version>7</version>
-          </dependency></dependencies></dependencyManagement></project>";
-        const PARENT: &[u8] = br"<project><modelVersion>4.0.0</modelVersion>
-          <groupId>test</groupId><artifactId>parent</artifactId><version>1</version>
-          <packaging>pom</packaging><dependencyManagement><dependencies><dependency>
-          <groupId>test</groupId><artifactId>shared</artifactId><version>1</version>
-          <type>pom</type><scope>import</scope>
-          </dependency></dependencies></dependencyManagement></project>";
-        let started = Arc::new(Notify::new());
-        let gets = Arc::new(AtomicUsize::new(0));
-        let (release, released) = watch::channel(false);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        let server_started = Arc::clone(&started);
-        let server_gets = Arc::clone(&gets);
-        let server = tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let started = Arc::clone(&server_started);
-                let gets = Arc::clone(&server_gets);
-                let release = release.clone();
-                let mut released = released.clone();
-                tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    let mut buffer = [0; 4096];
-                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match socket.read(&mut buffer).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => request.extend_from_slice(&buffer[..n]),
-                        }
-                    }
-                    let request = String::from_utf8_lossy(&request);
-                    let path = request.split_whitespace().nth(1).unwrap();
-                    let payload = match path {
-                        "/test/shared/1/shared-1.pom" => {
-                            gets.fetch_add(1, Ordering::SeqCst);
-                            started.notify_one();
-                            released.wait_for(|value| *value).await.unwrap();
-                            response("200 OK", BOM)
-                        }
-                        "/test/parent/1/parent-1.pom" => {
-                            // This request can only come from the root's sync
-                            // bridge. The sibling already owns the BOM cell.
-                            release.send_replace(true);
-                            response("200 OK", PARENT)
-                        }
-                        _ => response("404 Not Found", b""),
-                    };
-                    let _ = socket.write_all(&payload).await;
-                });
-            }
+    /// A POM for the classifier likes tests: `artifact` in group `t`, under
+    /// the reactor parent `parent`, aggregating `modules`, with `likes` as
+    /// its `os.detection.classifierWithLikes` and `body` after that.
+    fn likes_pom(
+        artifact: &str,
+        parent: Option<&str>,
+        modules: &[&str],
+        likes: Option<&str>,
+        body: &str,
+    ) -> String {
+        let parent = parent.map_or(String::new(), |parent| {
+            format!(
+                "<parent><groupId>t</groupId><artifactId>{parent}</artifactId><version>1</version>\
+                 <relativePath>../pom.xml</relativePath></parent>"
+            )
         });
-
-        ensure_crypto_provider();
-        let tmp = tempfile::tempdir().unwrap();
-        let pom_path = tmp.path().join("pom.xml");
-        std::fs::write(
-            &pom_path,
-            br"<project><modelVersion>4.0.0</modelVersion>
-          <parent><groupId>test</groupId><artifactId>parent</artifactId><version>1</version>
-          <relativePath/></parent><artifactId>root</artifactId></project>",
+        let modules: String = modules
+            .iter()
+            .map(|module| format!("<module>{module}</module>"))
+            .collect();
+        let likes = likes.map_or(String::new(), |likes| {
+            format!(
+                "<properties><os.detection.classifierWithLikes>{likes}\
+                 </os.detection.classifierWithLikes></properties>"
+            )
+        });
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion>{parent}<groupId>t</groupId>\
+             <artifactId>{artifact}</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules>{modules}</modules>{likes}{body}</project>"
         )
-        .unwrap();
-        let config = Config::for_testing_with_repos(
-            tmp.path().to_path_buf(),
-            ResolvedPaths::from_raeva_home(tmp.path().join("raeva")),
-            vec![repo_config(&url)],
-        );
-        let client = RepoClient::new(&config)
-            .await
-            .unwrap()
-            .with_allow_missing_checksums(true);
-        let repos: Vec<_> = config.repositories().iter().map(Repository::from).collect();
-        let store = Arc::new(Store::open(&tmp.path().join("store")).unwrap());
-        let ctx = ResolveContext::new(
-            config,
-            repos.clone(),
-            store,
-            Platform::new("linux", "x86_64").unwrap(),
-            Some(client.clone()),
-        );
-        let resolver = Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
-        let repo = repos[0].clone();
-        let download = Arc::new(Mutex::new(Some(
-            async move {
-                client
-                    .fetch_pom(&repo, &rv_repo::ArtifactRequest::new("test", "shared", "1"))
-                    .await
-            }
-            .boxed(),
-        )));
+    }
 
-        // A timeout on the reactor task itself cannot fire while that task is
-        // synchronously blocked. Time it on an independent task, and on failure
-        // drop the initializer to let the root take over its cell. This breaks
-        // the deadlock for cleanup instead of stranding a runtime thread.
-        let rescue = Arc::clone(&download);
-        let (done, finished) = oneshot::channel();
-        let watchdog = tokio::spawn(async move {
-            let result = tokio::time::timeout(Duration::from_secs(5), finished).await;
-            if result.is_err() {
-                rescue.lock().unwrap().take();
-            }
-            result
-        });
-        let dependency = futures::future::poll_fn(|cx| {
-            let mut slot = download.lock().unwrap();
-            match slot.as_mut() {
-                Some(future) => future.poll_unpin(cx).map(Some),
-                None => Poll::Ready(None),
-            }
-        });
-        let root = async {
-            started.notified().await;
-            resolver
-                .load_root_project(&pom_path, &repos, None, None)
-                .await
-        };
-        // Like buffer_unordered, join! polls both futures on this one task.
-        let (dependency, root) = futures::join!(dependency, root);
-        let _ = done.send(());
-        let completed = watchdog.await.unwrap();
-        server.abort();
-        completed
-            .expect("root model deadlocked the sibling POM initializer")
+    fn reactor_dependency(artifact: &str, version: &str) -> String {
+        format!(
+            "<dependencies><dependency><groupId>t</groupId><artifactId>{artifact}</artifactId>\
+             <version>{version}</version><type>pom</type></dependency></dependencies>"
+        )
+    }
+
+    /// A resolver for `workspace` on `platform`, for the target `jdk` when
+    /// set, on a Linux machine whose release is Ubuntu, like Debian, serving
+    /// `files`.
+    fn ubuntu_resolver(
+        workspace: &Workspace,
+        files: &HashMap<String, Vec<u8>>,
+        platform: &str,
+        jdk: Option<&str>,
+    ) -> (PlatformResolver, tempfile::TempDir) {
+        let host = rv_maven_model::HostSnapshot::for_testing(&[])
+            .with_os_release("ID=ubuntu\nID_LIKE=debian\nVERSION_ID=24.04\n");
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let config = Config::for_testing_with_repos(
+            workspace.root().to_path_buf(),
+            paths,
+            vec![repo_config(MEMORY_REPO)],
+        )
+        .with_host(host);
+        let source = MemoryPomSource::new(config.security.clone()).with_files(MEMORY_REPO, files);
+        let repos = config.repositories().iter().map(Repository::from).collect();
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let store = Arc::new(Store::open(store_dir.path()).expect("store"));
+        let (os, arch) = platform.split_once('-').expect("platform");
+        let mut platform = Platform::new(os, arch).expect("platform");
+        if let Some(jdk) = jdk {
+            platform = platform.with_jdk(jdk);
+        }
+        let context = ResolveContext::new(config, repos, store, platform, None)
+            .with_pom_source(Arc::new(source));
+        (PlatformResolver::new(context), store_dir)
+    }
+
+    /// os-maven-plugin reads `os.detection.classifierWithLikes` from the
+    /// project Maven 3.9.12 sorts first, else from the user properties, as
+    /// recorded for these reactors: a module's own value counts only when it
+    /// is that project. A project's value wins over a `-D` value, even when
+    /// empty.
+    #[tokio::test]
+    async fn classifier_likes_come_from_the_first_sorted_project() {
+        let user = ".mvn/maven.config";
+        type Files<'a> = Vec<(&'a str, String)>;
+        let cases: Vec<(&str, Files<'_>, Option<&str>)> = vec![
+            (
+                "the root parent is first",
+                vec![
+                    (
+                        "pom.xml",
+                        likes_pom("root", None, &["m1"], Some("root"), ""),
+                    ),
+                    (
+                        "m1/pom.xml",
+                        likes_pom("m1", Some("root"), &[], Some("m1"), ""),
+                    ),
+                ],
+                Some("root"),
+            ),
+            (
+                "a first module without a parent is first",
+                vec![
+                    (
+                        "pom.xml",
+                        likes_pom("root", None, &["bom", "m1"], Some("root"), ""),
+                    ),
+                    ("bom/pom.xml", likes_pom("bom", None, &[], None, "")),
+                    ("m1/pom.xml", likes_pom("m1", Some("root"), &[], None, "")),
+                ],
+                None,
+            ),
+            (
+                "the same module listed second is not",
+                vec![
+                    (
+                        "pom.xml",
+                        likes_pom("root", None, &["m1", "bom"], Some("root"), ""),
+                    ),
+                    ("bom/pom.xml", likes_pom("bom", None, &[], None, "")),
+                    ("m1/pom.xml", likes_pom("m1", Some("root"), &[], None, "")),
+                ],
+                Some("root"),
+            ),
+            (
+                "the first dependency leads before the parent",
+                vec![
+                    (
+                        "pom.xml",
+                        likes_pom("root", None, &["m1", "m2"], Some("root"), ""),
+                    ),
+                    (
+                        "m1/pom.xml",
+                        likes_pom(
+                            "m1",
+                            Some("root"),
+                            &[],
+                            None,
+                            &reactor_dependency("m2", "[1,2)"),
+                        ),
+                    ),
+                    ("m2/pom.xml", likes_pom("m2", None, &[], Some("m2"), "")),
+                ],
+                Some("m2"),
+            ),
+            (
+                "the chain goes through nested modules",
+                vec![
+                    ("pom.xml", likes_pom("root", None, &["a"], Some("root"), "")),
+                    (
+                        "a/pom.xml",
+                        likes_pom("a", Some("root"), &["a1"], Some("a"), ""),
+                    ),
+                    (
+                        "a/a1/pom.xml",
+                        likes_pom("a1", Some("a"), &[], Some("a1"), ""),
+                    ),
+                ],
+                Some("root"),
+            ),
+            (
+                "a user property stands in",
+                vec![
+                    ("pom.xml", likes_pom("root", None, &["m1"], None, "")),
+                    (
+                        "m1/pom.xml",
+                        likes_pom("m1", Some("root"), &[], Some("m1"), ""),
+                    ),
+                    (
+                        user,
+                        "-Dos.detection.classifierWithLikes=user\n".to_string(),
+                    ),
+                ],
+                Some("user"),
+            ),
+            (
+                "the project wins over a user property",
+                vec![
+                    ("pom.xml", likes_pom("root", None, &["m1"], Some(""), "")),
+                    ("m1/pom.xml", likes_pom("m1", Some("root"), &[], None, "")),
+                    (
+                        user,
+                        "-Dos.detection.classifierWithLikes=user\n".to_string(),
+                    ),
+                ],
+                Some(""),
+            ),
+        ];
+        for (name, files, expected) in cases {
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(path, text)| (*path, text.as_str()))
+                .collect();
+            let (_dir, workspace) = reactor(&files);
+            let workspace = Arc::new(workspace);
+            let (resolver, _store) =
+                ubuntu_resolver(&workspace, &HashMap::new(), "linux-x86_64", None);
+            assert_eq!(
+                resolver
+                    .classifier_likes(&workspace, &Arc::default())
+                    .await
+                    .as_deref(),
+                expected,
+                "{name}"
+            );
+            let (resolver, _store) =
+                ubuntu_resolver(&workspace, &HashMap::new(), "macos-aarch64", None);
+            assert_eq!(
+                resolver.classifier_likes(&workspace, &Arc::default()).await,
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    /// The projects on the way to the first sorted one import the same BOM,
+    /// which is built once for all of them unless its build logs, as each
+    /// project then logs it as its own.
+    #[test]
+    fn the_first_sorted_project_search_builds_a_shared_bom_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
             .unwrap();
-        assert_eq!(dependency.unwrap().unwrap().as_ref(), BOM);
-        let (_, project, _, _) = root.unwrap();
-        assert_eq!(project.artifact_id, "root");
-        assert_eq!(
-            project.dependency_management.dependencies[0]
-                .version
-                .as_deref(),
-            Some("7")
+        let import = "<dependencyManagement><dependencies><dependency><groupId>t</groupId>\
+                      <artifactId>bom</artifactId><version>1</version><type>pom</type>\
+                      <scope>import</scope></dependency></dependencies></dependencyManagement>";
+        let root = likes_pom("root", None, &["m1", "m2"], Some("root"), import);
+        let m1 = likes_pom(
+            "m1",
+            Some("root"),
+            &[],
+            None,
+            &reactor_dependency("m2", "1"),
         );
+        let m2 = likes_pom("m2", Some("root"), &[], None, "");
+        let (_dir, workspace) = reactor(&[
+            ("pom.xml", root.as_str()),
+            ("m1/pom.xml", m1.as_str()),
+            ("m2/pom.xml", m2.as_str()),
+        ]);
+        let workspace = Arc::new(workspace);
+        for (scope, builds, warnings) in [("test", 1, 0), ("weird", 3, 3)] {
+            let bom = format!(
+                "<project><groupId>t</groupId><artifactId>bom</artifactId><version>1</version>\
+                 <packaging>pom</packaging><dependencies><dependency><groupId>t</groupId>\
+                 <artifactId>x</artifactId><version>1</version><scope>{scope}</scope>\
+                 </dependency></dependencies></project>"
+            );
+            let files = HashMap::from([("t/bom/1/bom-1.pom".to_string(), bom.into_bytes())]);
+            let host = rv_maven_model::HostSnapshot::for_testing(&[])
+                .with_os_release("ID=ubuntu\nID_LIKE=debian\nVERSION_ID=24.04\n");
+            let paths = ResolvedPaths::for_testing().expect("paths");
+            let config = Config::for_testing_with_repos(
+                workspace.root().to_path_buf(),
+                paths,
+                vec![repo_config(MEMORY_REPO)],
+            )
+            .with_host(host);
+            let source = Arc::new(
+                MemoryPomSource::new(config.security.clone()).with_files(MEMORY_REPO, &files),
+            );
+            let repos = config.repositories().iter().map(Repository::from).collect();
+            let store_dir = tempfile::tempdir().expect("store tempdir");
+            let store = Arc::new(Store::open(store_dir.path()).expect("store"));
+            let platform = Platform::new("linux", "x86_64").expect("platform");
+            let context = ResolveContext::new(config, repos, store, platform, None)
+                .with_pom_source(source.clone());
+            let resolver = PlatformResolver::new(context);
+            let log = rv_test_support::capture_warnings(|| {
+                let likes =
+                    runtime.block_on(resolver.classifier_likes(&workspace, &Arc::default()));
+                assert_eq!(likes.as_deref(), Some("root"));
+            });
+            let bom_reads = (source.requests().iter())
+                .filter(|request| request.ends_with("bom-1.pom"))
+                .count();
+            assert_eq!(bom_reads, builds, "scope {scope}");
+            let warned = log.matches("unknown dependency scope").count();
+            assert_eq!(warned, warnings, "scope {scope}");
+        }
+    }
+
+    /// A command-line `-D` list comes after `.mvn/maven.config`, so it wins
+    /// where the first project sets none.
+    #[tokio::test]
+    async fn command_line_classifier_likes_win_over_maven_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (path, contents) in [
+            ("pom.xml", likes_pom("root", None, &["m1"], None, "")),
+            ("m1/pom.xml", likes_pom("m1", Some("root"), &[], None, "")),
+            (
+                ".mvn/maven.config",
+                "-Dos.detection.classifierWithLikes=fedora\n".to_string(),
+            ),
+        ] {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(path, contents).expect("write file");
+        }
+        let mut command_line = rv_config::maven_config::CommandLine::default();
+        command_line
+            .defines
+            .push("os.detection.classifierWithLikes=debian".to_string());
+        let environment = rv_maven_model::ModelEnvironment::builder()
+            .platform("linux", "x86_64")
+            .build();
+        let workspace = Arc::new(
+            Workspace::discover_with_context(
+                dir.path(),
+                rv_maven_model::ActivationContext::new(environment),
+                &command_line,
+            )
+            .expect("workspace"),
+        );
+        let (resolver, _store) = ubuntu_resolver(&workspace, &HashMap::new(), "linux-x86_64", None);
         assert_eq!(
-            gets.load(Ordering::SeqCst),
-            1,
-            "shared BOM must download once"
+            resolver
+                .classifier_likes(&workspace, &Arc::default())
+                .await
+                .as_deref(),
+            Some("debian")
         );
     }
 
+    /// Each JDK section reads the likes of the first project's profiles for
+    /// its own JDK.
     #[tokio::test]
-    async fn exact_sibling_keeps_outgoing_external_edges() {
+    async fn classifier_likes_follow_the_target_jdk() {
+        let profile = "<profiles><profile><id>jdk21</id><activation><jdk>[21,)</jdk>\
+                       </activation><properties><os.detection.classifierWithLikes>debian\
+                       </os.detection.classifierWithLikes></properties></profile></profiles>";
+        let files = [
+            (
+                "pom.xml",
+                likes_pom("root", None, &["m1"], Some("none"), profile),
+            ),
+            ("m1/pom.xml", likes_pom("m1", Some("root"), &[], None, "")),
+        ];
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (*path, text.as_str()))
+            .collect();
+        let (_dir, workspace) = reactor(&files);
+        let workspace = Arc::new(workspace);
+        for (jdk, expected) in [("17", "none"), ("21", "debian")] {
+            let (resolver, _store) =
+                ubuntu_resolver(&workspace, &HashMap::new(), "linux-x86_64", Some(jdk));
+            assert_eq!(
+                resolver
+                    .classifier_likes(&workspace, &Arc::default())
+                    .await
+                    .as_deref(),
+                Some(expected),
+                "JDK {jdk}"
+            );
+        }
+    }
+
+    /// The first project's classifier likes give every module and every
+    /// dependency's POM the classifier suffix, whatever list a module sets.
+    #[tokio::test]
+    async fn classifier_likes_apply_to_every_model_of_the_reactor() {
+        let native = |artifact: &str| {
+            format!(
+                "<dependencies><dependency><groupId>g</groupId><artifactId>{artifact}</artifactId>\
+                 <version>1</version><classifier>${{os.detected.classifier}}</classifier>\
+                 </dependency><dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+                 <version>1</version></dependency></dependencies>"
+            )
+        };
+        let files = [
+            (
+                "pom.xml",
+                likes_pom("root", None, &["m1", "m2"], Some("fedora, debian"), ""),
+            ),
+            (
+                "m1/pom.xml",
+                likes_pom("m1", Some("root"), &[], None, &native("n1")),
+            ),
+            (
+                "m2/pom.xml",
+                likes_pom("m2", Some("root"), &[], Some("none"), &native("n2")),
+            ),
+        ];
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (*path, text.as_str()))
+            .collect();
+        let (_dir, workspace) = reactor(&files);
+        let mut routes = HashMap::new();
+        for artifact in ["n1", "n2", "n3"] {
+            routes.insert(
+                format!("/g/{artifact}/1/{artifact}-1.pom"),
+                pom("g", artifact, "1", ""),
+            );
+        }
+        routes.insert(
+            "/g/lib/1/lib-1.pom".to_string(),
+            pom(
+                "g",
+                "lib",
+                "1",
+                "<dependencies><dependency><groupId>g</groupId><artifactId>n3</artifactId>\
+                 <version>1</version><classifier>${os.detected.classifier}</classifier>\
+                 </dependency></dependencies>",
+            ),
+        );
+        let workspace = Arc::new(workspace);
+        let (resolver, _store) = ubuntu_resolver(&workspace, &routes, "linux-x86_64", None);
+        let likes = resolver
+            .classifier_likes(&workspace, &Arc::default())
+            .await
+            .map(Arc::from);
+        let module = PlatformResolver::new(resolver.ctx.clone().with_classifier_likes(likes));
+        for (path, own) in [("m1/pom.xml", "n1"), ("m2/pom.xml", "n2")] {
+            let graph = resolve_graph(&module, &workspace, path)
+                .await
+                .unwrap_or_else(|error| panic!("{path}: {error}"));
+            for artifact in [own, "n3"] {
+                let classifier = node_by_artifact(&graph, artifact)
+                    .1
+                    .coord
+                    .classifier
+                    .clone();
+                assert_eq!(
+                    classifier.as_deref(),
+                    Some("linux-x86_64-debian"),
+                    "{path} {artifact}"
+                );
+            }
+        }
+    }
+
+    /// Maven 3.9 reads a reactor project's parents before it indexes the
+    /// reactor, so a `<parent>` with an empty `<relativePath/>` is looked up
+    /// in a repository even when another module has its coordinates. With no
+    /// repository holding it, Maven fails with "Non-resolvable parent POM".
+    #[tokio::test]
+    async fn reactor_parent_is_not_taken_from_another_module() {
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                 <modules><module>parent</module><module>child</module></modules></project>",
+            ),
+            (
+                "parent/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\
+                 </project>",
+            ),
+            (
+                "child/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+                 <artifactId>parent</artifactId><version>1</version><relativePath/></parent>\
+                 <artifactId>child</artifactId></project>",
+            ),
+        ]);
+        let (resolver, _store) = resolver(workspace.root(), None, true, false).await;
+
+        let error = resolve_module(&resolver, &workspace, "child/pom.xml")
+            .await
+            .expect_err("the parent is in no repository");
+        assert!(error.to_string().contains("t:parent:1"), "{error}");
+    }
+
+    /// How a dependency on a reactor module is answered: by the module when
+    /// it satisfies the request, otherwise by a repository.
+    #[tokio::test]
+    async fn reactor_modules_compete_with_repository_candidates() {
         let workspace = Workspace::discover(fixture("basic")).expect("workspace");
         let (url, _server) = spawn_repository();
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        let (online, _store) = resolver(workspace.root(), Some(&url), false, true).await;
 
-        let result = resolve_module(&resolver, &workspace, "app/pom.xml")
+        let app = resolve_module(&online, &workspace, "app/pom.xml")
             .await
             .expect("resolve app");
-        let (lib_index, lib) = node_by_artifact(&result.graph, "lib");
-        let (_, leaf) = node_by_artifact(&result.graph, "leaf");
-
+        let (lib_index, lib) = node_by_artifact(&app.graph, "lib");
+        let (_, leaf) = node_by_artifact(&app.graph, "leaf");
         assert_eq!(lib.workspace_module.as_deref(), Some("lib/pom.xml"));
-        assert!(lib.repo_url.is_none());
-        assert!(lib.checksum.is_none());
-        assert!(leaf.workspace_module.is_none());
-        assert!(leaf.repo_url.is_some());
+        assert!(lib.repo_url.is_none() && lib.checksum.is_none());
+        assert!(leaf.workspace_module.is_none() && leaf.repo_url.is_some());
         assert!(
-            result.graph.edges(lib_index).any(|(_, target, _)| result
+            app.graph.edges(lib_index).any(|(_, target, _)| app
                 .graph
                 .node(target)
                 .is_some_and(|node| node.coord.artifact_id.as_str() == "leaf")),
             "the sibling model's outgoing edge to its external dependency must survive"
         );
-    }
 
-    #[tokio::test]
-    async fn exact_sibling_version_mismatch_falls_back_and_errors_offline() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), None, true, true).await;
-
-        let error = resolve_module(&resolver, &workspace, "mismatch-app/pom.xml")
-            .await
-            .expect_err("workspace lib:1 must not satisfy exact lib:2");
-
-        assert!(error.to_string().contains("offline mode"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn range_selects_workspace_or_higher_repository_candidate() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (url, _server) = spawn_repository();
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
-
-        let sibling = resolve_module(&resolver, &workspace, "range-app/pom.xml")
-            .await
-            .expect("range selects sibling");
-        let (_, sibling_lib) = node_by_artifact(&sibling.graph, "lib");
-        assert_eq!(sibling_lib.workspace_module.as_deref(), Some("lib/pom.xml"));
-        assert_eq!(sibling_lib.coord.version.as_str(), "1");
-
-        let repository = resolve_module(&resolver, &workspace, "range-higher-app/pom.xml")
-            .await
-            .expect("higher repository version wins");
-        let (_, repository_lib) = node_by_artifact(&repository.graph, "lib");
-        assert!(repository_lib.workspace_module.is_none());
-        assert_eq!(repository_lib.coord.version.as_str(), "2");
-        assert!(repository_lib.repo_url.is_some());
-    }
-
-    #[tokio::test]
-    async fn dynamic_selector_competes_workspace_and_repository_candidates() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (workspace_only, _store) = resolver(workspace.root(), None, false, false).await;
-
-        let sibling = resolve_module(&workspace_only, &workspace, "dynamic-app/pom.xml")
-            .await
-            .expect("LATEST selects the only workspace candidate");
-        let (_, sibling_lib) = node_by_artifact(&sibling.graph, "dynamic-lib");
-        assert_eq!(
-            sibling_lib.workspace_module.as_deref(),
-            Some("dynamic-lib/pom.xml")
-        );
-        assert_eq!(sibling_lib.coord.version.as_str(), "1");
-
-        let (url, _server) = spawn_repository();
-        let (with_repository, _store) = resolver(workspace.root(), Some(&url), false, true).await;
-        let repository = resolve_module(&with_repository, &workspace, "dynamic-app/pom.xml")
-            .await
-            .expect("LATEST selects the higher repository candidate");
-        let (_, repository_lib) = node_by_artifact(&repository.graph, "dynamic-lib");
-        assert!(repository_lib.workspace_module.is_none());
-        assert_eq!(repository_lib.coord.version.as_str(), "2");
-    }
-
-    #[tokio::test]
-    async fn sibling_bom_import_manages_external_dependency() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (url, _server) = spawn_repository();
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
-
-        let result = resolve_module(&resolver, &workspace, "bom-app/pom.xml")
+        let bom_app = resolve_module(&online, &workspace, "bom-app/pom.xml")
             .await
             .expect("resolve sibling BOM");
-        let (_, leaf) = node_by_artifact(&result.graph, "leaf");
-
-        assert_eq!(leaf.coord.version.as_str(), "1");
-    }
-
-    #[tokio::test]
-    async fn exact_workspace_snapshot_needs_no_metadata_or_repo_client() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), None, false, false).await;
-
-        let result = resolve_module(&resolver, &workspace, "snapshot-app/pom.xml")
-            .await
-            .expect("workspace snapshot must short-circuit metadata");
-        let (_, snapshot) = node_by_artifact(&result.graph, "snapshot");
-
         assert_eq!(
-            snapshot.workspace_module.as_deref(),
-            Some("snapshot/pom.xml")
+            node_by_artifact(&bom_app.graph, "leaf")
+                .1
+                .coord
+                .version
+                .as_str(),
+            "1"
         );
-        assert_eq!(snapshot.coord.version.as_str(), "1-SNAPSHOT");
-    }
 
-    #[tokio::test]
-    async fn sibling_test_jar_keeps_requested_classifier_identity() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (url, _server) = spawn_repository();
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
-
-        let result = resolve_module(&resolver, &workspace, "classifier-app/pom.xml")
+        let classified = resolve_module(&online, &workspace, "classifier-app/pom.xml")
             .await
             .expect("resolve classifier app");
-        let (_, lib) = node_by_artifact(&result.graph, "lib");
-
+        let (_, lib) = node_by_artifact(&classified.graph, "lib");
         assert_eq!(lib.workspace_module.as_deref(), Some("lib/pom.xml"));
         assert_eq!(lib.coord.packaging.as_deref(), None);
         assert_eq!(lib.coord.classifier.as_deref(), Some("tests"));
-    }
 
-    #[tokio::test]
-    async fn interpolated_sibling_gav_is_used_for_candidate_validation() {
-        let workspace = Workspace::discover(fixture("basic")).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), None, false, false).await;
-
-        let result = resolve_module(&resolver, &workspace, "revision-app/pom.xml")
+        let (offline, _store) = resolver(workspace.root(), None, true, true).await;
+        let error = resolve_module(&offline, &workspace, "mismatch-app/pom.xml")
             .await
-            .expect("resolve CI-friendly sibling");
-        let (_, child) = node_by_artifact(&result.graph, "revision-child");
+            .expect_err("workspace lib:1 must not satisfy exact lib:2");
+        assert!(error.to_string().contains("offline mode"), "{error}");
 
-        assert_eq!(
-            child.workspace_module.as_deref(),
-            Some("revision-child/pom.xml")
-        );
-        assert_eq!(child.coord.version.as_str(), "1.0");
+        // Without a client or metadata: `LATEST`, an exact snapshot and a
+        // `${revision}` version find the module.
+        let (local, _store) = resolver(workspace.root(), None, false, false).await;
+        for (module, artifact, version) in [
+            ("dynamic-app", "dynamic-lib", "1"),
+            ("snapshot-app", "snapshot", "1-SNAPSHOT"),
+            ("revision-app", "revision-child", "1.0"),
+        ] {
+            let graph = resolve_graph(&local, &workspace, &format!("{module}/pom.xml"))
+                .await
+                .unwrap_or_else(|error| panic!("{module}: {error}"));
+            let (_, node) = node_by_artifact(&graph, artifact);
+            let expected = format!("{artifact}/pom.xml");
+            assert_eq!(node.workspace_module.as_deref(), Some(expected.as_str()));
+            assert_eq!(node.coord.version.as_str(), version, "{module}");
+        }
+
+        // With repository candidates, a range or `LATEST` takes the highest.
+        let (memory, _store) = memory_resolver(workspace.root(), &repository_routes());
+        for (module, artifact, sibling, version) in [
+            ("range-app", "lib", true, "1"),
+            ("range-higher-app", "lib", false, "2"),
+            ("dynamic-app", "dynamic-lib", false, "2"),
+        ] {
+            let graph = resolve_graph(&memory, &workspace, &format!("{module}/pom.xml"))
+                .await
+                .unwrap_or_else(|error| panic!("{module}: {error}"));
+            let (_, node) = node_by_artifact(&graph, artifact);
+            assert_eq!(node.workspace_module.is_some(), sibling, "{module}");
+            assert_eq!(node.repo_url.is_some(), !sibling, "{module}");
+            assert_eq!(node.coord.version.as_str(), version, "{module}");
+        }
     }
 
     #[tokio::test]
@@ -663,15 +957,55 @@ mod workspace_resolution {
         let error = resolve_module(&resolver, &workspace, "a/pom.xml")
             .await
             .expect_err("dependency cycle must fail");
-
-        assert!(matches!(
-            error,
-            ResolveError::WorkspaceDependencyCycle { .. }
-        ));
         assert_eq!(
             error.to_string(),
             "workspace dependency cycle detected: com.example:a -> com.example:b -> com.example:a"
         );
+    }
+
+    /// Resolution reads module POMs through `\\?\` paths on Windows but must
+    /// interpolate `${project.basedir}` in the plain form, or
+    /// `${project.basedir}/marker.txt` names no file and the profile adding
+    /// each dependency stays off. `app` is the module being resolved and
+    /// `lib` a sibling reached as a dependency.
+    #[tokio::test]
+    async fn module_basedir_is_plain_for_file_activation() {
+        let module = |artifact_id: &str, dependency: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>{artifact_id}</artifactId><version>1</version><profiles><profile>\
+                 <id>marked</id><activation><file>\
+                 <exists>${{project.basedir}}/marker.txt</exists></file></activation>\
+                 <dependencies><dependency><groupId>t</groupId>\
+                 <artifactId>{dependency}</artifactId><version>1</version></dependency>\
+                 </dependencies></profile></profiles></project>"
+            )
+        };
+        let (app, lib) = (module("app", "lib"), module("lib", "util"));
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                 <modules><module>app</module><module>lib</module><module>util</module>\
+                 </modules></project>",
+            ),
+            ("app/pom.xml", &app),
+            ("app/marker.txt", ""),
+            ("lib/pom.xml", &lib),
+            ("lib/marker.txt", ""),
+            (
+                "util/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>util</artifactId><version>1</version></project>",
+            ),
+        ]);
+        let (resolver, _store) = resolver(workspace.root(), None, false, false).await;
+
+        let result = resolve_module(&resolver, &workspace, "app/pom.xml")
+            .await
+            .expect("resolve app");
+        assert!(has_artifact(&result.graph, "lib") && has_artifact(&result.graph, "util"));
     }
 
     /// A reactor parent may import a sibling BOM through `${project.version}`.
@@ -679,1408 +1013,2396 @@ mod workspace_resolution {
     #[tokio::test]
     async fn sibling_bom_import_with_revision_parent_resolves() {
         let (url, _server) = spawn_repository();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let write = |path: &str, xml: &str| {
-            let path = dir.path().join(path);
-            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
-            std::fs::write(path, xml).expect("write pom");
-        };
-        write(
-            "pom.xml",
-            r#"<project><modelVersion>4.0.0</modelVersion>
-<groupId>t</groupId><artifactId>root</artifactId><version>${revision}</version><packaging>pom</packaging>
-<properties><revision>1.0-SNAPSHOT</revision></properties>
-<modules><module>bom</module><module>mid</module></modules></project>"#,
+        let parent = "<parent><groupId>t</groupId><artifactId>root</artifactId>\
+                      <version>${revision}</version></parent>";
+        let (bom, mid) = (
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion>{parent}<artifactId>bom</artifactId>\
+                 <packaging>pom</packaging><dependencyManagement><dependencies><dependency>\
+                 <groupId>com.example</groupId><artifactId>lib</artifactId><version>2</version>\
+                 </dependency></dependencies></dependencyManagement></project>"
+            ),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion>{parent}<artifactId>mid</artifactId>\
+                 <packaging>pom</packaging><modules><module>leaf</module></modules>\
+                 <dependencyManagement><dependencies><dependency><groupId>t</groupId>\
+                 <artifactId>bom</artifactId><version>${{project.version}}</version>\
+                 <type>pom</type><scope>import</scope></dependency></dependencies>\
+                 </dependencyManagement></project>"
+            ),
         );
-        write(
-            "bom/pom.xml",
-            r#"<project><modelVersion>4.0.0</modelVersion>
-<parent><groupId>t</groupId><artifactId>root</artifactId><version>${revision}</version></parent>
-<artifactId>bom</artifactId><packaging>pom</packaging>
-<dependencyManagement><dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId><version>2</version></dependency></dependencies></dependencyManagement></project>"#,
-        );
-        write(
-            "mid/pom.xml",
-            r#"<project><modelVersion>4.0.0</modelVersion>
-<parent><groupId>t</groupId><artifactId>root</artifactId><version>${revision}</version></parent>
-<artifactId>mid</artifactId><packaging>pom</packaging>
-<modules><module>leaf</module></modules>
-<dependencyManagement><dependencies><dependency><groupId>t</groupId><artifactId>bom</artifactId><version>${project.version}</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement></project>"#,
-        );
-        write(
-            "mid/leaf/pom.xml",
-            r#"<project><modelVersion>4.0.0</modelVersion>
-<parent><groupId>t</groupId><artifactId>mid</artifactId><version>${revision}</version></parent>
-<artifactId>leaf</artifactId>
-<dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId></dependency></dependencies></project>"#,
-        );
-        let workspace = Workspace::discover(dir.path()).expect("workspace");
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>root</artifactId><version>${revision}</version>\
+                 <packaging>pom</packaging><properties><revision>1.0-SNAPSHOT</revision>\
+                 </properties><modules><module>bom</module><module>mid</module></modules>\
+                 </project>",
+            ),
+            ("bom/pom.xml", &bom),
+            ("mid/pom.xml", &mid),
+            (
+                "mid/leaf/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+                 <artifactId>mid</artifactId><version>${revision}</version></parent>\
+                 <artifactId>leaf</artifactId><dependencies><dependency>\
+                 <groupId>com.example</groupId><artifactId>lib</artifactId></dependency>\
+                 </dependencies></project>",
+            ),
+        ]);
         let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
 
         let result = resolve_module(&resolver, &workspace, "mid/leaf/pom.xml")
             .await
             .expect("sibling BOM with a ${revision} parent must resolve");
-        let (_, lib) = node_by_artifact(&result.graph, "lib");
-
-        assert_eq!(lib.coord.version.as_str(), "2");
-    }
-
-    /// A missing required `<systemPath>` invalidates a dependency POM.
-    /// Maven warns, keeps the artifact, and discards its transitive dependencies.
-    #[tokio::test]
-    async fn invalid_system_dependency_in_remote_pom_drops_transitives() {
-        let broken_pom = br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>org.vendor</groupId>
-  <artifactId>broken</artifactId>
-  <version>1</version>
-  <dependencies>
-    <dependency>
-      <groupId>org.external</groupId>
-      <artifactId>leaf</artifactId>
-      <version>1</version>
-    </dependency>
-    <dependency>
-      <groupId>jdk.tools</groupId>
-      <artifactId>jdk.tools</artifactId>
-      <version>1.8</version>
-      <scope>system</scope>
-    </dependency>
-  </dependencies>
-</project>"#;
-        let leaf_pom = br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>org.external</groupId>
-  <artifactId>leaf</artifactId>
-  <version>1</version>
-</project>"#;
-        let routes = HashMap::from([
-            (
-                "/org/vendor/broken/1/broken-1.pom".to_string(),
-                broken_pom.to_vec(),
-            ),
-            (
-                "/org/vendor/broken/1/broken-1.jar".to_string(),
-                b"jar".to_vec(),
-            ),
-            (
-                "/org/external/leaf/1/leaf-1.pom".to_string(),
-                leaf_pom.to_vec(),
-            ),
-        ]);
-        let (url, _requests) = spawn_repository_with_routes(routes);
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        std::fs::write(
-            workspace_dir.path().join("pom.xml"),
-            r"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>app</artifactId>
-  <version>1</version>
-  <dependencies>
-    <dependency>
-      <groupId>org.vendor</groupId>
-      <artifactId>broken</artifactId>
-      <version>1</version>
-    </dependency>
-  </dependencies>
-</project>",
-        )
-        .expect("write pom");
-        let workspace = Workspace::discover(workspace_dir.path()).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
-
-        let result = resolve_module(&resolver, &workspace, "pom.xml")
-            .await
-            .expect("an invalid dependency POM must not fail the build");
-
-        node_by_artifact(&result.graph, "broken");
-        assert!(
-            result.graph.node_indices().all(|index| {
-                result
-                    .graph
-                    .node(index)
-                    .is_none_or(|node| node.coord.artifact_id.as_str() != "leaf")
-            }),
-            "transitives of an invalid POM are not available"
+        assert_eq!(
+            node_by_artifact(&result.graph, "lib")
+                .1
+                .coord
+                .version
+                .as_str(),
+            "2"
         );
     }
 
+    /// Maven's descriptor reader fails a dependency only when its parent or
+    /// an imported BOM cannot be resolved. Any other model error keeps the
+    /// artifact without its transitive dependencies, and a field Maven reads
+    /// leniently, in an inactive profile or an exclusion, costs nothing.
     #[tokio::test]
-    async fn sibling_declared_repository_is_trusted() {
+    async fn an_invalid_dependency_pom_drops_its_transitives() {
+        let leaf = "<dependency><groupId>org.external</groupId><artifactId>leaf</artifactId>\
+                    <version>1</version></dependency>";
+        let import = |artifact: &str, version: &str| {
+            format!(
+                "<dependencyManagement><dependencies><dependency><groupId>org.vendor</groupId>\
+                 <artifactId>{artifact}</artifactId>{version}<type>pom</type>\
+                 <scope>import</scope></dependency></dependencies></dependencyManagement>"
+            )
+        };
+        let broken = |rest: &str| pom("org.vendor", "broken", "1", rest);
+        let invalid = [
+            broken(&format!(
+                "<dependencies>{leaf}</dependencies><dependencies/>"
+            )),
+            broken(&format!(
+                "<version>1</version><dependencies>{leaf}</dependencies>"
+            )),
+            broken(&format!(
+                "<properties><a>${{b}}</a><b>${{a}}</b></properties><dependencies>{leaf}\
+                 <dependency><groupId>o</groupId><artifactId>c</artifactId>\
+                 <version>${{a}}</version></dependency></dependencies>"
+            )),
+            broken(&format!(
+                "{}<dependencies>{leaf}</dependencies>",
+                import("cycle", "<version>1</version>")
+            )),
+            broken(&format!(
+                "{}<dependencies>{leaf}</dependencies>",
+                import("cycle", "")
+            )),
+            broken(&format!(
+                "<dependencies>{leaf}<dependency><groupId>o</groupId><artifactId>api</artifactId>\
+                 </dependency></dependencies>"
+            )),
+            broken(&format!(
+                "<properties><empty/></properties><dependencies>{leaf}<dependency>\
+                 <groupId>o</groupId><artifactId>api</artifactId><version>${{empty}}</version>\
+                 </dependency></dependencies>"
+            )),
+            broken(&format!(
+                "<dependencies>{leaf}<dependency><groupId>jdk.tools</groupId>\
+                 <artifactId>jdk.tools</artifactId><version>1.8</version><scope>system</scope>\
+                 </dependency></dependencies>"
+            )),
+            b"<!DOCTYPE html><html><body>Sign in</body></html>".to_vec(),
+        ];
+        let managed_without_artifact = |activation: &str| {
+            broken(&format!(
+                "<dependencies>{leaf}</dependencies><profiles><profile><id>p</id>{activation}\
+                 <dependencyManagement><dependencies><dependency><groupId>o</groupId>\
+                 <version>1</version></dependency></dependencies></dependencyManagement>\
+                 </profile></profiles>"
+            ))
+        };
+        let invalid: Vec<Vec<u8>> = invalid
+            .into_iter()
+            .chain([
+                managed_without_artifact(
+                    "<activation><activeByDefault>true</activeByDefault></activation>",
+                ),
+                broken(&format!(
+                    "{}<dependencies>{leaf}</dependencies>",
+                    import("invalid", "<version>1</version>")
+                )),
+                broken(
+                    "<dependencies><dependency><groupId>org.external</groupId>\
+                     <artifactId>leaf</artifactId><version>1</version><type/></dependency>\
+                     </dependencies>",
+                ),
+                broken(&format!(
+                    "<dependencies>{leaf}<dependency><groupId>o</groupId>\
+                     <artifactId>bad+id</artifactId><version>1</version></dependency>\
+                     </dependencies>"
+                )),
+                broken(&format!(
+                    "<dependencies>{leaf}<dependency><groupId>o</groupId><artifactId>t</artifactId>\
+                     <version>1</version><systemPath>/opt/unused.jar</systemPath></dependency>\
+                     </dependencies>"
+                )),
+                broken(&format!(
+                    "<dependencyManagement><dependencies><dependency><groupId>o</groupId>\
+                     <artifactId>t</artifactId><version>1</version>\
+                     <systemPath>/opt/unused.jar</systemPath></dependency></dependencies>\
+                     </dependencyManagement><dependencies>{leaf}</dependencies>"
+                )),
+                broken(&format!(
+                    "<dependencies>{leaf}<dependency><groupId>o</groupId><artifactId>t</artifactId>\
+                     <version>1</version><scope>SYSTEM</scope>\
+                     <systemPath>/opt/unused.jar</systemPath></dependency></dependencies>"
+                )),
+                broken(&format!(
+                    "<dependencies>{leaf}<dependency><groupId>o</groupId><artifactId>t</artifactId>\
+                     <version>1</version><scope>system</scope>\
+                     <systemPath>${{missing}}/x.jar</systemPath></dependency></dependencies>"
+                )),
+            ])
+            .collect();
+        let lenient = [
+            managed_without_artifact(""),
+            broken(&format!(
+                "<dependencies>{leaf}<dependency><groupId>o</groupId><artifactId>t</artifactId>\
+                 <version>1</version><scope>SYSTEM</scope></dependency></dependencies>"
+            )),
+            broken(&format!(
+                "{}<dependencies>{leaf}</dependencies>",
+                import(
+                    "fine",
+                    "<version>1</version><systemPath>/opt/unused.jar</systemPath>"
+                )
+            )),
+            broken(
+                "<dependencies><dependency><groupId>o</groupId><artifactId>t</artifactId>\
+                 <version>1</version><exclusions><exclusion><groupId>org.external</groupId>\
+                 </exclusion></exclusions></dependency></dependencies>",
+            ),
+            broken(&format!(
+                "<dependencies>{leaf}</dependencies><profiles><profile><id>off</id>\
+                 <repositories><repository><id>nowhere</id></repository></repositories>\
+                 <dependencies><dependency><groupId>o</groupId></dependency></dependencies>\
+                 </profile></profiles>"
+            )),
+        ];
+        let failing = [
+            broken(&format!(
+                "<parent><groupId>org.vendor</groupId><artifactId>missing</artifactId>\
+                 <version>1</version></parent><dependencies>{leaf}</dependencies>"
+            )),
+            broken(&format!(
+                "{}<dependencies>{leaf}</dependencies>",
+                import("missing", "<version>1</version>")
+            )),
+            broken(&format!(
+                "{}<dependencies>{leaf}</dependencies>",
+                import("missing", "<version>${undefined}</version>")
+            )),
+        ]
+        .map(|pom| (pom, "org.vendor:missing:"));
+        let both = |first: &str, second: &str| {
+            let imports = format!(
+                "{}{}",
+                import(first, "<version>1</version>"),
+                import(second, "<version>1</version>")
+            )
+            .replace(
+                "</dependencies></dependencyManagement><dependencyManagement><dependencies>",
+                "",
+            );
+            broken(&format!("{imports}<dependencies>{leaf}</dependencies>"))
+        };
+        let failing = failing.into_iter().chain([
+            (both("invalid", "missing"), "org.vendor:missing:"),
+            (both("missing", "invalid"), "org.vendor:missing:"),
+            (
+                broken(&format!(
+                    "{}<dependencies>{leaf}</dependencies>",
+                    import("missing", "<version>1</version>")
+                        .replace("<groupId>org.vendor</groupId>", "<groupId>bad+g</groupId>")
+                )),
+                "bad+g:missing:1",
+            ),
+        ]);
+        let failing = failing.chain([(
+            broken(&format!(
+                "<dependencyManagement><dependencies><dependency><groupId>o</groupId>\
+                 <artifactId>unused</artifactId><version>1</version><type/></dependency>\
+                 </dependencies></dependencyManagement><dependencies>{leaf}</dependencies>"
+            )),
+            "o:unused: declares an empty <type>",
+        )]);
+        let app = pom(
+            "com.example",
+            "app",
+            "1",
+            "<dependencies><dependency><groupId>org.vendor</groupId>\
+             <artifactId>broken</artifactId><version>1</version></dependency></dependencies>",
+        );
+        let (_dir, workspace) = reactor(&[("pom.xml", std::str::from_utf8(&app).unwrap())]);
+        let cases = invalid
+            .into_iter()
+            .map(|pom| (pom, Ok(false)))
+            .chain(lenient.into_iter().map(|pom| (pom, Ok(true))))
+            .chain(failing.map(|(pom, message)| (pom, Err(message))));
+        for (broken_pom, outcome) in cases {
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/org/vendor/broken/1/broken-1.pom".to_string(),
+                broken_pom.clone(),
+            );
+            for (artifact, rest) in [
+                ("cycle", import("cycle", "<version>1</version>")),
+                (
+                    "invalid",
+                    "<dependencies><dependency><groupId>o</groupId><version>1</version>\
+                     </dependency></dependencies>"
+                        .to_string(),
+                ),
+                ("t", format!("<dependencies>{leaf}</dependencies>")),
+                ("fine", String::new()),
+            ] {
+                let group = if artifact == "t" { "o" } else { "org.vendor" };
+                routes.insert(
+                    format!(
+                        "/{group}/{artifact}/1/{artifact}-1.pom",
+                        group = group.replace('.', "/")
+                    ),
+                    pom(group, artifact, "1", &rest),
+                );
+            }
+            routes.insert(
+                "/org/external/leaf/1/leaf-1.pom".to_string(),
+                pom("org.external", "leaf", "1", ""),
+            );
+            let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+            let text = String::from_utf8_lossy(&broken_pom);
+            let result = resolve_graph(&resolver, &workspace, "pom.xml").await;
+            match outcome {
+                Ok(keeps_leaf) => {
+                    let graph = result.unwrap_or_else(|error| panic!("{text}: {error}"));
+                    assert!(has_artifact(&graph, "broken"), "{text}");
+                    assert_eq!(has_artifact(&graph, "leaf"), keeps_leaf, "{text}");
+                }
+                Err(message) => {
+                    let error = result.expect_err(&text);
+                    assert!(error.to_string().contains(message), "{error}");
+                }
+            }
+        }
+    }
+
+    /// A repository a dependency's POM declares is in the search of its own
+    /// subtree, and not of its siblings, whichever POM arrives first.
+    #[tokio::test]
+    async fn an_admitted_repository_reaches_the_same_models_on_every_schedule() {
+        const DECLARED: &str = "https://declared.example/maven2/";
+        let app = pom(
+            "t",
+            "app",
+            "1",
+            "<dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId>\
+             <version>1</version></dependency><dependency><groupId>g</groupId>\
+             <artifactId>b</artifactId><version>1</version></dependency></dependencies>",
+        );
+        let (_dir, workspace) = reactor(&[("pom.xml", std::str::from_utf8(&app).unwrap())]);
+        let child_in_a = HashMap::from([
+            (
+                "/g/a/1/a-1.pom".to_string(),
+                pom(
+                    "g",
+                    "a",
+                    "1",
+                    &format!(
+                        "<repositories><repository><id>declared</id><url>{DECLARED}</url>\
+                         </repository></repositories><dependencies><dependency>\
+                         <groupId>g</groupId><artifactId>c</artifactId><version>1</version>\
+                         </dependency></dependencies>"
+                    ),
+                ),
+            ),
+            (
+                "/g/c/1/c-1.pom".to_string(),
+                b"<project><modelVersion>4.0.0</modelVersion><parent><groupId>g</groupId>\
+                  <artifactId>p</artifactId><version>1</version></parent>\
+                  <artifactId>c</artifactId></project>"
+                    .to_vec(),
+            ),
+            ("/g/b/1/b-1.pom".to_string(), pom("g", "b", "1", "")),
+        ]);
+        let sibling_needs_declared = HashMap::from([
+            (
+                "/g/a/1/a-1.pom".to_string(),
+                pom(
+                    "g",
+                    "a",
+                    "1",
+                    &format!(
+                        "<repositories><repository><id>declared</id><url>{DECLARED}</url>\
+                         </repository></repositories>"
+                    ),
+                ),
+            ),
+            (
+                "/g/b/1/b-1.pom".to_string(),
+                b"<project><modelVersion>4.0.0</modelVersion><parent><groupId>g</groupId>\
+                  <artifactId>p</artifactId><version>1</version></parent>\
+                  <artifactId>b</artifactId></project>"
+                    .to_vec(),
+            ),
+        ]);
+        let declared = HashMap::from([(
+            "/g/p/1/p-1.pom".to_string(),
+            pom("g", "p", "1", "<packaging>pom</packaging>"),
+        )]);
+        for slow in ["g/a/1/a-1.pom", "g/b/1/b-1.pom"] {
+            for (configured, succeeds) in [(&child_in_a, true), (&sibling_needs_declared, false)] {
+                let mut config = Config::for_testing_with_repos(
+                    workspace.root().to_path_buf(),
+                    ResolvedPaths::for_testing().unwrap(),
+                    vec![repo_config(MEMORY_REPO)],
+                );
+                config.security.transitive_repository_allowlist = vec![DECLARED.to_string()];
+                let source = MemoryPomSource::new(config.security.clone())
+                    .with_files(MEMORY_REPO, configured)
+                    .with_files(DECLARED, &declared)
+                    .with_delay(slow, std::time::Duration::from_millis(200));
+                let repos = config.repositories().iter().map(Repository::from).collect();
+                let store_dir = tempfile::tempdir().unwrap();
+                let store = Arc::new(Store::open(store_dir.path()).unwrap());
+                let context = ResolveContext::new(
+                    config,
+                    repos,
+                    store,
+                    Platform::new("linux", "x86_64").unwrap(),
+                    None,
+                )
+                .with_pom_source(Arc::new(source));
+                let result =
+                    resolve_graph(&PlatformResolver::new(context), &workspace, "pom.xml").await;
+                if succeeds {
+                    let graph = result.unwrap_or_else(|error| panic!("{slow} first: {error}"));
+                    assert!(has_artifact(&graph, "c"), "{slow} first");
+                    assert!(has_artifact(&graph, "b"), "{slow} first");
+                } else {
+                    assert!(
+                        result.is_err(),
+                        "{slow} first: sibling must not see a's repo"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A classifier found with its POM through a dependency's repository and
+    /// the main artifact found without one through the root repositories
+    /// cannot share one POM pin, whichever path is visited first.
+    #[tokio::test]
+    async fn classifier_winners_that_disagree_on_a_pom_fail() {
+        ensure_crypto_provider();
+        let dep = |artifact: &str, classifier: &str| {
+            format!(
+                "<dependency><groupId>fx</groupId><artifactId>{artifact}</artifactId>\
+                 <version>1</version>{classifier}</dependency>"
+            )
+        };
+        let own = Arc::new(std::sync::OnceLock::<String>::new());
+        let addr_cell = Arc::clone(&own);
+        let server = StubServer::start(move |request| {
+            let addr = addr_cell.get().expect("addr");
+            let base = |repo: &str, artifact: &str| format!("/{repo}/fx/{artifact}/1/{artifact}-1");
+            let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+            routes.insert(
+                format!("{}.pom", base("repo1", "a")),
+                pom(
+                    "fx",
+                    "a",
+                    "1",
+                    &format!(
+                        "<repositories><repository><id>r2</id><url>http://{addr}/r2/</url>\
+                         </repository></repositories><dependencies>{}</dependencies>",
+                        dep("x", "<classifier>tests</classifier>")
+                    ),
+                ),
+            );
+            routes.insert(
+                format!("{}.pom", base("repo1", "b")),
+                pom(
+                    "fx",
+                    "b",
+                    "1",
+                    &format!("<dependencies>{}</dependencies>", dep("x", "")),
+                ),
+            );
+            for artifact in ["a", "b", "x"] {
+                routes.insert(format!("{}.jar", base("repo1", artifact)), b"jar".to_vec());
+            }
+            routes.insert(format!("{}.pom", base("r2", "x")), pom("fx", "x", "1", ""));
+            routes.insert(format!("{}-tests.jar", base("r2", "x")), b"tests".to_vec());
+            routes.get(&request.path).map_or_else(
+                || Response::new(404, ""),
+                |body| Response::new(200, body.clone()),
+            )
+        });
+        own.set(server.addr().to_string()).unwrap();
+        let repo1 = format!("http://{}/repo1/", server.addr());
+        let r2 = format!("http://{}/r2/", server.addr());
+
+        for deps_xml in [
+            format!("{}{}", dep("a", ""), dep("b", "")),
+            format!("{}{}", dep("b", ""), dep("a", "")),
+        ] {
+            let app = pom(
+                "fx",
+                "app",
+                "1",
+                &format!("<dependencies>{deps_xml}</dependencies>"),
+            );
+            let (dir, workspace) = reactor(&[("pom.xml", std::str::from_utf8(&app).unwrap())]);
+            let mut config = Config::for_testing_with_repos(
+                workspace.root().to_path_buf(),
+                ResolvedPaths::for_testing().unwrap(),
+                vec![repo_config(&repo1)],
+            );
+            config.security.transitive_repository_allowlist = vec![r2.clone()];
+            let client = RepoClient::new(&config)
+                .await
+                .unwrap()
+                .with_allow_missing_checksums(true);
+            let repos = config.repositories().iter().map(Repository::from).collect();
+            let store_dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(store_dir.path()).unwrap());
+            let context = ResolveContext::new(
+                config,
+                repos,
+                store,
+                Platform::new("linux", "x86_64").unwrap(),
+                Some(client),
+            );
+            let resolver = PlatformResolver::new(context);
+            let error = resolve_module(&resolver, &workspace, "pom.xml")
+                .await
+                .expect_err("the two winners disagree on the POM");
+            drop(dir);
+            assert!(
+                matches!(&error, ResolveError::ConflictingResolvedPomBytes { coord, .. }
+                    if coord == "fx:x:1"),
+                "{deps_xml}: {error:?}"
+            );
+        }
+    }
+
+    /// Per-path repository contexts match Maven 3.9.12 across subtrees,
+    /// siblings, ranges, nested contexts, and parent POMs.
+    #[tokio::test]
+    async fn transitive_repository_contexts_follow_dependency_paths() {
+        ensure_crypto_provider();
+        let dep = |artifact: &str, version: &str| {
+            format!(
+                "<dependency><groupId>fx</groupId><artifactId>{artifact}</artifactId>\
+                 <version>{version}</version></dependency>"
+            )
+        };
+        let repo_xml = |id: &str, url: &str| {
+            format!(
+                "<repositories><repository><id>{id}</id><url>{url}</url>\
+                 </repository></repositories>"
+            )
+        };
+        let meta = |versions: &[&str]| {
+            let items: String = versions
+                .iter()
+                .map(|v| format!("<version>{v}</version>"))
+                .collect();
+            format!(
+                "<metadata><groupId>fx</groupId><artifactId>z</artifactId>\
+                 <versioning><versions>{items}</versions></versioning></metadata>"
+            )
+            .into_bytes()
+        };
+
+        let own = Arc::new(std::sync::OnceLock::<String>::new());
+        let addr_cell = Arc::clone(&own);
+        let server = StubServer::start(move |request| {
+            let addr = addr_cell.get().expect("addr");
+            let r2 = format!("http://{addr}/r2/");
+            let r3 = format!("http://{addr}/r3/");
+            let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+            let add = |routes: &mut HashMap<String, Vec<u8>>,
+                       repo: &str,
+                       artifact: &str,
+                       version: &str,
+                       body: &str| {
+                let base = format!("/{repo}/fx/{artifact}/{version}/{artifact}-{version}");
+                routes.insert(format!("{base}.pom"), pom("fx", artifact, version, body));
+                routes.insert(
+                    format!("{base}.jar"),
+                    format!("{repo}:{artifact}:{version}").into_bytes(),
+                );
+            };
+            add(
+                &mut routes,
+                "repo1",
+                "a",
+                "1",
+                &format!(
+                    "{}<dependencies>{}{}</dependencies>",
+                    repo_xml("r2", &r2),
+                    dep("x", "1"),
+                    dep("c", "1")
+                ),
+            );
+            add(
+                &mut routes,
+                "repo1",
+                "c",
+                "1",
+                &format!("<dependencies>{}</dependencies>", dep("d", "1")),
+            );
+            add(&mut routes, "r2", "x", "1", "");
+            add(&mut routes, "r2", "d", "1", "");
+            add(
+                &mut routes,
+                "repo1",
+                "b",
+                "1",
+                &format!("<dependencies>{}</dependencies>", dep("y", "1")),
+            );
+            add(&mut routes, "r2", "y", "1", "");
+            add(
+                &mut routes,
+                "repo1",
+                "e",
+                "1",
+                &format!("<dependencies>{}</dependencies>", dep("z", "[1,)")),
+            );
+            add(
+                &mut routes,
+                "repo1",
+                "f",
+                "1",
+                &format!(
+                    "{}<dependencies>{}</dependencies>",
+                    repo_xml("r2", &r2),
+                    dep("z", "[1,)")
+                ),
+            );
+            add(&mut routes, "repo1", "z", "1", "");
+            add(&mut routes, "r2", "z", "2", "");
+            routes.insert("/repo1/fx/z/maven-metadata.xml".to_string(), meta(&["1"]));
+            routes.insert("/r2/fx/z/maven-metadata.xml".to_string(), meta(&["1", "2"]));
+            add(
+                &mut routes,
+                "repo1",
+                "g",
+                "1",
+                &format!(
+                    "{}<dependencies>{}</dependencies>",
+                    repo_xml("r3", &r3),
+                    dep("h", "1")
+                ),
+            );
+            add(
+                &mut routes,
+                "r3",
+                "h",
+                "1",
+                &format!(
+                    "{}<dependencies>{}</dependencies>",
+                    repo_xml("r2", &r2),
+                    dep("k", "1")
+                ),
+            );
+            add(&mut routes, "r2", "k", "1", "");
+            routes.insert(
+                "/r2/fx/mp/1/mp-1.pom".to_string(),
+                pom("fx", "mp", "1", "<packaging>pom</packaging>"),
+            );
+            add(
+                &mut routes,
+                "repo1",
+                "m",
+                "1",
+                &format!(
+                    "<parent><groupId>fx</groupId><artifactId>mp</artifactId>\
+                     <version>1</version></parent>{}",
+                    repo_xml("r2", &r2)
+                ),
+            );
+
+            routes.get(&request.path).map_or_else(
+                || Response::new(404, ""),
+                |body| Response::new(200, body.clone()),
+            )
+        });
+        own.set(server.addr().to_string()).unwrap();
+        let repo1 = format!("http://{}/repo1/", server.addr());
+        let r2 = format!("http://{}/r2/", server.addr());
+        let r3 = format!("http://{}/r3/", server.addr());
+
+        let run = |deps_xml: String| {
+            let repo1 = repo1.clone();
+            let r2 = r2.clone();
+            let r3 = r3.clone();
+            async move {
+                let app = pom(
+                    "fx",
+                    "app",
+                    "1",
+                    &format!("<dependencies>{deps_xml}</dependencies>"),
+                );
+                let (dir, workspace) = reactor(&[("pom.xml", std::str::from_utf8(&app).unwrap())]);
+                let mut config = Config::for_testing_with_repos(
+                    workspace.root().to_path_buf(),
+                    ResolvedPaths::for_testing().unwrap(),
+                    vec![repo_config(&repo1)],
+                );
+                config.security.transitive_repository_allowlist = vec![r2, r3];
+                let client = RepoClient::new(&config)
+                    .await
+                    .unwrap()
+                    .with_allow_missing_checksums(true);
+                let repos = config.repositories().iter().map(Repository::from).collect();
+                let store_dir = tempfile::tempdir().unwrap();
+                let store = Arc::new(Store::open(store_dir.path()).unwrap());
+                let context = ResolveContext::new(
+                    config,
+                    repos,
+                    store,
+                    Platform::new("linux", "x86_64").unwrap(),
+                    Some(client),
+                );
+                let resolver = PlatformResolver::new(context);
+                let res = resolve_module(&resolver, &workspace, "pom.xml").await;
+                drop(dir);
+                res
+            }
+        };
+
+        // (1) Subtree: app -> a (declares r2) -> x (only in r2), a -> c -> d (only in r2).
+        let res = run(dep("a", "1")).await.expect("subtree resolves");
+        for artifact in ["a", "c", "d", "x"] {
+            assert!(has_artifact(&res.graph, artifact), "missing {artifact}");
+        }
+
+        // (2) Siblings: app -> a (declares r2), app -> b -> y (only in r2), in either order.
+        for deps_xml in [
+            format!("{}{}", dep("a", "1"), dep("b", "1")),
+            format!("{}{}", dep("b", "1"), dep("a", "1")),
+        ] {
+            let err = run(deps_xml).await.expect_err("sibling y must fail");
+            assert!(err.to_string().contains("fx:y:1"), "{err}");
+        }
+        assert!(
+            !server
+                .requests()
+                .iter()
+                .any(|req| req.path.starts_with("/r2/fx/y/")),
+            "r2 must never be queried for sibling's dependency y"
+        );
+
+        // (3) Range on sibling: app -> a (declares r2), app -> e -> z:[1,) picks z 1.
+        for deps_xml in [
+            format!("{}{}", dep("a", "1"), dep("e", "1")),
+            format!("{}{}", dep("e", "1"), dep("a", "1")),
+        ] {
+            let res = run(deps_xml).await.expect("sibling range resolves");
+            assert_eq!(
+                node_by_artifact(&res.graph, "z").1.coord.version.as_str(),
+                "1"
+            );
+        }
+
+        // (4) Range in subtree: app -> f (declares r2) -> z:[1,) picks z 2.
+        let res = run(dep("f", "1")).await.expect("subtree range resolves");
+        assert_eq!(
+            node_by_artifact(&res.graph, "z").1.coord.version.as_str(),
+            "2"
+        );
+
+        // (5) Nested contexts: app -> g (declares r3) -> h (only in r3, declares r2) -> k (only in r2).
+        let res = run(dep("g", "1")).await.expect("nested contexts resolve");
+        for artifact in ["g", "h", "k"] {
+            assert!(has_artifact(&res.graph, artifact), "missing {artifact}");
+        }
+
+        // (6) Parent in own repo: app -> m (declares r2), m's parent mp only in r2.
+        let res = run(dep("m", "1"))
+            .await
+            .expect("parent in own repo resolves");
+        assert!(has_artifact(&res.graph, "m"));
+    }
+
+    /// Maven fails a project whose management holds a `<type/>` entry rather
+    /// than letting it manage the jar a dependency brings.
+    #[tokio::test]
+    async fn a_managed_empty_type_fails_the_project() {
+        let app = pom(
+            "com.example",
+            "app",
+            "1",
+            "<dependencyManagement><dependencies><dependency><groupId>g</groupId>\
+             <artifactId>leaf</artifactId><version>2</version><type/></dependency>\
+             </dependencies></dependencyManagement><dependencies><dependency>\
+             <groupId>g</groupId><artifactId>middle</artifactId><version>1</version>\
+             </dependency></dependencies>",
+        );
+        let (_dir, workspace) = reactor(&[("pom.xml", std::str::from_utf8(&app).unwrap())]);
+        let routes = HashMap::from([
+            (
+                "/g/middle/1/middle-1.pom".to_string(),
+                pom(
+                    "g",
+                    "middle",
+                    "1",
+                    "<dependencies><dependency><groupId>g</groupId><artifactId>leaf</artifactId>\
+                     <version>1</version></dependency></dependencies>",
+                ),
+            ),
+            (
+                "/g/leaf/1/leaf-1.pom".to_string(),
+                pom("g", "leaf", "1", ""),
+            ),
+            (
+                "/g/leaf/2/leaf-2.pom".to_string(),
+                pom("g", "leaf", "2", ""),
+            ),
+        ]);
+        let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+        let error = resolve_graph(&resolver, &workspace, "pom.xml")
+            .await
+            .expect_err("an empty managed type must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("g:leaf: declares an empty <type>"),
+            "{error}"
+        );
+    }
+
+    /// A dependency's parent is asked for as soon as the dependency's POM
+    /// arrives, before its `.sha256` answers: a repository may take far
+    /// longer for that 404 than for the POM. Here the 404s of the dependency
+    /// and its parent wait up to five seconds for the grandparent to be
+    /// asked for, so each hop must start before the last was verified.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parent_is_fetched_while_the_child_checksum_is_pending() {
+        use std::io::Write;
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
+        let (_dir, workspace) = reactor(&[(
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+             <artifactId>root</artifactId><version>1</version><dependencies><dependency>\
+             <groupId>org.ext</groupId><artifactId>lib</artifactId><version>1</version>\
+             </dependency></dependencies></project>",
+        )]);
+        let lib = pom(
+            "org.ext",
+            "lib",
+            "1",
+            "<parent><groupId>org.ext</groupId><artifactId>parent</artifactId>\
+             <version>1</version></parent>",
+        );
+        let parent = pom(
+            "org.ext",
+            "parent",
+            "1",
+            "<packaging>pom</packaging><parent><groupId>org.ext</groupId>\
+             <artifactId>grandparent</artifactId><version>1</version></parent>",
+        );
+        let grandparent = pom("org.ext", "grandparent", "1", "<packaging>pom</packaging>");
+        // Whether the grandparent was asked for, and for each `.sha256`
+        // answered, whether that came first.
+        let state = Arc::new((Mutex::new((false, Vec::new())), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("addr"));
+        let serving = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (state, lib, parent, grandparent) = (
+                    Arc::clone(&serving),
+                    lib.clone(),
+                    parent.clone(),
+                    grandparent.clone(),
+                );
+                std::thread::spawn(move || {
+                    let Some(head) = rv_test_support::http::read_request_head_blocking(&mut stream)
+                    else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&head);
+                    let path = head.split_whitespace().nth(1).unwrap_or_default();
+                    let (lock, asked) = &*state;
+                    let body = match path {
+                        "/org/ext/lib/1/lib-1.pom" => Some(lib),
+                        "/org/ext/lib/1/lib-1.jar" => Some(b"jar".to_vec()),
+                        "/org/ext/parent/1/parent-1.pom" => Some(parent),
+                        "/org/ext/grandparent/1/grandparent-1.pom" => {
+                            lock.lock().unwrap().0 = true;
+                            asked.notify_all();
+                            Some(grandparent)
+                        }
+                        "/org/ext/lib/1/lib-1.pom.sha256"
+                        | "/org/ext/parent/1/parent-1.pom.sha256" => {
+                            let guard = lock.lock().unwrap();
+                            let (mut guard, _) = asked
+                                .wait_timeout_while(guard, Duration::from_secs(5), |seen| !seen.0)
+                                .unwrap();
+                            let seen = guard.0;
+                            guard.1.push(seen);
+                            None
+                        }
+                        _ => None,
+                    };
+                    let response = match body {
+                        Some(body) => {
+                            let mut response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            response.extend(body);
+                            response
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    };
+                    let _ = stream.write_all(&response);
+                });
+            }
+        });
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        resolve_graph(&resolver, &workspace, "pom.xml")
+            .await
+            .expect("resolves");
+        assert_eq!(
+            state.0.lock().unwrap().1,
+            [true, true],
+            "the grandparent was not asked for before the .sha256 files answered"
+        );
+    }
+
+    /// The parent of a repository POM comes from the repositories, even where
+    /// its default `<relativePath>` from the project's directory names a
+    /// local POM with its coordinates, as in Maven.
+    #[tokio::test]
+    async fn a_remote_bom_takes_its_parent_from_the_repositories() {
+        let base = |lib: &str| {
+            pom(
+                "p",
+                "base",
+                "1",
+                &format!(
+                    "<packaging>pom</packaging><properties><lib.version>{lib}</lib.version></properties>"
+                ),
+            )
+        };
+        let local_base = String::from_utf8(base("2")).unwrap();
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+                 <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                 <modules><module>local/module</module></modules></project>",
+            ),
+            ("local/pom.xml", &local_base),
+            (
+                "local/module/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>p</groupId>\
+                 <artifactId>base</artifactId><version>1</version></parent>\
+                 <artifactId>module</artifactId><dependencyManagement><dependencies>\
+                 <dependency><groupId>p</groupId><artifactId>bom</artifactId><version>1</version>\
+                 <type>pom</type><scope>import</scope></dependency></dependencies>\
+                 </dependencyManagement><dependencies><dependency><groupId>p</groupId>\
+                 <artifactId>lib</artifactId></dependency></dependencies></project>",
+            ),
+        ]);
+        let mut routes = HashMap::new();
+        routes.insert("/p/base/1/base-1.pom".to_string(), base("1"));
+        routes.insert(
+            "/p/bom/1/bom-1.pom".to_string(),
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>p</groupId>\
+             <artifactId>base</artifactId><version>1</version></parent>\
+             <artifactId>bom</artifactId><packaging>pom</packaging><dependencyManagement>\
+             <dependencies><dependency><groupId>p</groupId><artifactId>lib</artifactId>\
+             <version>${lib.version}</version></dependency></dependencies>\
+             </dependencyManagement></project>"
+                .as_bytes()
+                .to_vec(),
+        );
+        for version in ["1", "2"] {
+            routes.insert(
+                format!("/p/lib/{version}/lib-{version}.pom"),
+                pom("p", "lib", version, ""),
+            );
+        }
+        let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+        let graph = resolve_graph(&resolver, &workspace, "local/module/pom.xml")
+            .await
+            .expect("resolves");
+        assert_eq!(
+            node_by_artifact(&graph, "lib").1.coord.version.as_str(),
+            "1"
+        );
+    }
+
+    /// A reactor module standing in for a parent or BOM reads its own local
+    /// parent from its own directory, whichever module imports it, also when
+    /// that parent inherits `${revision}`.
+    #[tokio::test]
+    async fn a_reactor_bom_reads_its_parent_from_its_own_directory() {
+        let project = |coords: &str, rest: &str| {
+            format!("<project><modelVersion>4.0.0</modelVersion>{coords}{rest}</project>")
+        };
+        let parent = |artifact: &str, version: &str, path: &str| {
+            format!(
+                "<parent><groupId>p</groupId><artifactId>{artifact}</artifactId>\
+                 <version>{version}</version><relativePath>{path}</relativePath></parent>"
+            )
+        };
+        let import = |version: &str| {
+            format!(
+                "<dependencyManagement><dependencies><dependency><groupId>p</groupId>\
+                 <artifactId>bom</artifactId><version>{version}</version><type>pom</type>\
+                 <scope>import</scope></dependency></dependencies></dependencyManagement>\
+                 <dependencies><dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+                 </dependency></dependencies>"
+            )
+        };
+        let manages = "<packaging>pom</packaging><dependencyManagement><dependencies>\
+                       <dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+                       <version>${leaf.version}</version></dependency></dependencies>\
+                       </dependencyManagement>";
+        let corp_with = |leaf: &str| {
+            project(
+                "<groupId>p</groupId><artifactId>corp</artifactId><version>1</version>",
+                &format!(
+                    "<packaging>pom</packaging><properties><leaf.version>{leaf}</leaf.version>\
+                     </properties>"
+                ),
+            )
+        };
+        let corp = corp_with("1");
+        let deep = [
+            (
+                "pom.xml",
+                project(
+                    "<groupId>p</groupId><artifactId>root</artifactId><version>1</version>",
+                    "<packaging>pom</packaging>\
+                     <modules><module>bom</module><module>services/deep/app</module></modules>",
+                ),
+            ),
+            ("parents/corp/pom.xml", corp.clone()),
+            (
+                "bom/pom.xml",
+                project(
+                    &parent("corp", "1", "../parents/corp/pom.xml"),
+                    &format!("<artifactId>bom</artifactId>{manages}"),
+                ),
+            ),
+            (
+                "services/deep/app/pom.xml",
+                project(
+                    "<groupId>p</groupId><artifactId>app</artifactId><version>1</version>",
+                    &import("1"),
+                ),
+            ),
+        ];
+        let revision = [
+            (
+                "pom.xml",
+                project(
+                    &parent("corp", "1", "parent/pom.xml"),
+                    "<artifactId>root</artifactId><version>${revision}</version>\
+                     <packaging>pom</packaging><properties><revision>1.0</revision></properties>\
+                     <modules><module>bom</module><module>app</module></modules>",
+                ),
+            ),
+            ("parent/pom.xml", corp),
+            (
+                "bom/pom.xml",
+                project(
+                    &parent("root", "${revision}", "../pom.xml"),
+                    &format!("<artifactId>bom</artifactId>{manages}"),
+                ),
+            ),
+            (
+                "app/pom.xml",
+                project(
+                    &parent("root", "${revision}", "../pom.xml"),
+                    &format!("<artifactId>app</artifactId>{}", import("${revision}")),
+                ),
+            ),
+        ];
+        // The BOM's parent is remote, so the importer's `../parents/pom.xml`
+        // with its coordinates is not read.
+        let remote = [
+            (
+                "pom.xml",
+                project(
+                    "<groupId>p</groupId><artifactId>root</artifactId><version>1</version>",
+                    "<packaging>pom</packaging>\
+                     <modules><module>bom</module><module>apps/app</module></modules>",
+                ),
+            ),
+            (
+                "bom/pom.xml",
+                project(
+                    &parent("corp", "1", "../parents/pom.xml"),
+                    &format!("<artifactId>bom</artifactId>{manages}"),
+                ),
+            ),
+            ("apps/parents/pom.xml", corp_with("2")),
+            (
+                "apps/app/pom.xml",
+                project(
+                    "<groupId>p</groupId><artifactId>app</artifactId><version>1</version>",
+                    &import("1"),
+                ),
+            ),
+        ];
+        let mut routes = HashMap::new();
+        for leaf in ["1", "2"] {
+            routes.insert(
+                format!("/p/leaf/{leaf}/leaf-{leaf}.pom"),
+                pom("p", "leaf", leaf, ""),
+            );
+        }
+        routes.insert(
+            "/p/corp/1/corp-1.pom".to_string(),
+            corp_with("1").into_bytes(),
+        );
+        for (files, app) in [
+            (&deep, "services/deep/app/pom.xml"),
+            (&revision, "app/pom.xml"),
+            (&remote, "apps/app/pom.xml"),
+        ] {
+            let files: Vec<(&str, &str)> = files
+                .iter()
+                .map(|(path, text)| (*path, text.as_str()))
+                .collect();
+            let (_dir, workspace) = reactor(&files);
+            let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+            let graph = resolve_graph(&resolver, &workspace, app)
+                .await
+                .unwrap_or_else(|error| panic!("{app}: {error}"));
+            assert_eq!(
+                node_by_artifact(&graph, "leaf").1.coord.version.as_str(),
+                "1"
+            );
+        }
+    }
+
+    /// A reactor module that a dependency's model reads as its parent
+    /// brings its own local parent, but not the root's `.mvn/maven.config`
+    /// `-D` values (MNG-7563).
+    #[tokio::test]
+    async fn maven_config_values_stay_out_of_a_dependency_model() {
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>p</groupId>\
+                 <artifactId>corp</artifactId><version>1</version>\
+                 <relativePath>corp/pom.xml</relativePath></parent>\
+                 <artifactId>root</artifactId><packaging>pom</packaging>\
+                 <modules><module>app</module></modules></project>",
+            ),
+            (
+                "corp/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+                 <artifactId>corp</artifactId><version>1</version><packaging>pom</packaging>\
+                 <properties><leaf.version>1</leaf.version></properties></project>",
+            ),
+            (
+                "app/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+                 <artifactId>app</artifactId><version>1</version><dependencies><dependency>\
+                 <groupId>ext</groupId><artifactId>lib</artifactId><version>1</version>\
+                 </dependency></dependencies></project>",
+            ),
+            (".mvn/maven.config", "-Dleaf.version=2\n"),
+        ]);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/ext/lib/1/lib-1.pom".to_string(),
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>p</groupId>\
+             <artifactId>root</artifactId><version>1</version><relativePath/></parent>\
+             <groupId>ext</groupId><artifactId>lib</artifactId><version>1</version>\
+             <dependencies><dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+             <version>${leaf.version}</version></dependency></dependencies></project>"
+                .as_bytes()
+                .to_vec(),
+        );
+        for version in ["1", "2"] {
+            routes.insert(
+                format!("/p/leaf/{version}/leaf-{version}.pom"),
+                pom("p", "leaf", version, ""),
+            );
+        }
+        let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+        let graph = resolve_graph(&resolver, &workspace, "app/pom.xml")
+            .await
+            .expect("resolves");
+        assert_eq!(
+            node_by_artifact(&graph, "leaf").1.coord.version.as_str(),
+            "1"
+        );
+    }
+
+    /// A dependency that inherits its version from a reactor module found
+    /// by the version `.mvn/maven.config` gives it takes the module's version
+    /// as written, expanded without the `-D` values (MNG-7563).
+    #[tokio::test]
+    async fn a_dependency_inherits_a_reactor_parents_version_as_written() {
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+                 <artifactId>root</artifactId><version>${revision}</version>\
+                 <packaging>pom</packaging><properties><revision>1</revision></properties>\
+                 <modules><module>app</module></modules></project>",
+            ),
+            (
+                "app/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+                 <artifactId>app</artifactId><version>1</version><dependencies><dependency>\
+                 <groupId>p</groupId><artifactId>lib</artifactId><version>2</version>\
+                 </dependency></dependencies></project>",
+            ),
+            (".mvn/maven.config", "-Drevision=2\n"),
+        ]);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/p/lib/2/lib-2.pom".to_string(),
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>p</groupId>\
+             <artifactId>root</artifactId><version>2</version><relativePath/></parent>\
+             <artifactId>lib</artifactId><dependencies><dependency><groupId>p</groupId>\
+             <artifactId>leaf</artifactId><version>${project.version}</version></dependency>\
+             </dependencies></project>"
+                .as_bytes()
+                .to_vec(),
+        );
+        for version in ["1", "2"] {
+            routes.insert(
+                format!("/p/leaf/{version}/leaf-{version}.pom"),
+                pom("p", "leaf", version, ""),
+            );
+        }
+        let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+        let graph = resolve_graph(&resolver, &workspace, "app/pom.xml")
+            .await
+            .expect("resolves");
+        assert_eq!(
+            node_by_artifact(&graph, "leaf").1.coord.version.as_str(),
+            "1"
+        );
+    }
+
+    /// A module version that a remote parent's property gives is the one
+    /// other modules depend on and import, as Maven indexes the reactor by
+    /// effective models.
+    #[tokio::test]
+    async fn module_versions_follow_remote_parent_properties() {
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>corp</groupId>\
+                 <artifactId>parent</artifactId><version>1.0</version><relativePath/></parent>\
+                 <artifactId>root</artifactId><version>${revision}</version>\
+                 <packaging>pom</packaging><modules><module>a</module><module>b</module>\
+                 </modules></project>",
+            ),
+            (
+                "a/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>corp</groupId>\
+                 <artifactId>root</artifactId><version>${revision}</version></parent>\
+                 <artifactId>a</artifactId><packaging>pom</packaging><dependencyManagement>\
+                 <dependencies><dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+                 <version>1</version></dependency></dependencies></dependencyManagement>\
+                 </project>",
+            ),
+            (
+                "b/pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>corp</groupId>\
+                 <artifactId>root</artifactId><version>${revision}</version></parent>\
+                 <artifactId>b</artifactId><dependencyManagement><dependencies><dependency>\
+                 <groupId>corp</groupId><artifactId>a</artifactId><version>${revision}</version>\
+                 <type>pom</type><scope>import</scope></dependency></dependencies>\
+                 </dependencyManagement><dependencies><dependency><groupId>corp</groupId>\
+                 <artifactId>a</artifactId><version>${revision}</version><type>pom</type>\
+                 </dependency><dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+                 </dependency></dependencies></project>",
+            ),
+        ]);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/corp/parent/1.0/parent-1.0.pom".to_string(),
+            pom(
+                "corp",
+                "parent",
+                "1.0",
+                "<packaging>pom</packaging><properties><revision>1.2.0</revision></properties>",
+            ),
+        );
+        routes.insert(
+            "/p/leaf/1/leaf-1.pom".to_string(),
+            pom("p", "leaf", "1", ""),
+        );
+        routes.insert("/p/leaf/1/leaf-1.jar".to_string(), b"leaf".to_vec());
+        let (url, _server) = spawn_repository_with_routes(routes);
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        let resolved = resolver
+            .resolve_workspace(&workspace)
+            .await
+            .expect("resolves");
+        let b = resolved
+            .modules
+            .iter()
+            .find(|module| module.pom_path == "b/pom.xml")
+            .expect("module b");
+        assert_eq!(b.resolution.module_gav.to_string(), "corp:b:1.2.0");
+        let a = node_by_artifact(&b.resolution.graph, "a").1;
+        assert_eq!(a.coord.version.as_str(), "1.2.0");
+        assert_eq!(
+            node_by_artifact(&b.resolution.graph, "leaf")
+                .1
+                .coord
+                .version
+                .as_str(),
+            "1"
+        );
+        assert_eq!(a.workspace_module.as_deref(), Some("a/pom.xml"));
+    }
+
+    /// Two modules that discovery sees with the same `${revision}` are told
+    /// apart by the versions their remote parents give, and fail only when
+    /// those are the same, as Maven's reactor does.
+    #[tokio::test]
+    async fn modules_are_compared_by_the_versions_their_remote_parents_give() {
+        let module = |parent: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>corp</groupId>\
+                 <artifactId>{parent}</artifactId><version>1.0</version><relativePath/>\
+                 </parent><groupId>g</groupId><artifactId>lib</artifactId>\
+                 <version>${{revision}}</version><packaging>pom</packaging></project>"
+            )
+        };
+        let (x, y) = (module("px"), module("py"));
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>corp</groupId>\
+                 <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                 <modules><module>x</module><module>y</module></modules></project>",
+            ),
+            ("x/pom.xml", &x),
+            ("y/pom.xml", &y),
+        ]);
+        for (y_revision, distinct) in [("2", true), ("1", false)] {
+            let mut routes = HashMap::new();
+            for (parent, revision) in [("px", "1"), ("py", y_revision)] {
+                routes.insert(
+                    format!("/corp/{parent}/1.0/{parent}-1.0.pom"),
+                    pom(
+                        "corp",
+                        parent,
+                        "1.0",
+                        &format!(
+                            "<packaging>pom</packaging><properties><revision>{revision}\
+                             </revision></properties>"
+                        ),
+                    ),
+                );
+            }
+            let (url, _server) = spawn_repository_with_routes(routes);
+            let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+            let result = resolver.resolve_workspace(&workspace).await;
+            if distinct {
+                let resolved = result.expect("distinct modules resolve");
+                let mut gavs: Vec<String> = resolved
+                    .modules
+                    .iter()
+                    .map(|module| module.resolution.module_gav.to_string())
+                    .collect();
+                gavs.sort();
+                assert_eq!(gavs, ["corp:root:1", "g:lib:1", "g:lib:2"]);
+            } else {
+                let error = result.expect_err("a collision fails").to_string();
+                assert!(error.contains("g:lib:1"), "{error}");
+            }
+        }
+    }
+
+    /// A module that inherits its version from a remote parent takes the
+    /// parent's `${revision}` with its own value, as Maven inherits the
+    /// parent model's version, and is indexed and compared by it. A
+    /// module's own version that names a platform value takes the parent's
+    /// property of that name.
+    #[tokio::test]
+    async fn a_module_inherits_a_remote_parents_version_expression() {
+        let module = |artifact: &str, own: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>g</groupId>\
+                 <artifactId>parent</artifactId><version>1</version><relativePath/></parent>\
+                 <artifactId>{artifact}</artifactId>{own}</project>"
+            )
+        };
+        let lib =
+            |artifact: &str| module(artifact, "<properties><revision>2</revision></properties>");
+        let app = module(
+            "app",
+            "<dependencies><dependency><groupId>g</groupId><artifactId>lib</artifactId>\
+             <version>2</version></dependency></dependencies>",
+        );
+        let routes = HashMap::from([(
+            "/g/parent/1/parent-1.pom".to_string(),
+            pom(
+                "g",
+                "parent",
+                "${revision}",
+                "<packaging>pom</packaging><properties><revision>1</revision>\
+                 <os.arch>2</os.arch></properties>",
+            ),
+        )]);
+        let (url, _server) = spawn_repository_with_routes(routes);
+        let root = "<project><modelVersion>4.0.0</modelVersion><groupId>corp</groupId>\
+                    <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                    <modules><module>a</module><module>b</module></modules></project>";
+        let versioned = module("lib", "<version>1</version>");
+        let distinct = Ok(["corp:root:1", "g:lib:1", "g:lib:2"]);
+        let with_app = Ok(["corp:root:1", "g:app:1", "g:lib:2"]);
+        let by_platform = module("lib", "<version>${os.arch}</version>");
+        for (a, b, outcome) in [
+            (lib("lib"), app.clone(), with_app),
+            (by_platform, app.clone(), with_app),
+            (lib("lib"), module("lib", ""), distinct),
+            (lib("lib"), versioned.clone(), distinct),
+            (versioned.clone(), lib("lib"), distinct),
+            (lib("lib"), lib("lib"), Err("g:lib:2")),
+        ] {
+            let (_dir, workspace) =
+                reactor(&[("pom.xml", root), ("a/pom.xml", &a), ("b/pom.xml", &b)]);
+            let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+            let result = resolver.resolve_workspace(&workspace).await;
+            match outcome {
+                Ok(expected) => {
+                    let resolved = result.unwrap_or_else(|error| panic!("{b}: {error}"));
+                    let mut gavs: Vec<String> = resolved
+                        .modules
+                        .iter()
+                        .map(|module| module.resolution.module_gav.to_string())
+                        .collect();
+                    gavs.sort();
+                    assert_eq!(gavs, expected);
+                }
+                Err(gav) => {
+                    let error = result.expect_err("a collision fails").to_string();
+                    assert!(error.contains(gav), "{error}");
+                }
+            }
+        }
+    }
+
+    /// A local parent's version is checked against a range as written, an
+    /// expression in it read as a qualifier: `${revision}` sorts below every
+    /// number, whatever value its own properties or `.mvn/maven.config` give
+    /// it, and `1.0${changelist}` between `1.0` and `1.0-custom`.
+    #[tokio::test]
+    async fn a_local_parent_with_an_expression_version_is_checked_as_written() {
+        let root = |version: &str, properties: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+                 <artifactId>par</artifactId><version>{version}</version>\
+                 <packaging>pom</packaging><properties>{properties}</properties>\
+                 <modules><module>app</module></modules><dependencyManagement><dependencies>\
+                 <dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+                 <version>1</version></dependency></dependencies></dependencyManagement>\
+                 </project>"
+            )
+        };
+        let app = |range: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>p</groupId>\
+                 <artifactId>par</artifactId><version>{range}</version></parent>\
+                 <artifactId>app</artifactId><version>1</version><dependencies><dependency>\
+                 <groupId>p</groupId><artifactId>leaf</artifactId></dependency></dependencies>\
+                 </project>"
+            )
+        };
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/p/leaf/1/leaf-1.pom".to_string(),
+            pom("p", "leaf", "1", ""),
+        );
+        for (version, properties, config, range, found) in [
+            ("${revision}", "<revision>1</revision>", "", "(,2]", true),
+            ("${revision}", "<revision>3</revision>", "", "(,2]", true),
+            ("${revision}", "", "-Drevision=1\n", "(,2]", true),
+            ("${revision}", "<revision>1</revision>", "", "[1,2]", false),
+            ("1.0${changelist}", "<changelist/>", "", "[1,2]", true),
+            (
+                "1.0${changelist}",
+                "<changelist/>",
+                "",
+                "[1.0,1.0-custom]",
+                true,
+            ),
+        ] {
+            let (_dir, workspace) = reactor(&[
+                ("pom.xml", &root(version, properties)),
+                ("app/pom.xml", &app(range)),
+                (".mvn/maven.config", config),
+            ]);
+            let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+            let result = resolve_graph(&resolver, &workspace, "app/pom.xml").await;
+            let case = format!("{version} {properties} {range}");
+            if found {
+                let graph = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+                assert!(has_artifact(&graph, "leaf"), "{case}");
+            } else {
+                let error = result.expect_err(&case).to_string();
+                assert!(error.contains("p:par:[1,2]"), "{error}");
+            }
+        }
+    }
+
+    /// A parent version range resolves to the highest version a repository
+    /// lists in it, or to a local parent in it, for the project and for a
+    /// dependency, `[1.5]` included. As in Maven, the range needs an upper
+    /// bound and the child its own constant version, and the model keeps the
+    /// range as its parent version. The POM served for the selected version
+    /// must declare it, maybe through its own parent, a profile there or a
+    /// user property. A range reads only the `<versions>` of a version list,
+    /// a range of one version needs no list, and the project's range sees
+    /// the repositories' versions, not the reactor's.
+    #[tokio::test]
+    async fn a_parent_version_range_takes_the_highest_version_in_it() {
+        let parent = |range: &str, path: &str| {
+            format!(
+                "<parent><groupId>p</groupId><artifactId>par</artifactId>\
+                 <version>{range}</version>{path}</parent>"
+            )
+        };
+        let leaf = "<dependency><groupId>p</groupId><artifactId>leaf</artifactId></dependency>";
+        let app = |parent: &str, version: &str, dependency: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion>{parent}<artifactId>app</artifactId>\
+                 {version}<dependencies>{dependency}</dependencies></project>"
+            )
+        };
+        let par = |version: &str, leaf: &str| {
+            pom(
+                "p",
+                "par",
+                version,
+                &format!(
+                    "<packaging>pom</packaging><modules><module>app</module></modules>\
+                     <dependencyManagement><dependencies><dependency><groupId>p</groupId>\
+                     <artifactId>leaf</artifactId><version>{leaf}</version></dependency>\
+                     </dependencies></dependencyManagement>"
+                ),
+            )
+        };
+        let mut routes = HashMap::new();
+        for (version, leaf) in [("1.0", "1"), ("1.5", "2"), ("2.0", "3")] {
+            routes.insert(
+                format!("/p/par/{version}/par-{version}.pom"),
+                par(version, leaf),
+            );
+            routes.insert(
+                format!("/p/leaf/{leaf}/leaf-{leaf}.pom"),
+                pom("p", "leaf", leaf, ""),
+            );
+        }
+        routes.insert("/p/par/3.5/par-3.5.pom".to_string(), par("3.0", "1"));
+        for (version, expression, revision) in [
+            (
+                "2.5",
+                "${revision}",
+                "<properties><revision>2.5</revision></properties>",
+            ),
+            (
+                "2.7",
+                "${revision}",
+                "<profiles><profile><id>on</id><activation><activeByDefault>true\
+                 </activeByDefault></activation><properties><revision>2.7</revision>\
+                 </properties></profile></profiles>",
+            ),
+            ("2.8", "${pom.parent.version}", ""),
+            (
+                "2.9",
+                "${par.release}",
+                "<properties><par.release>0</par.release></properties>",
+            ),
+        ] {
+            routes.insert(
+                format!("/p/top/{version}/top-{version}.pom"),
+                pom("p", "top", version, revision),
+            );
+            let payload = String::from_utf8(par(expression, "3")).unwrap().replacen(
+                "<groupId>p</groupId>",
+                &format!(
+                    "<parent><groupId>p</groupId><artifactId>top</artifactId>\
+                     <version>{version}</version><relativePath/></parent>"
+                ),
+                1,
+            );
+            routes.insert(
+                format!("/p/par/{version}/par-{version}.pom"),
+                payload.into_bytes(),
+            );
+        }
+        for (artifact, versions) in [("par", "1.5 2.0 2.5 2.7 2.8 2.9 3.5"), ("leaf", "1 2 3")] {
+            let versions: String = versions
+                .split(' ')
+                .map(|version| format!("<version>{version}</version>"))
+                .collect();
+            routes.insert(
+                format!("/p/{artifact}/maven-metadata.xml"),
+                format!(
+                    "<metadata><groupId>p</groupId><artifactId>{artifact}</artifactId>\
+                     <versioning><versions>{versions}</versions></versioning></metadata>"
+                )
+                .into_bytes(),
+            );
+        }
+        routes.insert(
+            "/ext/lib/1/lib-1.pom".to_string(),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion>{}<groupId>ext</groupId>\
+                 <artifactId>lib</artifactId><version>1</version><dependencies><dependency>\
+                 <groupId>p</groupId><artifactId>leaf</artifactId></dependency></dependencies>\
+                 </project>",
+                parent("[1.0,2.0)", "")
+            )
+            .into_bytes(),
+        );
+        let remote = parent("[1.0,2.0)", "<relativePath/>");
+        let local_root = String::from_utf8(par("1.0", "1")).unwrap();
+        let lib = "<dependency><groupId>ext</groupId><artifactId>lib</artifactId>\
+                   <version>1</version></dependency>";
+        routes.insert(
+            "/p/bare/maven-metadata.xml".to_string(),
+            b"<metadata><groupId>p</groupId><artifactId>bare</artifactId><versioning>\
+              <release>1.5</release><latest>1.5</latest></versioning></metadata>"
+                .to_vec(),
+        );
+        routes.insert(
+            "/p/bare/1.5/bare-1.5.pom".to_string(),
+            pom("p", "bare", "1.5", "<packaging>pom</packaging>"),
+        );
+        let ranged_leaf = "<dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+                           <version>${project.parent.version}</version></dependency>";
+        let cases: [(&str, String, Result<&str, &str>); 19] = [
+            (
+                "exact",
+                app(
+                    &parent("[1.5]", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Ok("2"),
+            ),
+            (
+                "local exact",
+                app(&parent("[1.0]", ""), "<version>1</version>", leaf),
+                Ok("1"),
+            ),
+            (
+                "other payload",
+                app(
+                    &parent("[3.0,4.0)", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Err("expected p:par:3.5, got p:par:3.0"),
+            ),
+            (
+                "remote",
+                app(&remote, "<groupId>g</groupId><version>1</version>", leaf),
+                Ok("2"),
+            ),
+            (
+                "local",
+                app(&parent("[1.0,2.0)", ""), "<version>1</version>", leaf),
+                Ok("1"),
+            ),
+            (
+                "unbounded",
+                app(
+                    &parent("[1.0,)", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Err("does not specify an upper bound"),
+            ),
+            (
+                "no match",
+                app(
+                    &parent("[4.0,5.0)", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Err("p:par:[4.0,5.0)"),
+            ),
+            (
+                "inherited version",
+                app(&remote, "", leaf),
+                Err("must be a constant"),
+            ),
+            (
+                "parent version expression",
+                app(&remote, "<version>${pom.parent.version}</version>", leaf),
+                Err("must be a constant"),
+            ),
+            (
+                "derived version",
+                app(
+                    &remote,
+                    "<version>${project.parent.version}-app</version>",
+                    leaf,
+                ),
+                Ok("2"),
+            ),
+            (
+                "range in the model",
+                app(&remote, "<version>1</version>", ranged_leaf),
+                Ok("1"),
+            ),
+            (
+                "expression payload",
+                app(
+                    &parent("[2.5,2.6)", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Ok("3"),
+            ),
+            (
+                "profile payload",
+                app(
+                    &parent("[2.7]", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Ok("3"),
+            ),
+            (
+                "parent alias payload",
+                app(
+                    &parent("[2.8]", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Ok("3"),
+            ),
+            (
+                "user property payload",
+                app(
+                    &parent("[2.9]", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Ok("3"),
+            ),
+            (
+                "exact without a list",
+                app(
+                    &parent("[1.0,1]", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Ok("1"),
+            ),
+            (
+                "no version list",
+                app(
+                    &parent("[1.0,2.0)", "<relativePath/>")
+                        .replace("<artifactId>par<", "<artifactId>bare<"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Err("p:bare:[1.0,2.0)"),
+            ),
+            (
+                "reactor not listed",
+                app(
+                    &parent("[1.0,1.2)", "<relativePath/>"),
+                    "<version>1</version>",
+                    leaf,
+                ),
+                Err("p:par:[1.0,1.2)"),
+            ),
+            (
+                "dependency",
+                app("", "<groupId>g</groupId><version>1</version>", lib),
+                Ok("2"),
+            ),
+        ];
+        for (name, app, expected) in cases {
+            let (_dir, workspace) = reactor(&[
+                ("pom.xml", &local_root),
+                ("app/pom.xml", &app),
+                (".mvn/maven.config", "-Dpar.release=2.9\n"),
+            ]);
+            let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+            let result = resolve_graph(&resolver, &workspace, "app/pom.xml").await;
+            match expected {
+                Ok(leaf) => {
+                    let graph = result.unwrap_or_else(|error| panic!("{name}: {error}"));
+                    let version = node_by_artifact(&graph, "leaf").1.coord.version.to_string();
+                    assert_eq!(version, leaf, "{name}");
+                }
+                Err(part) => {
+                    let error = result.expect_err(name).to_string();
+                    assert!(error.contains(part), "{name}: {error}");
+                }
+            }
+        }
+    }
+
+    /// The whole fixture reactor resolves in discovery order, and a
+    /// sibling's declared repository is trusted for another module.
+    #[tokio::test]
+    async fn reactor_resolves_in_discovery_order_and_trusts_sibling_repositories() {
         let (url, requests) = spawn_repository();
         let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        copy_tree(&fixture("basic"), workspace_dir.path()).expect("copy fixture");
+        fixtures::copy_tree_lf(&fixture("basic"), workspace_dir.path());
         let repo_owner = workspace_dir.path().join("repo-owner/pom.xml");
         let contents = std::fs::read_to_string(&repo_owner)
             .expect("read repo owner")
             .replace("__REPO_URL__", &url);
         std::fs::write(&repo_owner, contents).expect("rewrite repo URL");
         let workspace = Workspace::discover(workspace_dir.path()).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, false).await;
 
-        let result = resolve_module(&resolver, &workspace, "repo-app/pom.xml")
+        let (single, _store) = resolver(workspace.root(), Some(&url), false, false).await;
+        let result = resolve_module(&single, &workspace, "repo-app/pom.xml")
             .await
             .expect("trusted sibling repo resolves vendor dependency");
-        let (_, vendor) = node_by_artifact(&result.graph, "only-here");
-
-        assert!(vendor.repo_url.is_some());
+        assert!(
+            node_by_artifact(&result.graph, "only-here")
+                .1
+                .repo_url
+                .is_some()
+        );
         assert!(
             requests
                 .requests()
                 .iter()
                 .any(|request| request.path == "/org/vendor/only-here/1/only-here-1.pom")
         );
+
+        let (all, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        let resolved = all.resolve_workspace(&workspace).await.expect("resolve");
+        let paths = |paths: Vec<&str>| paths.join(" ");
+        assert_eq!(
+            paths(
+                resolved
+                    .modules
+                    .iter()
+                    .map(|m| m.pom_path.as_str())
+                    .collect()
+            ),
+            paths(
+                workspace
+                    .modules()
+                    .iter()
+                    .map(|m| m.pom_path.as_str())
+                    .collect()
+            )
+        );
+        assert!(resolved.modules.iter().any(|module| {
+            let graph = &module.resolution.graph;
+            graph.node_indices().any(|index| {
+                graph
+                    .node(index)
+                    .is_some_and(|node| node.workspace_module.is_some())
+            })
+        }));
+    }
+
+    /// A repository behind a blocked mirror gets no request, through the
+    /// mirror or around it, and the search goes on to the next repository.
+    #[tokio::test]
+    async fn a_blocked_mirror_moves_the_search_on() {
+        ensure_crypto_provider();
+        let repositories = tempfile::tempdir().unwrap();
+        let repository = |name: &str| {
+            let root = repositories.path().join(name);
+            let dir = root.join("lib/x/1");
+            std::fs::create_dir_all(&dir).unwrap();
+            for (extension, bytes) in [("pom", pom("lib", "x", "1", "")), ("jar", name.into())] {
+                let path = dir.join(format!("x-1.{extension}"));
+                std::fs::write(&path, &bytes).unwrap();
+                std::fs::write(
+                    path.with_extension(format!("{extension}.sha256")),
+                    BlobId::from_bytes(&bytes).to_string(),
+                )
+                .unwrap();
+            }
+            reqwest::Url::from_directory_path(&root)
+                .unwrap()
+                .to_string()
+        };
+        let (first, second) = (repository("first"), repository("second"));
+        let mut blocked = rv_config::MirrorConfig::new(Some("blocked"), &repository("mirror"));
+        blocked.mirror_of = vec!["first".to_string()];
+        blocked.blocked = true;
+        let (_dir, workspace) = reactor(&[(
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version><dependencies><dependency>\
+             <groupId>lib</groupId><artifactId>x</artifactId><version>1</version>\
+             </dependency></dependencies></project>",
+        )]);
+        let config = Config::for_testing_with_repos(
+            workspace.root().to_path_buf(),
+            ResolvedPaths::for_testing().unwrap(),
+            vec![
+                rv_config::RepoConfig::new(Some("first"), &first),
+                rv_config::RepoConfig::new(Some("second"), &second),
+            ],
+        )
+        .with_mirrors(vec![blocked]);
+        let client = RepoClient::new(&config).await.unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_dir.path()).unwrap());
+        let context = ResolveContext::new(
+            config.clone(),
+            config.repositories().iter().map(Repository::from).collect(),
+            store,
+            Platform::new("linux", "x86_64").unwrap(),
+            Some(client),
+        );
+        let resolved = PlatformResolver::new(context)
+            .resolve_workspace(&workspace)
+            .await
+            .unwrap();
+        let (_, node) = node_by_artifact(&resolved.modules[0].resolution.graph, "x");
+        assert_eq!(node.checksum, Some(BlobId::from_bytes(b"second")));
+        assert_eq!(node.repo_url.as_deref(), Some(second.as_str()));
     }
 
     #[tokio::test]
-    async fn per_module_driver_resolves_in_discovery_order_with_bounded_budget() {
-        let (url, _server) = spawn_repository();
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        copy_tree(&fixture("basic"), workspace_dir.path()).expect("copy fixture");
-        let repo_owner = workspace_dir.path().join("repo-owner/pom.xml");
-        let contents = std::fs::read_to_string(&repo_owner)
-            .expect("read repo owner")
-            .replace("__REPO_URL__", &url);
-        std::fs::write(&repo_owner, contents).expect("rewrite repo URL");
-        let workspace = Workspace::discover(workspace_dir.path()).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
-
-        let resolved = resolver
-            .resolve_workspace(&workspace)
-            .await
-            .expect("resolve workspace");
-
-        assert_eq!(resolved.modules.len(), workspace.len());
-        assert_eq!(
-            resolved
-                .modules
-                .iter()
-                .map(|module| module.pom_path.as_str())
-                .collect::<Vec<_>>(),
-            workspace
-                .modules()
-                .iter()
-                .map(|module| module.pom_path.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            resolved
-                .modules
-                .iter()
-                .any(
-                    |module| module.resolution.graph.node_indices().any(|index| {
-                        module
-                            .resolution
-                            .graph
-                            .node(index)
-                            .is_some_and(|node| node.workspace_module.is_some())
-                    })
-                )
-        );
-    }
-
-    #[test]
-    fn module_concurrency_cap_is_documented_and_sane() {
-        assert_eq!(crate::MAX_WORKSPACE_MODULE_CONCURRENCY, 4);
-        assert_eq!(crate::MAX_WORKSPACE_ARTIFACT_POPULATIONS, 1);
-    }
-
-    /// Resolves the workspaces in the manually cloned acceptance corpus.
-    ///
-    /// The corpus is PINNED: the per-project module counts asserted below are
-    /// properties of these exact refs, not of the projects' default branches
-    /// (upstream trunk adds and removes modules, so an unpinned checkout drifts
-    /// and fails here for reasons unrelated to resolution). Clone with:
-    ///
-    /// ```sh
-    /// git clone --depth 1 --branch 3.0.5 https://github.com/apache/pdfbox.git pdfbox
-    /// git clone --depth 1 --branch v5.0.2 https://github.com/dropwizard/dropwizard.git dropwizard
-    /// ```
-    ///
-    /// Set `RV_ACCEPTANCE_CORPUS` to the directory that holds those two
-    /// checkouts. The test skips when the variable is unset.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires the manually cloned acceptance corpus and network access"]
-    async fn resolves_real_pdfbox_and_dropwizard_workspaces() {
-        use crate::workspace::corpus::{
-            DROPWIZARD_MODULE_COUNT, DROPWIZARD_REF, PDFBOX_MODULE_COUNT, PDFBOX_REF, clone_hint,
-            corpus_drift_hint,
-        };
-
-        let Ok(corpus_root) = std::env::var("RV_ACCEPTANCE_CORPUS") else {
-            println!(
-                "skipping: set RV_ACCEPTANCE_CORPUS to the acceptance corpus directory to run \
-                 this test ({})",
-                clone_hint()
-            );
-            return;
-        };
-        let corpus_root = Path::new(&corpus_root);
-
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("rv_resolver::workspace=debug")
-            .with_test_writer()
-            .try_init();
-        assert_eq!(
-            std::env::var("JAVA_VERSION").as_deref(),
-            Ok("21"),
-            "run the corpus smoke with JAVA_VERSION=21"
-        );
+    async fn reactor_artifact_reuse_is_scoped_to_the_selected_endpoint() {
         ensure_crypto_provider();
-        let store_dir = tempfile::tempdir().expect("corpus store");
-        let store = Arc::new(Store::open(store_dir.path()).expect("store"));
-
-        for (project_name, corpus_ref, expected_modules) in [
-            ("pdfbox", PDFBOX_REF, PDFBOX_MODULE_COUNT),
-            ("dropwizard", DROPWIZARD_REF, DROPWIZARD_MODULE_COUNT),
-        ] {
-            let project_root = corpus_root.join(project_name);
-            let workspace = Workspace::discover(&project_root)
-                .unwrap_or_else(|error| panic!("discover {project_name}: {error}"));
-            assert_eq!(
-                workspace.len(),
-                expected_modules,
-                "{}",
-                corpus_drift_hint(project_name, corpus_ref)
-            );
-            let paths = ResolvedPaths::for_testing().expect("paths");
-            let mut config =
-                Config::for_testing_with_repos(project_root.clone(), paths, Vec::new());
-            config.network.concurrency = 16;
-            let client = RepoClient::new(&config)
-                .await
-                .expect("repo client")
-                .with_allow_missing_checksums(true);
-            let repositories = config.repositories().iter().map(Repository::from).collect();
-            let platform = Platform::new("linux", "x86_64").expect("platform");
-            let context = ResolveContext::new(
-                config,
-                repositories,
-                Arc::clone(&store),
-                platform,
-                Some(client),
-            );
-            let resolver = Resolver::with_strategy(context, ResolutionStrategy::NearestWins);
-            let resolved = resolver
-                .resolve_workspace(&workspace)
-                .await
-                .unwrap_or_else(|error| panic!("resolve {project_name}: {error}"));
-
-            println!("{project_name}: {} modules", resolved.modules.len());
-            assert_eq!(
-                resolved.modules.len(),
-                expected_modules,
-                "{}",
-                corpus_drift_hint(project_name, corpus_ref)
-            );
-            for module in &resolved.modules {
-                let mut workspace_nodes = 0;
-                let mut external_nodes = 0;
-                for index in module.resolution.graph.node_indices() {
-                    let Some(node) = module.resolution.graph.node(index) else {
-                        continue;
-                    };
-                    if node.workspace_module.is_some() {
-                        workspace_nodes += 1;
-                    } else if !node.local {
-                        external_nodes += 1;
-                    }
-                }
-                println!(
-                    "{project_name}\t{}\texternal={external_nodes}\tworkspace={workspace_nodes}",
-                    module.pom_path
+        let repositories = tempfile::tempdir().unwrap();
+        let repository = |name: &str, jar: &[u8]| {
+            let root = repositories.path().join(name);
+            let dir = root.join("lib/x/1");
+            std::fs::create_dir_all(&dir).unwrap();
+            for (extension, bytes) in [("pom", pom("lib", "x", "1", "")), ("jar", jar.to_vec())] {
+                let path = dir.join(format!("x-1.{extension}"));
+                std::fs::write(&path, &bytes).unwrap();
+                std::fs::write(
+                    path.with_extension(format!("{extension}.sha256")),
+                    BlobId::from_bytes(&bytes).to_string(),
+                )
+                .unwrap();
+            }
+            format!("file://{}/", root.display())
+        };
+        let direct = repository("direct", b"direct jar");
+        let mirror_url = repository("mirror", b"mirror jar");
+        let module = |id: &str| {
+            String::from_utf8(pom(
+                "t",
+                id,
+                "1",
+                &format!(
+                    "<repositories><repository><id>{id}</id><url>{direct}</url>\
+                     </repository></repositories><dependencies><dependency><groupId>lib</groupId>\
+                     <artifactId>x</artifactId><version>1</version></dependency></dependencies>"
+                ),
+            ))
+            .unwrap()
+        };
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                 <modules><module>a</module><module>b</module></modules></project>",
+            ),
+            ("a/pom.xml", &module("a")),
+            ("b/pom.xml", &module("b")),
+        ]);
+        let mut mirror = rv_config::MirrorConfig::new(Some("mirror"), &mirror_url);
+        mirror.mirror_of = vec!["a".to_string()];
+        let config = Config::for_testing(
+            workspace.root().to_path_buf(),
+            ResolvedPaths::for_testing().unwrap(),
+        )
+        .with_mirrors(vec![mirror]);
+        let client = RepoClient::new(&config).await.unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_dir.path()).unwrap());
+        let context = ResolveContext::new(
+            config.clone(),
+            Vec::new(),
+            store,
+            Platform::new("linux", "x86_64").unwrap(),
+            Some(client),
+        );
+        let resolver = PlatformResolver::new(context);
+        // Exercise both downloaded and persisted-cache insertions into reactor reuse.
+        for _ in 0..2 {
+            let resolved = resolver.resolve_workspace(&workspace).await.unwrap();
+            for (path, bytes) in [("a/pom.xml", b"mirror jar"), ("b/pom.xml", b"direct jar")] {
+                let module = resolved
+                    .modules
+                    .iter()
+                    .find(|module| module.pom_path == path)
+                    .unwrap();
+                assert_eq!(
+                    node_by_artifact(&module.resolution.graph, "x").1.checksum,
+                    Some(BlobId::from_bytes(bytes)),
+                    "{path}"
                 );
             }
+            let hashes = Default::default();
+            let model = crate::lock::PlatformModel {
+                active_profiles: &[],
+                pom_hashes: &hashes,
+                whole_reactor_pom_hashes: &hashes,
+            };
+            let error = crate::lock::assemble(&config, vec![(model, resolved)]).unwrap_err();
+            assert!(
+                matches!(error, crate::lock::AssembleError::Resolve(error) if matches!(*error, ResolveError::ConflictingArtifactBytes { .. }))
+            );
         }
     }
 
-    /// Regression: an all-reactor resolve of modules with heavily overlapping
-    /// dependency sets must finish.
-    ///
-    /// This is the shape that hung `rv sync` on real reactors (slf4j, pdfbox,
-    /// dropwizard, netty). More modules than `MAX_WORKSPACE_MODULE_CONCURRENCY`
-    /// so the fan-out slots recycle, every module pulling the same external
-    /// dependencies, and every one of those dependencies carrying a remote
-    /// `<parent>` — which is what drives model resolution through the
-    /// synchronous bridge in `sync_bridge`, where the lost wakeup lived.
-    ///
-    /// The stall watchdog is given a short window and passed in directly (no
-    /// process-global env var, so this stays safe under a parallel test
-    /// binary). A regression therefore surfaces as `WorkspaceStalled` rather
-    /// than as a test binary that never exits.
+    /// A reactor pass indexes everything it downloaded once at its end,
+    /// also when a later module fails, so a rerun reuses those files.
+    #[tokio::test]
+    async fn a_failed_module_leaves_the_earlier_downloads_indexed() {
+        let mut routes = HashMap::new();
+        routes.insert("/lib/ok/1/ok-1.pom".to_string(), pom("lib", "ok", "1", ""));
+        routes.insert("/lib/ok/1/ok-1.jar".to_string(), b"ok jar".to_vec());
+        routes.insert(
+            "/lib/gone/1/gone-1.pom".to_string(),
+            pom("lib", "gone", "1", ""),
+        );
+        let (url, _server) = spawn_repository_with_routes(routes);
+        let module = |name: &str, dependency: &str| {
+            String::from_utf8(pom(
+                "t",
+                name,
+                "1",
+                &format!(
+                    "<dependencies><dependency><groupId>lib</groupId>\
+                     <artifactId>{dependency}</artifactId><version>1</version></dependency>\
+                     </dependencies>"
+                ),
+            ))
+            .unwrap()
+        };
+        let (a, b) = (module("a", "ok"), module("b", "gone"));
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                 <modules><module>a</module><module>b</module></modules></project>",
+            ),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &b),
+        ]);
+        let (resolver, store_dir) = resolver(workspace.root(), Some(&url), false, true).await;
+
+        let error = resolver
+            .resolve_workspace(&workspace)
+            .await
+            .expect_err("lib:gone has no jar");
+        assert!(error.to_string().contains("gone"), "{error}");
+
+        let store = Store::open(store_dir.path()).expect("store");
+        for extension in ["jar", "pom"] {
+            let key = rv_maven_types::ArtifactCoord::new("lib", "ok", "1", extension, None);
+            assert!(store.lookup_artifact(&key).await.unwrap().is_some());
+        }
+    }
+
+    /// The store is shared by every project, but a resolution reuses only
+    /// bytes the same repository served with a checksum: another
+    /// repository's jar for the coordinate, or one admitted without a
+    /// checksum, is not taken. Its own copy is.
+    #[tokio::test]
+    async fn a_cached_jar_is_reused_only_from_the_repository_that_verified_it() {
+        ensure_crypto_provider();
+        let serve = |jar: &[u8], jar_sidecar: bool| {
+            let mut routes = HashMap::new();
+            let base = "/lib/x/1/x-1";
+            for (extension, bytes) in [("pom", pom("lib", "x", "1", "")), ("jar", jar.to_vec())] {
+                if extension == "pom" || jar_sidecar {
+                    let sidecar = BlobId::from_bytes(&bytes).to_string();
+                    routes.insert(format!("{base}.{extension}.sha256"), sidecar.into_bytes());
+                }
+                routes.insert(format!("{base}.{extension}"), bytes);
+            }
+            spawn_repository_with_routes(routes)
+        };
+        let (_project, workspace) = reactor(&[(
+            "pom.xml",
+            &String::from_utf8(pom(
+                "t",
+                "app",
+                "1",
+                "<dependencies><dependency><groupId>lib</groupId><artifactId>x</artifactId>\
+                 <version>1</version></dependency></dependencies>",
+            ))
+            .unwrap(),
+        )]);
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let resolve = |url: String, allow_missing: bool| {
+            let (root, store_dir) = (
+                workspace.root().to_path_buf(),
+                store_dir.path().to_path_buf(),
+            );
+            let workspace = workspace.clone();
+            async move {
+                let paths = ResolvedPaths::for_testing().expect("paths");
+                let config = Config::for_testing_with_repos(root, paths, vec![repo_config(&url)]);
+                let client = RepoClient::new(&config)
+                    .await
+                    .expect("repo client")
+                    .with_allow_missing_checksums(allow_missing);
+                let repos = config.repositories().iter().map(Repository::from).collect();
+                let store = Arc::new(Store::open(&store_dir).expect("store"));
+                let platform = Platform::new("linux", "x86_64").expect("platform");
+                let context = ResolveContext::new(config, repos, store, platform, Some(client));
+                let resolver = PlatformResolver::new(context);
+                resolve_module(&resolver, &workspace, "pom.xml")
+                    .await
+                    .map(|resolution| node_by_artifact(&resolution.graph, "x").1.checksum.clone())
+            }
+        };
+
+        let (a, a_server) = serve(b"jar from a", true);
+        let (b, _b) = serve(b"jar from b", true);
+        for (url, jar) in [
+            (&a, b"jar from a"),
+            (&b, b"jar from b"),
+            (&a, b"jar from a"),
+        ] {
+            let blob = resolve(url.clone(), false).await.expect("resolve");
+            assert_eq!(blob, Some(BlobId::from_bytes(jar)), "{url}");
+        }
+        // Back on repository a, its own copy is reused.
+        let jar_requests = (a_server.requests().iter())
+            .filter(|request| request.path == "/lib/x/1/x-1.jar")
+            .count();
+        assert_eq!(jar_requests, 1);
+
+        let (unchecked, _unchecked) = serve(b"jar without a checksum", false);
+        resolve(unchecked.clone(), true)
+            .await
+            .expect("allowed without a checksum");
+        let err = resolve(unchecked, false)
+            .await
+            .expect_err("strict needs a checksum");
+        assert!(err.to_string().contains("checksum"), "{err}");
+    }
+
+    /// Building the effective coordinates of modules whose remote parents give
+    /// their `${revision}` counts as progress for the stall watchdog, fetch by
+    /// fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn effective_module_coordinates_keep_the_watchdog_quiet() {
+        const MODULES: usize = 3;
+        // The server answers one POM at a time in 150ms, so the 18 parent
+        // fetches take 2.7s, over twice the watchdog's window, and the window
+        // leaves room for the slower steps of a loaded machine.
+        const LEVELS: usize = 6;
+        let mut routes = HashMap::new();
+        let mut files = vec![(
+            "pom.xml".to_string(),
+            String::from_utf8(pom(
+                "g",
+                "root",
+                "1",
+                &format!(
+                    "<packaging>pom</packaging><modules>{}</modules>",
+                    (0..MODULES)
+                        .map(|m| format!("<module>m{m}</module>"))
+                        .collect::<String>()
+                ),
+            ))
+            .unwrap(),
+        )];
+        for m in 0..MODULES {
+            // A chain of remote parents, each one round trip.
+            for level in 0..LEVELS {
+                let parent = if level + 1 < LEVELS {
+                    format!(
+                        "<parent><groupId>corp</groupId><artifactId>p{m}-{}</artifactId>\
+                         <version>1</version><relativePath/></parent>",
+                        level + 1
+                    )
+                } else {
+                    "<properties><revision>1</revision></properties>".to_string()
+                };
+                routes.insert(
+                    format!("/corp/p{m}-{level}/1/p{m}-{level}-1.pom"),
+                    pom(
+                        "corp",
+                        &format!("p{m}-{level}"),
+                        "1",
+                        &format!("<packaging>pom</packaging>{parent}"),
+                    ),
+                );
+            }
+            files.push((
+                format!("m{m}/pom.xml"),
+                format!(
+                    "<project><modelVersion>4.0.0</modelVersion><parent><groupId>corp</groupId>\
+                     <artifactId>p{m}-0</artifactId><version>1</version><relativePath/></parent>\
+                     <groupId>g</groupId><artifactId>m{m}</artifactId>\
+                     <version>${{revision}}</version><packaging>pom</packaging></project>"
+                ),
+            ));
+        }
+        let server = StubServer::start(move |request| {
+            if request.path.ends_with(".pom") {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            routes.get(&request.path).map_or_else(
+                || Response::new(404, ""),
+                |body| Response::new(200, body.clone()),
+            )
+        });
+        let url = format!("http://{}/", server.addr());
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let (_dir, workspace) = reactor(&files);
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        let resolved = resolver
+            .resolve_workspace_with_stall_timeout(
+                &workspace,
+                Some(std::time::Duration::from_millis(1_200)),
+            )
+            .await
+            .expect("steady parent fetches are progress");
+        assert_eq!(resolved.modules.len(), MODULES + 1);
+    }
+
+    /// An all-reactor resolve of more modules than run at once, all pulling
+    /// the same dependencies with a remote parent, must finish; a hang shows
+    /// as `WorkspaceStalled` under the short watchdog window.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn overlapping_reactor_modules_resolve_without_stalling() {
         const MODULES: usize = 8;
         const SHARED_DEPS: usize = 6;
-
-        let mut routes: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut routes = HashMap::new();
         routes.insert(
             "/org/shared/shared-parent/1/shared-parent-1.pom".to_string(),
-            br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>org.shared</groupId>
-  <artifactId>shared-parent</artifactId>
-  <version>1</version>
-  <packaging>pom</packaging>
-</project>"#
-                .to_vec(),
-        );
-        for dep in 0..SHARED_DEPS {
-            routes.insert(
-                format!("/org/shared/dep-{dep}/1/dep-{dep}-1.pom"),
-                format!(
-                    r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <parent>
-    <groupId>org.shared</groupId>
-    <artifactId>shared-parent</artifactId>
-    <version>1</version>
-  </parent>
-  <groupId>org.shared</groupId>
-  <artifactId>dep-{dep}</artifactId>
-  <version>1</version>
-</project>"#
-                )
-                .into_bytes(),
-            );
-            routes.insert(
-                format!("/org/shared/dep-{dep}/1/dep-{dep}-1.jar"),
-                format!("shared-dep-{dep}").into_bytes(),
-            );
-        }
-        let (url, _requests) = spawn_repository_with_routes(routes);
-
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        let module_names: Vec<String> = (0..MODULES).map(|m| format!("m{m}")).collect();
-        let module_elements = module_names
-            .iter()
-            .map(|name| format!("    <module>{name}</module>"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(
-            workspace_dir.path().join("pom.xml"),
-            format!(
-                r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>reactor</artifactId>
-  <version>1</version>
-  <packaging>pom</packaging>
-  <modules>
-{module_elements}
-  </modules>
-</project>"#
+            pom(
+                "org.shared",
+                "shared-parent",
+                "1",
+                "<packaging>pom</packaging>",
             ),
-        )
-        .expect("write root pom");
-
-        let dependencies = (0..SHARED_DEPS)
-            .map(|dep| {
-                format!(
-                    "    <dependency><groupId>org.shared</groupId>\
-                     <artifactId>dep-{dep}</artifactId><version>1</version></dependency>"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        for name in &module_names {
-            let dir = workspace_dir.path().join(name);
-            std::fs::create_dir_all(&dir).expect("module dir");
-            std::fs::write(
-                dir.join("pom.xml"),
-                format!(
-                    r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>{name}</artifactId>
-  <version>1</version>
-  <dependencies>
-{dependencies}
-  </dependencies>
-</project>"#
+        );
+        let mut dependencies = String::new();
+        for dep in 0..SHARED_DEPS {
+            let base = format!("/org/shared/dep-{dep}/1/dep-{dep}-1");
+            routes.insert(
+                format!("{base}.pom"),
+                pom(
+                    "org.shared",
+                    &format!("dep-{dep}"),
+                    "1",
+                    "<parent><groupId>org.shared</groupId><artifactId>shared-parent</artifactId>\
+                     <version>1</version></parent>",
                 ),
-            )
-            .expect("write module pom");
+            );
+            routes.insert(format!("{base}.jar"), format!("dep-{dep}").into_bytes());
+            dependencies.push_str(&format!(
+                "<dependency><groupId>org.shared</groupId><artifactId>dep-{dep}</artifactId>\
+                 <version>1</version></dependency>"
+            ));
         }
-
-        let workspace = Workspace::discover(workspace_dir.path()).expect("workspace");
-        assert_eq!(workspace.len(), MODULES + 1, "root plus every module");
+        let (url, _server) = spawn_repository_with_routes(routes);
+        let names: Vec<String> = (0..MODULES).map(|m| format!("m{m}")).collect();
+        let modules: String = names
+            .iter()
+            .map(|name| format!("<module>{name}</module>"))
+            .collect();
+        let root = pom(
+            "com.example",
+            "reactor",
+            "1",
+            &format!("<packaging>pom</packaging><modules>{modules}</modules>"),
+        );
+        let mut files = vec![("pom.xml".to_string(), String::from_utf8(root).unwrap())];
+        for name in &names {
+            let body = pom(
+                "com.example",
+                name,
+                "1",
+                &format!("<dependencies>{dependencies}</dependencies>"),
+            );
+            files.push((format!("{name}/pom.xml"), String::from_utf8(body).unwrap()));
+        }
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        let (_dir, workspace) = reactor(&files);
         let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
 
         let resolved = resolver
             .resolve_workspace_with_stall_timeout(
                 &workspace,
-                // Generous next to the milliseconds this takes against a
-                // loopback stub, small enough that a regression fails fast.
                 Some(std::time::Duration::from_secs(30)),
             )
             .await
             .expect("overlapping reactor modules must resolve");
-
         assert_eq!(resolved.modules.len(), MODULES + 1);
-        for module in &resolved.modules {
-            if module.pom_path == "pom.xml" {
-                continue;
-            }
+        for module in resolved.modules.iter().filter(|m| m.pom_path != "pom.xml") {
             assert_eq!(
                 module.resolution.packages.len(),
                 SHARED_DEPS,
-                "{} should pin every shared dependency",
+                "{}",
                 module.pom_path
             );
         }
     }
-
-    /// A module is only in the watchdog's in-flight set while it builds its
-    /// graph, but artifact population runs later, in its own serialized phase.
-    /// A download wedged there used to produce a stall report that named
-    /// nothing at all — the least useful moment to lose the label, since the
-    /// phase and the module together are what point at the wedged work.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stall_during_artifact_population_names_the_module_and_phase() {
-        let dep_pom = br#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>org.shared</groupId>
-  <artifactId>hangs</artifactId>
-  <version>1</version>
-</project>"#;
-        let routes = HashMap::from([(
-            "/org/shared/hangs/1/hangs-1.pom".to_string(),
-            dep_pom.to_vec(),
-        )]);
-        let (url, _requests) = spawn_repository_hanging_on_jars(routes).await;
-
-        let workspace_dir = tempfile::tempdir().expect("workspace tempdir");
-        std::fs::write(
-            workspace_dir.path().join("pom.xml"),
-            r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>reactor</artifactId>
-  <version>1</version>
-  <packaging>pom</packaging>
-  <modules>
-    <module>m0</module>
-  </modules>
-</project>"#,
-        )
-        .expect("write root pom");
-        let module_dir = workspace_dir.path().join("m0");
-        std::fs::create_dir_all(&module_dir).expect("module dir");
-        std::fs::write(
-            module_dir.join("pom.xml"),
-            r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>m0</artifactId>
-  <version>1</version>
-  <dependencies>
-    <dependency><groupId>org.shared</groupId>
-      <artifactId>hangs</artifactId><version>1</version></dependency>
-  </dependencies>
-</project>"#,
-        )
-        .expect("write module pom");
-
-        let workspace = Workspace::discover(workspace_dir.path()).expect("workspace");
-        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
-
-        let error = resolver
-            .resolve_workspace_with_stall_timeout(
-                &workspace,
-                // Well below rv-repo's request timeout, so the watchdog is
-                // what ends the run.
-                Some(std::time::Duration::from_secs(2)),
-            )
-            .await
-            .expect_err("a download that never answers must be reported, not waited on");
-
-        match error {
-            ResolveError::WorkspaceStalled { modules, .. } => {
-                assert_eq!(
-                    modules, "m0/pom.xml (artifact population)",
-                    "the stall must name the module and the phase it was in"
-                );
-            }
-            other => panic!("expected WorkspaceStalled, got {other:?}"),
-        }
-    }
-}
-
-#[test]
-fn resolution_result_builds_lockfile() {
-    let root = Node {
-        coord: Coord::parse("com.example:root:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: None,
-        checksum: None,
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let mut graph = Graph::new(root);
-    let dep = Node {
-        coord: Coord::parse("com.example:dep:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "deadbeef")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let dep_idx = graph.insert_node(dep);
-    graph.add_edge(
-        graph.root(),
-        dep_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("1.0".to_string()),
-        },
-    );
-
-    let result = ResolutionResult {
-        graph,
-        platform: Platform::new("linux", "x86_64").unwrap(),
-        packages: vec![rv_config::LockPackage {
-            group_id: "com.example".to_string(),
-            artifact_id: "dep".to_string(),
-            version: "1.0".to_string(),
-            snapshot_timestamp: None,
-            packaging: "jar".to_string(),
-            classifier: None,
-            repo_url: "https://repo.example/".to_string(),
-            checksum: Some(Checksum::new("sha256", "deadbeef")),
-            system_path: None,
-            direct_scope: Some("compile".to_string()),
-            extra: std::collections::BTreeMap::new(),
-        }],
-        edges: Vec::new(),
-        module_gav: rv_config::LockGav::new("com.example", "root", "1.0"),
-        module_packaging: "jar".to_string(),
-        repositories: Vec::new(),
-        trusted_repositories: Vec::new(),
-        support_pom_provenance: Vec::new(),
-        artifact_blobs: std::collections::BTreeMap::new(),
-        companion_pom_blobs: std::collections::BTreeMap::new(),
-    };
-
-    let lock = result.to_lockfile();
-    assert_eq!(lock.platforms.len(), 1);
-    assert_eq!(lock.platforms[0].modules[0].packages.len(), 1);
-}
-
-/// Test that build_lock_data correctly includes transitive dependency edges.
-#[test]
-fn build_lock_data_includes_transitive_edges() {
-    use super::build_lock_data;
-
-    // Create a graph: root -> A -> B (transitive dependency)
-    let root = Node {
-        coord: Coord::parse("com.example:root:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: None,
-        checksum: None,
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let mut graph = Graph::new(root);
-
-    // Add node A (direct dependency)
-    let a = Node {
-        coord: Coord::parse("com.example:a:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "aaaaaa")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let a_idx = graph.insert_node(a);
-    graph.add_edge(
-        graph.root(),
-        a_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("1.0".to_string()),
-        },
-    );
-
-    // Add node B (transitive dependency of A)
-    let b = Node {
-        coord: Coord::parse("com.example:b:2.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "bbbbbb")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let b_idx = graph.insert_node(b);
-    graph.add_edge(
-        a_idx,
-        b_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("2.0".to_string()),
-        },
-    );
-
-    let (packages, edges) = build_lock_data(&graph).unwrap();
-
-    // Should have 2 packages: A and B
-    assert_eq!(packages.len(), 2, "Expected 2 packages");
-
-    // Should have 1 edge: A -> B (the root->A edge is skipped)
-    assert_eq!(
-        edges.len(),
-        1,
-        "Expected 1 edge (A->B), got {}",
-        edges.len()
-    );
-
-    // Find the index of A and B in packages
-    let a_pkg_idx = packages
-        .iter()
-        .position(|p| p.artifact_id == "a")
-        .expect("package A not found");
-    let b_pkg_idx = packages
-        .iter()
-        .position(|p| p.artifact_id == "b")
-        .expect("package B not found");
-
-    // Verify the edge is from A to B
-    assert_eq!(edges[0].from, a_pkg_idx, "Edge should be from A");
-    assert_eq!(edges[0].to, b_pkg_idx, "Edge should be to B");
-}
-
-/// Test that diamond dependencies create correct edges.
-#[test]
-fn build_lock_data_handles_diamond_deps() {
-    use super::build_lock_data;
-
-    // Create a diamond: root -> A -> C, root -> B -> C
-    let root = Node {
-        coord: Coord::parse("com.example:root:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: None,
-        checksum: None,
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let mut graph = Graph::new(root);
-
-    // A
-    let a = Node {
-        coord: Coord::parse("com.example:a:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "aaaaaa")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let a_idx = graph.insert_node(a);
-    graph.add_edge(
-        graph.root(),
-        a_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("1.0".to_string()),
-        },
-    );
-
-    // B
-    let b = Node {
-        coord: Coord::parse("com.example:b:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "bbbbbb")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let b_idx = graph.insert_node(b);
-    graph.add_edge(
-        graph.root(),
-        b_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("1.0".to_string()),
-        },
-    );
-
-    // C (shared dependency)
-    let c = Node {
-        coord: Coord::parse("com.example:c:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "cccccc")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let c_idx = graph.insert_node(c);
-
-    // A -> C
-    graph.add_edge(
-        a_idx,
-        c_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("1.0".to_string()),
-        },
-    );
-
-    // B -> C
-    graph.add_edge(
-        b_idx,
-        c_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("1.0".to_string()),
-        },
-    );
-
-    let (packages, edges) = build_lock_data(&graph).unwrap();
-
-    // Should have 3 packages: A, B, C
-    assert_eq!(packages.len(), 3, "Expected 3 packages");
-
-    // Should have 2 edges: A -> C and B -> C (root edges are skipped)
-    assert_eq!(
-        edges.len(),
-        2,
-        "Expected 2 edges (A->C and B->C), got {}",
-        edges.len()
-    );
-}
-
-/// Test that direct-only dependencies result in no edges (expected behavior).
-#[test]
-fn build_lock_data_direct_only_has_no_edges() {
-    use super::build_lock_data;
-
-    // Create a graph with only direct dependencies: root -> A, root -> B
-    let root = Node {
-        coord: Coord::parse("com.example:root:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: None,
-        checksum: None,
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let mut graph = Graph::new(root);
-
-    // A (direct dependency)
-    let a = Node {
-        coord: Coord::parse("com.example:a:1.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "aaaaaa")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let a_idx = graph.insert_node(a);
-    graph.add_edge(
-        graph.root(),
-        a_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("1.0".to_string()),
-        },
-    );
-
-    // B (also direct dependency, no relation to A)
-    let b = Node {
-        coord: Coord::parse("com.example:b:2.0").unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("https://repo.example/")),
-        checksum: Some(Checksum::new("sha256", "bbbbbb")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let b_idx = graph.insert_node(b);
-    graph.add_edge(
-        graph.root(),
-        b_idx,
-        Edge {
-            scope: Scope::Compile,
-            optional: false,
-            exclusions: Vec::new(),
-            requested: Some("2.0".to_string()),
-        },
-    );
-
-    let (packages, edges) = build_lock_data(&graph).unwrap();
-
-    // Should have 2 packages: A and B
-    assert_eq!(packages.len(), 2, "Expected 2 packages");
-
-    // Should have 0 edges (both edges are from root, which is correctly skipped)
-    assert_eq!(
-        edges.len(),
-        0,
-        "Direct-only deps should have no edges in lock (root edges are not serialized)"
-    );
-
-    // Both packages should be marked as direct dependencies
-    assert!(
-        packages.iter().all(|p| p.direct_scope.is_some()),
-        "All direct deps should have direct_scope set"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn load_local_project_from_rv_toml() {
-    let root_tmp = tempfile::tempdir().unwrap();
-    let root = root_tmp.path();
-    let store_tmp = tempfile::tempdir().unwrap();
-    // Parent resolution follows relative_path (defaults to ../pom.xml from child_dir),
-    // so we need an actual pom.xml in root for the resolver to find.
-    write_pom(&root.join("pom.xml"), "com.example", "parent", "1.0");
-
-    let ctx = test_context(root, store_tmp.path());
-    let backend = RepoBackend::new(&ctx, Vec::new(), false);
-    let child_dir = root.join("child");
-    fs::create_dir_all(&child_dir).unwrap();
-    // Pass `project_root = root` so that the default `../pom.xml` traversal
-    // (child_dir/../pom.xml = root/pom.xml) passes the containment check.
-    // The workspace root encompasses both the child module and its parent POM.
-    let resolver = RepoParentResolver::with_strict_and_trust(
-        backend,
-        Some(child_dir),
-        Some(root.to_path_buf()),
-        false,
-        RepoTrust::Root,
-    );
-
-    let parent = Parent {
-        group_id: "com.example".to_string(),
-        artifact_id: "parent".to_string(),
-        version: "1.0".to_string(),
-        relative_path: None,
-    };
-
-    let pom = resolver.load_local_parent(&parent).expect("local parent");
-    assert_eq!(pom.artifact_id.as_deref(), Some("parent"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn selected_single_module_accepts_immediate_external_parent() {
-    use crate::ResolutionStrategy;
-
+async fn root_project_reads_its_local_parent() {
+    let parent = "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+                  <artifactId>parent</artifactId><version>1-SNAPSHOT</version>\
+                  <packaging>pom</packaging><repositories><repository><id>parent-only</id>\
+                  <url>https://parent-only.example/repo/</url></repository></repositories>\
+                  </project>";
     let checkout = tempfile::tempdir().unwrap();
     let child_dir = checkout.path().join("child");
     fs::create_dir_all(&child_dir).unwrap();
-    fs::write(
-        checkout.path().join("pom.xml"),
-        r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>parent</artifactId>
-  <version>1-SNAPSHOT</version>
-  <packaging>pom</packaging>
-</project>
-"#,
-    )
-    .unwrap();
+    fs::write(checkout.path().join("pom.xml"), parent).unwrap();
     fs::write(
         child_dir.join("pom.xml"),
-        r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <parent>
-    <groupId>com.example</groupId>
-    <artifactId>parent</artifactId>
-    <version>1-SNAPSHOT</version>
-    <relativePath>../pom.xml</relativePath>
-  </parent>
-  <artifactId>child</artifactId>
-</project>
-"#,
+        "<project><modelVersion>4.0.0</modelVersion><parent><groupId>com.example</groupId>\
+         <artifactId>parent</artifactId><version>1-SNAPSHOT</version>\
+         <relativePath>../pom.xml</relativePath></parent><artifactId>child</artifactId>\
+         </project>",
     )
     .unwrap();
 
+    // A selected submodule is a one-module reactor whose parent lies outside it.
     let workspace = Workspace::discover(&child_dir).expect("single-module workspace");
     assert_eq!(workspace.len(), 1);
-    let store = tempfile::tempdir().unwrap();
-    let ctx = test_context(&child_dir, store.path());
-    let resolver = crate::Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
-
-    let (_, project, _, _) = resolver
+    let resolver = offline_resolver(&child_dir, &checkout.path().join("store"));
+    let (_, project, observed, _) = resolver
         .load_root_project(
             &child_dir.join("pom.xml"),
             &[],
-            Some(Arc::new(workspace)),
+            Arc::new(workspace),
+            None,
             None,
         )
         .await
         .expect("selected submodule resolves its immediate local parent");
-
     assert_eq!(project.group_id, "com.example");
     assert_eq!(project.version, "1-SNAPSHOT");
-}
-
-#[test]
-fn empty_relative_path_skips_local_lookup() {
-    let root_tmp = tempfile::tempdir().unwrap();
-    let root = root_tmp.path();
-    let store_tmp = tempfile::tempdir().unwrap();
-    let child_dir = root.join("child");
-    fs::create_dir_all(&child_dir).unwrap();
-    write_pom(&root.join("pom.xml"), "com.example", "parent", "1.0");
-
-    let ctx = test_context(root, store_tmp.path());
-    let backend = RepoBackend::new(&ctx, Vec::new(), false);
-    let resolver = RepoParentResolver::with_strict(backend, Some(child_dir), false);
-    let parent = Parent {
-        group_id: "com.example".to_string(),
-        artifact_id: "parent".to_string(),
-        version: "1.0".to_string(),
-        relative_path: Some(String::new()),
-    };
-
-    assert!(resolver.load_local_parent(&parent).is_none());
-}
-
-/// Regression: parent POM `<repositories>` must propagate into the solver
-/// backend's repo set. `load_root_project` resolves the parent chain on a
-/// temporary backend; if the repos that backend observes are not returned to
-/// the caller, a transitive dep hosted only on a parent-declared repo is
-/// unresolvable once that backend is dropped.
-#[tokio::test(flavor = "multi_thread")]
-async fn parent_pom_repositories_propagate_to_resolver() {
-    use crate::ResolutionStrategy;
-
-    let root_tmp = tempfile::tempdir().unwrap();
-    let root = root_tmp.path();
-    let store_tmp = tempfile::tempdir().unwrap();
-
-    // Parent POM declares a custom repository.
-    fs::write(
-        root.join("pom.xml"),
-        r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>parent</artifactId>
-  <version>1.0</version>
-  <packaging>pom</packaging>
-  <repositories>
-    <repository>
-      <id>parent-only</id>
-      <url>https://parent-only.example/repo/</url>
-    </repository>
-  </repositories>
-</project>
-"#,
-    )
-    .unwrap();
-
-    // Child POM in a subdirectory inherits via relativePath.
-    let child_dir = root.join("child");
-    fs::create_dir_all(&child_dir).unwrap();
-    fs::write(
-        child_dir.join("pom.xml"),
-        r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <parent>
-    <groupId>com.example</groupId>
-    <artifactId>parent</artifactId>
-    <version>1.0</version>
-    <relativePath>../pom.xml</relativePath>
-  </parent>
-  <artifactId>child</artifactId>
-</project>
-"#,
-    )
-    .unwrap();
-
-    let ctx = test_context(&child_dir, store_tmp.path());
-    let resolver = crate::Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
-
-    let (_coord, project, observed, _support) = resolver
-        .load_root_project(&child_dir.join("pom.xml"), &[], None, None)
-        .await
-        .expect("load_root_project");
-
-    let has_in_observed = observed
-        .iter()
-        .any(|r| r.url == "https://parent-only.example/repo/");
-    let has_in_project = project
-        .repositories
-        .iter()
-        .any(|r| r.url == "https://parent-only.example/repo/");
+    // The parent's repositories reach the solver backend.
+    let parent_only = "https://parent-only.example/repo/";
     assert!(
-        has_in_observed || has_in_project,
-        "parent-declared repository must surface to the solver backend either \
-         via observed_repos (root-POM trusted observe) or via project.repositories \
-         (inherited from parent). observed urls: {:?}, project repo urls: {:?}",
-        observed.iter().map(|r| &r.url).collect::<Vec<_>>(),
-        project
-            .repositories
-            .iter()
-            .map(|r| &r.url)
-            .collect::<Vec<_>>(),
+        observed.iter().any(|repo| repo.url == parent_only)
+            || project
+                .repositories
+                .iter()
+                .any(|repo| repo.url == parent_only),
+        "{observed:?}"
     );
 }
 
-/// Root `file://${project.basedir}` repositories reach the solver after interpolation.
-/// Unsupported schemes must fail before resolution.
+/// Root `file://${project.basedir}` repositories reach the solver after
+/// interpolation. Unsupported schemes fail before resolution, and the error
+/// does not show the URL's credentials.
 #[tokio::test]
-async fn root_file_repository_is_interpolated_and_bad_schemes_fail_fast() {
-    use crate::ResolutionStrategy;
-
-    let store_tmp = tempfile::tempdir().unwrap();
+async fn root_repository_urls_are_interpolated_and_bad_schemes_fail_fast() {
     let pom_for = |url: &str| {
         format!(
-            r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>app</artifactId>
-  <version>1.0</version>
-  <repositories>
-    <repository>
-      <id>local</id>
-      <url>{url}</url>
-    </repository>
-  </repositories>
-</project>
-"#
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+             <artifactId>app</artifactId><version>1.0</version><repositories><repository>\
+             <id>local</id><url>{url}</url></repository></repositories></project>"
         )
     };
-
-    let good_tmp = tempfile::tempdir().unwrap();
-    fs::write(
-        good_tmp.path().join("pom.xml"),
-        pom_for("file:///${project.basedir}/lib"),
-    )
-    .unwrap();
-    let ctx = test_context(good_tmp.path(), store_tmp.path());
-    let resolver = crate::Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
-    let (_coord, _project, observed, _support) = resolver
-        .load_root_project(&good_tmp.path().join("pom.xml"), &[], None, None)
-        .await
-        .expect("file repository is supported");
-    let expected = format!("{}/lib", good_tmp.path().display());
+    let (dir, loaded) = load_root(&pom_for("file:///${project.basedir}/lib"), &[]).await;
+    let (_, _, observed) = loaded.expect("file repository is supported");
+    let expected = rv_repo::normalize_repo_url(&format!("file:///{}/lib", dir.path().display()));
     assert!(
         observed
             .iter()
-            .any(|repo| repo.is_local() && repo.url.contains(expected.trim_start_matches('/'))),
-        "observed: {:?}",
-        observed.iter().map(|r| &r.url).collect::<Vec<_>>()
+            .any(|repo| repo.is_local() && repo.url == expected),
+        "{observed:?}"
     );
     assert!(observed.iter().all(|repo| !repo.url.contains("${")));
 
-    let bad_tmp = tempfile::tempdir().unwrap();
-    fs::write(
-        bad_tmp.path().join("pom.xml"),
-        pom_for("ftp://files.example/m2/"),
-    )
-    .unwrap();
-    let ctx = test_context(bad_tmp.path(), store_tmp.path());
-    let resolver = crate::Resolver::with_strategy(ctx, ResolutionStrategy::NearestWins);
-    let err = resolver
-        .load_root_project(&bad_tmp.path().join("pom.xml"), &[], None, None)
-        .await
-        .expect_err("ftp repositories are unsupported");
-    assert!(err.to_string().contains("unsupported URL"), "{err}");
+    let (_dir, loaded) = load_root(&pom_for("ftp://alice:s3cret@files.example/m2/"), &[]).await;
+    let err = loaded.expect_err("ftp repositories are unsupported");
+    assert!(
+        err.to_string()
+            .contains("unsupported URL 'ftp://files.example/m2/'"),
+        "{err}"
+    );
 }
 
-/// The ROOT project's own parent must fail closed even in normal
-/// (non-`--frozen`) mode. A root pom declaring a parent that cannot be
-/// resolved (no local `../pom.xml` match, no remote client) must error rather
-/// than silently producing a lock from a model Maven itself cannot build.
-/// Transitive parents stay lenient; only the root contract is strict.
 #[tokio::test]
-async fn root_parent_resolution_is_strict_even_when_not_frozen() {
-    let proj_tmp = tempfile::tempdir().unwrap();
-    let proj = proj_tmp.path();
-    fs::write(
-        proj.join("pom.xml"),
-        r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <parent>
-    <groupId>com.example</groupId>
-    <artifactId>nonexistent-parent</artifactId>
-    <version>9.9.9</version>
-  </parent>
-  <artifactId>child</artifactId>
-</project>
-"#,
+async fn root_project_input_failures() {
+    let (_dir, loaded) = load_root(
+        "<project><modelVersion>4.0.0</modelVersion><parent><groupId>com.example</groupId>\
+         <artifactId>nonexistent-parent</artifactId><version>9.9.9</version></parent>\
+         <artifactId>child</artifactId></project>",
+        &[],
     )
-    .unwrap();
-
-    let store_tmp = tempfile::tempdir().unwrap();
-    let ctx = test_context(proj, store_tmp.path());
-    // Non-frozen / non-strict Resolver: the leniency that governs transitive
-    // resolution must NOT extend to the root's own parent.
-    let resolver = crate::Resolver::with_strategy(ctx, crate::ResolutionStrategy::NearestWins)
-        .with_strict(false);
-
-    let result = resolver
-        .load_root_project(&proj.join("pom.xml"), &[], None, None)
-        .await;
+    .await;
     assert!(
-        result.is_err(),
-        "an unresolvable ROOT parent must fail closed even without --frozen"
-    );
-}
-
-/// `.mvn/maven.config` `-D` entries must override same-named POM
-/// `<properties>` because Maven treats user properties as sitting above POM
-/// properties in the precedence chain. This test mirrors the merge step
-/// performed by `Resolver::load_root_project` so that a regression in the
-/// merge ordering is caught without setting up a full Resolver run.
-#[test]
-fn maven_config_properties_override_pom_properties() {
-    let tmp = tempfile::tempdir().unwrap();
-    let project_dir = tmp.path();
-    let mvn_dir = project_dir.join(".mvn");
-    std::fs::create_dir_all(&mvn_dir).unwrap();
-    std::fs::write(
-        mvn_dir.join("maven.config"),
-        "-Drevision=2.0\n-Dchangelist=\n",
-    )
-    .unwrap();
-
-    let pom_xml = r#"<project>
-  <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example</groupId>
-  <artifactId>cfg</artifactId>
-  <version>${revision}</version>
-  <properties>
-    <revision>1.0</revision>
-  </properties>
-</project>
-"#;
-    let mut pom = Pom::parse(pom_xml).unwrap();
-
-    // Same merge step as Resolver::load_root_project (Option A in the bug
-    // write-up): maven.config overwrites pom.properties.
-    let maven_config = crate::parent_resolver::parse_maven_config(project_dir);
-    for (key, value) in maven_config {
-        pom.properties.insert(key, value);
-    }
-
-    assert_eq!(
-        pom.properties.get("revision").map(String::as_str),
-        Some("2.0"),
-        "maven.config -Drevision=2.0 must override POM <revision>1.0</revision>"
-    );
-}
-
-/// Verifies the URL-dedup behaviour of `RepoBackend::extend_repos` when the
-/// operator has opted in to accepting transitive `<repositories>` (the
-/// default-deny path is covered by tests in `backend.rs`).
-#[test]
-fn repo_backend_extend_repos_accumulates_unique_urls() {
-    use rv_repo::Repository;
-    let tmp = tempfile::tempdir().unwrap();
-    let project_root = tmp.path();
-    let store_dir = project_root.join("store");
-    std::fs::create_dir_all(&store_dir).unwrap();
-    let mut ctx = test_context(project_root, &store_dir);
-    // Opt in so transitive repos are merged (default policy ignores them).
-    ctx.config.security.allow_transitive_repositories = true;
-
-    let initial = vec![Repository::new(
-        Some("central".to_string()),
-        "https://repo.example/central/",
-        true,
-        false,
-    )];
-    let backend = RepoBackend::new(&ctx, initial, false);
-
-    assert_eq!(backend.repos_snapshot().len(), 1);
-
-    // Extending with a new URL appends; duplicate URLs are ignored.
-    backend.extend_repos(
-        vec![
-            Repository::new(
-                Some("private".to_string()),
-                "https://repo.example/private/",
-                true,
-                false,
-            ),
-            Repository::new(
-                Some("central-dup".to_string()),
-                "https://repo.example/central/",
-                true,
-                false,
-            ),
-        ],
-        Some("g:a:1"),
+        loaded.is_err(),
+        "an unresolvable root parent must fail closed"
     );
 
-    let snapshot = backend.repos_snapshot();
-    assert_eq!(snapshot.len(), 2, "duplicate URL should not be added");
-    assert!(
-        snapshot
-            .iter()
-            .any(|r| r.url == "https://repo.example/central/")
-    );
-    assert!(
-        snapshot
-            .iter()
-            .any(|r| r.url == "https://repo.example/private/")
-    );
-}
-
-/// Regression: when `populate_artifacts` finds a cached blob in the store,
-/// it must re-verify the on-disk SHA-256 of that blob (and of every other
-/// cache hit) instead of trusting the index row. The previous implementation
-/// random-sampled 1% of cache hits, so a single corrupted blob outside the
-/// sample silently flowed downstream into the resolved graph as a trusted
-/// artifact.
-///
-/// This test exercises the primitive the populate hot loop relies on:
-/// `Store::verify_blobs` MUST return only the blobs whose on-disk bytes
-/// hash back to their index `BlobId`. `populate_artifacts` then pushes
-/// anything missing from the verified set into `to_fetch` (a refetch), so a
-/// tampered cache entry can never be approved.
-#[tokio::test]
-async fn verify_blobs_rejects_tampered_blob_so_populate_refetches() {
-    use rv_config::{ArtifactKey, BlobId};
-    use std::collections::HashSet;
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let store = Store::open(dir.path()).expect("open");
-
-    // Two intact blobs and one that will be corrupted in place. The
-    // populate_artifacts loop sees all three as cache candidates.
-    let good_payload_a = b"good-bytes-A".to_vec();
-    let good_a = store.put_bytes(&good_payload_a).await.expect("put a");
-    let key_a = ArtifactKey::new("com.ex", "a", "1.0.0", "jar", None);
-    store.add_artifact(&key_a, &good_a).await.expect("add a");
-
-    let good_payload_b = b"good-bytes-B".to_vec();
-    let good_b = store.put_bytes(&good_payload_b).await.expect("put b");
-    let key_b = ArtifactKey::new("com.ex", "b", "1.0.0", "jar", None);
-    store.add_artifact(&key_b, &good_b).await.expect("add b");
-
-    let bad_payload = b"will-be-tampered".to_vec();
-    let bad_id = store.put_bytes(&bad_payload).await.expect("put bad");
-    let key_bad = ArtifactKey::new("com.ex", "bad", "1.0.0", "jar", None);
-    store
-        .add_artifact(&key_bad, &bad_id)
-        .await
-        .expect("add bad");
-
-    // Tamper with the on-disk blob without touching the index row.
-    // Published blobs are read-only (0o444); restore write permission for
-    // the simulated corruption.
-    let bad_path = store.get_path(&bad_id);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&bad_path).expect("stat").permissions();
-        perms.set_mode(0o644);
-        fs::set_permissions(&bad_path, perms).expect("chmod");
-    }
-    fs::write(&bad_path, b"different-bytes").expect("tamper");
-
-    // Drive verify_blobs over the full set, mirroring the
-    // `verify_blobs(&all_ids)` call site in populate_artifacts.
-    let all = vec![good_a.clone(), good_b.clone(), bad_id.clone()];
-    let verified: HashSet<BlobId> = store
-        .verify_blobs(&all, rv_store::Store::default_verification_parallelism())
-        .await
-        .expect("verify");
-
-    assert!(
-        verified.contains(&good_a),
-        "intact blob A must remain in the verified set"
-    );
-    assert!(
-        verified.contains(&good_b),
-        "intact blob B must remain in the verified set"
-    );
-    assert!(
-        !verified.contains(&bad_id),
-        "tampered blob MUST be excluded from the verified set so populate_artifacts \
-         refetches it instead of silently trusting the index row"
-    );
-    // The "missing from verified" filter is what populate_artifacts uses to
-    // route a candidate into the `to_fetch` queue. Assert the contract holds:
-    // every candidate NOT in verified is treated as a cache miss.
-    let to_refetch: Vec<&BlobId> = all.iter().filter(|id| !verified.contains(id)).collect();
-    assert_eq!(to_refetch, vec![&bad_id]);
-}
-
-/// The root `pom.xml` is a project input like any other: it goes through the
-/// bounded read, so a file over `MAX_PROJECT_INPUT_SIZE` is rejected by size
-/// instead of being pulled into memory whole. The typed error is what the
-/// assertion pins down — an unbounded read would also fail here, but only
-/// later, as a parse error, and only after allocating the whole file.
-#[tokio::test]
-async fn oversized_root_pom_is_rejected_before_parsing() {
-    let proj_tmp = tempfile::tempdir().unwrap();
-    let proj = proj_tmp.path();
-    let store_tmp = tempfile::tempdir().unwrap();
-    fs::write(
-        proj.join("pom.xml"),
-        vec![b'x'; rv_config::MAX_PROJECT_INPUT_SIZE + 1],
-    )
-    .unwrap();
-
-    let ctx = test_context(proj, store_tmp.path());
-    let resolver = crate::Resolver::with_strategy(ctx, crate::ResolutionStrategy::NearestWins);
-
-    let error = resolver
-        .load_root_project(&proj.join("pom.xml"), &[], None, None)
-        .await
-        .expect_err("an oversized root POM must be rejected");
+    let oversized = "x".repeat(rv_config::MAX_PROJECT_INPUT_SIZE + 1);
+    let (_dir, loaded) = load_root(&oversized, &[]).await;
+    let error = loaded.expect_err("an oversized root POM must be rejected");
     assert!(
         matches!(
             error,
             crate::ResolveError::Config(rv_config::ConfigError::ProjectInputTooLarge { .. })
         ),
-        "expected the typed oversize error, got {error:?}"
+        "{error:?}"
     );
 }
 
-/// Reactor support POMs are buffered during the concurrent graph phase and
-/// written to the shared store afterwards. That write is fatal: the provenance
-/// `rv sync` records for these coordinates is recorded when they are buffered,
-/// so swallowing the flush failure would produce a lock naming support POMs the
-/// store never took — which only `rv export-m2` would discover.
-///
-/// The failure is injected the way `backend.rs` does it: the store's `tmp/`
-/// staging directory is replaced with a regular file, and `put_bytes` starts
-/// with a `create_dir_all` on it that no user can satisfy.
+/// The reactor's support-POM flush is fatal: provenance for those POMs is
+/// already recorded, so a swallowed failure would lock POMs the store never
+/// took. The store's `tmp/` is made a file so `put_bytes` fails.
 #[tokio::test]
 async fn workspace_support_pom_flush_failure_is_fatal() {
     let proj_tmp = tempfile::tempdir().unwrap();
     let store_tmp = tempfile::tempdir().unwrap();
-    let ctx = test_context(proj_tmp.path(), store_tmp.path());
-    let resolver = crate::Resolver::with_strategy(ctx, crate::ResolutionStrategy::NearestWins);
-
+    let resolver = offline_resolver(proj_tmp.path(), store_tmp.path());
     let buffered = crate::resolver::WorkspaceStoreState::for_testing(vec![(
-        rv_config::ArtifactKey::new("com.example", "theparent", "2.0", "pom", None),
+        ArtifactCoord::new("com.example", "theparent", "2.0", "pom", None),
         b"<project/>".to_vec(),
     )]);
-
     let staging = store_tmp.path().join("tmp");
     fs::remove_dir_all(&staging).expect("remove staging dir");
     fs::write(&staging, b"not a directory").expect("occupy staging path");
@@ -2088,223 +3410,69 @@ async fn workspace_support_pom_flush_failure_is_fatal() {
     let error = resolver
         .flush_workspace_support_poms(&buffered)
         .await
-        .expect_err("a failed support-POM flush must fail the resolve, not be swallowed");
-    assert!(
-        matches!(error, crate::ResolveError::Store(_)),
-        "expected a store error, got {error:?}"
-    );
+        .expect_err("a failed support-POM flush must fail the resolve");
+    assert!(matches!(error, crate::ResolveError::Store(_)), "{error:?}");
 }
 
-/// Each distinct buffered `(key, bytes)` pair is written once, in the order of
-/// its last observation, so the last observation decides the index entry.
+/// For `packaging = "pom"` the artifact and its companion POM are one file,
+/// so their two pins must agree; a jar or a classified `.pom` is another file.
 #[test]
-fn support_pom_buffer_writes_each_distinct_pom_once_in_last_seen_order() {
-    let key =
-        |artifact: &str| rv_config::ArtifactKey::new("com.example", artifact, "1", "pom", None);
-    let take = |observations: &[(&str, &[u8])]| {
-        let mut buffer = super::backend::SupportPomBuffer::default();
-        for (artifact, bytes) in observations {
-            buffer.record(key(artifact), &rv_config::BlobId::from_bytes(bytes), bytes);
-        }
-        buffer.take_in_write_order()
-    };
-
-    let kept = take(&[
-        ("bom", b"<a/>"),
-        ("parent", b"<p/>"),
-        ("bom", b"<a/>"),
-        ("bom", b"<a/>"),
-        ("parent", b"<p/>"),
-    ]);
-    assert_eq!(
-        kept,
-        [
-            (key("bom"), b"<a/>".to_vec()),
-            (key("parent"), b"<p/>".to_vec())
-        ]
-    );
-
-    // Distinct bytes for one coordinate are both kept; A, B, A writes B, A.
-    let kept = take(&[("bom", b"<a/>"), ("bom", b"<b/>"), ("bom", b"<a/>")]);
-    let bytes: Vec<_> = kept.iter().map(|(_, b)| b.as_slice()).collect();
-    assert_eq!(bytes, [b"<b/>".as_slice(), b"<a/>".as_slice()]);
-}
-
-mod pom_packaging_identity {
-    use rv_config::{BlobId, LockPackage};
-
-    use super::super::ensure_pom_packaging_identity;
-    use crate::ResolveError;
-
-    fn blob(digest: char) -> BlobId {
+fn a_pom_package_pins_one_file() {
+    let blob = |digest: char| -> BlobId {
         std::iter::repeat_n(digest, 64)
             .collect::<String>()
             .parse()
-            .expect("blob id")
-    }
-
-    fn package(packaging: &str, classifier: Option<&str>) -> LockPackage {
-        LockPackage {
-            group_id: "com.example".to_string(),
-            artifact_id: "platform".to_string(),
-            version: "1.0".to_string(),
-            snapshot_timestamp: None,
-            packaging: packaging.to_string(),
-            classifier: classifier.map(str::to_string),
-            repo_url: "https://repo.example/maven2".to_string(),
-            checksum: None,
-            system_path: None,
-            direct_scope: None,
-            extra: Default::default(),
+            .unwrap()
+    };
+    let package = |packaging: &str, classifier: Option<&str>| Coord {
+        group_id: "com.example".into(),
+        artifact_id: "platform".into(),
+        version: rv_maven_types::Version::parse("1.0").unwrap(),
+        packaging: Some(packaging.to_string()),
+        classifier: classifier.map(str::to_string),
+    };
+    let check = super::utils::ensure_pom_packaging_identity;
+    match check(&package("pom", None), &blob('a'), Some(&blob('b'))) {
+        Err(crate::ResolveError::ConflictingPomPackagedBytes {
+            coord,
+            artifact_sha256,
+            pom_sha256,
+        }) => {
+            assert_eq!(coord, "com.example:platform:1.0:pom");
+            assert_eq!(artifact_sha256, blob('a').to_string());
+            assert_eq!(pom_sha256, blob('b').to_string());
         }
+        other => panic!("expected ConflictingPomPackagedBytes, got {other:?}"),
     }
-
-    /// For `packaging = "pom"` the artifact and the companion POM are one
-    /// file. Two digests mean the lock would pin the payload to one and claim
-    /// the other, which is what `rv export-m2` then ships.
-    #[test]
-    fn rejects_a_pom_package_whose_two_pins_disagree() {
-        let error = ensure_pom_packaging_identity(&package("pom", None), &blob('a'), &blob('b'))
-            .expect_err("a pom package cannot pin two files");
-        match error {
-            ResolveError::ConflictingPomPackagedBytes {
-                coord,
-                artifact_sha256,
-                pom_sha256,
-            } => {
-                assert_eq!(coord, "com.example:platform:1.0:pom");
-                assert_eq!(artifact_sha256, blob('a').to_string());
-                assert_eq!(pom_sha256, blob('b').to_string());
-            }
-            other => panic!("expected ConflictingPomPackagedBytes, got {other:?}"),
+    match check(&package("pom", None), &blob('a'), None) {
+        Err(crate::ResolveError::ConflictingPomPackagedBytes { pom_sha256, .. }) => {
+            assert_eq!(pom_sha256, "none");
         }
+        other => panic!("expected ConflictingPomPackagedBytes, got {other:?}"),
     }
-
-    /// The normal case: one file, one digest, recorded twice.
-    #[test]
-    fn accepts_a_pom_package_whose_pins_agree() {
-        ensure_pom_packaging_identity(&package("pom", None), &blob('a'), &blob('a'))
-            .expect("agreeing pins are the healthy case");
-    }
-
-    /// A jar and its companion POM are two different files and must keep
-    /// differing digests; the check must not reach them.
-    #[test]
-    fn ignores_non_pom_packaging() {
-        ensure_pom_packaging_identity(&package("jar", None), &blob('a'), &blob('b'))
-            .expect("a jar's payload is not its POM");
-    }
-
-    /// A classifier'd `.pom` (`a-v-classifier.pom`) is its own file, not the
-    /// coordinate's companion POM, so it is not held to the identity.
-    #[test]
-    fn ignores_a_classified_pom_artifact() {
-        ensure_pom_packaging_identity(&package("pom", Some("tests")), &blob('a'), &blob('b'))
-            .expect("a classified .pom is a different file");
-    }
-}
-
-fn support_provenance(repo_id: &str, digest: char) -> SupportPomProvenance {
-    SupportPomProvenance {
-        repo_id: repo_id.to_string(),
-        sha256: std::iter::repeat_n(digest, 64).collect(),
-    }
-}
-
-/// Support-POM provenance is merged from two backends, and a coordinate can
-/// arrive twice: once from an id'd repository and once from an id-less one.
-/// Sorted order puts the id-less form first, so the merge has to prefer the
-/// known id explicitly or the coordinate loses its `_remote.repositories`
-/// marker. The preference is only ever a choice between two records of the
-/// SAME bytes, so it decides a label and never which POM gets exported.
-#[test]
-fn merged_support_provenance_prefers_a_known_repo_id() {
-    let merged = super::merge_support_pom_provenance(vec![
-        ("com.example:b:2.0".to_string(), support_provenance("", 'b')),
-        (
-            "com.example:a:1.0".to_string(),
-            support_provenance("corp", 'a'),
-        ),
-        (
-            "com.example:b:2.0".to_string(),
-            support_provenance("corp", 'b'),
-        ),
-        ("com.example:c:3.0".to_string(), support_provenance("", 'd')),
-    ])
-    .expect("agreeing digests merge");
-
-    assert_eq!(
-        merged,
-        vec![
-            (
-                "com.example:a:1.0".to_string(),
-                support_provenance("corp", 'a')
-            ),
-            (
-                "com.example:b:2.0".to_string(),
-                support_provenance("corp", 'b')
-            ),
-            // Only ever seen from an id-less repository: the coordinate is
-            // still recorded, which is what export-m2's completeness check
-            // needs.
-            ("com.example:c:3.0".to_string(), support_provenance("", 'd')),
-        ]
-    );
-}
-
-/// Two backends that fetched DIFFERENT bytes for one support POM must not be
-/// collapsed by repository-id preference. The lockfile pins one digest per
-/// coordinate and `rv export-m2` writes one `.pom`, so silently keeping the
-/// id'd entry would export bytes the other half of the resolution never read —
-/// and would hide the disagreement from `rv sync`'s reactor-wide check, whose
-/// whole job is to catch it.
-#[test]
-fn merged_support_provenance_rejects_conflicting_bytes() {
-    let error = super::merge_support_pom_provenance(vec![
-        ("com.example:b:2.0".to_string(), support_provenance("", 'b')),
-        (
-            "com.example:b:2.0".to_string(),
-            support_provenance("corp", 'c'),
-        ),
-    ])
-    .expect_err("differing digests for one coordinate must not merge");
-
-    match error {
-        crate::ResolveError::ConflictingResolvedPomBytes { coord, .. } => {
-            assert_eq!(coord, "com.example:b:2.0");
-        }
-        other => panic!("expected ConflictingResolvedPomBytes, got {other:?}"),
-    }
-}
-
-/// Negative control for the check above: identical bytes from two id-less
-/// observations are not a conflict, and stay one entry.
-#[test]
-fn merged_support_provenance_accepts_repeated_identical_observations() {
-    let merged = super::merge_support_pom_provenance(vec![
-        ("com.example:b:2.0".to_string(), support_provenance("", 'b')),
-        ("com.example:b:2.0".to_string(), support_provenance("", 'b')),
-    ])
-    .expect("identical observations merge");
-
-    assert_eq!(
-        merged,
-        vec![("com.example:b:2.0".to_string(), support_provenance("", 'b'))]
-    );
+    check(&package("pom", None), &blob('a'), Some(&blob('a'))).unwrap();
+    check(&package("jar", None), &blob('a'), Some(&blob('b'))).unwrap();
+    check(&package("jar", None), &blob('a'), None).unwrap();
+    check(&package("pom", Some("tests")), &blob('a'), None).unwrap();
 }
 
 mod stall_watchdog {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::super::{WorkPhase, WorkspaceProgress, watch_for_stall};
+    use super::super::{REACTOR_WIDE, WorkPhase, WorkspaceProgress, watch_for_stall};
     use crate::ResolveError;
 
+    /// The report names what is in flight, by module index with the reactor
+    /// flush last, and each with its phase.
     #[tokio::test]
     async fn fires_when_nothing_makes_progress_and_names_the_stuck_modules() {
         let progress = Arc::new(WorkspaceProgress::new());
+        progress.enter(2, "gamma/pom.xml", WorkPhase::Graph);
+        progress.enter(REACTOR_WIDE, "reactor", WorkPhase::SupportPomFlush);
         progress.enter(1, "beta/pom.xml", WorkPhase::Graph);
         progress.enter(0, "alpha/pom.xml", WorkPhase::ArtifactPopulation);
+        progress.leave(2);
 
         let stalled = tokio::time::timeout(
             Duration::from_secs(10),
@@ -2312,117 +3480,33 @@ mod stall_watchdog {
         )
         .await
         .expect("the watchdog must fire on its own");
-
         match stalled {
-            ResolveError::WorkspaceStalled { modules, .. } => {
-                // Ordered by module index, not by arrival, and each entry
-                // says which phase it was wedged in.
-                assert_eq!(
-                    modules,
-                    "alpha/pom.xml (artifact population), beta/pom.xml (graph)"
-                );
-            }
+            ResolveError::WorkspaceStalled { modules, .. } => assert_eq!(
+                modules,
+                "alpha/pom.xml (artifact population), beta/pom.xml (graph), \
+                 reactor (support POM flush)"
+            ),
             other => panic!("expected WorkspaceStalled, got {other:?}"),
         }
     }
 
-    /// The watchdog watches progress events, never elapsed time, so work that
-    /// is slow but alive — a big reactor on a slow mirror — never trips it.
+    /// The watchdog watches progress events, never elapsed time.
     #[tokio::test(start_paused = true)]
     async fn never_fires_while_progress_keeps_landing() {
         let progress = Arc::new(WorkspaceProgress::new());
         progress.enter(0, "alpha/pom.xml", WorkPhase::Graph);
-
         let window = Duration::from_millis(200);
         let ticker = {
             let progress = Arc::clone(&progress);
             tokio::spawn(async move {
-                // Well past the window, one event per sub-window.
                 for _ in 0..30 {
                     tokio::time::sleep(window / 4).await;
                     progress.note();
                 }
             })
         };
-
         let fired = tokio::time::timeout(window * 6, watch_for_stall(progress, window)).await;
-        assert!(
-            fired.is_err(),
-            "a resolution that keeps raising events must not be declared stalled: {fired:?}"
-        );
+        assert!(fired.is_err(), "{fired:?}");
         ticker.abort();
     }
-
-    #[test]
-    fn a_module_that_finishes_leaves_the_in_flight_set() {
-        let progress = WorkspaceProgress::new();
-        progress.enter(0, "alpha/pom.xml", WorkPhase::Graph);
-        progress.enter(1, "beta/pom.xml", WorkPhase::Graph);
-        progress.leave(0);
-        assert_eq!(progress.stuck_modules(), "beta/pom.xml (graph)");
-    }
-
-    /// The support-POM flush belongs to the reactor, not to any one module,
-    /// and runs between the graph phase and artifact population. It registers
-    /// under a key that sorts after every module index, so a stall report that
-    /// spans both reads in execution order.
-    #[test]
-    fn the_support_pom_flush_is_named_after_the_modules() {
-        let progress = WorkspaceProgress::new();
-        progress.enter(0, "alpha/pom.xml", WorkPhase::Graph);
-        progress.enter(
-            super::super::REACTOR_WIDE,
-            "reactor",
-            WorkPhase::SupportPomFlush,
-        );
-        assert_eq!(
-            progress.stuck_modules(),
-            "alpha/pom.xml (graph), reactor (support POM flush)"
-        );
-    }
-}
-
-#[test]
-fn lock_edges_deduplicate_declarations_that_serialize_identically() {
-    let node = |name: &str| Node {
-        coord: Coord::parse(name).unwrap(),
-        scope: Scope::Compile,
-        repo_url: Some(Arc::from("mock://repo")),
-        checksum: Some(Checksum::new("sha256", "abcd")),
-        workspace_module: None,
-        local: false,
-        system_path: None,
-    };
-    let mut graph = Graph::new(node("test:root:1"));
-    let a = graph.insert_node(node("test:a:1"));
-    let b = graph.insert_node(node("test:b:1"));
-    let edge = Edge {
-        scope: Scope::Compile,
-        optional: false,
-        exclusions: Vec::new(),
-        requested: None,
-    };
-    graph.add_edge(graph.root(), a, edge.clone());
-    graph.add_edge(a, b, edge.clone());
-    graph.add_edge(
-        a,
-        b,
-        Edge {
-            requested: Some("[1,2)".into()),
-            ..edge.clone()
-        },
-    );
-    graph.add_edge(
-        a,
-        b,
-        Edge {
-            optional: true,
-            ..edge
-        },
-    );
-    assert_eq!(graph.edges(a).count(), 3);
-    let (_, edges) = super::build_lock_data(&graph).unwrap();
-    assert_eq!(edges.len(), 2);
-    assert!(!edges[0].optional);
-    assert!(edges[1].optional);
 }

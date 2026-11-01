@@ -1,0 +1,9 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate and mvn help:active-profiles
+result=success
+module=org.sel:file-conditions:1.0
+active=exists-wins-over-missing
+active=exists-expanding-to-nothing
+active=exists-through-absent-directory
+active=exists-with-backslash
+active=missing-only

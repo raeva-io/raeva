@@ -1,0 +1,34 @@
+# Maven 3.9.11 on Temurin 21.0.12 JRE, macOS 27.0 arm64
+# mvn help:effective-pom (properties n, a, v, f) and mvn help:active-profiles
+a=aarch64
+f=${os.family}
+n=Mac OS X
+v=10.0
+active=name-not-linux
+active=name-not-windows
+active=name-bang
+active=name-bang-space
+active=name-mac-os-x
+active=arch-not-x86_64
+active=arch-aarch64
+active=arch-bang
+active=family-mac
+active=family-unix
+active=family-UNIX
+active=family-padded-unix
+active=family-not-windows
+active=family-not-not-windows
+active=family-empty
+active=version-exact
+active=version-padded
+active=version-regex
+active=version-regex-any
+active=version-not-other
+active=version-not-regex
+active=version-bang
+active=mac-aarch64
+active=family-interpolated
+active=property-os-name-mac
+active=property-os-arch-aarch64
+active=property-os-version
+active=property-os-version-value

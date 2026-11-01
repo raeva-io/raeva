@@ -1,0 +1,35 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.golden.reactor</groupId>
+  <artifactId>build-parent</artifactId>
+  <version>2.0</version>
+  <packaging>pom</packaging>
+
+  <properties>
+    <util.version>2.0</util.version>
+  </properties>
+
+  <repositories>
+    <repository>
+      <id>fixture</id>
+      <url>file://${project.basedir}/repository/</url>
+    </repository>
+  </repositories>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.golden</groupId>
+        <artifactId>util</artifactId>
+        <version>${util.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.golden</groupId>
+        <artifactId>bom</artifactId>
+        <version>1.0</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>

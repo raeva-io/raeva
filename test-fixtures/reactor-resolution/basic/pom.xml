@@ -18,7 +18,6 @@
     <module>snapshot</module>
     <module>snapshot-app</module>
     <module>classifier-app</module>
-    <module>remote-parent-child</module>
     <module>revision-child</module>
     <module>revision-app</module>
     <module>repo-owner</module>

@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# org.scope:a:1 declares rx without an id, its parent p declares ry without an id. The child's wins,
+# so d, in ry only, is not found.
+result=failure
+missing=org.scope:d:1

@@ -1,0 +1,5 @@
+# Maven 3.9.12 on OpenJDK 21, Linux x86_64
+# mvn -o -s empty-settings.xml -gs empty-settings.xml validate
+result=success
+module=org.example:parent:1-1
+module=org.example:child:1

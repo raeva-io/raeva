@@ -1,0 +1,20 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# t (test) reaches x and a (compile) reaches y, at the same depth, and x and y depend on
+# each other. Maven breaks the cycle at x, found first, and gathers the compile path through
+# y, which it has not resolved yet, into x, so both are compile.
+result=success
+module=org.ds:a-cycle-entered-from-both-sides:1.0
+# org.ds:a:jar:1.0:compile
+artifact=org.ds:a:1.0:repo
+scope=org.ds:a:1.0:compile
+# org.ds:t:jar:1.0:test
+artifact=org.ds:t:1.0:repo
+scope=org.ds:t:1.0:test
+# org.ds:x:jar:1.0:compile
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:compile
+# org.ds:y:jar:1.0:compile
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:compile

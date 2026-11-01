@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.d</groupId><artifactId>lpar</artifactId><version>1</version></parent>
+  <artifactId>lib</artifactId>
+  <profiles>
+    <profile>
+      <id>lp</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+      <build><defaultGoal>pgoal</defaultGoal></build>
+    </profile>
+  </profiles>
+  <dependencies>
+    <dependency><groupId>org.d</groupId><artifactId>n1</artifactId><version>1</version><classifier>${project.build.finalName}</classifier></dependency>
+    <dependency><groupId>org.d</groupId><artifactId>n2</artifactId><version>${project.build.directory}</version></dependency>
+    <dependency><groupId>org.d</groupId><artifactId>n3</artifactId><version>${build.defaultGoal}</version></dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,33 @@
+[package]
+name = "rv-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP client construction, TLS roots, retry rules and bounded reads for Raeva"
+readme = "README.md"
+documentation = "https://docs.rs/rv-http"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benches/"]
+
+[lints]
+workspace = true
+
+[dependencies]
+backon.workspace = true
+bytes.workspace = true
+fastrand.workspace = true
+futures.workspace = true
+httpdate.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "test-util"] }
+tempfile.workspace = true

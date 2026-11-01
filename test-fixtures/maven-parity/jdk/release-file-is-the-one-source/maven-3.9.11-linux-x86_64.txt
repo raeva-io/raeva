@@ -1,0 +1,11 @@
+# Maven 3.9.11 on OpenJDK 27 (java.version=27), Arch Linux x86_64
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# raeva runs with JAVA_HOME at jdk/, whose release file says JAVA_VERSION="27", and no JAVA_VERSION variable
+# Each profile adds a dependency, so its condition is a resolution input.
+result=success
+module=org.jdk:release-file-is-the-one-source:1.0
+artifact=org.jdk:lib:27:repo
+artifact=org.jdk:extra:1:repo
+artifact=org.jdk:other:1:repo
+active=java-version-27
+active=jdk-27

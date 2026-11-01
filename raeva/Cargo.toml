@@ -1,0 +1,96 @@
+[package]
+name = "raeva"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Raeva CLI - lockfile companion for Maven projects"
+readme = "README.md"
+documentation = "https://github.com/raeva-io/raeva/tree/main/docs"
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/", "benches/"]
+default-run = "raeva"
+
+[lints]
+workspace = true
+
+[dependencies]
+rv-config.workspace = true
+rv-export.workspace = true
+rv-fs.workspace = true
+rv-http.workspace = true
+rv-lock.workspace = true
+rv-maven-model.workspace = true
+rv-maven-types.workspace = true
+rv-repo.workspace = true
+rv-resolver.workspace = true
+rv-sbom.workspace = true
+rv-store.workspace = true
+rv-vuln.workspace = true
+
+chrono.workspace = true
+clap.workspace = true
+clap_complete = { workspace = true, features = ["unstable-dynamic"] }
+dirs.workspace = true
+dunce.workspace = true
+foldhash.workspace = true
+fs4.workspace = true
+futures.workspace = true
+hex.workspace = true
+console.workspace = true
+indicatif.workspace = true
+owo-colors.workspace = true
+pathdiff.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+strum.workspace = true
+tabled.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+rv-config = { workspace = true, features = ["testing"] }
+rusqlite.workspace = true
+rv-test-support.workspace = true
+jsonschema.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+temp-env.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "raeva"
+path = "src/main.rs"
+
+[package.metadata.dist]
+dist = true
+display-name = "Raeva"
+formula = "raeva"
+install-success-msg = "raeva is installed. Run 'raeva --help' to get started."
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/raeva-{ target }{ archive-suffix }"
+bin-dir = "raeva-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.wix]
+upgrade-guid = "669B33CA-33F8-40D6-BDFA-291F8F8C54C8"
+path-guid = "82D9CE98-C2E5-447E-87FE-E70DE6714C1B"
+license = false
+eula = false

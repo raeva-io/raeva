@@ -1,0 +1,4 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate
+result=failure
+error='groupId' with value '${undefined.group}' does not match a valid id pattern.

@@ -1,0 +1,203 @@
+schema_version = 8
+config_hash = "1c1b391c954f85038f5cabb3f3bc5f74ecb3e1ec0b963f7a007367f6a977c895"
+
+[[platforms]]
+targets = ["linux-x86_64"]
+
+[[platforms.artifacts]]
+repo_url = "./app/repository/"
+pom_sha256 = "8bdc0eb0181d3bb1335c2b67cea552bfe0040899b34ad7ceb75b0bf12b2b2612"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "core"
+version = "1.2"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "da046b16d5e771f0135be2a01a91443d90debda6c64fe2042da4acb2d26650da"
+
+[[platforms.artifacts]]
+repo_url = "./app/repository/"
+pom_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "lib"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[platforms.artifacts]]
+repo_url = "./api/repository/"
+pom_sha256 = "d0d9e8b0fe2a4483451e2f3e1c3980d13ba7fc9a1de47e9ccbab6f192c4c016e"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "util"
+version = "2.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "3456df58290b25826033531eceebf7855222c7267574c739d1e95aa9e7889ae5"
+
+[[platforms.modules]]
+path = "api/pom.xml"
+gav = "org.golden.reactor:api:2.0"
+packaging = "jar"
+packages = "org.golden:util:2.0\tjar\ttest"
+edges = ""
+
+[[platforms.modules]]
+path = "app/pom.xml"
+gav = "org.golden.reactor:app:2.0"
+packaging = "jar"
+packages = """
+org.golden:core:1.2\tjar\tcompile
+org.golden:lib:1.0\tjar\tcompile
+org.golden:util:2.0\tjar
+org.golden.reactor:api:2.0\tjar\tcompile\t\tapi/pom.xml"""
+edges = """
+0 2 compile
+3 2 compile"""
+
+[[platforms.modules]]
+path = "pom.xml"
+gav = "org.golden.reactor:reactor-root:2.0"
+packaging = "pom"
+packages = ""
+edges = ""
+
+[[platforms.support_poms]]
+coordinate = "org.golden:bom:1.0"
+repo_url = "./repository/"
+sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[platforms]]
+targets = ["windows-x86_64"]
+
+[[platforms.artifacts]]
+repo_url = "./app/repository/"
+pom_sha256 = "8bdc0eb0181d3bb1335c2b67cea552bfe0040899b34ad7ceb75b0bf12b2b2612"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "core"
+version = "1.1"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "da046b16d5e771f0135be2a01a91443d90debda6c64fe2042da4acb2d26650da"
+
+[[platforms.artifacts]]
+repo_url = "./app/repository/"
+pom_sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "lib"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[platforms.artifacts]]
+repo_url = "./api/repository/"
+pom_sha256 = "d0d9e8b0fe2a4483451e2f3e1c3980d13ba7fc9a1de47e9ccbab6f192c4c016e"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "util"
+version = "2.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "3456df58290b25826033531eceebf7855222c7267574c739d1e95aa9e7889ae5"
+
+[[platforms.modules]]
+path = "api/pom.xml"
+gav = "org.golden.reactor:api:2.0"
+packaging = "jar"
+packages = "org.golden:util:2.0\tjar\tcompile"
+edges = ""
+
+[[platforms.modules]]
+path = "app/pom.xml"
+gav = "org.golden.reactor:app:2.0"
+packaging = "jar"
+packages = """
+org.golden:core:1.1\tjar\tcompile
+org.golden:lib:1.0\tjar\tcompile
+org.golden:util:2.0\tjar
+org.golden.reactor:api:2.0\tjar\tcompile\t\tapi/pom.xml"""
+edges = """
+0 2 compile
+3 2 compile"""
+
+[[platforms.modules]]
+path = "pom.xml"
+gav = "org.golden.reactor:reactor-root:2.0"
+packaging = "pom"
+packages = ""
+edges = ""
+
+[[platforms.support_poms]]
+coordinate = "org.golden:bom:1.0"
+repo_url = "./repository/"
+sha256 = "3333333333333333333333333333333333333333333333333333333333333333"
+
+[[inputs]]
+target = "linux-x86_64"
+profiles = []
+
+[[inputs.poms]]
+path = "api/pom.xml"
+sha256 = "f274166ee428daa7a7aaff3945140d6a6d27b2137b4bca346253cec22aa3c59c"
+
+[[inputs.poms]]
+path = "app/pom.xml"
+sha256 = "5a3b66db578c756752fbe95bbdbfed49d89240b042c84afc0e9caa85db46dac2"
+
+[[inputs.poms]]
+path = "build-parent/pom.xml"
+sha256 = "4d25cb4525eb7c863e65905c094b7908b6b7644a7450b4747af4325ec81e4f38"
+
+[[inputs.poms]]
+path = "pom.xml"
+sha256 = "93357c3b7ad162b542879f71a1db7233443df0e6a73dc68b06043aeecd60c1e3"
+
+[[inputs]]
+target = "windows-x86_64"
+profiles = []
+
+[[inputs.poms]]
+path = "api/pom.xml"
+sha256 = "f274166ee428daa7a7aaff3945140d6a6d27b2137b4bca346253cec22aa3c59c"
+
+[[inputs.poms]]
+path = "app/pom.xml"
+sha256 = "5a3b66db578c756752fbe95bbdbfed49d89240b042c84afc0e9caa85db46dac2"
+
+[[inputs.poms]]
+path = "build-parent/pom.xml"
+sha256 = "4d25cb4525eb7c863e65905c094b7908b6b7644a7450b4747af4325ec81e4f38"
+
+[[inputs.poms]]
+path = "pom.xml"
+sha256 = "93357c3b7ad162b542879f71a1db7233443df0e6a73dc68b06043aeecd60c1e3"
+
+[metadata]
+repo_ids = """
+./api/repository/\tfixture
+./app/repository/\tfixture
+./repository/\tfixture
+https://repo1.maven.org/maven2/\tcentral"""

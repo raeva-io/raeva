@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; settings.xml passed with -s
+# mvn dependency:list; artifact= is group:artifact:directory version:repository id from _remote.repositories
+# A range that no repository can satisfy finds no versions, though a repository that disables releases is listed.
+result=failure
+error=Dependency not found: org.t:missing
+# Maven: No versions available for org.t:missing:jar:[1,2) within specified range

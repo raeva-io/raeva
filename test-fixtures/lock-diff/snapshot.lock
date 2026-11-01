@@ -1,0 +1,76 @@
+schema_version = 8
+config_hash = "5ec34314da4a8a9960952b5e99ee0783d31722fffaa67a6a0fabadb887d04887"
+
+[[platforms]]
+targets = ["linux-x86_64"]
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "72a977e479b5af4fcfc767fe7ca55a541f3cf5518a6e42d32633355dea70f984"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "snap"
+version = "1.0-SNAPSHOT"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "ee8006c949ef3e2f4bc38d246a1e8054ddba82adbe82ff2dfb39d44352ee54f0"
+
+[platforms.artifacts.snapshot]
+timestamp = "20240202.020202"
+build_number = 9
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "9cb6318751371cccee15444ca8df987af5a7ca07b7361f098f5adf3b1ceda924"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "util"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "ecff2cca714af60194891bf55cd1683f0d4430daf2566002c384ad7bb046a917"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "5cf30c4a534e932941d03435732a8cb80589f6101370d4488075882f9fa9497f"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "util-user"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "e2c297610b43fc0b964b0f75f67b29d8f70aca4ef20ef69ac5ca5e32da2c1379"
+
+[[platforms.modules]]
+path = "pom.xml"
+gav = "org.golden.app:snapshot-consumer:1.0-SNAPSHOT"
+packaging = "jar"
+packages = """
+org.golden:snap:1.0-SNAPSHOT\tjar\tcompile
+org.golden:util:1.0\tjar
+org.golden:util-user:1.0\tjar\tcompile"""
+edges = """
+0 1 compile
+2 1 compile"""
+
+[[inputs]]
+target = "linux-x86_64"
+profiles = []
+
+[[inputs.poms]]
+path = "pom.xml"
+sha256 = "00b227d9d937b20389aaf146884c43d26a583f9dc0b97ecc34770dc0524cd657"
+
+[metadata]
+repo_ids = """
+./repository/\tfixture-snapshots
+https://repo1.maven.org/maven2/\tcentral"""

@@ -1,0 +1,24 @@
+{
+  "exit_code": 7,
+  "stdout": {
+    "code": "LOCKFILE_MISMATCH",
+    "data": {
+      "warnings": [
+        {
+          "code": "SYSTEM_SCOPE",
+          "context": {
+            "coordinate": "org.golden:vendored:0.9",
+            "path": "lib/vendored-0.9.jar"
+          },
+          "message": "system-scoped dependency org.golden:vendored:0.9 is non-portable"
+        }
+      ]
+    },
+    "error": "raeva.lock is out of date: resolving again changes these entries:\n  runtime-only  1.0, scope runtime -> compile",
+    "exit_code": 7,
+    "hints": [
+      "Run 'raeva sync' to update raeva.lock"
+    ],
+    "success": false
+  }
+}

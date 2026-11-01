@@ -1,0 +1,30 @@
+[package]
+name = "rv-maven-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Maven versions, coordinates and repository layout types for Raeva"
+readme = "README.md"
+documentation = "https://docs.rs/rv-maven-types"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/"]
+
+[lints]
+workspace = true
+
+[dependencies]
+derive_more.workspace = true
+hex.workspace = true
+md-5.workspace = true
+packageurl.workspace = true
+serde.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

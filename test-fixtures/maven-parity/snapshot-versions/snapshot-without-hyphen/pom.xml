@@ -1,0 +1,23 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.snap</groupId>
+  <artifactId>snapshot-without-hyphen</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>snaps</id>
+      <url>file://${project.basedir}/snaps/</url>
+      <releases><enabled>false</enabled></releases>
+      <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+    <repository>
+      <id>rels</id>
+      <url>file://${project.basedir}/rels/</url>
+      <releases><enabled>true</enabled></releases>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.snap</groupId><artifactId>no-hyphen</artifactId><version>1.0SNAPSHOT</version></dependency>
+  </dependencies>
+</project>

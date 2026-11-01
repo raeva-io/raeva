@@ -1,0 +1,6 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate and mvn help:active-profiles
+result=success
+module=org.mc:profile-option-interpolated:1.0
+active=extra
+active=arch-amd64

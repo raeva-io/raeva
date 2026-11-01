@@ -1,103 +1,155 @@
-use std::sync::LazyLock;
-use std::time::Duration;
-
-use regex::Regex;
-use serde::{Deserialize, Serialize};
+use rv_maven_types::is_snapshot_version;
 use url::Url;
 
 use crate::error::Result;
+use crate::policy::Provenance;
 use rv_config::{ChecksumPolicy, UpdatePolicy};
 
 /// A configured Maven-compatible artifact repository with URL and release/snapshot policies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Two repositories are equal when they describe the same endpoint and
+/// policies; where each was declared ([`Repository::provenance`]) is not
+/// compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Repository {
+    /// The repository id, which selects credentials and mirrors and which
+    /// Maven records in `_remote.repositories`.
     pub id: Option<String>,
+    /// The base URL as declared, normalized with [`normalize_repo_url`].
+    /// Not redacted; pass it through [`rv_config::redact_url`] before
+    /// showing it.
     pub url: String,
+    /// Whether release versions are fetched from it.
     pub releases_enabled: bool,
+    /// Whether snapshot versions are fetched from it.
     pub snapshots_enabled: bool,
-    #[serde(default, skip_serializing_if = "is_default_update_policy")]
+    /// How long cached snapshot metadata and `-SNAPSHOT` POMs stay fresh.
+    /// Defaults to [`UpdatePolicy::default`].
     pub snapshots_update_policy: UpdatePolicy,
     /// Update policy for release artifacts. Defaults to `daily` to match
     /// Maven's `<releases><updatePolicy>daily</updatePolicy></releases>`.
-    #[serde(
-        default = "default_release_update_policy",
-        skip_serializing_if = "is_default_release_policy"
-    )]
     pub releases_update_policy: UpdatePolicy,
-    #[serde(default)]
+    /// What a checksum mismatch on remote release `maven-metadata.xml`
+    /// does after one refetch: `fail` refuses it (and also refuses metadata
+    /// without a sidecar), `warn` and `ignore` log and use it. POMs and
+    /// artifacts are always verified.
     pub releases_checksum_policy: ChecksumPolicy,
-    #[serde(default)]
+    /// [`Repository::releases_checksum_policy`] for snapshot metadata.
     pub snapshots_checksum_policy: ChecksumPolicy,
+    /// Where this repository was declared. Not compared.
+    provenance: Uncompared<Provenance>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Uncompared<T>(T);
+
+impl<T> PartialEq for Uncompared<T> {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl<T> Eq for Uncompared<T> {}
+
+/// How strongly a checksum policy refuses: `warn` and `ignore` accept,
+/// `fail` refuses mismatching metadata, and an unsupported one refuses the
+/// repository.
+fn strictness(policy: ChecksumPolicy) -> u8 {
+    match policy {
+        ChecksumPolicy::Warn | ChecksumPolicy::Ignore => 0,
+        ChecksumPolicy::Fail => 1,
+        ChecksumPolicy::Unsupported => 2,
+    }
 }
 
 impl Repository {
+    /// A repository at `url` (normalized with [`normalize_repo_url`]) with
+    /// the default update and checksum policies and
+    /// [`Provenance::Caller`]. The URL is not parsed here; a bad one fails
+    /// at the first request.
     pub fn new(
         id: Option<String>,
         url: impl Into<String>,
         releases_enabled: bool,
         snapshots_enabled: bool,
     ) -> Self {
-        let url = normalize_url(url.into());
         Self {
             id,
-            url,
+            url: normalize_repo_url(&url.into()),
             releases_enabled,
             snapshots_enabled,
             snapshots_update_policy: UpdatePolicy::default(),
-            releases_update_policy: default_release_update_policy(),
+            releases_update_policy: UpdatePolicy::Daily,
             releases_checksum_policy: ChecksumPolicy::default(),
             snapshots_checksum_policy: ChecksumPolicy::default(),
+            provenance: Uncompared(Provenance::Caller),
         }
     }
 
+    /// Where this repository was declared, which decides what
+    /// [`crate::RepositoryPolicy`] lets it do.
+    pub fn provenance(&self) -> Provenance {
+        self.provenance.0
+    }
+
+    pub(crate) fn set_provenance(&mut self, provenance: Provenance) {
+        self.provenance.0 = provenance;
+    }
+
     pub(crate) fn from_config(config: &rv_config::RepoConfig) -> Self {
-        let mut out = Self::new(
-            config.id.clone(),
-            config.url.clone(),
-            config.releases.unwrap_or(true),
-            config.snapshots.unwrap_or(false),
-        )
-        .with_snapshot_policy(config.snapshots_update_policy.unwrap_or_default());
-        out.releases_update_policy = config
-            .releases_update_policy
-            .unwrap_or_else(default_release_update_policy);
-        out.releases_checksum_policy = config.releases_checksum_policy.unwrap_or_default();
-        out.snapshots_checksum_policy = config.snapshots_checksum_policy.unwrap_or_default();
-        out
+        Self {
+            snapshots_update_policy: config.snapshots_update_policy.unwrap_or_default(),
+            releases_update_policy: config.releases_update_policy.unwrap_or(UpdatePolicy::Daily),
+            releases_checksum_policy: config.releases_checksum_policy.unwrap_or_default(),
+            snapshots_checksum_policy: config.snapshots_checksum_policy.unwrap_or_default(),
+            provenance: Uncompared(Provenance::Configured),
+            ..Self::new(
+                config.id.clone(),
+                config.url.clone(),
+                config.releases.unwrap_or(true),
+                config.snapshots.unwrap_or(false),
+            )
+        }
     }
 
     pub(crate) fn from_maven_repo(repo: &rv_maven_model::Repository) -> Self {
-        let mut out = Self::new(
+        let base = Self::new(
             repo.id.clone(),
             repo.url.clone(),
             repo.releases_enabled,
             repo.snapshots_enabled,
         );
-        if let Some(policy) = repo
-            .snapshots_update_policy
-            .as_deref()
-            .and_then(UpdatePolicy::parse)
-        {
-            out.snapshots_update_policy = policy;
+        let update = |policy: &Option<String>, default| {
+            policy
+                .as_deref()
+                .and_then(UpdatePolicy::parse)
+                .unwrap_or(default)
+        };
+        let checksum = |policy: &Option<String>| {
+            policy
+                .as_deref()
+                .map(ChecksumPolicy::from_maven)
+                .unwrap_or_default()
+        };
+        Self {
+            snapshots_update_policy: update(
+                &repo.snapshots_update_policy,
+                base.snapshots_update_policy,
+            ),
+            releases_update_policy: update(
+                &repo.releases_update_policy,
+                base.releases_update_policy,
+            ),
+            releases_checksum_policy: checksum(&repo.releases_checksum_policy),
+            snapshots_checksum_policy: checksum(&repo.snapshots_checksum_policy),
+            provenance: Uncompared(if repo.root_declared {
+                Provenance::LocalPom
+            } else {
+                Provenance::FetchedPom
+            }),
+            ..base
         }
-        if let Some(policy) = repo
-            .releases_update_policy
-            .as_deref()
-            .and_then(UpdatePolicy::parse)
-        {
-            out.releases_update_policy = policy;
-        }
-        out.releases_checksum_policy = repo
-            .releases_checksum_policy
-            .as_deref()
-            .and_then(ChecksumPolicy::parse)
-            .unwrap_or_default();
-        out.snapshots_checksum_policy = repo
-            .snapshots_checksum_policy
-            .as_deref()
-            .and_then(ChecksumPolicy::parse)
-            .unwrap_or_default();
-        out
     }
 
     pub(crate) fn metadata_checksum_policy(&self, version: &str) -> ChecksumPolicy {
@@ -109,14 +161,106 @@ impl Repository {
     }
 
     /// Preserve explicit strictness when multiple declarations share a URL.
-    /// Repository deduplication must never discard a POM's `fail` policy.
+    /// Repository deduplication must never discard a POM's `fail` policy,
+    /// nor a [`ChecksumPolicy::Unsupported`] one that refuses the
+    /// repository. Maven keeps a declaration under another id as a separate
+    /// repository, so its unsupported policy refuses only that one: here it
+    /// counts as `fail`, and cannot refuse the repository kept.
     pub fn merge_checksum_policies(&mut self, other: &Self) {
-        if other.releases_checksum_policy == ChecksumPolicy::Fail {
-            self.releases_checksum_policy = ChecksumPolicy::Fail;
+        self.merge_policies(other, self.id == other.id);
+    }
+
+    /// [`Repository::merge_checksum_policies`] for a declaration in a POM
+    /// fetched for a dependency. Maven keeps the repository it met first
+    /// under an id and drops a later declaration with that id, so here an
+    /// unsupported policy counts as `fail` whatever the id.
+    pub fn merge_fetched_checksum_policies(&mut self, other: &Self) {
+        self.merge_policies(other, false);
+    }
+
+    fn merge_policies(&mut self, other: &Self, keep_unsupported: bool) {
+        let stricter = |mine: &mut ChecksumPolicy, theirs: ChecksumPolicy| {
+            let theirs = match theirs {
+                ChecksumPolicy::Unsupported if !keep_unsupported => ChecksumPolicy::Fail,
+                theirs => theirs,
+            };
+            if strictness(theirs) > strictness(*mine) {
+                *mine = theirs;
+            }
+        };
+        stricter(
+            &mut self.releases_checksum_policy,
+            other.releases_checksum_policy,
+        );
+        stricter(
+            &mut self.snapshots_checksum_policy,
+            other.snapshots_checksum_policy,
+        );
+    }
+
+    /// Whether either checksum policy is one that
+    /// [`Repository::merge_checksum_policies`] keeps over the other
+    /// declaration's.
+    pub fn has_strict_checksum_policy(&self) -> bool {
+        strictness(self.releases_checksum_policy) > 0
+            || strictness(self.snapshots_checksum_policy) > 0
+    }
+
+    /// The repository as Maven reads its version listing: for a range or
+    /// `LATEST` (`with_snapshots`) under every version kind it enables, with
+    /// the least strict checksum policy and the most frequent update policy
+    /// among them, and for `RELEASE` under the releases policies only.
+    /// `None` when it enables no kind the listing reads. The repository
+    /// returned reads the listing under its releases policies, which hold
+    /// the merged ones.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError::Config`](crate::RepoError::Config) when the checksum
+    /// policy of a kind the listing reads is unsupported, which makes Maven
+    /// refuse the listing.
+    pub fn version_listing(&self, with_snapshots: bool) -> Result<Option<Self>> {
+        let snapshots = with_snapshots && self.snapshots_enabled;
+        if !self.releases_enabled && !snapshots {
+            return Ok(None);
         }
-        if other.snapshots_checksum_policy == ChecksumPolicy::Fail {
-            self.snapshots_checksum_policy = ChecksumPolicy::Fail;
+        for (read, policy, kind) in [
+            (
+                self.releases_enabled,
+                self.releases_checksum_policy,
+                "releases",
+            ),
+            (snapshots, self.snapshots_checksum_policy, "snapshots"),
+        ] {
+            if read && policy == ChecksumPolicy::Unsupported {
+                return Err(unsupported_policy(self, kind));
+            }
         }
+        let mut listing = self.clone();
+        if !self.releases_enabled {
+            listing.releases_enabled = true;
+            listing.releases_checksum_policy = self.snapshots_checksum_policy;
+            listing.releases_update_policy = self.snapshots_update_policy;
+        } else if snapshots {
+            // Maven applies the more lenient policy, ignore before warn. Both
+            // policies passed the unsupported check above.
+            if matches!(
+                (
+                    self.snapshots_checksum_policy,
+                    self.releases_checksum_policy
+                ),
+                (
+                    ChecksumPolicy::Ignore,
+                    ChecksumPolicy::Warn | ChecksumPolicy::Fail
+                ) | (ChecksumPolicy::Warn, ChecksumPolicy::Fail)
+            ) {
+                listing.releases_checksum_policy = self.snapshots_checksum_policy;
+            }
+            if self.snapshots_update_policy.ttl_secs() < self.releases_update_policy.ttl_secs() {
+                listing.releases_update_policy = self.snapshots_update_policy;
+            }
+        }
+        Ok(Some(listing))
     }
 
     /// Returns true if this repository's release/snapshot policy allows the given version.
@@ -128,24 +272,44 @@ impl Repository {
         }
     }
 
+    /// Whether this repository's policy keeps `version` among the versions it
+    /// lists for a range. Maven filters that listing with
+    /// `ArtifactUtils.isSnapshot`, not maven-resolver's rule.
+    pub fn allows_listed_version(&self, version: &str) -> bool {
+        if rv_maven_types::is_listed_snapshot_version(version) {
+            self.snapshots_enabled
+        } else {
+            self.releases_enabled
+        }
+    }
+
     /// True for a read-only `file://` repository on the local filesystem.
     pub fn is_local(&self) -> bool {
         self.base_url().is_ok_and(|url| url.scheme() == "file")
     }
 
+    /// [`Repository::url`] parsed.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError::Url`](crate::RepoError::Url) when it does not parse.
     pub fn base_url(&self) -> Result<Url> {
         Ok(Url::parse(&self.url)?)
     }
 
-    pub fn url_for_path(&self, path: &str) -> Result<Url> {
+    pub(crate) fn url_for_path(&self, path: &str) -> Result<Url> {
         let base = self.base_url()?;
         let trimmed = path.trim_start_matches('/');
 
         // Reject a parent-directory segment up front. `Url::join` collapses
         // `..` per RFC 3986, so an unsanitized `..` in a (server-derived)
         // path could climb above the repository root while staying on the
-        // same host, which the origin check below would not catch.
-        if has_parent_dir_segment(trimmed) {
+        // same host, which the origin check below would not catch. Percent-
+        // encoded spellings (`%2e%2e`, `.%2e`, …) still count.
+        if trimmed
+            .split('/')
+            .any(|seg| seg.replace("%2e", ".").replace("%2E", ".") == "..")
+        {
             return Err(crate::error::RepoError::InvalidCoord(format!(
                 "artifact path '{path}' contains a parent-directory ('..') segment"
             )));
@@ -169,10 +333,12 @@ impl Repository {
         }
 
         // Defense-in-depth: the resolved path must remain under the
-        // repository's own base directory. Catches any residual climb the
-        // segment check above might miss while still on the same host.
-        let base_dir = base_directory(base.path());
-        if !joined.path().starts_with(&base_dir) {
+        // repository's own base directory (everything up to and including the
+        // final `/`). Catches any residual climb the segment check above
+        // might miss while still on the same host.
+        let base_path = base.path();
+        let base_dir = base_path.rfind('/').map_or("/", |idx| &base_path[..=idx]);
+        if !joined.path().starts_with(base_dir) {
             return Err(crate::error::RepoError::InvalidCoord(format!(
                 "artifact path '{path}' escapes the repository base path '{base_dir}'"
             )));
@@ -181,13 +347,7 @@ impl Repository {
         Ok(joined)
     }
 
-    pub(crate) fn with_snapshot_policy(mut self, policy: UpdatePolicy) -> Self {
-        self.snapshots_update_policy = policy;
-        self
-    }
-
-    /// Returns the configured update policy for a version of the given kind.
-    pub fn update_policy_for(&self, version: &str) -> UpdatePolicy {
+    pub(crate) fn update_policy_for(&self, version: &str) -> UpdatePolicy {
         if is_snapshot_version(version) {
             self.snapshots_update_policy
         } else {
@@ -195,31 +355,30 @@ impl Repository {
         }
     }
 
-    /// Cache TTL implied by the repository's update policy for the given
-    /// version. `always` collapses to zero (forcing a refetch), `never`
-    /// returns a year (effectively no expiry), and `daily` / `interval:N`
-    /// pass through their declared durations.
-    pub fn update_policy_ttl(&self, version: &str) -> Duration {
-        update_policy_to_duration(self.update_policy_for(version))
+    /// Seconds a copy for `version` fetched now stays fresh.
+    pub(crate) fn update_policy_ttl(&self, version: &str) -> i64 {
+        fresh_secs(self.update_policy_for(version), &chrono::Local::now())
     }
 }
 
-fn update_policy_to_duration(policy: UpdatePolicy) -> Duration {
+/// Seconds a copy written at `written` stays fresh under `policy`. As in
+/// Maven, `daily` lasts until the next local midnight.
+pub fn fresh_secs(policy: UpdatePolicy, written: &chrono::DateTime<chrono::Local>) -> i64 {
     match policy {
-        UpdatePolicy::Always => Duration::from_secs(0),
-        UpdatePolicy::Daily => Duration::from_secs(24 * 60 * 60),
-        UpdatePolicy::Interval(minutes) => Duration::from_secs(u64::from(minutes) * 60),
-        // `never` caps at one year so the cache still ages out eventually.
-        // Treating it as i64::MAX (the policy's own sentinel) overflows when
-        // converted to Duration arithmetic downstream.
-        UpdatePolicy::Never => Duration::from_secs(365 * 24 * 60 * 60),
+        UpdatePolicy::Daily => until_next_midnight(written),
+        policy => policy.ttl_secs(),
     }
 }
 
-impl From<rv_config::RepoConfig> for Repository {
-    fn from(config: rv_config::RepoConfig) -> Self {
-        Self::from_config(&config)
-    }
+fn until_next_midnight<Tz: chrono::TimeZone>(now: &chrono::DateTime<Tz>) -> i64 {
+    let midnight = now
+        .date_naive()
+        .succ_opt()
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .and_then(|midnight| now.timezone().from_local_datetime(&midnight).earliest());
+    midnight.map_or(UpdatePolicy::Daily.ttl_secs(), |midnight| {
+        (midnight - now.clone()).num_seconds().max(1)
+    })
 }
 
 impl From<&rv_config::RepoConfig> for Repository {
@@ -240,65 +399,36 @@ impl From<&rv_maven_model::Repository> for Repository {
     }
 }
 
-/// Normalizes a repository URL to a trailing-slash form.
-///
-/// Trims whitespace and appends a trailing slash if one is not already
-/// present, so URL comparison and path joining stay consistent.
-pub fn normalize_repo_url(url: &str) -> String {
-    let trimmed = url.trim();
-    if trimmed.ends_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/")
-    }
-}
+pub use rv_lock::normalize_repo_url;
 
-fn normalize_url(url: String) -> String {
-    normalize_repo_url(&url)
-}
-
-fn is_default_update_policy(policy: &UpdatePolicy) -> bool {
-    *policy == UpdatePolicy::default()
-}
-
-fn default_release_update_policy() -> UpdatePolicy {
-    UpdatePolicy::Daily
-}
-
-fn is_default_release_policy(policy: &UpdatePolicy) -> bool {
-    *policy == default_release_update_policy()
-}
-
-pub fn is_snapshot_version(version: &str) -> bool {
-    static TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"-\d{8}\.\d{6}-\d+$").expect("snapshot timestamp regex must compile")
-    });
-    version.ends_with("-SNAPSHOT") || TIMESTAMP_RE.is_match(version)
-}
-
-/// True if any `/`-delimited segment of `path` is a parent-directory
-/// reference (`..`), including the percent-encoded spellings (`%2e%2e`,
-/// `.%2e`, …) that `Url::join` would otherwise still collapse.
-fn has_parent_dir_segment(path: &str) -> bool {
-    path.split('/').any(|seg| {
-        let decoded = seg.replace("%2e", ".").replace("%2E", ".");
-        decoded == ".."
-    })
-}
-
-/// The directory portion of a URL path: everything up to and including the
-/// final `/`. Used to verify a joined artifact URL stays under the
-/// repository's base directory.
-fn base_directory(path: &str) -> String {
-    match path.rfind('/') {
-        Some(idx) => path[..=idx].to_string(),
-        None => "/".to_string(),
-    }
+/// The refusal of a download that an unsupported `kind` checksum policy of
+/// `repo` covers.
+pub(crate) fn unsupported_policy(repo: &Repository, kind: &str) -> crate::RepoError {
+    crate::RepoError::Config(format!(
+        "repository '{}' has a <{kind}><checksumPolicy> that is not fail, warn or ignore, so raeva \
+         does not download from it",
+        rv_maven_types::bounded(repo.id.as_deref().unwrap_or("repository"))
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Repository, is_snapshot_version};
+    use super::Repository;
+
+    /// As Maven's update check, `daily` expires at the next local midnight,
+    /// however recently the copy was fetched, and `never` does not expire.
+    #[test]
+    fn daily_lasts_until_midnight_and_never_does_not_expire() {
+        use chrono::TimeZone;
+        let zone = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        for (hour, minute, ttl) in [(23, 59, 60), (0, 0, 86_400), (12, 30, 41_400)] {
+            let now = zone.with_ymd_and_hms(2026, 3, 1, hour, minute, 0).unwrap();
+            assert_eq!(super::until_next_midnight(&now), ttl, "{now}");
+        }
+        let mut repo = Repository::new(None, "https://example.com/", true, true);
+        repo.releases_update_policy = rv_config::UpdatePolicy::Never;
+        assert_eq!(repo.update_policy_ttl("1.0"), i64::MAX);
+    }
 
     #[test]
     fn local_classification_uses_the_parsed_scheme() {
@@ -313,170 +443,134 @@ mod tests {
         assert!(!Repository::new(None, "https://example.com/", true, true).is_local());
     }
 
+    /// A range listing is filtered with Maven's `ArtifactUtils.isSnapshot`,
+    /// which ignores case and needs a hyphen before a timestamp, while a
+    /// request uses maven-resolver's rule.
     #[test]
-    fn normalizes_url_trailing_slash() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
+    fn versions_follow_the_enabled_kinds() {
+        // (releases, snapshots, version, requested, listed)
+        #[rustfmt::skip]
+        let cases = [
+            (true, false, "2.5.3", true, true),
+            (true, false, "1.0-SNAPSHOT", false, false),
+            (true, false, "1.0-snapshot", true, false),
+            (true, false, "20240101.010101-1", false, true),
+            (false, true, "2.5.3", false, false),
+            (false, true, "2.0.0-SNAPSHOT", true, true),
+            (true, true, "1.0.0", true, true),
+            (true, true, "1.0-SNAPSHOT", true, true),
+        ];
+        for (releases, snapshots, version, requested, listed) in cases {
+            let repo = Repository::new(None, "https://repo.example/", releases, snapshots);
+            assert_eq!(
+                repo.allows_version(version),
+                requested,
+                "{version} {releases} {snapshots}"
+            );
+            assert_eq!(
+                repo.allows_listed_version(version),
+                listed,
+                "{version} {releases} {snapshots}"
+            );
+        }
+    }
+
+    /// A server-controlled snapshot value spliced into a file name could
+    /// carry `..` segments that `Url::join` collapses into a same-host
+    /// climb above the repository root.
+    #[test]
+    fn url_for_path_stays_under_the_repository() {
+        let repo = Repository::new(None, "https://repo1.maven.org/maven2", true, false);
         assert!(repo.url.ends_with('/'));
+        for (path, expected) in [
+            (
+                "org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar",
+                "https://repo1.maven.org/maven2/org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar",
+            ),
+            (
+                "//evil.com/malicious-artifact.jar",
+                "https://repo1.maven.org/maven2/evil.com/malicious-artifact.jar",
+            ),
+        ] {
+            assert_eq!(repo.url_for_path(path).unwrap().as_str(), expected);
+        }
+        for path in [
+            "http://evil.com/artifact.jar",
+            "com/example/lib/1.0/lib-../../../../private/secret.jar",
+            "../../../../etc/passwd",
+            "com/example/%2e%2e/%2e%2e/%2e%2e/secret.jar",
+        ] {
+            repo.url_for_path(path).expect_err(path);
+        }
     }
 
+    /// Merging two declarations of one URL keeps the strictest checksum
+    /// policy of each kind, an unsupported one above `fail`.
     #[test]
-    fn builds_joined_url() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
-        let url = repo
-            .url_for_path("com/example/lib/1.0/lib-1.0.jar")
-            .unwrap();
-        assert!(url.as_str().contains("com/example/lib/1.0"));
-    }
+    fn merging_keeps_the_strictest_checksum_policy() {
+        use rv_config::ChecksumPolicy;
+        let mut first = Repository::new(None, "https://repo.example/", true, true);
+        first.releases_checksum_policy = ChecksumPolicy::Fail;
+        let mut second = first.clone();
+        second.releases_checksum_policy = ChecksumPolicy::Unsupported;
+        second.snapshots_checksum_policy = ChecksumPolicy::Ignore;
+        assert!(second.has_strict_checksum_policy());
+        first.merge_checksum_policies(&second);
+        assert_eq!(first.releases_checksum_policy, ChecksumPolicy::Unsupported);
+        assert_eq!(first.snapshots_checksum_policy, ChecksumPolicy::Warn);
+        second.merge_checksum_policies(&Repository::new(None, "https://repo.example/", true, true));
+        assert_eq!(second.releases_checksum_policy, ChecksumPolicy::Unsupported);
 
-    #[test]
-    fn detects_snapshot_version() {
-        assert!(is_snapshot_version("1.0-SNAPSHOT"));
-        assert!(is_snapshot_version("2.0.0-SNAPSHOT"));
-        assert!(is_snapshot_version("1.0.0-beta-SNAPSHOT"));
-        assert!(is_snapshot_version("1.0-20231115.123456-1"));
-        assert!(!is_snapshot_version("1.0"));
-        assert!(!is_snapshot_version("1.0.0"));
-        assert!(!is_snapshot_version("1.0-beta"));
-        assert!(!is_snapshot_version("SNAPSHOT"));
-    }
-
-    #[test]
-    fn repo_allows_release_version_when_releases_enabled() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
-        assert!(repo.allows_version("1.0.0"));
-        assert!(repo.allows_version("2.5.3"));
-    }
-
-    #[test]
-    fn repo_rejects_snapshot_version_when_snapshots_disabled() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
-        assert!(!repo.allows_version("1.0-SNAPSHOT"));
-        assert!(!repo.allows_version("2.0.0-SNAPSHOT"));
-    }
-
-    #[test]
-    fn repo_allows_snapshot_version_when_snapshots_enabled() {
-        let repo = Repository::new(
-            Some("snapshots".to_string()),
-            "https://repo.example/snapshots",
-            false,
-            true,
-        );
-        assert!(repo.allows_version("1.0-SNAPSHOT"));
-        assert!(repo.allows_version("2.0.0-SNAPSHOT"));
-    }
-
-    #[test]
-    fn repo_rejects_release_version_when_releases_disabled() {
-        let repo = Repository::new(
-            Some("snapshots".to_string()),
-            "https://repo.example/snapshots",
-            false,
-            true,
-        );
-        assert!(!repo.allows_version("1.0.0"));
-        assert!(!repo.allows_version("2.5.3"));
-    }
-
-    #[test]
-    fn repo_allows_both_when_both_enabled() {
-        let repo = Repository::new(
-            Some("mixed".to_string()),
-            "https://repo.example/all",
+        // Under another id, an unsupported policy only tightens to `fail`.
+        let mut configured = Repository::new(
+            Some("configured".to_string()),
+            "https://repo.example/",
             true,
             true,
         );
-        assert!(repo.allows_version("1.0.0"));
-        assert!(repo.allows_version("1.0-SNAPSHOT"));
+        let mut other = configured.clone();
+        other.id = Some("other".to_string());
+        other.releases_checksum_policy = ChecksumPolicy::Unsupported;
+        configured.merge_checksum_policies(&other);
+        assert_eq!(configured.releases_checksum_policy, ChecksumPolicy::Fail);
     }
 
     #[test]
-    fn url_for_path_strips_leading_slashes() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
-        // Double-slash would be a protocol-relative URL attack, but
-        // trim_start_matches('/') neutralizes it; the result stays on the original host.
-        let result = repo.url_for_path("//evil.com/malicious-artifact.jar");
-        let url = result.expect("leading slashes are stripped, path is safe");
-        assert_eq!(url.host_str(), Some("repo1.maven.org"));
-    }
+    fn version_listing_merges_the_policies_of_the_kinds_it_reads() {
+        use rv_config::{ChecksumPolicy, UpdatePolicy};
 
-    #[test]
-    fn url_for_path_rejects_scheme_change() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
-        repo.url_for_path("http://evil.com/artifact.jar")
-            .expect_err("scheme change must be rejected");
-    }
+        let mut repo = Repository::new(Some("r".into()), "https://example.com/", true, true);
+        repo.releases_checksum_policy = ChecksumPolicy::Warn;
+        repo.snapshots_checksum_policy = ChecksumPolicy::Fail;
+        repo.releases_update_policy = UpdatePolicy::Never;
+        repo.snapshots_update_policy = UpdatePolicy::Always;
 
-    #[test]
-    fn url_for_path_rejects_parent_dir_traversal() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
-        // A server-controlled snapshot value spliced into the filename could
-        // carry `..` segments that Url::join collapses into a same-host climb
-        // above the repository root.
-        repo.url_for_path("com/example/lib/1.0/lib-../../../../private/secret.jar")
-            .expect_err("'..' traversal must be rejected");
-        repo.url_for_path("../../../../etc/passwd")
-            .expect_err("leading '..' traversal must be rejected");
-    }
+        let range = repo.version_listing(true).unwrap().unwrap();
+        assert_eq!(range.releases_checksum_policy, ChecksumPolicy::Warn);
+        assert_eq!(range.releases_update_policy, UpdatePolicy::Always);
+        let release = repo.version_listing(false).unwrap().unwrap();
+        assert_eq!(release.releases_checksum_policy, ChecksumPolicy::Warn);
+        assert_eq!(release.releases_update_policy, UpdatePolicy::Never);
 
-    #[test]
-    fn url_for_path_rejects_percent_encoded_traversal() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
+        repo.releases_enabled = false;
+        assert!(repo.version_listing(false).unwrap().is_none());
+        let snapshots_only = repo.version_listing(true).unwrap().unwrap();
+        assert!(snapshots_only.releases_enabled);
+        assert_eq!(
+            snapshots_only.releases_checksum_policy,
+            ChecksumPolicy::Fail
         );
-        repo.url_for_path("com/example/%2e%2e/%2e%2e/%2e%2e/secret.jar")
-            .expect_err("percent-encoded '..' traversal must be rejected");
-    }
 
-    #[test]
-    fn url_for_path_accepts_normal_artifact_path() {
-        let repo = Repository::new(
-            Some("central".to_string()),
-            "https://repo1.maven.org/maven2",
-            true,
-            false,
-        );
-        let url = repo
-            .url_for_path("org/apache/commons/commons-lang3/3.14.0/commons-lang3-3.14.0.jar")
-            .expect("a normal artifact path stays under the base directory");
-        assert!(url.path().starts_with("/maven2/org/apache/commons/"));
+        repo.releases_enabled = true;
+        repo.releases_checksum_policy = ChecksumPolicy::Fail;
+        repo.snapshots_checksum_policy = ChecksumPolicy::Ignore;
+        let range = repo.version_listing(true).unwrap().unwrap();
+        assert_eq!(range.releases_checksum_policy, ChecksumPolicy::Ignore);
+
+        repo.releases_enabled = false;
+        repo.snapshots_checksum_policy = ChecksumPolicy::Unsupported;
+        assert!(repo.version_listing(true).is_err());
+        repo.releases_enabled = true;
+        assert!(repo.version_listing(false).is_ok());
     }
 }

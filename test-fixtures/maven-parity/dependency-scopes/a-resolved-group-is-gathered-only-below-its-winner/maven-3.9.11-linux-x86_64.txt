@@ -1,0 +1,26 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# x is picked inside a cycle. Maven gathers for it through the resolved a only at a's
+# winning occurrence, the direct one, not below z, so the compile path a, b, y reaches x,
+# and x is compile.
+result=success
+module=org.ds:a-resolved-group-is-gathered-only-below-its-winner:1.0
+# org.ds:a:jar:1.0:compile
+artifact=org.ds:a:1.0:repo
+scope=org.ds:a:1.0:compile
+# org.ds:b:jar:1.0:compile
+artifact=org.ds:b:1.0:repo
+scope=org.ds:b:1.0:compile
+# org.ds:t:jar:1.0:test
+artifact=org.ds:t:1.0:repo
+scope=org.ds:t:1.0:test
+# org.ds:x:jar:1.0:compile
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:compile
+# org.ds:y:jar:1.0:compile
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:compile
+# org.ds:z:jar:1.0:compile
+artifact=org.ds:z:1.0:repo
+scope=org.ds:z:1.0:compile

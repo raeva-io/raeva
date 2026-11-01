@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate
+result=success
+module=org.interp:root:1.0
+module=org.interp:parent-version:1.0-b
+module=org.interp:version-property:2.0
+module=org.prop.sub:group-property:1.0

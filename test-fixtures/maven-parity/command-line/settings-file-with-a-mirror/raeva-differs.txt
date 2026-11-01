@@ -1,0 +1,6 @@
+# raeva.lock records each file under the repository the POM declares, never
+# under the mirror that served it, so raeva names corp's URL, whose last
+# segment is absent, where Maven's _remote.repositories names corp-mirror.
+result=success
+module=org.cl:settings-file-with-a-mirror:1.0
+artifact=org.cl:lib:1.0:absent

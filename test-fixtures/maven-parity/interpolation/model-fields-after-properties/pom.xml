@@ -1,0 +1,2 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.interp</groupId><artifactId>root</artifactId><version>1.0</version><packaging>pom</packaging>
+<modules><module>parent-version</module><module>version-property</module><module>group-property</module></modules></project>

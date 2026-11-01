@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+result=success
+module=org.f4:repositories-of-two-profiles:1.0
+artifact=org.f4:lib:1.0:secondrepo
+active=first
+active=second

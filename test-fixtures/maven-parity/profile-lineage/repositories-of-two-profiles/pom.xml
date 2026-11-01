@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  
+  <groupId>org.f4</groupId><artifactId>repositories-of-two-profiles</artifactId><version>1.0</version>
+  <repositories><repository><id>pomrepo</id><url>file://${project.basedir}/pomrepo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+<profiles><profile><id>first</id><activation><activeByDefault>true</activeByDefault></activation><repositories><repository><id>firstrepo</id><url>file://${project.basedir}/firstrepo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories></profile><profile><id>second</id><activation><activeByDefault>true</activeByDefault></activation><repositories><repository><id>secondrepo</id><url>file://${project.basedir}/secondrepo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories></profile></profiles><dependencies><dependency><groupId>org.f4</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies>
+</project>

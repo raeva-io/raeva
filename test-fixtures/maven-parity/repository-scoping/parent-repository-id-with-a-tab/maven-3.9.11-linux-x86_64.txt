@@ -1,0 +1,7 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list
+# The repository serving the parent has an id that is padded and holds a tab. Maven trims the id
+# and resolves; the tab cannot be recorded in raeva.lock, so the parent's pin names no repository.
+result=success
+module=org.scope:parent-repository-id-with-a-tab:1

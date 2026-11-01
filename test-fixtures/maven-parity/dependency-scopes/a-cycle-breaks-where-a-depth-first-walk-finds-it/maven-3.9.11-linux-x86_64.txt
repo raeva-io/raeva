@@ -1,0 +1,23 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# x and y depend on each other at the same depth with as many parents left. Maven breaks
+# the cycle at the one its depth-first walk numbered first, y, below u, and gathers the
+# compile path through a into it; x, below y, is then compile too.
+result=success
+module=org.ds:a-cycle-breaks-where-a-depth-first-walk-finds-it:1.0
+# org.ds:a:jar:1.0:compile
+artifact=org.ds:a:1.0:repo
+scope=org.ds:a:1.0:compile
+# org.ds:t:jar:1.0:test
+artifact=org.ds:t:1.0:repo
+scope=org.ds:t:1.0:test
+# org.ds:u:jar:1.0:test
+artifact=org.ds:u:1.0:repo
+scope=org.ds:u:1.0:test
+# org.ds:x:jar:1.0:compile
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:compile
+# org.ds:y:jar:1.0:compile
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:compile

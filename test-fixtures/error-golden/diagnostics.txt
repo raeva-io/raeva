@@ -1,0 +1,655 @@
+STORE Failure
+artifact store error: disk full; check available space on the store volume
+----
+STORE Failure
+artifact store error: disk full; check available space on the store volume
+----
+STORE Failure
+artifact store error: permission denied accessing the store at /home/u/.raeva/store; check directory permissions
+----
+STORE Failure
+artifact store error: store file or directory not found; run 'raeva sync' to initialise the store
+----
+STORE Failure
+artifact store error: I/O error: io detail
+----
+STORE Failure
+artifact store error: disk full; check available space on the store volume
+----
+STORE Failure
+artifact store error: cannot open the artifact database; check directory permissions
+----
+STORE Failure
+artifact store error: the store index in /home/u/.raeva/store is damaged; run 'raeva sync' again once no other raeva process uses the store, and raeva starts a new index
+----
+STORE Failure
+artifact store error: open; try running 'raeva sync' again; if the problem persists, delete /home/u/.raeva/store
+----
+STORE Failure
+artifact store error: could not grow the shared-memory file of the store index in /home/u/.raeva/store, most often because its volume is full; check available space there
+----
+STORE Failure
+artifact store error: integrity check failed: bad
+----
+STORE Failure
+lock timeout acquiring lock
+
+Another raeva process holds the store lock. Wait for it to finish or terminate the holder process before retrying. Do NOT delete the lock file while a process may still be running: with advisory file locks, removing the file creates a new inode that a fresh process can lock independently of the existing holder, breaking mutual exclusion.
+
+Lock holder info: pid 7
+----
+STORE Failure
+artifact store error: no database connection available (busy); try again in a moment
+----
+STORE Failure
+artifact store error: no database connection available (busy); try again in a moment
+----
+STORE Failure
+repository metadata cache error: read; run the command again; if the problem persists, delete /home/u/.raeva/metadata.db
+----
+STORE Failure
+repository metadata cache error: no connection available; run the command again; if the problem persists, delete /home/u/.raeva/metadata.db
+----
+STORE Failure
+repository metadata cache error: io detail; run the command again; if the problem persists, delete /home/u/.raeva/metadata.db
+----
+STORE Failure
+repository metadata cache error: disk full; check available space on the volume of /home/u/.raeva/metadata.db
+----
+STORE Failure
+repository metadata cache error: database error; run the command again; if the problem persists, delete /home/u/.raeva/metadata.db
+----
+STORE Failure
+repository metadata cache error: could not grow the shared-memory file of /home/u/.raeva/metadata.db, most often because its volume is full; check available space there
+----
+STORE Failure
+artifact store error: no database connection available (busy); try again in a moment
+----
+LOCKFILE_INVALID Config
+Lockfile error: raeva.lock records no checksum for g:a:1, so a download of it cannot be verified
+
+  Suggestions:
+    - Run 'raeva sync --update' to resolve again and write a lock that pins every artifact
+
+----
+REPOSITORY Resolution
+Invalid repository metadata: invalid metadata: bad xml
+
+  The POM or metadata could not be parsed.
+
+  Suggestions:
+    - Verify the repository is serving valid metadata (not HTML or an error page)
+    - Try 'raeva sync --update' to refetch metadata
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+AUTH Config
+Authentication failed: auth error: no token
+
+  Suggestions:
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+PROXY_AUTH Config
+Authentication failed: auth error: 407 Proxy Authentication Required for https://repo.example/m2/a.pom - the proxy wants credentials: username and password (or token) in config.toml or settings.xml, or user:password@ in HTTPS_PROXY or HTTP_PROXY
+
+  Suggestions:
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+AUTH Config
+While fetching g:a:1:
+
+Authentication required for repository access
+
+  The repository returned HTTP 403.
+
+  Searched:
+    - https://repo.example/m2/ (403)
+
+  Refused by:
+    - repository without an id at https://repo.example/m2/ (HTTP 403: no credentials were sent)
+
+  Suggestions:
+    - Give the repository an id to configure its credentials in ~/.m2/settings.xml or the user config.toml
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+AUTH Config
+While fetching g:a:1:
+
+Authentication required for repository access
+
+  The repository returned HTTP 401.
+
+  Searched:
+    - https://repo.example/m2/ (401)
+
+  Refused by:
+    - '9a\b' at https://repo.example/m2/ (HTTP 401: no credentials were sent)
+
+  Suggestions:
+    - Add a <server> entry to ~/.m2/settings.xml. On CI, read the values from
+      environment variables:
+
+      <server>
+        <id>9a\b</id>
+        <username>${env.REPO_9A_B_USER}</username>
+        <password>${env.REPO_9A_B_TOKEN}</password>
+      </server>
+
+    - Or add an [[auth]] entry to your user config file. Keep credentials out of the
+      project raeva.toml, which is usually committed:
+
+      # /home/u/.config/raeva/config.toml
+      [[auth]]
+      id = "9a\\b"
+      username = "your-username"
+      password = "your-password"
+
+      A registry token that stands in for a password goes in password; use
+      token = "..." only for HTTP Bearer authentication.
+
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+AUTH Config
+While fetching g:a:1:
+
+The repository refused the credentials raeva sent
+
+  The repository returned HTTP 401.
+
+  Searched:
+    - https://repo.example/m2/ (401)
+
+  Refused by:
+    - 'raeva' at https://repo.example/m2/ (HTTP 401: credentials for id 'raeva' from ~/.m2/settings.xml were sent but rejected)
+
+  Suggestions:
+    - Check the credentials for id 'raeva' in ~/.m2/settings.xml: the username or token may be wrong, or the token expired or was revoked
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+AUTH Config
+While fetching g:a:1:
+
+The repository refused the credentials raeva sent
+
+  The repository returned HTTP 401.
+
+  Searched:
+    - https://repo.example/m2/ (401)
+
+  Refused by:
+    - 'raeva' at https://repo.example/m2/ (HTTP 401: credentials for id 'raeva' from ~/.m2/settings.xml were sent but rejected; RAEVA_TOKEN is not set, so the repository received the literal text ${env.RAEVA_TOKEN})
+
+  Suggestions:
+    - Set RAEVA_TOKEN in the environment; the credentials for id 'raeva' in ~/.m2/settings.xml read it
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+AUTH Config
+While fetching g:a:1:
+
+The repository refused the credentials raeva sent
+
+  The repository returned HTTP 403.
+
+  Searched:
+    - https://repo.example/m2/ (403)
+
+  Refused by:
+    - 'corp' at https://repo.example/m2/ (HTTP 403: credentials for id 'corp' from the user config.toml were sent but do not grant access)
+
+  Suggestions:
+    - Check that the credentials for id 'corp' in the user config.toml grant read access to this repository: the token's scope or organization may not cover it
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+NETWORK Network
+While fetching g:a:1:
+
+Network error while accessing repositories
+
+  transfer failed: slow
+
+  Suggestions:
+    - Run the command again later: when resolving, raeva does not fall back to another repository after a failure like this, on purpose, so raeva.lock does not depend on which repository answered
+    - Check your network connection and proxy settings
+    - If you are behind a proxy, set HTTPS_PROXY and HTTP_PROXY (NO_PROXY for hosts to reach directly), or configure one in config.toml or settings.xml
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+NETWORK Network
+While fetching g:a:1:
+
+Network error while accessing repositories
+
+  unexpected response: 429 Too Many Requests for https://repo.example/m2/a.pom
+
+  repo.example answered 429 Too Many Requests, as a busy or rate-limited server does. When resolving, raeva does not fall back to another repository after such an answer, on purpose, so raeva.lock does not depend on which repository answered.
+
+  Suggestions:
+    - Run the command again later
+    - Or route repo.example through a mirror: [[mirrors]] in config.toml or <mirror> in settings.xml
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+REPOSITORY Resolution
+While fetching g:a:1:
+
+Repository error: unexpected response: 500 Internal Server Error for https://repo.example/m2/a.pom
+
+  Searched:
+    - https://repo.example/m2/ (500)
+
+  Suggestions:
+    - The repository failed with HTTP 500, a fault on its side: run the command again later, and if it persists, tell the repository's operator
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+INVALID_POM Resolution
+Parent POM not found: g:p:1-SNAPSHOT
+
+  This parent POM could not be resolved.
+
+  Suggestions:
+    - SNAPSHOT parents require a repository with snapshots = true
+    - If the parent is internal, add its repository to raeva.toml
+    - A local <relativePath> parent is read only inside the project directory, or one level above a single module; run raeva from a directory that contains it
+
+----
+INVALID_POM Resolution
+Local POM error: x
+
+  Suggestions:
+    - Set <systemPath> to an absolute path inside the project, such as ${project.basedir}/lib/name.jar; raeva refuses a path outside it
+    - Or deploy the jar to a repository and depend on it without system scope, which is not portable
+
+----
+INVALID_POM Resolution
+Invalid POM metadata: the POM is not well-formed XML: bad at line 3
+
+  The POM is not well-formed XML, and Maven rejects it too.
+
+  Suggestions:
+    - Verify the repository is serving a valid POM (not HTML or an error page)
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+INVALID_POM Resolution
+Invalid POM metadata: missing required field: version
+
+  The POM was read, but its content is not a model raeva accepts.
+
+  Suggestions:
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+INVALID_POM Config
+Invalid pom.xml: the POM is not well-formed XML: bad at line 3
+
+  File: app/pom.xml
+
+  Suggestions:
+    - Check for XML syntax errors (unclosed tags, unescaped characters)
+    - Verify the file is valid XML by opening it in a browser or XML validator
+    - Run 'mvn validate' to check POM validity
+
+----
+ARTIFACT_NOT_FOUND Resolution
+Dependency not found: g:a:1
+
+  Searched:
+    - https://repo.example/m2/ (404)
+
+  Blocked plain-HTTP repositories, which Maven's default HTTP blocker refuses too:
+    - http://old.example/m2/ (declared by g:legacy:1)
+
+  To allow one, mirror it, or declare its URL in [[repositories]] in raeva.toml,
+  config.toml or settings.xml.
+
+  Ignored transitive repositories: raeva ignores dependency POM repositories by default.
+  Maven would search these for this artifact:
+    - https://corp.example/a/ (declared by g:dep:1)
+    - https://corp.example/a (declared by g:dep:1)
+
+  To use one, add it to raeva.toml. [[repositories]] adds to Maven Central and the
+  repositories already searched:
+
+      [[repositories]]
+      id = "corp-a"
+      url = "https://corp.example/a/"
+
+      [[repositories]]
+      id = "corp-a-2"
+      url = "https://corp.example/a"
+
+  A settings.xml profile <repositories> also works, or add the URL to [security]
+  transitive_repository_allowlist in the user config.toml. A repository that redirects
+  downloads to another host still needs a [[repositories]] entry.
+
+  Suggestions:
+    - Check the group, artifact and version, and that this version is published
+    - Check the URLs of the repositories searched, including the path (such as an organization name), and that their credentials can read the artifact
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+ARTIFACT_NOT_FOUND Resolution
+Dependency not found: g:a:1
+
+  This artifact was not found in any configured repository.
+
+  Suggestions:
+    - Check the group, artifact and version, and that this version is published
+    - If the artifact is in a private repository, add that repository to [[repositories]] in raeva.toml or to settings.xml
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+ARTIFACT_NOT_FOUND Resolution
+Dependency not found: g:a:1
+
+  In app/pom.xml, through g:dep:1
+
+  Searched:
+    - https://repo1.maven.org/maven2/ (404)
+
+  Suggestions:
+    - Check the group, artifact and version, and that this version is published
+    - If the artifact is in a private repository, add that repository to [[repositories]] in raeva.toml or to settings.xml
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+ARTIFACT_NOT_FOUND Resolution
+Dependency not found: g:a:1
+
+  Searched:
+    - https://repo1.maven.org/maven2/ through mirror https://mirror.example/all/ (404)
+
+  Suggestions:
+    - Check the group, artifact and version, and that this version is published
+    - Every request went through the mirror https://mirror.example/all/, so the artifact must be available there; a repository you add goes through it too if the mirror's mirrorOf matches it
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+RESOLUTION Resolution
+no snapshot-enabled repository available for g:a:1.0-SNAPSHOT: none of the configured repositories (central) have snapshots enabled
+
+  Suggestions:
+    - Add the repository that publishes this SNAPSHOT to [[repositories]] in raeva.toml with snapshots = true, or to settings.xml with snapshots enabled, or depend on a released version
+
+----
+ARTIFACT_NOT_FOUND Resolution
+Dependency not found: g:a:1
+
+  Searched:
+    - https://repo1.maven.org/maven2/ through mirror https://mirror.example/a/ (404)
+    - https://repo.maven.apache.org/maven2/ through mirror https://mirror.example/b/ (404)
+
+  Suggestions:
+    - Check the group, artifact and version, and that this version is published
+    - Every request went through the mirrors https://mirror.example/a/ and https://mirror.example/b/, so the artifact must be available there; a repository you add goes through one of them too if its mirrorOf matches it
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+RESOLUTION Resolution
+missing version for dependency g:a
+
+  In app/pom.xml
+
+----
+NO_REPOSITORIES Config
+13 artifact fetch error(s); the first:
+
+No repositories configured
+
+  Dependency resolution requires at least one repository.
+
+  Also failed:
+    artifact not found: g:a:0
+    artifact not found: g:a:1
+    artifact not found: g:a:2
+    artifact not found: g:a:3
+    artifact not found: g:a:4
+    artifact not found: g:a:5
+    artifact not found: g:a:6
+    artifact not found: g:a:7
+    artifact not found: g:a:8
+    artifact not found: g:a:9
+    ... and 2 more
+
+  Suggestions:
+    - Add a repository to raeva.toml:
+
+      [[repositories]]
+      id = "central"
+      url = "https://repo1.maven.org/maven2/"
+
+    - Run 'raeva doctor' to verify configuration
+    - Check the group, artifact and version, and that this version is published
+    - If the artifact is in a private repository, add that repository to [[repositories]] in raeva.toml or to settings.xml
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+VERSION_CONFLICT Resolution
+Version conflict: g:a
+
+  Requested: 1
+  Selected: 2
+
+  Suggestions:
+    - Pin the version in pom.xml, with <dependencyManagement> or a direct dependency
+    - Run 'raeva tree' to locate conflicting requests
+
+----
+IO Failure
+io error: io detail
+----
+IO Failure
+I/O error: /p/raeva.lock: io detail
+
+  Suggestions:
+    - Check the permissions of /p/raeva.lock and of its directory
+
+----
+INTERNAL Failure
+internal error: x
+----
+INTERNAL Failure
+reactor resolution stalled: no progress for 9s while resolving app
+
+  Suggestions:
+    - This is a bug in raeva, not in your project; please report it with this message
+    - Set RAEVA_WORKSPACE_STALL_TIMEOUT_SECS to raise the limit, or to 0 to disable the check
+
+----
+RESOLUTION Resolution
+pom-packaged dependency g:a resolved its artifact to 1 and its companion POM to 2, but for packaging=pom those are the same Maven file; one lockfile row cannot pin both
+
+  Suggestions:
+    - Re-run 'raeva sync --update'
+
+----
+RESOLUTION Resolution
+relocation cycle detected: a -> b
+----
+LOCKFILE_MISMATCH LockMismatch
+export error: lockfile pin for k (sha256=1) does not match the blob in the global store (2)
+
+  Suggestions:
+    - Run 'raeva sync' first
+
+----
+LOCKFILE_MISMATCH LockMismatch
+export error: missing blob for k
+
+  Suggestions:
+    - Run 'raeva sync' to download the locked files of every platform in raeva.lock, then retry the export
+
+----
+LOCKFILE_MISMATCH LockMismatch
+export error: store corruption: blob at /home/u/.raeva/store/blobs/1 has SHA-256 2 but index recorded 1
+
+  Suggestions:
+    - Run 'raeva sync' to download the damaged file again, then retry the export
+
+----
+LOCKFILE_MISMATCH LockMismatch
+export error: raeva.lock pins the POM for k to sha256 1, but the content store holds no copy of those bytes that a repository raeva.lock records served; refusing to export a POM this lockfile was not resolved against
+
+  Suggestions:
+    - Run 'raeva sync' with network access to restore the locked POMs, then retry the export
+
+----
+LOCKFILE_INVALID Config
+export error: raeva.lock records no POM digest for k; refusing to export a POM this lockfile does not pin
+
+  Suggestions:
+    - Run 'raeva sync --update' to rewrite raeva.lock
+
+----
+LOCKFILE_INVALID Config
+export error: invalid coordinate: k
+----
+LOCAL_REPOSITORY Config
+export error: path traversal attempt detected: x
+----
+LOCAL_REPOSITORY Config
+export error: A and a differ only in letter case, and the file system holding "x" does not distinguish case, so both would be written to the same file
+
+  Suggestions:
+    - Export to a case-sensitive volume with --m2-path
+
+----
+EXPORT Failure
+export error: destination "x" already exists with different bytes than raeva.lock pins for k (expected sha256 1, found 2)
+
+  Suggestions:
+    - Rerun with --overwrite to replace it
+
+----
+EXPORT Failure
+export error: io error: io detail
+----
+VULNERABILITY_SERVICE Failure
+OSV named 12 vulnerability record(s) that could not be fetched: GHSA-0 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-1 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-2 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-3 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-4 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-5 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-6 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-7 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-8 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-9 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more) and 2 more; invalid response: x
+
+  Suggestions:
+    - Run the scan again: until every record is fetched, the findings are incomplete
+
+----
+VULNERABILITY_SERVICE Usage
+vulnerability scan failed: OSV named 2 vulnerability record(s) that could not be fetched: GHSA-1 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more), GHSA-2 (pkg:maven/g/a0@1, pkg:maven/g/a1@1, pkg:maven/g/a2@1 and 1 more); they failed for different reasons, the first: rate limited by OSV API
+
+  Suggestions:
+    - Run the scan again: until every record is fetched, the findings are incomplete
+
+----
+NOT_FOUND Resolution
+failed to download 1 artifact(s): Repository error: not found: a
+
+  Failed:
+    g:a:1: gone
+
+----
+AUTH Config
+failed to download 12 artifact(s): Authentication required for repository access
+
+  The repository returned HTTP 401.
+
+  Failed:
+    g:a0:1: refused
+    g:a1:1: refused
+    g:a2:1: refused
+    g:a3:1: refused
+    g:a4:1: refused
+    g:a5:1: refused
+    g:a6:1: refused
+    g:a7:1: refused
+    g:a8:1: refused
+    g:a9:1: refused
+    ... and 2 more
+
+  Suggestions:
+    - Add a <server> entry to ~/.m2/settings.xml. On CI, read the values from
+      environment variables:
+
+      <server>
+        <id>repository-id</id>
+        <username>${env.REPOSITORY_ID_USER}</username>
+        <password>${env.REPOSITORY_ID_TOKEN}</password>
+      </server>
+
+    - Or add an [[auth]] entry to your user config file. Keep credentials out of the
+      project raeva.toml, which is usually committed:
+
+      # /home/u/.config/raeva/config.toml
+      [[auth]]
+      id = "repository-id"
+      username = "your-username"
+      password = "your-password"
+
+      A registry token that stands in for a password goes in password; use
+      token = "..." only for HTTP Bearer authentication.
+
+    - Run 'raeva doctor' to diagnose repository connectivity
+
+----
+PLATFORM_MISSING Config
+raeva.lock has no section for platform linux-x86_64; it records darwin-arm64
+
+  Suggestions:
+    - Run 'raeva sync --platforms linux-x86_64' to add it; the sync keeps the platforms raeva.lock records
+    - No machine checks darwin-arm64: raeva names platforms linux-x86_64, linux-aarch64, macos-x86_64, macos-aarch64, windows-x86_64, windows-aarch64
+
+----
+PLATFORM_MISSING Config
+raeva.lock has no section for platform linux-x86_64; it records macos-aarch64, windows-x86_64
+
+  Suggestions:
+    - Run 'raeva sync --platforms linux-x86_64' to add it; the sync keeps the platforms raeva.lock records
+    - Or check only the recorded platforms: 'raeva sync --frozen --platforms macos-aarch64,windows-x86_64'
+
+----
+LOCKFILE_INVALID Config
+raeva.lock has schema version 9, which a newer raeva wrote; this raeva reads schema 8
+
+  Suggestions:
+    - Upgrade raeva to a release that reads schema 9, here and where CI installs it
+
+----
+LOCKFILE_MISSING Config
+lockfile not found: /p/raeva.lock
+
+  Suggestions:
+    - Run 'raeva sync' to create it and commit raeva.lock; CI checks it with 'raeva sync --frozen'
+
+----
+PROJECT_FILE_MISSING Config
+project file not found: pom.xml
+
+  Suggestions:
+    - Run raeva in the directory of the root pom.xml, or name that directory with -C <dir>
+
+----
+LOCKFILE_BUSY Failure
+raeva.lock in p is in use by another raeva process: io detail. Wait for it to finish and run the command again
+----
+IO Failure
+I/O error: io detail
+----
+SBOM Failure
+SBOM generation failed: invalid component data: x
+----
+ERROR Failure
+plain
+----
+USAGE Usage
+x
+----
+REPOSITORY_ORIGIN_ALIAS Config
+repositories a and b name different directories, which raeva.lock would record as the one origin ./repo/; declare each directory with a path of its own
+----
+DOCTOR_CHECKS_FAILED Partial
+1 check(s) failed

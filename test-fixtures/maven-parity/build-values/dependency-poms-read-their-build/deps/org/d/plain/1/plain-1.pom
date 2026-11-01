@@ -1,0 +1,4 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.d</groupId><artifactId>plain</artifactId><version>1</version>
+  <dependencies>
+    <dependency><groupId>org.d</groupId><artifactId>n4</artifactId><version>1</version><classifier>${project.build.finalName}</classifier></dependency>
+  </dependencies></project>

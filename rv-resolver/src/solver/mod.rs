@@ -1,54 +1,49 @@
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures::stream::{self, StreamExt};
-use rv_maven_model::{Dependency, DependencyManagement, Project, Scope};
-use rv_version::{Coord, Version, VersionReq};
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use indexmap::IndexMap;
+use petgraph::graph::NodeIndex;
+use rv_maven_model::{Dependency, DependencyManagement, PomError, Project, Scope};
+use rv_maven_types::{Coord, Version, VersionReq, bounded};
 
-use crate::ResolutionStrategy;
+use crate::context::RepoContext;
 use crate::error::{DroppedRepo, RepoSearchStatus, ResolveError, Result};
-use crate::graph::{CoordKey, Edge, Graph, Node};
+use crate::graph::{CoordKey, Edge, Graph, Node, RepoRef, same_text};
+use crate::util::{DynamicVersionToken, parse_dynamic_version_token};
 
-mod platform;
+mod management;
 mod queue;
 mod relocation;
 
-pub(crate) use self::platform::{ConstraintVersion, PlatformConstraint, PlatformConstraints};
-use self::platform::{merge_platform_constraints, resolve_version_str};
-use self::queue::{ExclusionKey, PathNode, QueueItem, extend_exclusions, is_excluded, push_queue};
+pub(crate) use self::management::Management;
+use self::management::resolve_version_str;
+pub(crate) use self::queue::{ExclusionKey, PathNode, excludes};
+use self::queue::{
+    QueueItem, ShadowOrigin, SortKey, TreeOrder, extend_exclusions, is_excluded, push_queue,
+};
+use self::relocation::RelocationCache;
 
 #[cfg(test)]
 mod tests;
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// Default parallel POM fetches. 32 saturates most home and corporate
-/// connections without overwhelming the typical Maven repository's per-host
-/// rate limit.
-const DEFAULT_FETCH_CONCURRENCY: usize = 32;
-/// Hard ceiling on fetch concurrency to keep file-descriptor and socket
-/// usage bounded even when users override the default. Aligned with the
-/// artifact-fetch ceiling in `Resolver::populate_artifacts`
-/// (`network.concurrency.clamp(1, MAX_FETCH_CONCURRENCY)`) so the POM-fetch and
-/// artifact-fetch stages share one cap instead of silently throttling POM
-/// fetches to half.
-pub(crate) const MAX_FETCH_CONCURRENCY: usize = 128;
-
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedVersion {
     pub version: Version,
-    pub repo_url: Option<Arc<str>>,
+    /// The repository whose SNAPSHOT metadata named this version.
+    pub repo: Option<RepoRef>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedProject {
-    pub project: Project,
+    pub project: Arc<Project>,
     pub repo_url: Option<Arc<str>>,
     pub workspace_module: Option<String>,
-    pub platform_constraints: Option<PlatformConstraints>,
 }
 
 pub(crate) trait Backend {
@@ -56,11 +51,19 @@ pub(crate) trait Backend {
         None
     }
 
+    /// Called for each reactor module read below an external dependency.
+    fn note_transitive_selection(&self) {}
+
+    fn is_reactor_module(&self, _group: &str, _artifact: &str, _version: &str) -> bool {
+        false
+    }
+
     fn resolve_version<'a>(
         &'a self,
         group_id: &'a str,
         artifact_id: &'a str,
         req: &'a VersionReq,
+        repos: &'a RepoContext,
     ) -> BoxFuture<'a, Result<ResolvedVersion>>;
 
     /// All matching versions in ascending Maven version order.
@@ -70,88 +73,101 @@ pub(crate) trait Backend {
         group_id: &'a str,
         artifact_id: &'a str,
         req: &'a VersionReq,
+        repos: &'a RepoContext,
     ) -> BoxFuture<'a, Result<Vec<ResolvedVersion>>> {
-        let resolution = self.resolve_version(group_id, artifact_id, req);
+        let resolution = self.resolve_version(group_id, artifact_id, req, repos);
         Box::pin(async move { resolution.await.map(|v| vec![v]) })
     }
 
     fn resolve_snapshot_version<'a>(
         &'a self,
         coord: &'a Coord,
+        _repos: &'a RepoContext,
     ) -> BoxFuture<'a, Result<ResolvedVersion>> {
         Box::pin(async move {
             Ok(ResolvedVersion {
                 version: coord.version.clone(),
-                repo_url: None,
+                repo: None,
             })
         })
     }
 
+    /// `resolve_snapshot_pom`: `coord` is a build SNAPSHOT metadata
+    /// selected, whose POM build is resolved on its own.
     fn fetch_project<'a>(
         &'a self,
         coord: &'a Coord,
-        scope: Scope,
+        resolve_snapshot_pom: bool,
+        repos: &'a RepoContext,
     ) -> BoxFuture<'a, Result<ResolvedProject>>;
 
+    /// Aggregate `project`'s admitted repositories onto `parent` for its
+    /// children, Maven style (existing repository IDs win).
+    fn extend_repo_context(
+        &self,
+        parent: &RepoContext,
+        _coord: &Coord,
+        _project: &Project,
+    ) -> RepoContext {
+        parent.clone()
+    }
+
+    /// Whether the backend acts on the `prefetch_*` hints, so the solver
+    /// can skip working them out.
+    fn prefetches(&self) -> bool {
+        true
+    }
+
+    /// `coord` is queued and [`Backend::fetch_project`] will likely be
+    /// asked for it, so the backend may start fetching. A hint only.
+    fn prefetch_project(&self, _coord: &Coord, _repos: &RepoContext) {}
+
+    /// `coord` is a version of a range the solver reads, and Maven reads
+    /// each one up to the first that relocates, so the backend may fetch
+    /// it ahead of the guesses [`Backend::prefetch_project`] names. A hint
+    /// only.
+    fn prefetch_range_version(&self, coord: &Coord, repos: &RepoContext) {
+        self.prefetch_project(coord, repos);
+    }
+
+    /// A queued declaration reads the versions of `group_id:artifact_id`
+    /// that `req` accepts, so the backend may list them and fetch each as
+    /// [`Backend::prefetch_range_version`] does. A hint only.
+    fn prefetch_range(
+        &self,
+        _group_id: &str,
+        _artifact_id: &str,
+        _req: &VersionReq,
+        _repos: &RepoContext,
+    ) {
+    }
+
+    /// `coord` entered the graph, served by `repo_url`, and its artifact
+    /// will likely be fetched, so the backend may start downloading it. A
+    /// hint only.
+    fn prefetch_artifact(&self, _coord: &Coord, _repo_url: Option<&str>, _repos: &RepoContext) {}
+
     /// Transitive repositories that were ignored but declared by a POM on
-    /// `path` (`group:artifact` pairs, root first) and could serve `version`.
+    /// `path` (`group:artifact:version`, root first) and could serve
+    /// `version`.
     fn dropped_repos_on_path(
         &self,
-        _path: &[(String, String)],
+        _path: &[String],
         _version: &str,
         _searched: &[RepoSearchStatus],
     ) -> Vec<DroppedRepo> {
         Vec::new()
     }
-}
 
-/// A fetch budget shared by concurrent module solves in one reactor.
-///
-/// Each share grows as other solves finish. The budget is advisory: a request
-/// semaphore could deadlock when `block_on_async` parks a thread whose sibling
-/// fetches hold permits and need that thread to progress.
-#[derive(Debug)]
-pub(crate) struct FetchShare {
-    total: usize,
-    active: AtomicUsize,
-}
-
-impl FetchShare {
-    pub(crate) fn new(total: usize) -> Self {
-        Self {
-            total: total.clamp(1, MAX_FETCH_CONCURRENCY),
-            active: AtomicUsize::new(0),
-        }
-    }
-
-    /// Register one running solve until the guard drops.
-    pub(crate) fn enter(self: &Arc<Self>) -> FetchShareGuard {
-        self.active.fetch_add(1, Ordering::Relaxed);
-        FetchShareGuard(Arc::clone(self))
-    }
-
-    pub(crate) fn current(&self) -> usize {
-        (self.total / self.active.load(Ordering::Relaxed).max(1)).max(1)
-    }
-}
-
-pub(crate) struct FetchShareGuard(Arc<FetchShare>);
-
-impl Drop for FetchShareGuard {
-    fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    /// `coord` won mediation through a declaration below `path`.
+    fn note_winner(&self, _coord: &Coord, _path: &Arc<PathNode>) -> Result<()> {
+        Ok(())
     }
 }
 
 pub(crate) struct Solver<'a, B: Backend> {
     backend: &'a B,
-    strategy: ResolutionStrategy,
-    platform_constraints: Option<PlatformConstraints>,
-    fetch_concurrency: usize,
-    fetch_share: Option<Arc<FetchShare>>,
-    /// When true, use full Maven scope transitivity rules (e.g. compile->test = test).
-    /// Set for pom.xml sources; false for rv.toml (simplified behavior).
-    strict_maven_compat: bool,
+    management: Management,
 }
 
 #[derive(Debug, Clone)]
@@ -161,42 +177,49 @@ pub(crate) struct SolverRoot {
     pub scope: Scope,
 }
 
+const MAX_WINNER_CHANGES: u32 = 256;
+
+const ROOT_GENERATION: u64 = 1;
+
+struct Walk {
+    graph: Graph,
+    /// The generation of each node's winner, by node index. A node takes a
+    /// new one whenever its winner changes or it leaves the resolution,
+    /// which makes the declarations of the previous winner stale.
+    generations: Vec<u64>,
+    next_generation: u64,
+    selected: HashMap<CoordKey, Selected>,
+    groups: HashMap<CoordKey, CoordKey>,
+    declared: HashMap<NodeIndex, Vec<CoordKey>>,
+    shadows: HashMap<CoordKey, Vec<CoordKey>>,
+    /// Groups to mediate again, in declaration order.
+    dirty: VecDeque<CoordKey>,
+    /// Membership for [`Self::dirty`]. Keeps `contains` O(1).
+    dirty_set: HashSet<CoordKey>,
+    queue: BinaryHeap<QueueItem>,
+    next_declared_at: u64,
+    /// Range declarations of a shadow walk, to load and walk: each one's
+    /// candidates, from the lowest version up.
+    walk_loads: Vec<Vec<Arc<Candidate>>>,
+    confirm: Vec<(CoordKey, Arc<Candidate>, usize)>,
+    /// The highest candidates of range declarations whose versions are not
+    /// loaded yet, in declaration order.
+    unscanned: VecDeque<(CoordKey, Arc<Candidate>)>,
+    /// Declarations before this one were hinted to the backend.
+    hinted: u64,
+    relocations: RelocationCache,
+}
+
 impl<'a, B: Backend> Solver<'a, B> {
-    pub(crate) fn with_strategy(
-        backend: &'a B,
-        strategy: ResolutionStrategy,
-        platform_constraints: Option<PlatformConstraints>,
-    ) -> Self {
+    pub(crate) fn new(backend: &'a B) -> Self {
         Self {
             backend,
-            strategy,
-            platform_constraints,
-            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
-            fetch_share: None,
-            strict_maven_compat: false,
+            management: Management::default(),
         }
     }
 
-    pub(crate) fn with_fetch_concurrency(mut self, concurrency: usize) -> Self {
-        self.fetch_concurrency = concurrency.clamp(1, MAX_FETCH_CONCURRENCY);
-        self
-    }
-
-    pub(crate) fn with_fetch_share(mut self, share: Arc<FetchShare>) -> Self {
-        self.fetch_share = Some(share);
-        self
-    }
-
-    /// Current number of items to resolve in parallel.
-    fn current_fetch_concurrency(&self) -> usize {
-        match &self.fetch_share {
-            Some(share) => share.current(),
-            None => self.fetch_concurrency.max(1),
-        }
-    }
-
-    pub(crate) fn with_strict_maven_compat(mut self, enabled: bool) -> Self {
-        self.strict_maven_compat = enabled;
+    pub(crate) fn with_management(mut self, management: Management) -> Self {
+        self.management = management;
         self
     }
 
@@ -206,387 +229,1628 @@ impl<'a, B: Backend> Solver<'a, B> {
             dependencies,
             scope,
         } = root;
-        let root_key = CoordKey::from(&coord);
-        let root_version = coord.version.clone();
-        let root_version_arc = Arc::new(root_version.clone());
-        let root_node = Node {
+        let path = PathNode::root(&coord);
+        let mut walk = Walk::new(Graph::new(Node {
             workspace_module: self.backend.workspace_module(&coord),
             coord,
             scope,
             repo_url: None,
+            build_repo: None,
+            repos: RepoContext::default(),
             checksum: None,
             local: false,
             system_path: None,
-        };
-        let mut graph = Graph::new(root_node);
-
-        // Estimate capacity based on typical dependency expansion factor.
-        let estimated_deps = dependencies.len() * 10;
-        let mut selected: HashMap<CoordKey, Selected<Option<ResolvedProject>>> =
-            HashMap::with_capacity(estimated_deps);
-        selected.insert(
-            root_key.clone(),
-            Selected {
-                node: graph.root(),
-                version: root_version.clone(),
-                hard: Vec::new(),
-                candidates: Vec::new(),
-                winner: None,
-            },
-        );
-        let mut requirements = HashMap::new();
-        let relocation_cache = Mutex::new(HashMap::with_capacity(32));
-        let mut platform_constraints =
-            Arc::new(self.platform_constraints.clone().unwrap_or_default());
-        let fetch_concurrency = self.current_fetch_concurrency();
-
-        let mut next_declared_at: u64 = 0;
-        let mut queue = BinaryHeap::with_capacity(estimated_deps);
-        let root_path = PathNode::root(root_key.clone());
-        let empty_exclusions: Arc<[ExclusionKey]> = Arc::from(Vec::new());
-        for dep in dependencies {
-            let declared_at = next_declared_at;
-            next_declared_at += 1;
-            push_queue(
-                &mut queue,
-                QueueItem::new(
-                    graph.root(),
-                    Arc::clone(&root_version_arc),
-                    Arc::new(dep),
-                    scope,
-                    1,
-                    declared_at,
-                    Arc::clone(&empty_exclusions),
-                    Arc::clone(&root_path),
-                ),
-            )?;
+            winner_parent: None,
+        }));
+        let exclusions: Arc<[ExclusionKey]> = Arc::from(Vec::new());
+        for (index, dependency) in dependencies.into_iter().enumerate() {
+            let item = QueueItem {
+                parent: walk.graph.root(),
+                parent_generation: ROOT_GENERATION,
+                dependency: Arc::new(dependency),
+                managed_scope: false,
+                depth: 1,
+                order: TreeOrder::default().child(index),
+                declared_at: walk.declare(),
+                exclusions: Arc::clone(&exclusions),
+                path: Arc::clone(&path),
+                shadow: None,
+            };
+            // Before any of them is read, so the module's dependencies
+            // download nothing first.
+            let managed = apply_managed_metadata(&self.management, item.clone());
+            if managed.dependency.effective_scope() != Scope::Import {
+                let version = resolve_version_str(&self.management, &managed.dependency, 1)?;
+                refuse_undefined_property(self, &managed, version)?;
+            }
+            push_queue(&mut walk.queue, item)?;
         }
-
-        let mut batch: Vec<QueueItem> = Vec::with_capacity(fetch_concurrency);
+        // Items are read one at a time, in queue order, and each is mediated
+        // before the next is read, as Maven collects: what a read records or
+        // logs, and which reads happen at all, follow from the graph alone.
+        // The backend prefetches the POMs of queued items concurrently.
         loop {
-            while let Some(item) = queue.pop() {
-                if is_barrier(&item) {
-                    if !batch.is_empty() {
-                        let current = std::mem::take(&mut batch);
-                        process_batch(
-                            self,
-                            current,
-                            &mut graph,
-                            &mut selected,
-                            &mut requirements,
-                            &mut platform_constraints,
-                            &mut queue,
-                            &mut next_declared_at,
-                            &relocation_cache,
-                        )
-                        .await?;
-                    }
-                    process_batch(
-                        self,
-                        vec![item],
-                        &mut graph,
-                        &mut selected,
-                        &mut requirements,
-                        &mut platform_constraints,
-                        &mut queue,
-                        &mut next_declared_at,
-                        &relocation_cache,
-                    )
-                    .await?;
+            self.hint_queued(&mut walk);
+            let Some(item) = walk.queue.pop() else {
+                if walk.walk_excluded_dependencies(self.backend)? {
                     continue;
                 }
+                return walk.finish(self.backend);
+            };
+            self.hint_queued(&mut walk);
+            let outcome = resolve_item(self, item.clone(), &walk.relocations)
+                .await
+                .map_err(|err| declared_below(err, &item.path));
+            self.mediate(&mut walk, item, outcome).await?;
+        }
+    }
 
-                batch.push(item);
-                if batch.len() >= self.current_fetch_concurrency() {
-                    let current = std::mem::take(&mut batch);
-                    process_batch(
-                        self,
-                        current,
-                        &mut graph,
-                        &mut selected,
-                        &mut requirements,
-                        &mut platform_constraints,
-                        &mut queue,
-                        &mut next_declared_at,
-                        &relocation_cache,
+    /// Tell the backend which POMs the items queued since the last hint will
+    /// fetch, in the order the queue hands them out.
+    fn hint_queued(&self, walk: &mut Walk) {
+        if walk.hinted >= walk.next_declared_at || !self.backend.prefetches() {
+            return;
+        }
+        let mut fresh: Vec<&QueueItem> = walk
+            .queue
+            .iter()
+            .filter(|item| item.declared_at >= walk.hinted)
+            .collect();
+        fresh.sort_by(|a, b| b.cmp(a));
+        for item in fresh {
+            match prefetch_requirement(item, &self.management) {
+                Some((dependency, RequestedRequirement::Ranges(req))) => {
+                    self.backend.prefetch_range(
+                        &dependency.group_id,
+                        &dependency.artifact_id,
+                        &req,
+                        &item.path.repos,
                     )
-                    .await?;
                 }
-            }
-
-            if !batch.is_empty() {
-                let current = std::mem::take(&mut batch);
-                process_batch(
-                    self,
-                    current,
-                    &mut graph,
-                    &mut selected,
-                    &mut requirements,
-                    &mut platform_constraints,
-                    &mut queue,
-                    &mut next_declared_at,
-                    &relocation_cache,
-                )
-                .await?;
-            }
-
-            if queue.is_empty() {
-                break;
+                Some((dependency, requirement)) => {
+                    if let Some(coord) = fixed_coord(&dependency, requirement) {
+                        self.backend.prefetch_project(&coord, &item.path.repos);
+                    }
+                }
+                None => {}
             }
         }
+        walk.hinted = walk.next_declared_at;
+    }
 
-        Ok(graph)
+    /// Tell the backend which POMs the children of `item` will fetch, as
+    /// soon as its `project` is built: they are queued only once it wins.
+    fn hint_children(&self, item: &QueueItem, coord: &Coord, project: &Project) {
+        if !self.backend.prefetches() {
+            return;
+        }
+        let child_repos = self
+            .backend
+            .extend_repo_context(&item.path.repos, coord, project);
+        let exclusions = extend_exclusions(&item.exclusions, &item.dependency.exclusions);
+        for dependency in &project.dependencies {
+            let mut dependency = dependency.clone();
+            if dependency.version.is_none() {
+                dependency.version =
+                    managed_child_version(&project.dependency_management, &dependency);
+            }
+            let child = QueueItem {
+                dependency: Arc::new(dependency),
+                depth: item.depth + 1,
+                exclusions: Arc::clone(&exclusions),
+                ..item.clone()
+            };
+            if let Some(coord) = prefetch_coord(&child, &self.management) {
+                self.backend.prefetch_project(&coord, &child_repos);
+            }
+        }
+    }
+
+    async fn mediate(
+        &self,
+        walk: &mut Walk,
+        item: QueueItem,
+        outcome: Result<Option<Resolution>>,
+    ) -> Result<()> {
+        // An item that went stale while queued is read too: Maven reads the
+        // subtree of a candidate that loses later. Its result is dropped,
+        // failures included.
+        if !walk.is_live(&item) {
+            return Ok(());
+        }
+        match outcome? {
+            None => {}
+            Some(resolution) => walk.add_resolution(self.backend, resolution)?,
+        }
+        loop {
+            if let Some((key, candidate)) = walk.unscanned.pop_front() {
+                let key = walk.group_of(&key);
+                if walk.holds(&key, &candidate) {
+                    self.load(walk, &key, candidate).await?;
+                }
+            // Maven's dirty tree has a range's subtree too, so a walk reads
+            // the range as a declaration does and walks each version it
+            // reads.
+            } else if let Some(probes) = walk.walk_loads.pop() {
+                let loads = self.load_in_order(&probes, &walk.relocations).await;
+                for loaded in loads {
+                    match loaded? {
+                        Load::Ready(candidate) => walk.add_resolution(
+                            self.backend,
+                            Resolution {
+                                candidate,
+                                alternatives: Vec::new(),
+                                aliases: Vec::new(),
+                            },
+                        )?,
+                        Load::Relocated(resolution) | Load::Cyclic(resolution) => {
+                            walk.add_resolution(self.backend, resolution)?
+                        }
+                        Load::Excluded => {}
+                    }
+                }
+            } else if !walk.confirm.is_empty() {
+                for (key, candidate, from) in std::mem::take(&mut walk.confirm) {
+                    self.confirm(walk, key, candidate, from).await?;
+                }
+            } else if let Some(key) = walk.take_dirty() {
+                self.reconsider(walk, key).await?;
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Mediate a group again: the nearest candidate that every hard
+    /// constraint accepts wins. A winner whose project is not loaded yet, a
+    /// range's alternative, is loaded first and may relocate.
+    async fn reconsider(&self, walk: &mut Walk, key: CoordKey) -> Result<()> {
+        loop {
+            let key = walk.group_of(&key);
+            let Some(selection) = walk.selected.get_mut(&key) else {
+                return Ok(());
+            };
+            selection.settled = None;
+            if selection.candidates.iter().all(|c| c.item.shadow.is_some()) {
+                walk.drop_group(&key);
+                return Ok(());
+            }
+            let best = selection.best();
+            // A range whose lowest version relocates has no hard constraint
+            // left, so the ranges that decide the mediation load that first.
+            let unconfirmed = selection.unconfirmed(best.as_deref());
+            let dirty = best
+                .as_ref()
+                .map(|best| selection.dirty_ranges(best))
+                .unwrap_or_default();
+            if !unconfirmed.is_empty() {
+                for candidate in unconfirmed {
+                    let key = walk.group_of(&key);
+                    if walk.holds(&key, &candidate) {
+                        self.load(walk, &key, candidate).await?;
+                    }
+                }
+                continue;
+            }
+            let Some(best) = best else {
+                // Maven reports a conflict only once every candidate is in;
+                // a later eviction may still remove the constraint.
+                selection.note_conflict();
+                return Ok(());
+            };
+            // Maven's dirty tree still reads a losing range's preferred
+            // version when that range already accepts the nearer winner. A
+            // Ready result is only a probe.
+            if !dirty.is_empty() {
+                let mut relocated = false;
+                for candidate in dirty {
+                    let key = walk.group_of(&key);
+                    if !walk.holds(&key, &candidate) {
+                        continue;
+                    }
+                    let declared_at = candidate.item.declared_at;
+                    // Another declaration in the same repository context may
+                    // already have loaded this version.
+                    let already = walk.selected.get(&key).is_some_and(|selection| {
+                        selection.candidates.iter().any(|c| {
+                            same_text(&c.coord, &candidate.coord)
+                                && c.item.path.repos == candidate.item.path.repos
+                                && c.resolved_project.is_some()
+                        })
+                    });
+                    if already {
+                        if let Some(selection) = walk.selected.get_mut(&key) {
+                            selection.dirty_checked.insert(declared_at);
+                        }
+                        continue;
+                    }
+                    match load_candidate(self, candidate.as_ref().clone(), &walk.relocations)
+                        .await?
+                    {
+                        Load::Relocated(_) | Load::Cyclic(_) => {
+                            self.load(walk, &key, candidate).await?;
+                            relocated = true;
+                        }
+                        Load::Ready(_) | Load::Excluded => {
+                            if let Some(selection) = walk.selected.get_mut(&key) {
+                                selection.dirty_checked.insert(declared_at);
+                            }
+                        }
+                    }
+                }
+                if relocated {
+                    continue;
+                }
+            }
+            let selection = walk.selected.get_mut(&key).expect("mediated group");
+            selection.conflict = None;
+            if let Some(winner) = &selection.winner
+                && winner.same(&best)
+            {
+                // A declaration took the place of its own shadow.
+                selection.winner = Some(best);
+                selection.settle();
+                walk.scan_losers(self.backend, &key, 0)?;
+                return Ok(());
+            }
+            if best.resolved_project.is_none() {
+                self.load(walk, &key, best).await?;
+                continue;
+            }
+            walk.commit(self.backend, &key, best)?;
+            if let Some(selection) = walk.selected.get_mut(&key) {
+                selection.settle();
+            }
+            walk.scan_losers(self.backend, &key, 0)?;
+            return Ok(());
+        }
     }
 }
 
-#[allow(clippy::large_enum_variant)] // Boxing adds complexity; enum is stack-local and short-lived
-enum ResolutionOutcome {
-    System {
-        item: QueueItem,
-        coord: Coord,
-    },
-    Resolved {
-        item: QueueItem,
-        coord: Coord,
-        resolved: ResolvedVersion,
-        resolved_project: Option<ResolvedProject>,
-        alternatives: Vec<ResolvedVersion>,
-        effective_scope: Scope,
-        child_scope: Option<Scope>,
-        /// Requirement for the final coordinate, reset after relocation.
-        requirement: RequestedRequirement,
-    },
+impl<B: Backend> Solver<'_, B> {
+    async fn confirm(
+        &self,
+        walk: &mut Walk,
+        key: CoordKey,
+        candidate: Arc<Candidate>,
+        from: usize,
+    ) -> Result<()> {
+        let key = walk.group_of(&key);
+        if let Some(index) = walk.pending(&key, &candidate, from)
+            && let Load::Ready(loaded) =
+                load_candidate(self, candidate.as_ref().clone(), &walk.relocations).await?
+        {
+            walk.selected.get_mut(&key).expect("pending").candidates[index] = Arc::new(loaded);
+            return walk.scan_losers(self.backend, &key, from);
+        }
+        walk.mark_dirty(key);
+        Ok(())
+    }
+
+    async fn load(&self, walk: &mut Walk, key: &CoordKey, candidate: Arc<Candidate>) -> Result<()> {
+        let Some(relocated) = self.load_one(walk, key, candidate).await? else {
+            return Ok(());
+        };
+        let others: Vec<_> = walk
+            .selected
+            .get(&walk.group_of(key))
+            .into_iter()
+            .flat_map(|selection| &selection.candidates)
+            .filter(|c| c.resolved_project.is_none() && same_text(&c.coord, &relocated.coord))
+            .cloned()
+            .collect();
+        for other in others {
+            let key = walk.group_of(key);
+            if walk.holds(&key, &other) {
+                self.load_one(walk, &key, other).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a candidate of the group `key`, and return the candidate that
+    /// relocated, if one did. Maven 3.9 reads every version of a range, from
+    /// the lowest up, and stops at the first that relocates, so the versions
+    /// of the range below this one are loaded first, in that order.
+    async fn load_one(
+        &self,
+        walk: &mut Walk,
+        key: &CoordKey,
+        candidate: Arc<Candidate>,
+    ) -> Result<Option<Arc<Candidate>>> {
+        let prefix = &candidate.source[..candidate.source.len() - 1];
+        let mut lower: Vec<Arc<Candidate>> = walk.selected[key]
+            .candidates
+            .iter()
+            .filter(|c| {
+                c.item.declared_at == candidate.item.declared_at
+                    && c.resolved_project.is_none()
+                    && c.source.len() == candidate.source.len()
+                    && c.source[..c.source.len() - 1] == *prefix
+                    && c.source < candidate.source
+            })
+            .cloned()
+            .collect();
+        lower.sort_by(|a, b| a.source.cmp(&b.source));
+        lower.push(candidate);
+        let loads = self.load_in_order(&lower, &walk.relocations).await;
+        let complete = loads.len() == lower.len();
+        let last = lower.len() - 1;
+        for (index, (probe, loaded)) in lower.into_iter().zip(loads).enumerate() {
+            // A cyclic load can merge the group into another or drop
+            // candidates; the walk goes on with those left.
+            let key = walk.group_of(key);
+            if !walk.holds(&key, &probe) {
+                if index == last {
+                    walk.mark_dirty(key);
+                }
+                continue;
+            }
+            let loaded = loaded?;
+            let relocated = !matches!(loaded, Load::Ready(_) | Load::Cyclic(_));
+            walk.apply_load(self.backend, &key, &probe, loaded)?;
+            if relocated {
+                return Ok(Some(probe));
+            }
+        }
+        // The load that stopped the rest was of a version no longer held,
+        // so the group is mediated again with those left.
+        if !complete {
+            walk.mark_dirty(walk.group_of(key));
+        }
+        Ok(None)
+    }
+
+    /// Load a range's candidates, from the lowest version up, and return the
+    /// results in order through the first that relocates, is excluded or
+    /// fails. Maven reads no version above that one, and what a load reads
+    /// goes into the lock, so they load one at a time; the range's POMs are
+    /// already being fetched.
+    async fn load_in_order(
+        &self,
+        probes: &[Arc<Candidate>],
+        relocations: &RelocationCache,
+    ) -> Vec<Result<Load>> {
+        let mut results = Vec::new();
+        for probe in probes {
+            let loaded = load_candidate(self, probe.as_ref().clone(), relocations).await;
+            let stops = !matches!(loaded, Ok(Load::Ready(_) | Load::Cyclic(_)));
+            results.push(loaded);
+            if stops {
+                break;
+            }
+        }
+        results
+    }
+}
+
+enum ShadowRole {
+    Candidate,
+    Walk,
+    Drop,
+}
+
+impl Walk {
+    fn new(graph: Graph) -> Self {
+        Self {
+            graph,
+            generations: vec![ROOT_GENERATION],
+            next_generation: ROOT_GENERATION + 1,
+            selected: HashMap::new(),
+            groups: HashMap::new(),
+            declared: HashMap::new(),
+            shadows: HashMap::new(),
+            dirty: VecDeque::new(),
+            dirty_set: HashSet::new(),
+            queue: BinaryHeap::new(),
+            next_declared_at: 0,
+            walk_loads: Vec::new(),
+            confirm: Vec::new(),
+            unscanned: VecDeque::new(),
+            hinted: 0,
+            relocations: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn declare(&mut self) -> u64 {
+        self.next_declared_at += 1;
+        self.next_declared_at - 1
+    }
+
+    /// Enqueue `key` for mediation if it is not already queued.
+    fn mark_dirty(&mut self, key: CoordKey) {
+        if self.dirty_set.insert(key.clone()) {
+            self.dirty.push_back(key);
+        }
+    }
+
+    /// Take the next group that needs mediation.
+    fn take_dirty(&mut self) -> Option<CoordKey> {
+        let key = self.dirty.pop_front()?;
+        self.dirty_set.remove(&key);
+        Some(key)
+    }
+
+    fn is_dirty(&self, key: &CoordKey) -> bool {
+        self.dirty_set.contains(key)
+    }
+
+    fn generation(&mut self) -> u64 {
+        self.next_generation += 1;
+        self.next_generation - 1
+    }
+
+    fn add_node(&mut self, node: Node) -> NodeIndex {
+        let index = self.graph.insert_node(node);
+        let generation = self.generation();
+        self.generations.push(generation);
+        debug_assert_eq!(self.generations.len(), index.index() + 1);
+        index
+    }
+
+    fn group_of(&self, key: &CoordKey) -> CoordKey {
+        let mut key = key;
+        while let Some(next) = self.groups.get(key) {
+            key = next;
+        }
+        key.clone()
+    }
+
+    fn is_live(&self, item: &QueueItem) -> bool {
+        match &item.shadow {
+            None => self.generations[item.parent.index()] == item.parent_generation,
+            Some(origin) => self
+                .selected
+                .get(&self.group_of(&origin.group))
+                .is_some_and(|selection| selection.instance(origin).is_some()),
+        }
+    }
+
+    fn holds(&self, key: &CoordKey, candidate: &Arc<Candidate>) -> bool {
+        self.selected.get(key).is_some_and(|selection| {
+            selection
+                .candidates
+                .iter()
+                .any(|c| Arc::ptr_eq(c, candidate))
+        })
+    }
+
+    fn add_resolution<B: Backend>(&mut self, backend: &B, resolution: Resolution) -> Result<()> {
+        let Resolution {
+            candidate,
+            alternatives,
+            aliases,
+        } = resolution;
+        let item = candidate.item.clone();
+        let target = CoordKey::from(&candidate.coord);
+        if item.shadow.is_none()
+            && let Some(module) = candidate
+                .resolved_project
+                .as_ref()
+                .and_then(|p| p.workspace_module.as_deref())
+            && let Some(cycle) = self.workspace_dependency_cycle(&item, module)
+        {
+            return Err(ResolveError::WorkspaceDependencyCycle { cycle });
+        }
+        // A cycle is cut on the artifact before a relocation counts, so a
+        // cyclic target joins no group; nor does Maven gather a candidate of
+        // a group below another of the group.
+        let cyclic = item.path.contains(&target);
+        if cyclic {
+            for alias in candidate.inherited.iter() {
+                self.union(alias, &target);
+            }
+        } else {
+            // Maven's ConflictMarker puts a relocation's source, target and
+            // the coordinates between them in one conflict group.
+            for alias in &aliases {
+                self.union(alias, &target);
+            }
+        }
+        if cyclic || self.beneath_own_group(&item.path, &target) {
+            if item.shadow.is_none()
+                && let Some(existing) = self.selected.get(&self.group_of(&target))
+            {
+                let edge = edge(&item);
+                self.graph.add_edge(item.parent, existing.node, edge);
+            }
+            tracing::debug!(
+                cycle = %item.path.format_cycle(&target),
+                "breaking cyclic dependency"
+            );
+            return Ok(());
+        }
+        let key = self.group_of(&target);
+        let scope = candidate.scope();
+        let mut candidates: Vec<_> = alternatives
+            .into_iter()
+            .enumerate()
+            .map(|(position, resolved)| {
+                Arc::new(Candidate {
+                    coord: Coord {
+                        version: resolved.version.clone(),
+                        ..candidate.coord.clone()
+                    },
+                    source: {
+                        let mut source = candidate.source.clone();
+                        *source.last_mut().expect("a version") = position;
+                        source
+                    },
+                    resolved,
+                    // A system file has no descriptor to load.
+                    resolved_project: candidate
+                        .resolved_project
+                        .clone()
+                        .filter(|_| candidate.scope() == Scope::System),
+                    ..candidate.clone()
+                })
+            })
+            .collect();
+        candidates.push(Arc::new(candidate));
+        if let Some(origin) = &item.shadow {
+            match self.shadow_role(origin, &key, &target) {
+                ShadowRole::Candidate => {}
+                ShadowRole::Walk => {
+                    let highest = candidates.last().expect("a candidate");
+                    if highest.resolved_project.is_some() {
+                        let root = self.graph.root();
+                        self.queue_children(backend, highest, root, 0, Some(Arc::clone(origin)))?;
+                    } else {
+                        self.walk_loads.push(candidates);
+                    }
+                    return Ok(());
+                }
+                ShadowRole::Drop => return Ok(()),
+            }
+        }
+        if candidates.len() > 1
+            && let Some(highest) = candidates.last().filter(|c| c.resolved_project.is_none())
+        {
+            self.unscanned.push_back((key.clone(), Arc::clone(highest)));
+        }
+        // A declaration ranked behind a settled winner that its constraint
+        // accepts changes nothing but the losers to scan, once a range that
+        // rejects a nearer candidate has its lowest version confirmed.
+        let mut settled = None;
+        let node = match self.selected.get_mut(&key) {
+            Some(selection) => {
+                let before = selection.candidates.len();
+                if item.shadow.is_some() {
+                    if selection
+                        .candidates
+                        .iter()
+                        .any(|c| c.item.order == item.order)
+                    {
+                        return Ok(());
+                    }
+                } else {
+                    // A declaration takes the place of its own shadow.
+                    selection
+                        .candidates
+                        .retain(|c| c.item.shadow.is_none() || c.item.order != item.order);
+                    if selection.candidates.len() == before
+                        && let Some(winner) = &selection.winner
+                        && let Some(state) = &mut selection.settled
+                        && candidates.iter().all(|c| {
+                            c.rank() > winner.rank()
+                                && c.hard
+                                    .as_ref()
+                                    .is_none_or(|hard| hard.req.matches(&winner.coord.version))
+                        })
+                    {
+                        let lowest = candidates
+                            .iter()
+                            .filter(|c| c.hard.as_ref().is_some_and(|hard| state.rejects(hard)))
+                            .min_by(|a, b| a.source.cmp(&b.source))
+                            .filter(|c| c.resolved_project.is_none())
+                            .cloned();
+                        settled = Some((before, lowest));
+                    }
+                }
+                selection.candidates.extend(candidates);
+                selection.node
+            }
+            None if item.shadow.is_some() => return Ok(()),
+            None => {
+                let coord = candidates.last().expect("declared").coord.clone();
+                let node = self.add_node(Node {
+                    coord,
+                    scope,
+                    repo_url: None,
+                    build_repo: None,
+                    repos: RepoContext::default(),
+                    checksum: None,
+                    workspace_module: None,
+                    local: false,
+                    system_path: None,
+                    winner_parent: None,
+                });
+                self.selected
+                    .insert(key.clone(), Selected::new(node, candidates));
+                node
+            }
+        };
+        match &item.shadow {
+            None => {
+                self.graph.add_edge(item.parent, node, edge(&item));
+                self.declared
+                    .entry(item.parent)
+                    .or_default()
+                    .push(key.clone());
+            }
+            Some(origin) => {
+                let origin = self.group_of(&origin.group);
+                self.shadows.entry(origin).or_default().push(key.clone());
+            }
+        }
+        match settled {
+            Some((from, None)) if !self.is_dirty(&key) => {
+                // A losing range that already accepts the winner still has a
+                // preferred version Maven's dirty tree reads for relocation.
+                let dirty = self.selected.get(&key).is_some_and(|selection| {
+                    selection
+                        .winner
+                        .as_ref()
+                        .is_some_and(|winner| !selection.dirty_ranges(winner).is_empty())
+                });
+                if dirty {
+                    self.mark_dirty(key);
+                    Ok(())
+                } else {
+                    self.scan_losers(backend, &key, from)
+                }
+            }
+            Some((from, Some(lowest))) if !self.is_dirty(&key) => {
+                self.confirm.push((key, lowest, from));
+                Ok(())
+            }
+            _ => {
+                self.mark_dirty(key);
+                Ok(())
+            }
+        }
+    }
+
+    fn pending(&self, key: &CoordKey, candidate: &Arc<Candidate>, from: usize) -> Option<usize> {
+        if self.is_dirty(key) {
+            return None;
+        }
+        let selection = self.selected.get(key).filter(|s| s.settled.is_some())?;
+        let index = selection
+            .candidates
+            .get(from..)?
+            .iter()
+            .position(|c| Arc::ptr_eq(c, candidate))?;
+        Some(from + index)
+    }
+
+    /// What a shadow declaration of `target` is: a candidate where Maven
+    /// gathers it, a step of a walk below its origin through keys nothing
+    /// selected, or nothing.
+    fn shadow_role(&self, origin: &ShadowOrigin, key: &CoordKey, target: &CoordKey) -> ShadowRole {
+        let Some(selection) = self.selected.get(&self.group_of(&origin.group)) else {
+            return ShadowRole::Drop;
+        };
+        let Some(instance) = selection.instance(origin) else {
+            return ShadowRole::Drop;
+        };
+        let selected = self.selected.contains_key(key);
+        if selection.winner.as_ref().is_some_and(|w| w.same(instance)) {
+            // The origin won since: its own declarations are on their way.
+            return match selected {
+                true => ShadowRole::Candidate,
+                false => ShadowRole::Drop,
+            };
+        }
+        match (selection.on_winner_path(target), selected) {
+            (true, true) if self.mediated_before(key, &origin.group) => ShadowRole::Candidate,
+            (false, false) => ShadowRole::Walk,
+            _ => ShadowRole::Drop,
+        }
+    }
+
+    /// Merge the group of a relocation's target into its source's.
+    fn union(&mut self, source: &CoordKey, target: &CoordKey) {
+        let (into, from) = (self.group_of(source), self.group_of(target));
+        if into == from {
+            return;
+        }
+        self.groups.insert(from.clone(), into.clone());
+        if let Some(shadows) = self.shadows.remove(&from) {
+            self.shadows
+                .entry(into.clone())
+                .or_default()
+                .extend(shadows);
+        }
+        let Some(moved) = self.selected.remove(&from) else {
+            return;
+        };
+        match self.selected.get_mut(&into) {
+            None => {
+                self.selected.insert(into.clone(), moved);
+            }
+            Some(selection) => {
+                selection.settled = None;
+                selection.candidates.extend(moved.candidates);
+                let (dead, alive) = (moved.node, selection.node);
+                self.graph.retarget_incoming(dead, alive);
+                self.retire(dead, None);
+            }
+        }
+        if let Some(mut selection) = self.selected.remove(&into) {
+            selection
+                .candidates
+                .retain(|c| !self.beneath_own_group(&c.item.path, &into));
+            self.selected.insert(into.clone(), selection);
+        }
+        self.mark_dirty(into);
+    }
+
+    fn beneath_own_group(&self, path: &PathNode, key: &CoordKey) -> bool {
+        if self.groups.is_empty() {
+            return path.contains(key);
+        }
+        let group = self.group_of(key);
+        path.keys().any(|k| self.group_of(k) == group)
+    }
+
+    fn drop_group(&mut self, key: &CoordKey) {
+        if let Some(selection) = self.selected.remove(key) {
+            self.graph.clear_incoming(selection.node);
+            self.retire(selection.node, None);
+            self.revalidate_shadows(key);
+        }
+    }
+
+    /// Retire what `node`'s winner declared: the node's generation moves on,
+    /// so its queued declarations go stale, and its candidates leave their
+    /// groups. `convert` keeps those of the keys on the new winner's path as
+    /// shadows of the former winner, which stays a candidate: Maven mediated
+    /// those keys first, gathering what lies below every candidate of this
+    /// group.
+    fn retire(&mut self, node: NodeIndex, convert: Option<(&Arc<ShadowOrigin>, &PathNode)>) {
+        let old = self.generations[node.index()];
+        self.generations[node.index()] = self.generation();
+        self.graph.clear_outgoing(node);
+        let mut touched: Vec<CoordKey> = Vec::new();
+        for key in self.declared.remove(&node).unwrap_or_default() {
+            let key = self.group_of(&key);
+            if touched.contains(&key) {
+                continue;
+            }
+            let convert = convert.filter(|(origin, _)| self.mediated_before(&key, &origin.group));
+            let Some(selection) = self.selected.get_mut(&key) else {
+                continue;
+            };
+            let mut changed = false;
+            let mut converted = false;
+            selection.candidates.retain_mut(|candidate| {
+                let item = &candidate.item;
+                if item.shadow.is_some() || item.parent != node || item.parent_generation != old {
+                    return true;
+                }
+                changed = true;
+                if let Some((origin, path)) = convert
+                    && path.contains(&CoordKey::from(&candidate.coord))
+                {
+                    let mut shadow = candidate.as_ref().clone();
+                    shadow.item.shadow = Some(Arc::clone(origin));
+                    *candidate = Arc::new(shadow);
+                    converted = true;
+                    return true;
+                }
+                false
+            });
+            if converted && let Some((origin, _)) = convert {
+                let origin = self.group_of(&origin.group);
+                self.shadows.entry(origin).or_default().push(key.clone());
+            }
+            if changed {
+                touched.push(key);
+            }
+        }
+        for key in touched {
+            self.revalidate_shadows(&key);
+            self.mark_dirty(key);
+        }
+    }
+
+    /// Drop the shadows that originate in `group` and no longer hold.
+    fn revalidate_shadows(&mut self, group: &CoordKey) {
+        let Some(targets) = self.shadows.remove(group) else {
+            return;
+        };
+        let mut kept: Vec<CoordKey> = Vec::new();
+        for key in targets {
+            let key = self.group_of(&key);
+            if kept.contains(&key) {
+                continue;
+            }
+            let Some(selection) = self.selected.get(&key) else {
+                continue;
+            };
+            let mut stale = Vec::new();
+            let mut live = false;
+            for candidate in &selection.candidates {
+                let Some(origin) = &candidate.item.shadow else {
+                    continue;
+                };
+                if self.group_of(&origin.group) != *group {
+                    continue;
+                }
+                if self.shadow_holds(origin, &CoordKey::from(&candidate.coord)) {
+                    live = true;
+                } else {
+                    stale.push(Arc::clone(candidate));
+                }
+            }
+            if !stale.is_empty() {
+                let selection = self.selected.get_mut(&key).expect("checked above");
+                selection
+                    .candidates
+                    .retain(|c| !stale.iter().any(|s| Arc::ptr_eq(s, c)));
+                self.mark_dirty(key.clone());
+            }
+            if live {
+                kept.push(key);
+            }
+        }
+        if !kept.is_empty() {
+            self.shadows.insert(group.clone(), kept);
+        }
+    }
+
+    fn shadow_holds(&self, origin: &ShadowOrigin, target: &CoordKey) -> bool {
+        let Some(selection) = self.selected.get(&self.group_of(&origin.group)) else {
+            return false;
+        };
+        let Some(instance) = selection.instance(origin) else {
+            return false;
+        };
+        selection.winner.as_ref().is_some_and(|w| w.same(instance))
+            || (selection.on_winner_path(target) && self.mediated_before(target, &origin.group))
+    }
+
+    /// Whether Maven mediates `key` before `other`, both in one cycle: the
+    /// nearer first, as its ConflictIdSorter breaks a cycle. Mediating
+    /// `key` then gathers what lies below every candidate of `other`.
+    fn mediated_before(&self, key: &CoordKey, other: &CoordKey) -> bool {
+        let first = |key: &CoordKey| {
+            self.selected
+                .get(&self.group_of(key))
+                .and_then(|selection| {
+                    selection
+                        .candidates
+                        .iter()
+                        .map(|c| (c.item.depth, &c.item.order))
+                        .min()
+                })
+        };
+        match (first(key), first(other)) {
+            (Some(key), Some(other)) => key < other,
+            _ => false,
+        }
+    }
+
+    /// Put a loaded project in place of the candidate it was loaded for. When
+    /// it relocates, Maven's walk up a range stops at the version that
+    /// relocates: the candidates of that declaration from this version up
+    /// give way to the relocation's target. A cyclic one gives way alone.
+    fn apply_load<B: Backend>(
+        &mut self,
+        backend: &B,
+        key: &CoordKey,
+        best: &Arc<Candidate>,
+        loaded: Load,
+    ) -> Result<()> {
+        let selection = self.selected.get_mut(key).expect("mediated group");
+        let resolution = match loaded {
+            Load::Ready(candidate) => {
+                let candidate = Arc::new(candidate);
+                for retained in &mut selection.candidates {
+                    if Arc::ptr_eq(retained, best) {
+                        *retained = Arc::clone(&candidate);
+                    }
+                }
+                return Ok(());
+            }
+            Load::Relocated(resolution) => (Some(resolution), true),
+            Load::Cyclic(resolution) => (Some(resolution), false),
+            Load::Excluded => (None, true),
+        };
+        let (resolution, stops) = resolution;
+        let item = &best.item;
+        selection.candidates.retain(|c| {
+            !Arc::ptr_eq(c, best)
+                && (!stops || c.item.declared_at != item.declared_at || c.source < best.source)
+        });
+        let remaining = selection
+            .candidates
+            .iter()
+            .any(|c| c.item.declared_at == item.declared_at);
+        if item.shadow.is_none() && !remaining {
+            let node = selection.node;
+            self.graph.remove_edge(item.parent, node, &edge(item));
+        }
+        self.revalidate_shadows(key);
+        self.mark_dirty(key.clone());
+        match resolution {
+            Some(resolution) => self.add_resolution(backend, resolution),
+            None => Ok(()),
+        }
+    }
+
+    /// Make `winner` the group's winner: the node takes its coordinate and a
+    /// new generation, and the winner's dependencies are queued.
+    fn commit<B: Backend>(
+        &mut self,
+        backend: &B,
+        key: &CoordKey,
+        winner: Arc<Candidate>,
+    ) -> Result<()> {
+        let project = winner.resolved_project.as_ref().expect("winner loaded");
+        if winner.item.shadow.is_none()
+            && let Some(module) = project.workspace_module.as_deref()
+            && let Some(cycle) = self.workspace_dependency_cycle(&winner.item, module)
+        {
+            return Err(ResolveError::WorkspaceDependencyCycle { cycle });
+        }
+        let selection = self.selected.get_mut(key).expect("mediated group");
+        // A winner never seen before is progress; one that comes back may be
+        // an oscillation.
+        if !selection
+            .winners
+            .insert((winner.item.order.clone(), winner.coord.to_string()))
+        {
+            selection.changes += 1;
+        }
+        if selection.changes > MAX_WINNER_CHANGES {
+            return Err(ResolveError::MediationDiverged {
+                coord: format!("{}:{}", winner.coord.group_id, winner.coord.artifact_id),
+                changes: MAX_WINNER_CHANGES,
+            });
+        }
+        let previous = selection.winner.replace(Arc::clone(&winner));
+        let child_repos =
+            backend.extend_repo_context(&winner.item.path.repos, &winner.coord, &project.project);
+        let path = PathNode::extend(
+            &winner.item.path,
+            &winner.coord,
+            &winner.resolved.version,
+            child_repos,
+        );
+        selection.winner_path = Some(Arc::clone(&path));
+        selection.scanned.clear();
+        selection.walked.clear();
+        selection.dirty_checked.clear();
+        let node = selection.node;
+        let convert = previous
+            .and_then(|previous| selection.instance_of(&previous).cloned())
+            .map(|previous| {
+                Arc::new(ShadowOrigin {
+                    group: key.clone(),
+                    instance: previous.item.declared_at,
+                    coord: previous.coord.clone(),
+                })
+            });
+        self.retire(node, convert.as_ref().map(|origin| (origin, path.as_ref())));
+        let generation = self.generations[node.index()];
+        if let Some(target) = self.graph.node_mut(node) {
+            target.coord = Coord {
+                version: winner.resolved.version.clone(),
+                ..winner.coord.clone()
+            };
+            target.scope = winner.scope();
+            target.winner_parent = winner.item.shadow.is_none().then_some(winner.item.parent);
+            target.local = winner.scope() == Scope::System;
+            target.system_path = winner.item.dependency.system_path.clone();
+            target.build_repo = winner.resolved.repo.clone().filter(|_| !target.local);
+            target.repo_url = target
+                .build_repo
+                .as_ref()
+                .map(|repo| Arc::clone(&repo.url))
+                .or_else(|| project.repo_url.clone())
+                .filter(|_| !target.local);
+            target.repos = winner.item.path.repos.clone();
+            target.workspace_module = project.workspace_module.clone();
+            // A classifier still naming a property fails once the graph is
+            // in, and names no file to fetch.
+            let unread = (target.coord.classifier.as_deref()).is_some_and(|c| c.contains("${"));
+            if target.workspace_module.is_none() && !target.local && !unread {
+                backend.prefetch_artifact(&target.coord, target.repo_url.as_deref(), &target.repos);
+            }
+        }
+        self.revalidate_shadows(key);
+        self.queue_children(backend, &winner, node, generation, None)
+    }
+
+    /// Queue what `winner` declares, below `parent` at `generation`, or as
+    /// shadows of `shadow`. One with no `<version>` takes it from the
+    /// winner's own effective dependencyManagement, as Maven does for every
+    /// artifact; the declared scope is left alone.
+    fn queue_children<B: Backend>(
+        &mut self,
+        backend: &B,
+        winner: &Candidate,
+        parent: NodeIndex,
+        generation: u64,
+        shadow: Option<Arc<ShadowOrigin>>,
+    ) -> Result<()> {
+        if !winner.follows() {
+            return Ok(());
+        }
+        let project = &winner.resolved_project.as_ref().expect("loaded").project;
+        let item = &winner.item;
+        let child_repos = backend.extend_repo_context(&item.path.repos, &winner.coord, project);
+        let path = PathNode::extend(
+            &item.path,
+            &winner.coord,
+            &winner.resolved.version,
+            child_repos,
+        );
+        let exclusions = extend_exclusions(&item.exclusions, &item.dependency.exclusions);
+        for (index, mut dependency) in project.dependencies.iter().cloned().enumerate() {
+            if dependency.version.is_none() {
+                dependency.version =
+                    managed_child_version(&project.dependency_management, &dependency);
+            }
+            let child = QueueItem {
+                parent,
+                parent_generation: generation,
+                dependency: Arc::new(dependency),
+                managed_scope: false,
+                depth: item.depth + 1,
+                order: item.order.child(index),
+                declared_at: self.declare(),
+                exclusions: Arc::clone(&exclusions),
+                path: Arc::clone(&path),
+                shadow: shadow.clone(),
+            };
+            push_queue(&mut self.queue, child)?;
+        }
+        Ok(())
+    }
+
+    /// Queue a shadow of the `index`th declaration of `of`'s project.
+    fn queue_shadow<B: Backend>(
+        &mut self,
+        backend: &B,
+        of: &Candidate,
+        project: &Project,
+        index: usize,
+        origin: &Arc<ShadowOrigin>,
+    ) -> Result<()> {
+        if !of.follows() {
+            return Ok(());
+        }
+        let mut dependency = project.dependencies[index].clone();
+        if dependency.version.is_none() {
+            dependency.version = managed_child_version(&project.dependency_management, &dependency);
+        }
+        let item = &of.item;
+        let child_repos = backend.extend_repo_context(&item.path.repos, &of.coord, project);
+        let shadow = QueueItem {
+            parent: self.graph.root(),
+            parent_generation: 0,
+            dependency: Arc::new(dependency),
+            managed_scope: false,
+            depth: item.depth + 1,
+            order: item.order.child(index),
+            declared_at: self.declare(),
+            exclusions: extend_exclusions(&item.exclusions, &item.dependency.exclusions),
+            path: PathNode::extend(&item.path, &of.coord, &of.resolved.version, child_repos),
+            shadow: Some(Arc::clone(origin)),
+        };
+        push_queue(&mut self.queue, shadow)
+    }
+
+    /// Queue shadows of what the group's losers declare for keys on its
+    /// winner's path, which Maven gathers through them (see
+    /// [`ShadowOrigin`]).
+    fn scan_losers<B: Backend>(&mut self, backend: &B, key: &CoordKey, from: usize) -> Result<()> {
+        let Some(selection) = self.selected.get_mut(key) else {
+            return Ok(());
+        };
+        let (Some(winner), Some(path)) = (selection.winner.clone(), selection.winner_path.clone())
+        else {
+            return Ok(());
+        };
+        let losers: Vec<_> = selection.candidates[from..]
+            .iter()
+            .filter(|c| {
+                c.item.shadow.is_none()
+                    && c.resolved_project.is_some()
+                    && c.follows()
+                    && !c.same(&winner)
+            })
+            .filter(|c| selection.scanned.insert(c.item.declared_at))
+            .cloned()
+            .collect();
+        // GA membership on the winner path, built once for every loser×dep check.
+        let path_ga: HashSet<(&str, &str)> = path
+            .keys()
+            .map(|k| (k.group_id.as_str(), k.artifact_id.as_str()))
+            .collect();
+        for loser in losers {
+            let project = Arc::clone(&loser.resolved_project.as_ref().expect("loaded").project);
+            let own = PathNode::extend(
+                &loser.item.path,
+                &loser.coord,
+                &loser.resolved.version,
+                loser.item.path.repos.clone(),
+            );
+            let exclusions =
+                extend_exclusions(&loser.item.exclusions, &loser.item.dependency.exclusions);
+            let origin = Arc::new(ShadowOrigin {
+                group: key.clone(),
+                instance: loser.item.declared_at,
+                coord: loser.coord.clone(),
+            });
+            for (index, dependency) in project.dependencies.iter().enumerate() {
+                let on_path = path_ga.contains(&(
+                    dependency.group_id.as_str(),
+                    dependency.artifact_id.as_str(),
+                ));
+                if !on_path {
+                    continue;
+                }
+                let target = key_of(dependency);
+                if !path.contains(&target)
+                    || !self.mediated_before(&target, key)
+                    || own.contains(&target)
+                    || !dependency.is_followed_transitively()
+                    || is_excluded(dependency, &exclusions)
+                {
+                    continue;
+                }
+                self.queue_shadow(backend, &loser, &project, index, &origin)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Once the queue drains, walk below what a loser with the winner's
+    /// version declares and the winner's path excludes, through keys nothing
+    /// selected: Maven gathers that subtree too, and it can reach back to a
+    /// key on the winner's path. Whether anything was queued.
+    fn walk_excluded_dependencies<B: Backend>(&mut self, backend: &B) -> Result<bool> {
+        let mut keys: Vec<CoordKey> = self.selected.keys().cloned().collect();
+        keys.sort_by(|a, b| {
+            (
+                a.group_id.as_str(),
+                a.artifact_id.as_str(),
+                &a.packaging,
+                &a.classifier,
+            )
+                .cmp(&(
+                    b.group_id.as_str(),
+                    b.artifact_id.as_str(),
+                    &b.packaging,
+                    &b.classifier,
+                ))
+        });
+        let mut queued = false;
+        for key in keys {
+            let Some(selection) = self.selected.get_mut(&key) else {
+                continue;
+            };
+            let Some(winner) = selection.winner.clone() else {
+                continue;
+            };
+            let excluded =
+                extend_exclusions(&winner.item.exclusions, &winner.item.dependency.exclusions);
+            let Some(resolved) = winner
+                .resolved_project
+                .as_ref()
+                .filter(|_| !excluded.is_empty())
+            else {
+                continue;
+            };
+            let project = Arc::clone(&resolved.project);
+            let losers: Vec<_> = selection
+                .candidates
+                .iter()
+                .filter(|c| {
+                    c.item.shadow.is_none()
+                        && same_text(&c.coord, &winner.coord)
+                        && c.follows()
+                        && !c.same(&winner)
+                })
+                .filter(|c| selection.walked.insert(c.item.declared_at))
+                .cloned()
+                .collect();
+            for loser in losers {
+                let allowed =
+                    extend_exclusions(&loser.item.exclusions, &loser.item.dependency.exclusions);
+                let own = PathNode::extend(
+                    &loser.item.path,
+                    &loser.coord,
+                    &loser.resolved.version,
+                    loser.item.path.repos.clone(),
+                );
+                let origin = Arc::new(ShadowOrigin {
+                    group: key.clone(),
+                    instance: loser.item.declared_at,
+                    coord: loser.coord.clone(),
+                });
+                for (index, dependency) in project.dependencies.iter().enumerate() {
+                    if !dependency.is_followed_transitively()
+                        || !is_excluded(dependency, &excluded)
+                        || is_excluded(dependency, &allowed)
+                    {
+                        continue;
+                    }
+                    let target = key_of(dependency);
+                    if own.contains(&target) || self.selected.contains_key(&self.group_of(&target))
+                    {
+                        continue;
+                    }
+                    self.queue_shadow(backend, &loser, &project, index, &origin)?;
+                    queued = true;
+                }
+            }
+        }
+        Ok(queued)
+    }
+
+    fn workspace_dependency_cycle(&self, item: &QueueItem, target_module: &str) -> Option<String> {
+        let mut coordinates = Vec::new();
+        let mut current = Some(item.path.as_ref());
+        while let Some(path) = current {
+            let node = match path.parent {
+                None => self.graph.root(),
+                Some(_) => self.selected.get(&self.group_of(&path.key))?.node,
+            };
+            let node = self.graph.node(node)?;
+            let workspace_module = node.workspace_module.as_deref()?;
+            coordinates.push(format!(
+                "{}:{}",
+                node.coord.group_id, node.coord.artifact_id
+            ));
+            if workspace_module == target_module {
+                coordinates.reverse();
+                coordinates.push(coordinates.first().expect("cycle contains target").clone());
+                return Some(coordinates.join(" -> "));
+            }
+            current = path.parent.as_deref();
+        }
+        None
+    }
+
+    fn finish<B: Backend>(mut self, backend: &B) -> Result<Graph> {
+        self.graph.select_scopes()?;
+        for selection in self.selected.values() {
+            if let (Some(winner), Some(node)) = (&selection.winner, self.graph.node(selection.node))
+            {
+                backend.note_winner(&node.coord, &winner.item.path)?;
+            }
+        }
+        let conflict = self
+            .selected
+            .into_values()
+            .filter_map(|selection| selection.conflict)
+            .min_by(|a, b| a.at.cmp(&b.at));
+        match conflict {
+            Some(conflict) => Err(ResolveError::VersionConflict {
+                coord: conflict.coord,
+                requested: conflict.requested,
+                selected: conflict.selected,
+            }),
+            None => Ok(self.graph),
+        }
+    }
+}
+
+fn edge(item: &QueueItem) -> Edge {
+    Edge {
+        scope: item.dependency.effective_scope(),
+        managed_scope: item.managed_scope,
+        declared: (item.depth == 1).then_some(item.declared_at),
+        optional: item.dependency.effective_optional(),
+        exclusions: item.dependency.exclusions.clone(),
+        requested: item.dependency.version.clone(),
+    }
+}
+
+fn key_of(dependency: &Dependency) -> CoordKey {
+    CoordKey {
+        group_id: dependency.group_id.as_str().into(),
+        artifact_id: dependency.artifact_id.as_str().into(),
+        packaging: match dependency.effective_type() {
+            "jar" => None,
+            other => Some(other.to_string()),
+        },
+        classifier: dependency.effective_classifier().map(str::to_string),
+    }
+}
+
+struct Resolution {
+    candidate: Candidate,
+    alternatives: Vec<ResolvedVersion>,
+    /// When the candidate is the target of the declared artifact's
+    /// relocation, the keys it relocated from.
+    aliases: Vec<CoordKey>,
+}
+
+#[allow(clippy::large_enum_variant)] // short-lived and stack-local
+enum Load {
+    Ready(Candidate),
+    Relocated(Resolution),
+    /// The project relocates onto an artifact on its own path. Maven cuts
+    /// the cycle there and goes on to the range's next version.
+    Cyclic(Resolution),
+    Excluded,
 }
 
 #[derive(Debug, Clone)]
 enum RequestedRequirement {
     Exact(Version),
-    /// A Maven "soft" pin: a bare `<version>X</version>` that survived
-    /// dep-mgmt processing (no covering constraint was found in
-    /// `resolve_version_str`). Kept distinct from `Exact` so downstream
-    /// mediation can still decide between two competing transitive soft
-    /// pins without treating either as hard.
+    /// A bare `<version>X</version>` that no management covered: a Maven
+    /// soft pin, which mediation may move.
     Soft(Version),
     Ranges(VersionReq),
-    DynamicRelease,
-    DynamicIntegration,
+    Dynamic(DynamicVersionToken),
 }
 
-/// Apply the root dependency management's non-version metadata to a transitive
-/// dependency (depth >= 2): a managed `<scope>`/`<optional>` fills a blank the
-/// dependency left, and managed `<exclusions>` union with the declared set.
-/// Depth 1 is the model layer's job, and versions come from
-/// `resolve_version_str`.
-///
-/// Maven's ClassicDependencyManager overrides declared scope but ignores managed `<optional>`.
-/// `resolve_item` prunes transitive dependencies using declared values first.
-/// A dependency managed to `test` therefore retains its subtree.
-fn apply_managed_metadata(constraints: &PlatformConstraints, mut item: QueueItem) -> QueueItem {
-    if item.depth <= 1 {
-        return item;
-    }
-    let Some(managed) = constraints.managed(
-        &item.dependency.group_id,
-        &item.dependency.artifact_id,
-        item.dependency.effective_type(),
-        item.dependency.effective_classifier(),
-    ) else {
+/// Apply the root management as Maven's ClassicDependencyManager does: its
+/// exclusions join those of every dependency, direct ones included, while its
+/// scope and system path apply from depth 2, since the model layer manages
+/// depth 1. It overrides the declared scope but ignores a managed
+/// `<optional>`, and `resolve_item` prunes on the declared values first, so a
+/// dependency managed to `test` keeps its subtree.
+fn apply_managed_metadata(management: &Management, mut item: QueueItem) -> QueueItem {
+    let Some(managed) = management.managed(&item.dependency) else {
         return item;
     };
-    if managed.scope.is_none() && managed.exclusions.is_empty() {
+    if (managed.scope.is_none() || item.depth <= 1) && managed.exclusions.is_empty() {
         return item;
     }
-    let dep = Arc::make_mut(&mut item.dependency);
-    if let Some(scope) = &managed.scope {
+    item.managed_scope |= manage(managed, Arc::make_mut(&mut item.dependency), item.depth);
+    item
+}
+
+/// Whether the scope was managed.
+fn manage(managed: &Dependency, dep: &mut Dependency, depth: usize) -> bool {
+    let scope = managed.scope.as_ref().filter(|_| depth > 1);
+    if let Some(scope) = scope {
         dep.scope = Some(scope.clone());
+        // A dependency managed to `system` takes the managed `<systemPath>`;
+        // one managed elsewhere loses its own.
+        if dep.effective_scope() == Scope::System {
+            if managed.system_path.is_some() {
+                dep.system_path.clone_from(&managed.system_path);
+            }
+        } else {
+            dep.system_path = None;
+        }
     }
     for exclusion in &managed.exclusions {
         if !dep.exclusions.contains(exclusion) {
             dep.exclusions.push(exclusion.clone());
         }
     }
-    item
+    scope.is_some()
+}
+
+/// Whether Maven collects what `dependency` declares: not for a system
+/// file, nor, by its FatArtifactTraverser, for a `war`, `ear` or `rar`,
+/// which carries its dependencies inside.
+fn follows(dependency: &Dependency) -> bool {
+    !dependency.includes_dependencies() && dependency.effective_scope() != Scope::System
 }
 
 const MAX_RELOCATION_MANAGEMENT_PASSES: usize = 8;
 
-async fn resolve_item<'a, B: Backend>(
-    solver: &Solver<'a, B>,
-    item: QueueItem,
-    constraints: Arc<PlatformConstraints>,
-    relocation_cache: &Mutex<HashMap<Coord, Coord>>,
-) -> Result<Vec<ResolutionOutcome>> {
-    // Maven's scope/optional selectors prune transitive deps on the declared
-    // values, before dependency management is applied.
-    let declared_scope = item.dependency.effective_scope();
-    let declared_optional = item.dependency.effective_optional();
-    let item = apply_managed_metadata(constraints.as_ref(), item);
-    if is_excluded(&item.dependency, item.exclusions.as_ref()) {
-        tracing::debug!(
-            group_id = %item.dependency.group_id,
-            artifact_id = %item.dependency.artifact_id,
-            "excluded dependency skipped"
-        );
-        return Ok(Vec::new());
+fn coord_of(dependency: &Dependency, version: Version) -> Coord {
+    let type_ = dependency.effective_type();
+    Coord {
+        group_id: dependency.group_id.as_str().into(),
+        artifact_id: dependency.artifact_id.as_str().into(),
+        version,
+        packaging: (type_ != "jar").then(|| type_.to_string()),
+        classifier: dependency.effective_classifier().map(str::to_string),
     }
+}
 
-    if declared_optional && item.depth > 1 {
-        return Ok(Vec::new());
-    }
-
-    let dep_scope = item.dependency.effective_scope();
-
-    if dep_scope == Scope::Import {
-        return Ok(Vec::new());
-    }
-
-    if item.depth > 1
-        && matches!(
-            declared_scope,
-            Scope::Test | Scope::Provided | Scope::System
-        )
+/// Fail on a `${...}` left in `item`'s coordinate, naming the POM that
+/// declared it. Maven fails only on a dependency it keeps, and a module's
+/// own dependency is always kept, so its type and classifier count too,
+/// unless the reactor builds it; a transitive one's are checked once
+/// mediation has kept it.
+fn refuse_undefined_property<B: Backend>(
+    solver: &Solver<'_, B>,
+    item: &QueueItem,
+    version_str: &str,
+) -> Result<()> {
+    let dependency = &item.dependency;
+    let (group, artifact) = (&dependency.group_id, &dependency.artifact_id);
+    let mut coord = format!("{group}:{artifact}:{version_str}");
+    // A range or LATEST/RELEASE may select a reactor module, whose
+    // artifact is never fetched, and a POM may relocate into one, whose POM
+    // Maven's reactor serves whatever the classifier; those wait for the
+    // selected node.
+    let exact = !version_str.contains(['[', '('])
+        && !matches!(version_str, "LATEST" | "RELEASE")
+        && dependency.effective_type() != "pom";
+    if item.depth == 1
+        && exact
+        && !solver
+            .backend
+            .is_reactor_module(group, artifact, version_str)
     {
-        return Ok(Vec::new());
+        let type_ = dependency.effective_type();
+        let packaging = if type_ == "jar" { "" } else { type_ };
+        match dependency.effective_classifier() {
+            Some(classifier) => coord.push_str(&format!(":{packaging}:{classifier}")),
+            None if !packaging.is_empty() => coord.push_str(&format!(":{packaging}")),
+            None => {}
+        }
     }
-
-    let effective_scope = inherit_scope(item.parent_scope, dep_scope);
-    if effective_scope != dep_scope {
-        tracing::debug!(
-            group_id = %item.dependency.group_id,
-            artifact_id = %item.dependency.artifact_id,
-            original_scope = ?dep_scope,
-            effective_scope = ?effective_scope,
-            "scope mediation applied"
-        );
-    }
-    // Per Maven spec:
-    // - Direct optional deps (depth=1): the dep IS included, its children ARE queued normally.
-    // - Transitive optional deps (depth>1): already skipped above; child_scope=None is moot.
-    //
-    // `transitive_from` answers "given my parent's effective scope and my
-    // declared scope, what scope do I propagate as?". The answer matters
-    // both for whether we descend (None drops the subtree) and for the
-    // scope our children inherit as their `parent_scope`.
-    //
-    // A direct `provided` or `test` dep needs a special case: `transitive_from`
-    // returns `None` for it (neither scope is transitive), which would drop its
-    // compile/runtime children. Maven keeps those children on the provided/test
-    // classpath, so a direct provided/test dep descends at its own scope and its
-    // children inherit it (a compile child of a test dep is a `test` child).
-    // Deeper provided/test transitive edges stay dropped by the `depth > 1` skip
-    // above, matching Maven.
-    //
-    // Direct `optional` deps are handled by the early skip above.
-    let child_scope = if declared_optional && item.depth > 1 {
-        // Should not reach here (skipped above), but be safe
-        None
-    } else if matches!(dep_scope, Scope::Provided | Scope::Test) {
-        // Maven retains subtrees managed to test or provided scope at that scope.
-        Some(dep_scope)
-    } else if solver.strict_maven_compat {
-        Scope::transitive_from_maven_compat(item.parent_scope, dep_scope)
-    } else {
-        Scope::transitive_from(item.parent_scope, dep_scope)
+    let Some(property) = crate::error::undefined_property(&coord) else {
+        return Ok(());
     };
-
-    if dep_scope == Scope::System {
-        // A system-scoped dependency must carry an explicit version.
-        // Without one, surface a MissingVersion error rather than coining a
-        // fake "SYSTEM" version that parses into a bogus coordinate and ships
-        // a non-existent pin into the graph/lockfile.
-        let version_str =
-            item.dependency
-                .version
-                .as_deref()
-                .ok_or_else(|| ResolveError::MissingVersion {
-                    group_id: item.dependency.group_id.clone(),
-                    artifact_id: item.dependency.artifact_id.clone(),
-                })?;
-        let version = Version::parse(version_str)?;
-        let packaging = packaging_opt(item.dependency.effective_type());
-        let coord = Coord {
-            group_id: item.dependency.group_id.clone().into(),
-            artifact_id: item.dependency.artifact_id.clone().into(),
-            version,
-            packaging,
-            classifier: item
-                .dependency
-                .effective_classifier()
-                .map(|s| s.to_string()),
-        };
-        return Ok(vec![ResolutionOutcome::System { item, coord }]);
+    // A version the root's management gave is the root's.
+    let managed = crate::error::undefined_property(&format!("{group}:{artifact}")).is_none()
+        && dependency.version.as_deref() != Some(version_str);
+    let mut declaring = item.path.as_ref();
+    if managed {
+        while let Some(parent) = declaring.parent.as_deref() {
+            declaring = parent;
+        }
     }
+    let declared_by = declaring.coordinates().pop().unwrap_or_default();
+    let module = Coord::parse(&declared_by)
+        .ok()
+        .and_then(|declaring| solver.backend.workspace_module(&declaring));
+    Err(ResolveError::UndefinedProperty {
+        property: property.to_string(),
+        declared_by: module.unwrap_or(declared_by),
+        coord,
+    })
+}
 
-    let version_str = resolve_version_str(constraints.as_ref(), &item.dependency, item.depth)?;
-
-    let requirement = parse_requested_requirement(
-        &item.dependency.group_id,
-        &item.dependency.artifact_id,
-        version_str.as_ref(),
-    )?;
-
-    let packaging = packaging_opt(item.dependency.effective_type());
-    let classifier = item
-        .dependency
-        .effective_classifier()
-        .map(|s| s.to_string());
-
-    let versions = resolve_requirement_versions(
+async fn resolve_item<B: Backend>(
+    solver: &Solver<'_, B>,
+    item: QueueItem,
+    relocations: &RelocationCache,
+) -> Result<Option<Resolution>> {
+    // Maven's scope and optional selectors prune transitive dependencies on
+    // the declared values, before management applies.
+    let followed = item.dependency.is_followed_transitively();
+    let item = apply_managed_metadata(&solver.management, item);
+    let dep_scope = item.dependency.effective_scope();
+    if is_excluded(&item.dependency, &item.exclusions)
+        || (item.depth > 1 && !followed)
+        || dep_scope == Scope::Import
+    {
+        return Ok(None);
+    }
+    let version_str = resolve_version_str(&solver.management, &item.dependency, item.depth)?;
+    refuse_undefined_property(solver, &item, version_str)?;
+    let dependency = &item.dependency;
+    let (requirement, versions, resolved) = requested_versions(
         solver,
-        &item.dependency.group_id,
-        &item.dependency.artifact_id,
-        &requirement,
+        &dependency.group_id,
+        &dependency.artifact_id,
+        version_str,
+        &item.path.repos,
     )
     .await?;
+    if dep_scope == Scope::System {
+        let coord = coord_of(dependency, resolved.version);
+        let candidate = Candidate {
+            hard: hard_constraint(&requirement),
+            source: vec![versions.len()],
+            ..system_candidate(item, coord)?
+        };
+        return Ok(Some(Resolution {
+            candidate,
+            alternatives: versions,
+            aliases: Vec::new(),
+        }));
+    }
 
-    let mut versions = versions;
-    let resolved = versions
+    let coord = coord_of(dependency, resolved.version.clone());
+    // Mediation reads a range's versions one at a time, from the lowest up,
+    // so start their fetches now.
+    if matches!(requirement, RequestedRequirement::Ranges(_)) {
+        for version in &versions {
+            let lower = coord_of(dependency, version.version.clone());
+            solver
+                .backend
+                .prefetch_range_version(&lower, &item.path.repos);
+        }
+        solver
+            .backend
+            .prefetch_range_version(&coord, &item.path.repos);
+    }
+    let candidate = Candidate {
+        hard: hard_constraint(&requirement),
+        source: vec![versions.len()],
+        inherited: Arc::from([]),
+        item,
+        coord,
+        resolved,
+        resolved_project: None,
+    };
+    if matches!(requirement, RequestedRequirement::Ranges(_)) {
+        return Ok(Some(Resolution {
+            candidate,
+            alternatives: versions,
+            aliases: Vec::new(),
+        }));
+    }
+    Ok(
+        match load_candidate(solver, candidate, relocations).await? {
+            Load::Ready(candidate) => Some(Resolution {
+                candidate,
+                alternatives: Vec::new(),
+                aliases: Vec::new(),
+            }),
+            Load::Relocated(resolution) | Load::Cyclic(resolution) => Some(resolution),
+            Load::Excluded => None,
+        },
+    )
+}
+
+/// The requirement `version` states for `group_id:artifact_id`, the versions
+/// it admits below the highest, and the highest.
+async fn requested_versions<B: Backend>(
+    solver: &Solver<'_, B>,
+    group_id: &str,
+    artifact_id: &str,
+    version: &str,
+    repos: &RepoContext,
+) -> Result<(RequestedRequirement, Vec<ResolvedVersion>, ResolvedVersion)> {
+    let requirement = parse_requested_requirement(group_id, artifact_id, version)?;
+    let mut versions =
+        resolve_requirement_versions(solver, group_id, artifact_id, &requirement, repos).await?;
+    let highest = versions
         .pop()
         .ok_or_else(|| ResolveError::VersionNotFound {
-            coord: format!(
-                "{}:{}",
-                item.dependency.group_id, item.dependency.artifact_id
-            ),
-            requirement: version_str.to_string(),
+            coord: format!("{group_id}:{artifact_id}"),
+            requirement: version.to_string(),
         })?;
-    let coord = Coord {
-        group_id: item.dependency.group_id.clone().into(),
-        artifact_id: item.dependency.artifact_id.clone().into(),
-        version: resolved.version.clone(),
-        packaging,
-        classifier,
-    };
-    // Only the version list is needed for mediation. A range descriptor is
-    // fetched when its candidate wins, including a later backtracking winner.
-    if matches!(requirement, RequestedRequirement::Ranges(_)) {
-        return Ok(vec![ResolutionOutcome::Resolved {
-            item,
-            coord,
-            resolved,
-            resolved_project: None,
-            alternatives: versions,
-            effective_scope,
-            child_scope,
-            requirement,
-        }]);
+    Ok((requirement, versions, highest))
+}
+
+fn system_candidate(item: QueueItem, coord: Coord) -> Result<Candidate> {
+    // raeva neither coins a version nor locks a row with no file and no
+    // repository.
+    if item
+        .dependency
+        .system_path
+        .as_deref()
+        .is_none_or(|path| path.trim().is_empty())
+    {
+        return Err(PomError::InvalidSystemPath(format!(
+            "system-scoped dependency {}:{} requires a non-empty <systemPath>",
+            bounded(&item.dependency.group_id),
+            bounded(&item.dependency.artifact_id)
+        ))
+        .into());
     }
-    Ok(vec![
-        load_candidate(
-            solver,
-            Candidate {
-                item,
-                coord,
-                resolved,
-                resolved_project: None,
-                effective_scope,
-                child_scope,
-            },
-            requirement,
-            &constraints,
-            relocation_cache,
-        )
-        .await?,
-    ])
+    let project = Project::new(
+        &coord.group_id,
+        &coord.artifact_id,
+        &coord.version.to_string(),
+    );
+    Ok(Candidate {
+        resolved: ResolvedVersion {
+            version: coord.version.clone(),
+            repo: None,
+        },
+        resolved_project: Some(ResolvedProject {
+            project: Arc::new(project),
+            repo_url: None,
+            workspace_module: None,
+        }),
+        hard: None,
+        source: vec![0],
+        inherited: Arc::from([]),
+        item,
+        coord,
+    })
 }
 
 async fn resolve_requirement_versions<B: Backend>(
@@ -594,169 +1858,343 @@ async fn resolve_requirement_versions<B: Backend>(
     group_id: &str,
     artifact_id: &str,
     requirement: &RequestedRequirement,
+    repos: &RepoContext,
 ) -> Result<Vec<ResolvedVersion>> {
-    Ok(match requirement {
+    let marker = match requirement {
         RequestedRequirement::Exact(version) | RequestedRequirement::Soft(version) => {
-            // Without a platform constraint, use the soft requirement's recorded version.
-            // Conflict mediation compares it with other requirements later.
-            vec![ResolvedVersion {
+            return Ok(vec![ResolvedVersion {
                 version: version.clone(),
-                repo_url: None,
-            }]
+                repo: None,
+            }]);
         }
         RequestedRequirement::Ranges(req) => {
-            solver
+            return solver
                 .backend
-                .resolve_versions(group_id, artifact_id, req)
-                .await?
+                .resolve_versions(group_id, artifact_id, req, repos)
+                .await;
         }
-        RequestedRequirement::DynamicRelease => {
-            let req = VersionReq::Exact(Version::parse("RELEASE").map_err(|err| {
-                ResolveError::SolverInvariant {
-                    detail: format!("failed to parse RELEASE marker: {err}"),
-                }
-            })?);
-            vec![
-                solver
-                    .backend
-                    .resolve_version(group_id, artifact_id, &req)
-                    .await?,
-            ]
-        }
-        RequestedRequirement::DynamicIntegration => {
-            let req = VersionReq::Exact(Version::parse("LATEST").map_err(|err| {
-                ResolveError::SolverInvariant {
-                    detail: format!("failed to parse LATEST marker: {err}"),
-                }
-            })?);
-            vec![
-                solver
-                    .backend
-                    .resolve_version(group_id, artifact_id, &req)
-                    .await?,
-            ]
-        }
+        RequestedRequirement::Dynamic(token) => token.requirement_label(),
+    };
+    let req = VersionReq::Exact(Version::parse(marker)?);
+    let resolved = solver
+        .backend
+        .resolve_version(group_id, artifact_id, &req, repos)
+        .await?;
+    Ok(vec![resolved])
+}
+
+/// Fetch a candidate's project. A SNAPSHOT keeps its base version for
+/// mediation and records the build it resolved to. A relocation restarts the
+/// declaration as Maven's DfDependencyCollector does: the target is excluded
+/// and managed as itself, and its version is a soft preference of its own
+/// unless management sets one.
+async fn load_candidate<B: Backend>(
+    solver: &Solver<'_, B>,
+    candidate: Candidate,
+    relocations: &RelocationCache,
+) -> Result<Load> {
+    let path = Arc::clone(&candidate.item.path);
+    let coord = format!(
+        "{}:{}:{}",
+        candidate.coord.group_id, candidate.coord.artifact_id, candidate.coord.version
+    );
+    (load_declared(solver, candidate, relocations).await).map_err(|err| {
+        // A fault in the candidate's own model, such as a missing parent,
+        // does not name the candidate, nor the relocation target whose
+        // model it is, which the relocation fetch put below it.
+        let (target, err) = match err {
+            ResolveError::Declared { module, via, error } if module.is_empty() => (via, *error),
+            err => (Vec::new(), err),
+        };
+        let own = matches!(err.cause(), ResolveError::Pom(_));
+        let mut via = path.coordinates();
+        via.remove(0);
+        via.extend(own.then_some(coord));
+        via.extend(target);
+        err.declared_via(via)
     })
 }
 
-async fn load_candidate<B: Backend>(
+/// `err`, for a dependency that the last POM on `path` declares.
+fn declared_below(err: ResolveError, path: &PathNode) -> ResolveError {
+    let mut via = path.coordinates();
+    via.remove(0);
+    err.declared_via(via)
+}
+
+async fn load_declared<B: Backend>(
     solver: &Solver<'_, B>,
-    candidate: Candidate<Option<ResolvedProject>>,
-    mut requirement: RequestedRequirement,
-    constraints: &PlatformConstraints,
-    relocation_cache: &Mutex<HashMap<Coord, Coord>>,
-) -> Result<ResolutionOutcome> {
+    candidate: Candidate,
+    relocations: &RelocationCache,
+) -> Result<Load> {
     let Candidate {
         item,
         coord,
-        resolved,
-        effective_scope,
-        child_scope,
+        mut resolved,
+        hard,
+        source,
+        inherited,
         ..
     } = candidate;
-    let resolved = if resolved.version.as_str().ends_with("-SNAPSHOT") {
-        let mut snapshot = solver.backend.resolve_snapshot_version(&coord).await?;
-        if snapshot.repo_url.is_none() {
-            snapshot.repo_url = resolved.repo_url.clone();
+    let item_ref = &item;
+    let requested = &coord;
+    let relocated = !inherited.is_empty();
+    let fetch = move |coord: Coord| async move {
+        let (mut target, project, snapshot, between, inherited_build) = solver
+            .fetch_project_with_relocation_cached(&coord, &item_ref.path.repos, relocations)
+            .await
+            .map_err(|err| attach_dropped_repos(solver, item_ref, &coord, err))
+            // A management or range target is a model of its own.
+            .map_err(|err| match same_text(&coord, requested) {
+                true => err,
+                false => err.in_model_of(&coord),
+            })?;
+        // A build kept along a relocation without a version is the target's
+        // version itself: Maven mediates and constrains it as that build.
+        if let Some(build) = snapshot.as_ref().filter(|_| inherited_build) {
+            target.version = build.version.clone();
         }
-        snapshot
-    } else {
-        resolved
+        // A reactor module reached through an external POM, winning or not,
+        // is no edge of the module's own record. Only an external POM
+        // relocates, and a candidate that carries relocations, as a managed
+        // range after one does, was reached through one.
+        if project.workspace_module.is_some()
+            && (relocated
+                || !same_text(&target, requested)
+                || (item_ref.path.below_root()).any(|(key, version)| {
+                    let backend = &solver.backend;
+                    !backend.is_reactor_module(&key.group_id, &key.artifact_id, version)
+                }))
+        {
+            solver.backend.note_transitive_selection();
+        }
+        Ok::<_, ResolveError>((target, project, snapshot, between))
     };
-    let coord = Coord {
-        version: resolved.version.clone(),
-        ..coord
-    };
-    let original_coord = coord.clone();
-    let (mut coord, mut resolved_project) = solver
-        .fetch_project_with_relocation_cached(&coord, effective_scope, relocation_cache)
-        .await
-        .map_err(|err| attach_dropped_repos(solver, &item, &coord, err))?;
-    let relocated = coord != original_coord;
-    if relocated {
-        // DfDependencyCollector restarts collection with the relocated
-        // artifact. The source range belongs to the source coordinate;
-        // the target's concrete version is a soft preference of its own.
-        requirement = RequestedRequirement::Soft(coord.version.clone());
+    let (mut target, mut project, mut snapshot, between) = fetch(coord.clone()).await?;
+    if same_text(&target, &coord) {
+        if let Some(snapshot) = snapshot {
+            resolved.version = snapshot.version;
+            resolved.repo = snapshot.repo;
+        }
+        if follows(&item.dependency) {
+            solver.hint_children(&item, &coord, &project.project);
+        }
+        return Ok(Load::Ready(Candidate {
+            item,
+            coord,
+            resolved,
+            resolved_project: Some(project),
+            hard,
+            source,
+            inherited,
+        }));
     }
-    let mut resolved = resolved;
+    let mut inherited = inherited;
+    let mut dependency = (*item.dependency).clone();
+    let mut managed_scope = item.managed_scope;
+    let mut hard = None;
     let mut alternatives = Vec::new();
-    // Maven reapplies root dependencyManagement to relocated transitive dependencies
-    // (depth >= 2). The model layer manages direct dependencies. A managed target
-    // may relocate again, so repeat until its coordinates stabilize.
-    if relocated && item.depth > 1 {
-        let mut source_coord = original_coord;
-        for _ in 0..MAX_RELOCATION_MANAGEMENT_PASSES {
-            if coord.group_id == source_coord.group_id
-                && coord.artifact_id == source_coord.artifact_id
-            {
-                break;
-            }
-            let Some(managed) = constraints.apply_constraint(
-                coord.group_id.as_str(),
-                coord.artifact_id.as_str(),
-                item.dependency.effective_type(),
-                item.dependency.effective_classifier(),
-                None,
-            ) else {
-                break;
-            };
-            requirement = parse_requested_requirement(
-                coord.group_id.as_str(),
-                coord.artifact_id.as_str(),
-                managed.version.trim(),
-            )?;
-            let mut versions = resolve_requirement_versions(
-                solver,
-                coord.group_id.as_str(),
-                coord.artifact_id.as_str(),
-                &requirement,
-            )
-            .await?;
-            resolved = versions
-                .pop()
-                .ok_or_else(|| ResolveError::VersionNotFound {
-                    coord: format!("{}:{}", coord.group_id, coord.artifact_id),
-                    requirement: managed.version.clone(),
-                })?;
-            let managed_coord = Coord {
-                version: resolved.version.clone(),
-                ..coord.clone()
-            };
-            alternatives = versions;
-            if managed_coord == coord {
-                break;
-            }
-            source_coord = managed_coord.clone();
-            (coord, resolved_project) = solver
-                .fetch_project_with_relocation_cached(
-                    &managed_coord,
-                    effective_scope,
-                    relocation_cache,
-                )
-                .await
-                .map_err(|err| attach_dropped_repos(solver, &item, &managed_coord, err))?;
-            if coord != managed_coord {
-                requirement = RequestedRequirement::Soft(coord.version.clone());
-                alternatives.clear();
-            }
+    // The coordinate whose versions `resolved` was listed among.
+    let mut listed_for = None;
+    let mut aliases: Vec<CoordKey> = std::iter::once(&coord)
+        .chain(&between)
+        .map(CoordKey::from)
+        .collect();
+    let mut previous = coord.clone();
+    let mut cyclic = false;
+    for pass in 0.. {
+        // Maven recurses without end on a managed chain that comes back.
+        if pass == MAX_RELOCATION_MANAGEMENT_PASSES {
+            return Err(ResolveError::RelocationCycle(format!(
+                "{coord} -> {target} (more than {MAX_RELOCATION_MANAGEMENT_PASSES} managed relocations)"
+            )));
         }
+        // A cyclic target is cut before anything else applies to it.
+        if item.path.contains(&CoordKey::from(&target)) {
+            cyclic = true;
+            break;
+        }
+        if excludes(
+            &item.exclusions,
+            target.group_id.as_str(),
+            target.artifact_id.as_str(),
+        ) {
+            return Ok(Load::Excluded);
+        }
+        // Maven runs its dependency selector again on each relocation
+        // target, with the management applied so far.
+        if item.depth > 1 && !dependency.is_followed_transitively() {
+            return Ok(Load::Excluded);
+        }
+        if target.group_id == previous.group_id && target.artifact_id == previous.artifact_id {
+            break;
+        }
+        // Maven manages the target as a dependency of its own, and a
+        // managed target may relocate again. Only the target's own
+        // management makes Maven take its scope as it is.
+        let Some(managed) = solver.management.entry(
+            target.group_id.as_str(),
+            target.artifact_id.as_str(),
+            &item.dependency,
+        ) else {
+            managed_scope = false;
+            break;
+        };
+        managed_scope = manage(managed, &mut dependency, item.depth);
+        let version = managed.version.clone().filter(|_| item.depth > 1);
+        if dependency.effective_scope() == Scope::System {
+            let (versions, version, hard) = match version {
+                Some(version) => {
+                    let (group_id, artifact_id) =
+                        (target.group_id.as_str(), target.artifact_id.as_str());
+                    let repos = &item.path.repos;
+                    let (requirement, versions, highest) =
+                        requested_versions(solver, group_id, artifact_id, &version, repos).await?;
+                    (versions, highest.version, hard_constraint(&requirement))
+                }
+                None => (Vec::new(), target.version.clone(), None),
+            };
+            let item = QueueItem {
+                dependency: Arc::new(dependency),
+                managed_scope,
+                ..item
+            };
+            let coord = Coord { version, ..target };
+            return Ok(Load::Relocated(Resolution {
+                candidate: Candidate {
+                    hard,
+                    source: vec![versions.len()],
+                    ..system_candidate(item, coord)?
+                },
+                alternatives: versions,
+                aliases,
+            }));
+        }
+        let Some(version) = version else {
+            break;
+        };
+        let (group_id, artifact_id) = (target.group_id.as_str(), target.artifact_id.as_str());
+        let (requirement, mut versions, highest) =
+            requested_versions(solver, group_id, artifact_id, &version, &item.path.repos).await?;
+        resolved = highest;
+        let mut managed = Coord {
+            version: resolved.version.clone(),
+            ..target.clone()
+        };
+        // Maven walks a range up from its lowest version and stops at the
+        // first that relocates. The versions below it keep this chain's
+        // relocations as aliases, so whether the lowest relocates decides
+        // them.
+        let lowest = match &requirement {
+            RequestedRequirement::Ranges(_) => {
+                let lowest = versions.first().unwrap_or(&resolved).clone();
+                let coord = Coord {
+                    version: lowest.version.clone(),
+                    ..target.clone()
+                };
+                let (end, ..) = fetch(coord.clone()).await?;
+                let stops = !same_text(&end, &coord) && !item.path.contains(&CoordKey::from(&end));
+                stops.then_some((lowest, coord))
+            }
+            _ => None,
+        };
+        if let Some((lowest, coord)) = lowest {
+            resolved = lowest;
+            managed = coord;
+            versions.clear();
+        } else if matches!(requirement, RequestedRequirement::Ranges(_)) {
+            // A managed range is walked like a declared one, so it is
+            // mediated lazily as one.
+            let item = QueueItem {
+                dependency: Arc::new(dependency),
+                managed_scope,
+                ..item
+            };
+            // Each lazy range starts a new load, so the budget is the
+            // length of the chain of ranges.
+            if source.len() >= MAX_RELOCATION_MANAGEMENT_PASSES {
+                return Err(ResolveError::RelocationCycle(format!(
+                    "{coord} -> {managed} (more than {MAX_RELOCATION_MANAGEMENT_PASSES} managed relocations)"
+                )));
+            }
+            let mut source = source;
+            source.push(versions.len());
+            return Ok(Load::Relocated(Resolution {
+                candidate: Candidate {
+                    item,
+                    coord: managed,
+                    resolved,
+                    resolved_project: None,
+                    hard: hard_constraint(&requirement),
+                    source,
+                    inherited: aliases.clone().into(),
+                },
+                alternatives: versions,
+                aliases,
+            }));
+        }
+        hard = hard_constraint(&requirement);
+        alternatives = versions;
+        listed_for = Some(managed.clone());
+        if same_text(&managed, &target) {
+            break;
+        }
+        previous = managed.clone();
+        let between;
+        (target, project, snapshot, between) = fetch(managed.clone()).await?;
+        if same_text(&target, &managed) {
+            // Nothing applies again to a managed version that stays.
+            break;
+        }
+        // Maven's collector replaces the relocations it carries with those
+        // of the latest descriptor that relocates.
+        let relocated = std::iter::once(&managed)
+            .chain(&between)
+            .map(CoordKey::from)
+            .collect();
+        inherited = std::mem::replace(&mut aliases, relocated).into();
+        hard = None;
+        alternatives.clear();
     }
-    tracing::debug!(
-        coord = %coord,
-        scope = ?effective_scope,
-        depth = item.depth,
-        "resolved dependency"
-    );
-    Ok(ResolutionOutcome::Resolved {
-        item,
-        coord,
-        resolved,
-        resolved_project: Some(resolved_project),
+    if listed_for.is_none_or(|listed| !same_text(&listed, &target)) {
+        // Maven fetches a relocation target from the requesting node's
+        // repositories, so the repository that listed the source's versions
+        // says nothing about where the target comes from.
+        resolved = ResolvedVersion {
+            version: target.version.clone(),
+            repo: None,
+        };
+    }
+    if let Some(snapshot) = snapshot {
+        resolved.version = snapshot.version;
+        resolved.repo = snapshot.repo;
+    }
+    let item = QueueItem {
+        dependency: Arc::new(dependency),
+        managed_scope,
+        ..item
+    };
+    tracing::debug!(from = %coord, to = %target, depth = item.depth, "relocated dependency");
+    if follows(&item.dependency) {
+        solver.hint_children(&item, &target, &project.project);
+    }
+    let resolution = Resolution {
+        candidate: Candidate {
+            item,
+            coord: target,
+            resolved,
+            resolved_project: Some(project),
+            hard,
+            source,
+            inherited,
+        },
         alternatives,
-        effective_scope,
-        child_scope,
-        requirement,
+        aliases,
+    };
+    Ok(if cyclic {
+        Load::Cyclic(resolution)
+    } else {
+        Load::Relocated(resolution)
     })
 }
 
@@ -772,22 +2210,13 @@ fn attach_dropped_repos<B: Backend>(
         coord: failed,
         searched,
         mut dropped_repos,
+        classifier_like,
     } = err
     else {
         return err;
     };
-    let mut path = Vec::new();
-    let mut current = Some(&item.path);
-    while let Some(node) = current {
-        path.push((
-            node.key.group_id.to_string(),
-            node.key.artifact_id.to_string(),
-        ));
-        current = node.parent.as_ref();
-    }
-    path.reverse();
     dropped_repos.extend(solver.backend.dropped_repos_on_path(
-        &path,
+        &item.path.coordinates(),
         &coord.version.to_string(),
         &searched,
     ));
@@ -795,6 +2224,7 @@ fn attach_dropped_repos<B: Backend>(
         coord: failed,
         searched,
         dropped_repos,
+        classifier_like,
     }
 }
 
@@ -804,867 +2234,379 @@ fn parse_requested_requirement(
     raw_version: &str,
 ) -> Result<RequestedRequirement> {
     let trimmed = raw_version.trim();
-    let lowered = trimmed.to_ascii_lowercase();
-    match lowered.as_str() {
-        "release" | "latest.release" => return Ok(RequestedRequirement::DynamicRelease),
-        "latest" | "latest.integration" => return Ok(RequestedRequirement::DynamicIntegration),
-        _ => {}
+    let invalid = || ResolveError::InvalidVersionRequirement {
+        coord: format!("{group_id}:{artifact_id}"),
+        value: trimmed.to_string(),
+    };
+    if let Some(token) = parse_dynamic_version_token(trimmed) {
+        return Ok(RequestedRequirement::Dynamic(token));
+    }
+    // Gradle's dynamic versions; `1.0+b1` is a plain Maven version.
+    if trimmed.ends_with('+') || trimmed.to_ascii_lowercase().starts_with("latest.") {
+        return Err(invalid());
+    }
+    let req = VersionReq::parse(trimmed).map_err(|_| invalid())?;
+    // DefaultVersionRangeResolver takes a range whose bounds are equal, as
+    // `[1,1]` or `[1]`, as that one version without reading metadata.
+    if let Some(version) = req.exact_version() {
+        return Ok(RequestedRequirement::Exact(version.clone()));
+    }
+    Ok(match req {
+        VersionReq::Soft(version) => RequestedRequirement::Soft(version),
+        req => RequestedRequirement::Ranges(req),
+    })
+}
+
+fn hard_constraint(requirement: &RequestedRequirement) -> Option<Arc<Hard>> {
+    let req = match requirement {
+        RequestedRequirement::Ranges(range) => range.clone(),
+        RequestedRequirement::Exact(version) => VersionReq::Exact(version.clone()),
+        _ => return None,
+    };
+    Some(Arc::new(Hard {
+        text: req.to_string().into(),
+        req,
+    }))
+}
+
+#[derive(Debug)]
+struct Hard {
+    req: VersionReq,
+    text: Box<str>,
+}
+
+#[derive(Debug, Clone)]
+struct Conflict {
+    coord: String,
+    requested: String,
+    selected: String,
+    at: SortKey,
+}
+
+#[derive(Debug)]
+struct Selected {
+    node: NodeIndex,
+    candidates: Vec<Arc<Candidate>>,
+    winner: Option<Arc<Candidate>>,
+    winner_path: Option<Arc<PathNode>>,
+    /// Losers already scanned for shadows under this winner.
+    scanned: HashSet<u64>,
+    /// Losers already walked below what the winner's path excludes.
+    walked: HashSet<u64>,
+    /// Losing range declarations whose preferred version was probed for a
+    /// dirty-tree relocation and did not relocate.
+    dirty_checked: HashSet<u64>,
+    conflict: Option<Conflict>,
+    winners: HashSet<(TreeOrder, String)>,
+    /// How often a winner came back.
+    changes: u32,
+    settled: Option<Settled>,
+}
+
+/// The candidates nearer than a settled winner, which some constraint
+/// rejects.
+#[derive(Debug)]
+struct Settled {
+    nearer: Vec<Arc<Candidate>>,
+    rejects: HashMap<Box<str>, bool>,
+}
+
+impl Settled {
+    fn rejects(&mut self, hard: &Hard) -> bool {
+        if let Some(&known) = self.rejects.get(&hard.text) {
+            return known;
+        }
+        let rejects = self
+            .nearer
+            .iter()
+            .any(|c| !hard.req.matches(&c.coord.version));
+        self.rejects.insert(hard.text.clone(), rejects);
+        rejects
+    }
+}
+
+impl Selected {
+    fn new(node: NodeIndex, candidates: Vec<Arc<Candidate>>) -> Self {
+        Self {
+            node,
+            candidates,
+            winner: None,
+            winner_path: None,
+            scanned: HashSet::new(),
+            walked: HashSet::new(),
+            dirty_checked: HashSet::new(),
+            conflict: None,
+            winners: HashSet::new(),
+            changes: 0,
+            settled: None,
+        }
     }
 
-    if is_unsupported_dynamic_syntax(trimmed) {
-        return Err(ResolveError::InvalidVersionRequirement {
-            coord: format!("{group_id}:{artifact_id}"),
-            value: trimmed.to_string(),
+    fn settle(&mut self) {
+        self.settled = self.winner.as_ref().map(|winner| {
+            let rank = winner.rank();
+            Settled {
+                nearer: self
+                    .candidates
+                    .iter()
+                    .filter(|c| c.rank() < rank)
+                    .cloned()
+                    .collect(),
+                rejects: HashMap::new(),
+            }
         });
     }
 
-    let requirement =
-        VersionReq::parse(trimmed).map_err(|_| ResolveError::InvalidVersionRequirement {
-            coord: format!("{group_id}:{artifact_id}"),
-            value: trimmed.to_string(),
-        })?;
-    match requirement {
-        // Preserve Maven's soft-vs-hard distinction. Collapsing `Soft` into
-        // `Exact` would harden transitive soft pins and bypass any later
-        // override path that distinguishes the two.
-        VersionReq::Exact(version) => Ok(RequestedRequirement::Exact(version)),
-        VersionReq::Soft(version) => Ok(RequestedRequirement::Soft(version)),
-        VersionReq::Ranges(_) => Ok(RequestedRequirement::Ranges(requirement)),
-    }
-}
-
-fn is_unsupported_dynamic_syntax(version: &str) -> bool {
-    let lowered = version.trim().to_ascii_lowercase();
-    lowered.contains('+')
-        || (lowered.starts_with("latest.")
-            && lowered != "latest.release"
-            && lowered != "latest.integration")
-}
-
-#[allow(clippy::too_many_arguments)] // process_batch is an internal helper with tightly related args
-async fn process_batch<'a, B: Backend>(
-    solver: &Solver<'a, B>,
-    batch: Vec<QueueItem>,
-    graph: &mut Graph,
-    selected: &mut HashMap<CoordKey, Selected<Option<ResolvedProject>>>,
-    requirements: &mut HashMap<u64, (CoordKey, RequestedRequirement)>,
-    platform_constraints: &mut Arc<PlatformConstraints>,
-    queue: &mut BinaryHeap<QueueItem>,
-    next_declared_at: &mut u64,
-    relocation_cache: &Mutex<HashMap<Coord, Coord>>,
-) -> Result<()> {
-    if batch.is_empty() {
-        return Ok(());
+    /// Maven's NearestVersionSelector: every hard constraint must accept the
+    /// winner, which is the nearest candidate, the first in depth-first
+    /// order among equally near ones unless a sibling has a higher version.
+    fn best(&self) -> Option<Arc<Candidate>> {
+        let hard = self.constraints();
+        self.candidates
+            .iter()
+            .filter(|c| hard.iter().all(|h| h.req.matches(&c.coord.version)))
+            .min_by(|a, b| a.rank().cmp(&b.rank()))
+            .cloned()
     }
 
-    let batch_len = batch.len();
-    let constraints_snapshot = Arc::clone(platform_constraints);
-    let concurrency = solver.current_fetch_concurrency().min(batch_len).max(1);
-
-    let results: Vec<_> = stream::iter(batch.into_iter().enumerate())
-        .map(|(idx, item)| {
-            let constraints_snapshot = Arc::clone(&constraints_snapshot);
-            async move {
-                let outcome =
-                    resolve_item(solver, item, constraints_snapshot, relocation_cache).await;
-                (idx, outcome)
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
-
-    let mut results = results;
-    results.sort_by_key(|(idx, _)| *idx);
-    let mut outcomes = Vec::new();
-    for (_, result) in results {
-        outcomes.extend(result?.into_iter().map(Some));
+    fn constraints(&self) -> Vec<&Hard> {
+        let mut seen = HashSet::new();
+        self.candidates
+            .iter()
+            .filter_map(|c| c.hard.as_deref())
+            .filter(|hard| seen.insert(&*hard.text))
+            .collect()
     }
 
-    // The production `RepoBackend` (resolver/backend.rs) always returns
-    // `platform_constraints: None` because <dependencyManagement>/BOM handling
-    // now happens in the model layer (`Project::from_pom_with_context`), not as
-    // solver-surfaced platform constraints. So for the real resolver this whole
-    // block is inert. It is kept (and exercised by the solver tests via mock
-    // backends) as a live extension point: a `Backend` impl MAY surface
-    // platform constraints here and the solver will merge them and requeue any
-    // in-flight resolution they invalidate. Guarded behind `has_new_constraints`
-    // so it costs nothing when no backend produces constraints.
-    let has_new_constraints = outcomes.iter().flatten().any(|o| {
-        matches!(
-            o,
-            ResolutionOutcome::Resolved { resolved_project, .. }
-                if resolved_project.as_ref().is_some_and(|p| p.platform_constraints.is_some())
-        )
-    });
-
-    if has_new_constraints {
-        // This is the single merge point for a batch's newly discovered
-        // constraints. The first-seen and replacement branches below do not
-        // re-merge per outcome; they would only fold in the same constraints
-        // already merged here. When `has_new_constraints` is false every
-        // outcome carries `None`, which `merge_platform_constraints` treats
-        // as a no-op, so nothing is lost by skipping the block.
-        for outcome in outcomes.iter().flatten() {
-            if let ResolutionOutcome::Resolved {
-                resolved_project, ..
-            } = outcome
+    /// The unloaded highest candidate of each losing range whose constraint
+    /// already accepts `best`. Only ranges from another declaration count:
+    /// alternatives of the winner's own range are not a dirty-tree read.
+    /// Maven still reads that preferred version, so a relocation there can
+    /// join this conflict group.
+    fn dirty_ranges(&self, best: &Candidate) -> Vec<Arc<Candidate>> {
+        let mut highest: IndexMap<u64, &Arc<Candidate>> = IndexMap::new();
+        for candidate in &self.candidates {
+            if candidate.item.shadow.is_some()
+                || candidate.same(best)
+                || candidate.item.declared_at == best.item.declared_at
             {
-                merge_platform_constraints(
-                    Arc::make_mut(platform_constraints),
-                    resolved_project
-                        .as_ref()
-                        .and_then(|p| p.platform_constraints.as_ref()),
-                );
+                continue;
             }
-        }
-
-        let mut requeued = HashSet::new();
-        for outcome in outcomes.iter_mut() {
-            let Some(ResolutionOutcome::Resolved { item, .. }) = outcome else {
+            let Some(hard) = candidate.hard.as_deref() else {
                 continue;
             };
-
-            let new_version_str =
-                resolve_version_str(platform_constraints.as_ref(), &item.dependency, item.depth)?;
-            let old_version_str =
-                resolve_version_str(&constraints_snapshot, &item.dependency, item.depth)?;
-
-            if new_version_str != old_version_str {
-                tracing::debug!(
-                    dep = %item.dependency.artifact_id,
-                    old = %old_version_str,
-                    new = %new_version_str,
-                    "intra-batch constraint discovery invalidated resolution; requeuing"
-                );
-
-                let stale_outcome =
-                    outcome
-                        .take()
-                        .ok_or_else(|| ResolveError::SolverInvariant {
-                            detail: "expected outcome during requeue".to_string(),
-                        })?;
-                if let ResolutionOutcome::Resolved { item, .. } = stale_outcome {
-                    // Preserve declared_at to keep Maven's first-declared-wins
-                    // tiebreak stable across requeues.
-                    // All alternatives of one range share the same request.
-                    if requeued.insert(item.declared_at) {
-                        push_queue(queue, item)?;
-                    }
-                }
+            if !matches!(hard.req, VersionReq::Ranges(_)) {
+                continue;
+            }
+            if self.dirty_checked.contains(&candidate.item.declared_at) {
+                continue;
+            }
+            if !hard.req.matches(&best.coord.version) || candidate.resolved_project.is_some() {
+                continue;
+            }
+            let entry = highest
+                .entry(candidate.item.declared_at)
+                .or_insert(candidate);
+            if candidate.source > entry.source {
+                *entry = candidate;
             }
         }
+        highest.into_values().cloned().collect()
     }
 
-    let mut outcomes: VecDeque<_> = outcomes.into_iter().flatten().collect();
-    while let Some(outcome) = outcomes.pop_front() {
-        match outcome {
-            ResolutionOutcome::System { item, coord } => {
-                let Some(parent_node) = graph.node(item.parent) else {
-                    continue;
-                };
-                if &parent_node.coord.version != item.parent_version.as_ref() {
-                    continue;
-                }
-
-                let key = CoordKey::from(&coord);
-                if let Some(existing) = selected.get(&key) {
-                    // Node already exists; still add parent->child edge
-                    // so the graph reflects all dependency relationships.
-                    let edge = Edge {
-                        scope: Scope::System,
-                        optional: item.dependency.effective_optional(),
-                        exclusions: item.dependency.exclusions.clone(),
-                        requested: item.dependency.version.clone(),
-                    };
-                    graph.add_edge(item.parent, existing.node, edge);
-                    continue;
-                }
-                let coord_version = coord.version.clone();
-                let node = Node {
-                    coord,
-                    scope: Scope::System,
-                    repo_url: None,
-                    checksum: None,
-                    workspace_module: None,
-                    local: true,
-                    system_path: item.dependency.system_path.clone(),
-                };
-                let node_idx = graph.insert_node(node);
-                let edge = Edge {
-                    scope: Scope::System,
-                    optional: item.dependency.effective_optional(),
-                    exclusions: item.dependency.exclusions.clone(),
-                    requested: item.dependency.version.clone(),
-                };
-                graph.add_edge(item.parent, node_idx, edge);
-                selected.insert(
-                    key,
-                    Selected {
-                        node: node_idx,
-                        version: coord_version,
-                        hard: Vec::new(),
-                        candidates: Vec::new(),
-                        winner: None,
-                    },
-                );
-            }
-            ResolutionOutcome::Resolved {
-                item,
-                coord,
-                resolved,
-                resolved_project,
-                alternatives,
-                effective_scope,
-                child_scope,
-                requirement,
-            } => {
-                let Some(parent_node) = graph.node(item.parent) else {
-                    continue;
-                };
-                if &parent_node.coord.version != item.parent_version.as_ref() {
-                    continue;
-                }
-
-                let key = CoordKey::from(&coord);
-                let coord_version = coord.version.clone();
-
-                let edge = Edge {
-                    scope: effective_scope,
-                    optional: item.dependency.effective_optional(),
-                    exclusions: item.dependency.exclusions.clone(),
-                    requested: item.dependency.version.clone(),
-                };
-
-                if let Some(workspace_module) = resolved_project
-                    .as_ref()
-                    .and_then(|p| p.workspace_module.as_deref())
-                    && let Some(cycle) =
-                        workspace_dependency_cycle(&item, workspace_module, graph, selected)
-                {
-                    return Err(ResolveError::WorkspaceDependencyCycle { cycle });
-                }
-
-                if item.path.contains(&key) {
-                    if let Some(existing) = selected.get(&key) {
-                        graph.add_edge(item.parent, existing.node, edge);
-                        tracing::debug!(
-                            cycle = %item.path.format_cycle(&key),
-                            "breaking cyclic dependency"
-                        );
-                    }
-                    continue;
-                }
-
-                let candidate = Arc::new(Candidate {
-                    item,
-                    coord,
-                    resolved,
-                    resolved_project,
-                    effective_scope,
-                    child_scope,
-                });
-                let retry_alternatives = alternatives.clone();
-                let mut candidates = Vec::with_capacity(alternatives.len() + 1);
-                for resolved in alternatives {
-                    candidates.push(Arc::new(Candidate {
-                        coord: Coord {
-                            version: resolved.version.clone(),
-                            ..candidate.coord.clone()
-                        },
-                        resolved,
-                        resolved_project: None,
-                        ..candidate.as_ref().clone()
-                    }));
-                }
-                candidates.push(Arc::clone(&candidate));
-                let mut selection = selected.get(&key).cloned().unwrap_or_else(|| Selected {
-                    node: graph.root(), // replaced when the first winner is inserted
-                    version: coord_version,
-                    hard: Vec::new(),
-                    candidates: Vec::new(),
-                    winner: None,
-                });
-                let winner = selection.consider_all(candidates, &requirement, solver.strategy)?;
-                let Some(mut winner) = winner else {
-                    graph.add_edge(candidate.item.parent, selection.node, edge);
-                    requirements.insert(candidate.item.declared_at, (key.clone(), requirement));
-                    selected.insert(key, selection);
-                    continue;
-                };
-                if winner.resolved_project.is_none() {
-                    let winner_requirement = requirements
-                        .get(&winner.item.declared_at)
-                        .map(|(_, requirement)| requirement.clone())
-                        .unwrap_or_else(|| requirement.clone());
-                    let loaded = load_candidate(
-                        solver,
-                        winner.as_ref().clone(),
-                        winner_requirement,
-                        platform_constraints,
-                        relocation_cache,
-                    )
-                    .await?;
-                    let ResolutionOutcome::Resolved {
-                        coord,
-                        resolved,
-                        resolved_project,
-                        ..
-                    } = &loaded
-                    else {
-                        unreachable!()
-                    };
-                    if coord != &winner.coord {
-                        // Relocation ends this declaration's source alternatives and constraints.
-                        // Mediate the target under its own requirement.
-                        let declaration = winner.item.declared_at;
-                        requirements.remove(&declaration);
-                        let mut detached_source = false;
-                        let mut discarded_parent = None;
-                        if let Some(source) = selected.get_mut(&key) {
-                            source
-                                .candidates
-                                .retain(|c| c.item.declared_at != declaration);
-                            source.hard = requirements
-                                .values()
-                                .filter(|(source_key, _)| source_key == &key)
-                                .filter_map(|(_, req)| hard_constraint(req))
-                                .collect();
-                            detached_source = graph.remove_edge(
-                                winner.item.parent,
-                                source.node,
-                                &Edge {
-                                    scope: winner.effective_scope,
-                                    optional: winner.item.dependency.effective_optional(),
-                                    exclusions: winner.item.dependency.exclusions.clone(),
-                                    requested: winner.item.dependency.version.clone(),
-                                },
-                            );
-                            if detached_source
-                                || source
-                                    .winner
-                                    .as_ref()
-                                    .is_some_and(|c| c.item.declared_at == declaration)
-                            {
-                                source.winner = None;
-                                discarded_parent = Some(source.node);
-                                let orphaned = graph.replace_node_version(
-                                    source.node,
-                                    graph
-                                        .node(source.node)
-                                        .expect("selected node")
-                                        .coord
-                                        .clone(),
-                                );
-                                for orphan in orphaned {
-                                    selected.remove(&orphan);
-                                }
-                            }
-                        }
-                        if detached_source {
-                            selected.remove(&key);
-                        }
-                        if let Some(parent) = discarded_parent {
-                            withdraw_discarded_declarations(
-                                parent,
-                                graph,
-                                selected,
-                                requirements,
-                                &mut outcomes,
-                            );
-                        }
-                        if declaration != candidate.item.declared_at {
-                            // Backtracking loaded a retained declaration. The
-                            // new request still needs its constraint and edge.
-                            outcomes.push_front(ResolutionOutcome::Resolved {
-                                item: candidate.item.clone(),
-                                coord: candidate.coord.clone(),
-                                resolved: candidate.resolved.clone(),
-                                resolved_project: candidate.resolved_project.clone(),
-                                alternatives: retry_alternatives,
-                                effective_scope: candidate.effective_scope,
-                                child_scope: candidate.child_scope,
-                                requirement,
-                            });
-                        }
-                        outcomes.push_front(loaded);
-                        continue;
-                    }
-                    let loaded_winner = Arc::new(Candidate {
-                        coord: coord.clone(),
-                        resolved: resolved.clone(),
-                        resolved_project: resolved_project.clone(),
-                        ..winner.as_ref().clone()
-                    });
-                    for retained in &mut selection.candidates {
-                        if Arc::ptr_eq(retained, &winner) {
-                            *retained = Arc::clone(&loaded_winner);
-                        }
-                    }
-                    winner = loaded_winner;
-                    selection.winner = Some(Arc::clone(&winner));
-                }
-                let project = winner
-                    .resolved_project
-                    .as_ref()
-                    .expect("winner descriptor loaded");
-                if let Some(workspace_module) = project.workspace_module.as_deref()
-                    && let Some(cycle) =
-                        workspace_dependency_cycle(&winner.item, workspace_module, graph, selected)
-                {
-                    return Err(ResolveError::WorkspaceDependencyCycle { cycle });
-                }
-                let replaced = selected.get(&key).map(|existing| existing.node);
-                let node_idx = if let Some(existing) = selected.get(&key) {
-                    let node_idx = existing.node;
-                    let orphaned_keys = graph.replace_node_version(node_idx, winner.coord.clone());
-                    for orphaned_key in orphaned_keys {
-                        selected.remove(&orphaned_key);
-                    }
-                    node_idx
-                } else {
-                    graph.insert_node(Node {
-                        coord: winner.coord.clone(),
-                        scope: winner.effective_scope,
-                        repo_url: None,
-                        checksum: None,
-                        workspace_module: None,
-                        local: false,
-                        system_path: winner.item.dependency.system_path.clone(),
-                    })
-                };
-                if let Some(node) = graph.node_mut(node_idx) {
-                    node.scope = winner.effective_scope;
-                    node.repo_url = winner
-                        .resolved
-                        .repo_url
-                        .clone()
-                        .or_else(|| project.repo_url.clone());
-                    node.workspace_module = project.workspace_module.clone();
-                }
-                graph.add_edge(candidate.item.parent, node_idx, edge);
-                selection.node = node_idx;
-                selection.version = winner.coord.version.clone();
-                requirements.insert(candidate.item.declared_at, (key.clone(), requirement));
-                selected.insert(key.clone(), selection);
-                if let Some(parent) = replaced
-                    && solver.strategy == ResolutionStrategy::NearestWins
-                {
-                    withdraw_discarded_declarations(
-                        parent,
-                        graph,
-                        selected,
-                        requirements,
-                        &mut outcomes,
-                    );
-                }
-                #[cfg(debug_assertions)]
-                graph.assert_index_consistent();
-                queue_children(
-                    queue,
-                    &winner.item,
-                    &key,
-                    node_idx,
-                    winner.child_scope,
-                    &winner.coord.version,
-                    project,
-                    next_declared_at,
-                )?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn withdraw_discarded_declarations(
-    parent: petgraph::graph::NodeIndex,
-    graph: &mut Graph,
-    selected: &mut HashMap<CoordKey, Selected<Option<ResolvedProject>>>,
-    requirements: &mut HashMap<u64, (CoordKey, RequestedRequirement)>,
-    outcomes: &mut VecDeque<ResolutionOutcome>,
-) {
-    let mut affected = HashSet::new();
-    loop {
-        let live_nodes: HashSet<_> = selected.values().map(|selection| selection.node).collect();
-        let mut empty = Vec::new();
-        for (key, selection) in selected.iter_mut() {
-            let previous_len = selection.candidates.len();
-            selection.candidates.retain(|candidate| {
-                let item = &candidate.item;
-                item.parent != parent
-                    && live_nodes.contains(&item.parent)
-                    && graph
-                        .node(item.parent)
-                        .is_some_and(|node| node.coord.version == *item.parent_version)
-            });
-            if selection.candidates.len() != previous_len {
-                affected.insert(key.clone());
-                selection.winner = None;
-                if selection.candidates.is_empty() {
-                    empty.push(key.clone());
-                }
-            }
-        }
-        if empty.is_empty() {
-            break;
-        }
-        for key in empty {
-            if let Some(selection) = selected.remove(&key) {
-                let coord = graph
-                    .node(selection.node)
-                    .expect("selected node")
-                    .coord
-                    .clone();
-                for orphan in graph.replace_node_version(selection.node, coord) {
-                    selected.remove(&orphan);
-                }
-            }
-        }
-    }
-    let declarations: HashSet<_> = selected
-        .values()
-        .flat_map(|selection| selection.candidates.iter().map(|c| c.item.declared_at))
-        .collect();
-    requirements.retain(|declaration, _| declarations.contains(declaration));
-    let mut pending = Vec::new();
-    for key in affected {
-        let Some(selection) = selected.get_mut(&key) else {
-            continue;
-        };
-        selection.hard = requirements
-            .values()
-            .filter(|(target, _)| target == &key)
-            .filter_map(|(_, requirement)| hard_constraint(requirement))
+    /// The unloaded lowest candidates of the ranges whose constraint
+    /// rejects a candidate nearer than `best`, or any candidate when there
+    /// is no `best`.
+    fn unconfirmed(&self, best: Option<&Candidate>) -> Vec<Arc<Candidate>> {
+        let nearer: Vec<&Arc<Candidate>> = self
+            .candidates
+            .iter()
+            .filter(|c| best.is_none_or(|best| c.rank() < best.rank()))
             .collect();
-        if let Some(candidate) = selection.candidates.first() {
-            let requirement = requirements[&candidate.item.declared_at].1.clone();
-            pending.push(ResolutionOutcome::Resolved {
-                item: candidate.item.clone(),
-                coord: candidate.coord.clone(),
-                resolved: candidate.resolved.clone(),
-                resolved_project: candidate.resolved_project.clone(),
-                alternatives: Vec::new(),
-                effective_scope: candidate.effective_scope,
-                child_scope: candidate.child_scope,
-                requirement,
-            });
+        if nearer.is_empty() {
+            return Vec::new();
         }
-    }
-    pending.sort_by_key(|outcome| match outcome {
-        ResolutionOutcome::Resolved { item, .. } => item.declared_at,
-        ResolutionOutcome::System { item, .. } => item.declared_at,
-    });
-    for outcome in pending.into_iter().rev() {
-        outcomes.push_front(outcome);
-    }
-}
-
-/// The part of a request that is a hard constraint: a range or a bracketed pin.
-fn hard_constraint(requirement: &RequestedRequirement) -> Option<VersionReq> {
-    match requirement {
-        RequestedRequirement::Ranges(range) => Some(range.clone()),
-        RequestedRequirement::Exact(version) => Some(VersionReq::Exact(version.clone())),
-        _ => None,
-    }
-}
-
-fn workspace_dependency_cycle(
-    item: &QueueItem,
-    target_module: &str,
-    graph: &Graph,
-    selected: &HashMap<CoordKey, Selected<Option<ResolvedProject>>>,
-) -> Option<String> {
-    let mut coordinates = Vec::new();
-    let mut current = Some(item.path.as_ref());
-    while let Some(path) = current {
-        let selected_node = selected.get(&path.key)?;
-        let node = graph.node(selected_node.node)?;
-        let workspace_module = node.workspace_module.as_deref()?;
-        coordinates.push(format!(
-            "{}:{}",
-            node.coord.group_id, node.coord.artifact_id
-        ));
-        if workspace_module == target_module {
-            coordinates.reverse();
-            coordinates.push(coordinates.first().expect("cycle contains target").clone());
-            return Some(coordinates.join(" -> "));
-        }
-        current = path.parent.as_deref();
-    }
-    None
-}
-
-#[cfg(test)]
-impl<'a, B: Backend> Solver<'a, B> {
-    pub(crate) fn new(backend: &'a B) -> Self {
-        Self::with_strategy(backend, ResolutionStrategy::default(), None)
-    }
-
-    /// Set platform constraints for this solver.
-    ///
-    /// Platform constraints are applied to dependencies that don't have a version specified.
-    /// Enforced platform constraints override any existing version.
-    pub(crate) fn with_platform_constraints(mut self, constraints: PlatformConstraints) -> Self {
-        self.platform_constraints = Some(constraints);
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Selected<P = ResolvedProject> {
-    node: petgraph::graph::NodeIndex,
-    version: Version,
-    /// Hard constraints (ranges and `[x]` pins) requested for this key so far.
-    /// Like maven-resolver's NearestVersionSelector, the winner must satisfy
-    /// every one of them.
-    hard: Vec<VersionReq>,
-    candidates: Vec<Arc<Candidate<P>>>,
-    winner: Option<Arc<Candidate<P>>>,
-}
-
-// Generic payloads let mediation compare fetched descriptors and lazy range
-// candidates using only coordinates and traversal context.
-#[derive(Debug, Clone)]
-struct Candidate<P = ResolvedProject> {
-    item: QueueItem,
-    coord: Coord,
-    resolved: ResolvedVersion,
-    resolved_project: P,
-    effective_scope: Scope,
-    child_scope: Option<Scope>,
-}
-
-impl<P> Candidate<P> {
-    fn is_nearer(&self, other: &Self) -> bool {
-        // NearestVersionSelector compares sibling versions before depth.
-        // Relocation can create siblings after model dependency deduplication.
-        if self.item.parent == other.item.parent
-            && self.item.parent_version == other.item.parent_version
-        {
-            self.coord.version > other.coord.version
-        } else {
-            // Ordered batch processing and the retained candidate list keep
-            // the first encountered path on an equal-depth tie.
-            self.item.depth < other.item.depth
-        }
-    }
-}
-
-impl<P> Selected<P> {
-    /// Retain declarations so removing a parent can make rejected candidates eligible again.
-    /// Backtrack when a new range rejects the winner.
-    /// Return the new winner only when it changes.
-    /// Return traversal context only when the winner changes.
-    #[cfg(test)]
-    fn consider(
-        &mut self,
-        candidate: Arc<Candidate<P>>,
-        requirement: &RequestedRequirement,
-        strategy: ResolutionStrategy,
-    ) -> Result<Option<Arc<Candidate<P>>>> {
-        self.consider_all(vec![candidate], requirement, strategy)
-    }
-
-    fn consider_all(
-        &mut self,
-        candidates: Vec<Arc<Candidate<P>>>,
-        requirement: &RequestedRequirement,
-        strategy: ResolutionStrategy,
-    ) -> Result<Option<Arc<Candidate<P>>>> {
-        let candidate = candidates.last().expect("nonempty declaration");
-        if let Some(hard) = hard_constraint(requirement)
-            && !self.hard.contains(&hard)
-        {
-            self.hard.push(hard);
-        }
-        let acceptable = |version: &Version| self.hard.iter().all(|hard| hard.matches(version));
-        let previous = self.winner.clone();
-        match strategy {
-            ResolutionStrategy::NearestWins => {
-                let backtrack = self.winner.is_none() || !acceptable(&self.version);
-                for candidate in &candidates {
-                    if acceptable(&candidate.coord.version)
-                        && !backtrack
-                        && self
-                            .winner
-                            .as_ref()
-                            .is_none_or(|winner| candidate.is_nearer(winner))
-                    {
-                        self.winner = Some(Arc::clone(candidate));
-                    }
-                }
-                for candidate in &candidates {
-                    if !self.candidates.iter().any(|retained| {
-                        retained.item.declared_at == candidate.item.declared_at
-                            && retained.coord == candidate.coord
-                    }) {
-                        self.candidates.push(Arc::clone(candidate));
-                    }
-                }
-                if backtrack {
-                    self.winner = None;
-                    for retained in self
-                        .candidates
-                        .iter()
-                        .filter(|c| acceptable(&c.coord.version))
-                    {
-                        if self
-                            .winner
-                            .as_ref()
-                            .is_none_or(|winner| retained.is_nearer(winner))
-                        {
-                            self.winner = Some(Arc::clone(retained));
-                        }
-                    }
-                    if self.winner.is_none() {
-                        return Err(self.conflict(candidate, requirement));
-                    }
-                }
+        let rejecting: HashSet<&str> = self
+            .constraints()
+            .into_iter()
+            .filter(|h| nearer.iter().any(|c| !h.req.matches(&c.coord.version)))
+            .map(|h| &*h.text)
+            .collect();
+        let mut lowest: IndexMap<(u64, &str), &Arc<Candidate>> = IndexMap::new();
+        for candidate in &self.candidates {
+            let Some(hard) = candidate.hard.as_deref() else {
+                continue;
+            };
+            if !rejecting.contains(&*hard.text) {
+                continue;
             }
-            ResolutionStrategy::HighestWins => {
-                if self.winner.is_none() || candidate.coord.version > self.version {
-                    self.winner = Some(Arc::clone(candidate));
-                } else if hard_constraint(requirement)
-                    .is_some_and(|hard| !hard.matches(&self.version))
-                {
-                    return Err(self.conflict(candidate, requirement));
-                }
+            let entry = lowest
+                .entry((candidate.item.declared_at, &*hard.text))
+                .or_insert(candidate);
+            if candidate.source < entry.source {
+                *entry = candidate;
             }
         }
-        Ok(self
-            .winner
+        lowest
+            .into_values()
+            .filter(|c| c.resolved_project.is_none())
+            .cloned()
+            .collect()
+    }
+
+    fn note_conflict(&mut self) {
+        let selected = self.winner.as_ref().map(|winner| &winner.coord.version);
+        let rejecting = |c: &&Arc<Candidate>| {
+            c.hard
+                .as_ref()
+                .is_some_and(|hard| selected.is_none_or(|version| !hard.req.matches(version)))
+        };
+        let Some(culprit) = self
+            .candidates
+            .iter()
+            .filter(rejecting)
+            .max_by_key(|c| c.item.declared_at)
+            .or_else(|| self.candidates.first())
+        else {
+            return;
+        };
+        let requested = match culprit.hard.as_deref().map(|hard| &hard.req) {
+            Some(VersionReq::Exact(version)) => version.to_string(),
+            Some(hard) => hard.to_string(),
+            None => culprit.coord.version.to_string(),
+        };
+        self.conflict = Some(Conflict {
+            coord: format!("{}:{}", culprit.coord.group_id, culprit.coord.artifact_id),
+            requested,
+            selected: selected.unwrap_or(&culprit.coord.version).to_string(),
+            at: culprit.item.sort_key(),
+        });
+    }
+
+    fn instance(&self, origin: &ShadowOrigin) -> Option<&Arc<Candidate>> {
+        self.candidates.iter().find(|c| {
+            c.item.shadow.is_none()
+                && c.item.declared_at == origin.instance
+                && same_text(&c.coord, &origin.coord)
+        })
+    }
+
+    fn instance_of(&self, candidate: &Candidate) -> Option<&Arc<Candidate>> {
+        self.candidates.iter().find(|c| {
+            c.item.shadow.is_none()
+                && candidate.item.shadow.is_none()
+                && c.item.declared_at == candidate.item.declared_at
+                && same_text(&c.coord, &candidate.coord)
+        })
+    }
+
+    fn on_winner_path(&self, key: &CoordKey) -> bool {
+        self.winner_path
             .as_ref()
-            .filter(|winner| {
-                previous
-                    .as_ref()
-                    .is_none_or(|previous| !Arc::ptr_eq(winner, previous))
-            })
-            .cloned())
-    }
-
-    fn conflict(
-        &self,
-        candidate: &Candidate<P>,
-        requirement: &RequestedRequirement,
-    ) -> ResolveError {
-        ResolveError::VersionConflict {
-            coord: format!(
-                "{}:{}",
-                candidate.coord.group_id, candidate.coord.artifact_id
-            ),
-            requested: hard_constraint(requirement).map_or_else(
-                || candidate.coord.version.to_string(),
-                |hard| match hard {
-                    VersionReq::Exact(version) => version.to_string(),
-                    _ => hard.to_string(),
-                },
-            ),
-            selected: self.version.to_string(),
-        }
+            .is_some_and(|path| path.contains(key))
     }
 }
 
-/// Push the resolved project's declared dependencies onto the queue as
-/// children of `node_idx`. Shared between the first-seen and the
-/// replacement (conflict-resolved) branches in `process_batch`. No-op when
-/// `child_scope` is `None` (the resolved item is a leaf for traversal).
-// Distinct, well-named parameters threaded into the solver hot path; bundling
-// them into a struct would only obscure the two call sites.
-#[allow(clippy::too_many_arguments)]
-fn queue_children(
-    queue: &mut BinaryHeap<QueueItem>,
-    item: &QueueItem,
-    key: &CoordKey,
-    node_idx: petgraph::graph::NodeIndex,
-    child_scope: Option<Scope>,
-    coord_version: &Version,
-    resolved_project: &ResolvedProject,
-    next_declared_at: &mut u64,
-) -> Result<()> {
-    let Some(child_scope) = child_scope else {
-        return Ok(());
-    };
-    let next_path = PathNode::extend(&item.path, key.clone());
-    let next_exclusions = extend_exclusions(&item.exclusions, &item.dependency.exclusions);
-    let coord_version = Arc::new(coord_version.clone());
-    let dep_mgmt = &resolved_project.project.dependency_management;
-    for mut dep in resolved_project.project.dependencies.iter().cloned() {
-        // A child with no <version> takes it from the resolving artifact's own
-        // effective dependencyManagement (its entries plus the parent chain and
-        // import BOMs, already merged by the model layer), as Maven does for
-        // every artifact, not just the root. Only the version is filled here; an
-        // explicit version wins and the declared scope is left untouched.
-        if dep.version.is_none()
-            && let Some(version) = managed_child_version(dep_mgmt, &dep)
-        {
-            dep.version = Some(version);
-        }
-        let declared_at = *next_declared_at;
-        *next_declared_at += 1;
-        push_queue(
-            queue,
-            QueueItem::new(
-                node_idx,
-                Arc::clone(&coord_version),
-                Arc::new(dep),
-                child_scope,
-                item.depth + 1,
-                declared_at,
-                Arc::clone(&next_exclusions),
-                Arc::clone(&next_path),
-            ),
-        )?;
+#[derive(Debug, Clone)]
+struct Candidate {
+    item: QueueItem,
+    /// The coordinate mediation compares; a SNAPSHOT keeps its base version.
+    coord: Coord,
+    /// The version of the file, a SNAPSHOT's timestamped build, and the
+    /// repository that listed it.
+    resolved: ResolvedVersion,
+    resolved_project: Option<ResolvedProject>,
+    hard: Option<Arc<Hard>>,
+    /// The positions, in the listed order, of the versions of the ranges on
+    /// the way to this candidate: the declared artifact's, then, where a
+    /// relocation's target is managed to a range, the target's. A range
+    /// stops at the first version that relocates. Two spellings of one
+    /// version keep their own positions.
+    source: Vec<usize>,
+    /// The relocations Maven's collector carries into this candidate's
+    /// descriptor read, which a relocation onto a cyclic target keeps.
+    inherited: Arc<[CoordKey]>,
+}
+
+impl Candidate {
+    /// Nearest first; then depth-first order of the parents, so that
+    /// siblings compare by version, highest first; then depth-first order.
+    fn rank(&self) -> (usize, &TreeOrder, Reverse<&Version>, &TreeOrder, u64) {
+        (
+            self.item.depth,
+            self.item.order.parent(),
+            Reverse(&self.coord.version),
+            &self.item.order,
+            self.item.declared_at,
+        )
     }
-    Ok(())
+
+    fn same(&self, other: &Self) -> bool {
+        self.item.order == other.item.order && same_text(&self.coord, &other.coord)
+    }
+
+    /// The declared scope, or the one management set.
+    fn scope(&self) -> Scope {
+        self.item.dependency.effective_scope()
+    }
+
+    fn follows(&self) -> bool {
+        follows(&self.item.dependency)
+    }
 }
 
 /// Find the version a resolved artifact's effective dependencyManagement
 /// supplies for one of its child dependencies, matched by Maven's management
-/// key `(groupId, artifactId, type, classifier)`. Returns `None` when the
-/// child is unmanaged or the matching entry carries no version (a management
-/// entry may manage only scope/exclusions).
+/// key `(groupId, artifactId, type, classifier)`: the first matching entry
+/// that carries one.
 fn managed_child_version(mgmt: &DependencyManagement, dep: &Dependency) -> Option<String> {
     mgmt.dependencies
         .iter()
-        .find(|managed| {
+        .filter(|managed| {
             managed.group_id == dep.group_id
                 && managed.artifact_id == dep.artifact_id
                 && managed.effective_type() == dep.effective_type()
                 && managed.effective_classifier() == dep.effective_classifier()
         })
-        .and_then(|managed| managed.version.clone())
+        .find_map(|managed| managed.version.clone())
 }
 
-fn inherit_scope(parent: Scope, child: Scope) -> Scope {
-    match (parent, child) {
-        // Runtime propagates onto compile-scoped children (Maven mediation).
-        (Scope::Runtime, Scope::Compile) => Scope::Runtime,
-        // Test-scoped ancestors keep their test classification on
-        // transitive children. Without this, `transitive_from(Test,
-        // Compile|Runtime)` would queue the child for traversal but
-        // emit it with the child's declared scope, dropping the test
-        // classification from the lock file.
-        (Scope::Test, Scope::Compile | Scope::Runtime) => Scope::Test,
-        // A test child (e.g. managed to test) of a provided parent stays test.
-        (Scope::Provided, Scope::Test) => Scope::Test,
-        // Other inherited (non-Compile/Runtime) parent scopes win
-        // outright, matching maven-resolver's relaxed-mode semantics.
-        (Scope::Test | Scope::Provided | Scope::System | Scope::Import, _) => parent,
-        _ => child,
+/// The managed dependency and the requirement [`resolve_item`] resolves
+/// for `item`, unless it skips the item: the same skips, in the same order.
+fn prefetch_requirement(
+    item: &QueueItem,
+    management: &Management,
+) -> Option<(Arc<Dependency>, RequestedRequirement)> {
+    let followed = item.dependency.is_followed_transitively();
+    let item = apply_managed_metadata(management, item.clone());
+    let dependency = &item.dependency;
+    if is_excluded(dependency, &item.exclusions)
+        || (item.depth > 1 && !followed)
+        || matches!(dependency.effective_scope(), Scope::Import | Scope::System)
+    {
+        return None;
     }
+    let version_str = resolve_version_str(management, dependency, item.depth).ok()?;
+    let requirement =
+        parse_requested_requirement(&dependency.group_id, &dependency.artifact_id, version_str)
+            .ok()?;
+    Some((item.dependency, requirement))
 }
 
-fn is_barrier(item: &QueueItem) -> bool {
-    // BOM-import deps are skipped upstream by `resolve_item`, so the only
-    // remaining barrier is the platform/enforced-platform dep type. Those
-    // must drain before sibling plain deps so their constraints land first.
-    matches!(
-        item.dependency.type_.as_deref(),
-        Some("platform") | Some("enforced-platform")
-    )
+/// The coordinates [`resolve_item`] fetches the project of for `item`, when
+/// it fetches one by a fixed, non-snapshot version.
+fn prefetch_coord(item: &QueueItem, management: &Management) -> Option<Coord> {
+    let (dependency, requirement) = prefetch_requirement(item, management)?;
+    fixed_coord(&dependency, requirement)
 }
 
-fn packaging_opt(effective_type: &str) -> Option<String> {
-    (effective_type != "jar").then(|| effective_type.to_string())
+fn fixed_coord(dependency: &Dependency, requirement: RequestedRequirement) -> Option<Coord> {
+    let (RequestedRequirement::Exact(version) | RequestedRequirement::Soft(version)) = requirement
+    else {
+        return None;
+    };
+    if rv_maven_types::resolves_through_snapshot_metadata(version.as_str()) {
+        return None;
+    }
+    Some(coord_of(dependency, version))
 }

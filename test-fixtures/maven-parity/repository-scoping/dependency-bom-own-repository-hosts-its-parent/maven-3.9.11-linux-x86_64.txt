@@ -1,0 +1,10 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# As bom-own-repository-hosts-its-parent, with the BOM imported by the dependency org.scope:a:1.
+result=success
+module=org.scope:dependency-bom-own-repository-hosts-its-parent:1
+# org.scope:a:jar:1:compile
+artifact=org.scope:a:1:r1
+# org.scope:c:jar:1:compile
+artifact=org.scope:c:1:r1

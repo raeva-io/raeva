@@ -1,0 +1,6 @@
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "use rv_http::client_builder, which installs the crypto provider" },
+    { path = "reqwest::Client::builder", reason = "use rv_http::client_builder, which installs the crypto provider" },
+    { path = "reqwest::ClientBuilder::new", reason = "use rv_http::client_builder, which installs the crypto provider" },
+    { path = "reqwest::get", reason = "use rv_http::client_builder, which installs the crypto provider" },
+]

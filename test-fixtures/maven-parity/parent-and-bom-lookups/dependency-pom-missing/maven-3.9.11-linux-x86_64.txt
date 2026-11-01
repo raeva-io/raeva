@@ -1,0 +1,7 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories
+# [WARNING] The POM for org.f3:lib:jar:1.0 is missing, no dependency information available
+result=success
+module=org.f3:dependency-pom-missing:1.0
+artifact=org.f3:lib:1.0:r1

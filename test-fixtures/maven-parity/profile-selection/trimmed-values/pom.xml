@@ -1,0 +1,32 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.sel</groupId>
+  <artifactId>trimmed-values</artifactId>
+  <version>1.0</version>
+  <profiles>
+    <profile>
+      <id>os-name-with-spaces-from-property</id>
+      <activation><os><name>${target}</name></os></activation>
+    </profile>
+    <profile>
+      <id>os-name-with-spaces-as-written</id>
+      <activation><os><name> Linux </name></os></activation>
+    </profile>
+    <profile>
+      <id>property-value-with-spaces-from-property</id>
+      <activation><property><name>pv</name><value>${spaced}</value></property></activation>
+    </profile>
+    <profile>
+      <id>property-value-with-spaces-as-written</id>
+      <activation><property><name> pv </name><value> x </value></property></activation>
+    </profile>
+    <profile>
+      <id>property-set-to-a-space</id>
+      <activation><property><name>blank</name></property></activation>
+    </profile>
+    <profile>
+      <id>version-regex-with-lookahead</id>
+      <activation><os><version>regex:(?=10).*</version></os></activation>
+    </profile>
+  </profiles>
+</project>

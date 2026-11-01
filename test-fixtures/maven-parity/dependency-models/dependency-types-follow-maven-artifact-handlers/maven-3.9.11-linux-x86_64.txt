@@ -1,0 +1,25 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# Each dependency names a <type>. Maven's artifact handlers give maven-plugin, ejb, ejb-client,
+# java-source, javadoc and test-jar the jar extension, and ejb-client, java-source, javadoc and
+# test-jar the classifiers client, sources, javadoc and tests; zip and war are their own extension.
+# The repository holds only those files. war bundles its dependencies, so Maven does not collect
+# org.ty:webdep:1.0, which org.ty:web:1.0 declares.
+result=success
+module=org.ty:dependency-types-follow-maven-artifact-handlers:1.0
+# org.ty:plugin:maven-plugin:1.0:compile
+artifact=org.ty:plugin:1.0:repo
+# org.ty:ejbc:ejb-client:client:1.0:compile
+artifact=org.ty:ejbc:1.0:repo
+# org.ty:ejb:ejb:1.0:compile
+artifact=org.ty:ejb:1.0:repo
+# org.ty:src:java-source:sources:1.0:compile
+artifact=org.ty:src:1.0:repo
+# org.ty:doc:javadoc:javadoc:1.0:compile
+artifact=org.ty:doc:1.0:repo
+# org.ty:web:war:1.0:compile
+artifact=org.ty:web:1.0:repo
+# org.ty:arch:zip:1.0:compile
+artifact=org.ty:arch:1.0:repo
+# org.ty:tj:test-jar:tests:1.0:compile
+artifact=org.ty:tj:1.0:repo

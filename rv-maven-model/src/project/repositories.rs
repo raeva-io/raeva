@@ -11,20 +11,15 @@ pub(crate) fn resolve_repositories(
 ) -> Result<Vec<Repository>, PomError> {
     repos
         .into_iter()
+        .filter(|repo| !repo.url.is_empty())
         .map(|repo| {
-            Ok(Repository {
-                root_declared: repo.root_declared,
+            let mut repo = Repository {
                 id: properties.interpolate_opt(repo.id.as_deref(), project)?,
                 url: properties.interpolate_str(&repo.url, project)?,
-                releases_enabled: repo.releases_enabled,
-                snapshots_enabled: repo.snapshots_enabled,
-                releases_update_policy: repo.releases_update_policy,
-                snapshots_update_policy: repo.snapshots_update_policy,
-                releases_checksum_policy: properties
-                    .interpolate_opt(repo.releases_checksum_policy.as_deref(), project)?,
-                snapshots_checksum_policy: properties
-                    .interpolate_opt(repo.snapshots_checksum_policy.as_deref(), project)?,
-            })
+                ..repo
+            };
+            repo.interpolate_policies(|text| properties.interpolate_str(text, project))?;
+            Ok(repo)
         })
         .collect()
 }

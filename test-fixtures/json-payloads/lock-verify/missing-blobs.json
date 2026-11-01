@@ -1,0 +1,128 @@
+{
+  "exit_code": 7,
+  "stdout": {
+    "code": "LOCKFILE_MISMATCH",
+    "data": {
+      "corrupt": 0,
+      "corrupt_artifacts": [],
+      "downloaded": 0,
+      "missing": 14,
+      "missing_artifacts": [
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:api-spec:1.0:jar"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:api-spec:1.0:pom"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:core:1.1:jar"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:core:1.1:pom"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:lib:1.0:jar"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:lib:1.0:jar:jdk11"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:lib:1.0:jar:tests"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:lib:1.0:pom"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:runtime-only:1.0:jar"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:runtime-only:1.0:pom"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:testlib:1.0:jar"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:testlib:1.0:pom"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:util:1.0:jar"
+        },
+        {
+          "actual": null,
+          "affected_modules": [
+            "pom.xml"
+          ],
+          "coordinate": "org.golden:util:1.0:pom"
+        }
+      ],
+      "no_checksum": 0,
+      "no_checksum_artifacts": [],
+      "pin_mismatch": 0,
+      "pin_mismatch_artifacts": [],
+      "untrusted_origin": 0,
+      "untrusted_origin_artifacts": [],
+      "verified": 0,
+      "warnings": [],
+      "workspace_entries": [],
+      "workspace_skipped": 0
+    },
+    "error": "the store does not hold what raeva.lock pins: 14 missing, 0 corrupt",
+    "exit_code": 7,
+    "hints": [
+      "Run 'raeva lock verify --download' or 'raeva sync' to fetch them"
+    ],
+    "success": false
+  }
+}

@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.scope</groupId><artifactId>e</artifactId><version>1</version><repositories><repository><url>@BASE@/ry/</url></repository></repositories><dependencies><dependency><groupId>org.scope</groupId><artifactId>f</artifactId><version>1</version></dependency></dependencies></project>

@@ -1,0 +1,6 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  
+  <groupId>org.f4</groupId><artifactId>duplicate-anonymous-profiles</artifactId><version>1.0</version>
+<profiles><profile><activation><activeByDefault>true</activeByDefault></activation></profile><profile></profile></profiles>
+</project>

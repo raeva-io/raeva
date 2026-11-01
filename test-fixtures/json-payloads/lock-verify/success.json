@@ -1,0 +1,23 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "corrupt": 0,
+      "corrupt_artifacts": [],
+      "downloaded": 0,
+      "missing": 0,
+      "missing_artifacts": [],
+      "no_checksum": 0,
+      "no_checksum_artifacts": [],
+      "pin_mismatch": 0,
+      "pin_mismatch_artifacts": [],
+      "untrusted_origin": 0,
+      "untrusted_origin_artifacts": [],
+      "verified": 14,
+      "warnings": [],
+      "workspace_entries": [],
+      "workspace_skipped": 0
+    },
+    "success": true
+  }
+}

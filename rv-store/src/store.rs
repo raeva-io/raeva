@@ -1,1002 +1,426 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
-use bytes::Bytes;
-use futures_core::Stream;
-use futures_util::StreamExt;
-use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
-use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
-use tokio::fs as tokio_fs;
-use tokio::io::AsyncWriteExt;
+use tempfile::{NamedTempFile, TempPath};
 
-use crate::error::{IoResultExt, Result, StoreError, db_error_with_context};
+use crate::durability::Durability;
+use crate::error::{DbResultExt, IoResultExt, Result, StoreError};
 use crate::index;
 use crate::paths;
-use rv_config::{ArtifactKey, BlobId};
+use crate::pin::StoredBlob;
+use crate::sqlite;
+use rv_fs::lock_exclusive_until;
+use rv_maven_types::{ArtifactCoord, BlobId};
 
 const INDEX_DB: &str = "index.sqlite";
 
-const TMP_DIR: &str = "tmp";
+pub(crate) const TMP_DIR: &str = "tmp";
 const LOCK_FILE: &str = ".lock";
-/// r2d2 pool size for the SQLite index. SQLite handles concurrent readers
-/// in WAL mode; eight is enough for the resolver/sync fan-out without
-/// running into the per-process file-descriptor ceiling.
-const DEFAULT_POOL_SIZE: u32 = 8;
+/// r2d2 pool size for the SQLite index: enough for the resolver's fan-out
+/// without running into the per-process file-descriptor ceiling.
+const POOL_SIZE: u32 = 8;
 
-/// Sweep `tmp/` of files older than 24 hours. Uses a non-blocking `StoreLock`
-/// to defer to active writers; the next `Store::open` retries.
+// foreign_keys is per connection and OFF by default. temp_store keeps temp
+// B-trees in memory, so a crash leaves no temp files behind.
+const INDEX: sqlite::Spec = sqlite::Spec {
+    pragmas: "PRAGMA busy_timeout=5000;
+              PRAGMA cache_size=-32000;
+              PRAGMA synchronous=NORMAL;
+              PRAGMA foreign_keys=ON;
+              PRAGMA temp_store=MEMORY;",
+    max_size: POOL_SIZE,
+    init: index::init_db,
+    lock: |path| Ok(Box::new(StoreLock::acquire(path.parent().unwrap_or(path))?)),
+};
+/// Files in `tmp/` older than this are removed when a store opens.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(24 * 3600);
+/// How long a writer waits for the store lock before giving up.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Remove stale files from `tmp/`, unless another writer holds the store
+/// lock; the next open retries then. Dropping the file releases the lock.
 fn sweep_temp_dir(root: &Path) {
-    let lock_path = root.join(LOCK_FILE);
-    let lock_file = match OpenOptions::new()
+    let Ok(lock) = open_lock_file(&root.join(LOCK_FILE)) else {
+        return;
+    };
+    if lock.try_lock().is_ok() {
+        sweep_stale(&root.join(TMP_DIR));
+    }
+}
+
+fn sweep_stale(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    // `DirEntry::file_type` does not follow symlinks, so a symlink, which
+    // could steer the sweep at another file, is neither a file nor a
+    // directory here.
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            sweep_stale(&path);
+            let _ = fs::remove_dir(&path);
+        } else if file_type.is_file()
+            && entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_TEMP_AGE)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::debug!(
-                path = %lock_path.display(),
-                error = %e,
-                "skipping temp cleanup: cannot open lock file"
-            );
-            return;
-        }
-    };
-
-    // Non-blocking try-lock so cleanup never blocks store open. If a real
-    // writer is mid-flight, defer this sweep to the next open.
-    use fs2::FileExt;
-    if lock_file.try_lock_exclusive().is_err() {
-        tracing::debug!("skipping temp cleanup: store lock held by another process");
-        return;
-    }
-    // RAII guard so we unlock on every exit path.
-    struct UnlockOnDrop<'a>(&'a File);
-    impl Drop for UnlockOnDrop<'_> {
-        fn drop(&mut self) {
-            let _ = fs2::FileExt::unlock(self.0);
-        }
-    }
-    let _guard = UnlockOnDrop(&lock_file);
-
-    let tmp_dir = root.join(TMP_DIR);
-    let stale_threshold = Duration::from_secs(24 * 3600);
-    sweep_temp_dir_recursive(&tmp_dir, stale_threshold);
+        .open(path)
 }
 
-fn sweep_temp_dir_recursive(dir: &Path, stale_threshold: Duration) {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(
-                path = %dir.display(),
-                error = %e,
-                "failed to read temp directory during cleanup"
-            );
-            return;
+fn verify_blob_at_path(path: &Path, expected: &BlobId) -> Result<()> {
+    let file = match open_unfollowed(path) {
+        Ok(file) => file,
+        Err(err) if is_nofollow_symlink(&err) => {
+            return Err(StoreError::IntegrityError(format!(
+                "blob at {} is not a regular file",
+                path.display()
+            )));
+        }
+        Err(err) => {
+            return Err(err).io_context(|| format!("failed to stat blob {}", path.display()));
         }
     };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    path = %dir.display(),
-                    error = %e,
-                    "failed to read temp directory entry during cleanup"
-                );
-                continue;
-            }
-        };
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::debug!(
-                    path = %path.display(),
-                    error = %e,
-                    "failed to stat temp entry during cleanup"
-                );
-                continue;
-            }
-        };
-
-        // Skip symlinks: temp dir should not legitimately contain them and
-        // following them would let an attacker steer cleanup at a chosen file.
-        if file_type.is_symlink() {
-            continue;
-        }
-
-        if file_type.is_dir() {
-            sweep_temp_dir_recursive(&path, stale_threshold);
-            // Best-effort attempt to remove the directory if empty after
-            // descending. Ignore errors (not-empty / not-found are both fine).
-            let _ = fs::remove_dir(&path);
-            continue;
-        }
-
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let stale = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| SystemTime::now().duration_since(t).ok())
-            .is_some_and(|age| age > stale_threshold);
-        if stale && let Err(e) = fs::remove_file(&path) {
-            tracing::debug!(path = %path.display(), error = %e, "failed to remove stale temp file");
-        }
+    let meta = file
+        .metadata()
+        .io_context(|| format!("failed to stat blob {}", path.display()))?;
+    if !opened_is_regular(&meta) {
+        return Err(StoreError::IntegrityError(format!(
+            "blob at {} is not a regular file",
+            path.display()
+        )));
     }
-}
-
-/// Verifies that the blob at path matches the expected ID by computing its hash.
-/// Returns Ok(id) if the blob exists and matches, Err otherwise.
-fn verify_blob_at_path(path: &Path, expected: &BlobId) -> Result<BlobId> {
-    let actual = BlobId::from_file(path)?;
+    let actual = BlobId::from_reader(file)?;
     if &actual == expected {
-        Ok(actual)
+        Ok(())
     } else {
         Err(StoreError::IntegrityError(format!(
-            "blob at {} has hash {} but expected {}",
-            path.display(),
-            actual,
-            expected
+            "blob at {} has hash {actual} but expected {expected}",
+            path.display()
         )))
     }
 }
 
-/// Set 0o444 on a freshly-staged CAS blob before publish so the published
-/// inode is world-readable. The tempfile crate defaults to 0o600, which
-/// breaks multi-user / CI runs where `mvn` runs under a different uid than
-/// the writer. Unix only; Windows ACLs are left to the OS default.
-#[cfg(unix)]
-fn set_blob_readonly(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o444)) {
-        tracing::debug!(
-            path = %path.display(),
-            error = %e,
-            "failed to set 0o444 on staged CAS blob"
+/// Whether `path` is a regular file. Symlinks, including those to a regular
+/// file, are not.
+pub(crate) fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// Open `path` without following a final symlink or reparse point.
+fn open_unfollowed(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+    );
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::os::windows::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            FILE_FLAG_OPEN_REPARSE_POINT,
         );
     }
+    options.open(path)
 }
 
-#[cfg(not(unix))]
-fn set_blob_readonly(_path: &Path) {}
+fn opened_is_regular(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        meta.is_file() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.is_file()
+    }
+}
 
-/// fsync the directory chain from a published blob's parent up to and
-/// including the store's blob root so every dirent the publish may have
-/// created (both shard directories plus the blob itself) survives a crash.
-/// Syncing all levels unconditionally is two extra opens per publish and is
-/// simpler than tracking which directories create_dir_all actually made.
-///
-/// Failures are returned, not advisory: an EIO here means the dirent may not
-/// be durable, so committing an index row for the blob could leave the row
-/// pointing at a file that vanishes after a crash. Callers must treat a
-/// failure as a failed publish and must not index the blob. The published
-/// file itself is left in place; without an index row it is a harmless
-/// orphan that GC collects, and deleting it could orphan other index rows
-/// when the blob already existed.
+/// `O_NOFOLLOW` on a symlink is `ELOOP` (`ErrorKind::FilesystemLoop` is
+/// unstable on the MSRV).
+fn is_nofollow_symlink(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        rustix::io::Errno::from_io_error(err) == Some(rustix::io::Errno::LOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+fn is_absent_or_symlink(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::NotFound || is_nofollow_symlink(err)
+}
+
+/// [`open_unfollowed_regular`] for a blob, with the path in the error.
+pub(crate) fn open_regular_file(path: &Path) -> Result<Option<File>> {
+    open_unfollowed_regular(path).io_context(|| format!("failed to open blob {}", path.display()))
+}
+
+/// Open `path` as a regular file without following a symlink. A missing
+/// path, a symlink, or anything else that is not a regular file is
+/// `Ok(None)`. Something swapped in for a regular file, such as a link or a
+/// FIFO, is neither opened through nor blocks the open; on Windows the open
+/// does not follow a reparse point and refuses the reparse point itself.
+pub fn open_unfollowed_regular(path: &Path) -> std::io::Result<Option<File>> {
+    match open_unfollowed(path) {
+        Ok(file) => {
+            let meta = file.metadata()?;
+            Ok(opened_is_regular(&meta).then_some(file))
+        }
+        Err(err) if is_absent_or_symlink(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Locks `mutex`, recovering the data from a panicked holder.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Make a staged blob 0o444 so users other than the writer, such as `mvn`
+/// under another uid in CI, can read it. tempfile creates 0o600 files.
 #[cfg(unix)]
-fn fsync_blob_dirs(blob_root: &Path, blob_path: &Path) -> Result<()> {
-    let mut dir = blob_path.parent();
-    while let Some(d) = dir {
-        let handle = File::open(d)
-            .io_context(|| format!("failed to open directory {} for fsync", d.display()))?;
-        handle
-            .sync_all()
-            .io_context(|| format!("failed to fsync directory {}", d.display()))?;
-        if d == blob_root {
-            break;
-        }
-        dir = d.parent();
+pub(crate) fn set_blob_readonly(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o444)) {
+        tracing::debug!(path = %path.display(), error = %e, "failed to set 0o444 on staged CAS blob");
     }
-    Ok(())
 }
 
-/// Directory fsync is unavailable on this platform (File::open on a
-/// directory fails on Windows); dirent durability is left to the OS,
-/// matching the previous advisory behavior.
 #[cfg(not(unix))]
-fn fsync_blob_dirs(_blob_root: &Path, _blob_path: &Path) -> Result<()> {
+pub(crate) fn set_blob_readonly(_path: &Path) {}
+
+/// Sync a blob file before it is published where its directories cannot be
+/// synced later (see the `durability` module).
+pub(crate) fn sync_before_publish(file: &File) -> Result<()> {
+    if cfg!(unix) {
+        return Ok(());
+    }
+    file.sync_all()
+        .io_context(|| "failed to sync blob".to_string())
+}
+
+/// Link `temp` at `target` without replacing a file already there, so a
+/// concurrent writer of the same bytes keeps its inode. A file found there is
+/// reused if it hashes to `id`; a corrupt one is replaced once. Returns
+/// whether this call published the file.
+fn persist_blob(temp: TempPath, target: &Path, id: &BlobId) -> Result<bool> {
+    let mut temp = temp;
+    for retry in [false, true] {
+        match temp.persist_noclobber(target) {
+            Ok(()) => {
+                if is_regular_file(target) {
+                    return Ok(true);
+                }
+                // The temp path was replaced with a symlink (or other
+                // non-file) before the link; do not leave it as a blob.
+                let _ = fs::remove_file(target);
+                return Err(StoreError::IntegrityError(format!(
+                    "blob at {} is not a regular file",
+                    target.display()
+                )));
+            }
+            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => temp = err.path,
+            Err(err) => {
+                return Err(err.error)
+                    .io_context(|| format!("failed to persist blob to {}", target.display()));
+            }
+        }
+        match verify_blob_at_path(target, id) {
+            Ok(()) => return Ok(false),
+            // The run that found the file damaged warned about it; this only
+            // replaces the bytes.
+            Err(StoreError::IntegrityError(msg)) if !retry => {
+                tracing::debug!(path = %target.display(), "detected corrupt blob, repairing: {msg}");
+                fs::remove_file(target).io_context(|| {
+                    format!("failed to remove corrupt blob at {}", target.display())
+                })?;
+            }
+            // Removed between the link attempt and the check.
+            Err(StoreError::IoError(err))
+                if !retry && err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("the retry returns")
+}
+
+/// Publish the staged file `temp` as blob `id` of the store at `root` and
+/// queue it for the next sync. Returns the sync ticket and whether this call
+/// published the file.
+pub(crate) fn publish_blob(root: &Path, temp: TempPath, id: &BlobId) -> Result<(u64, bool)> {
+    let target = root.join(paths::blob_path(id));
+    let created = {
+        let _lock = StoreLock::acquire(root)?;
+        let parent = target.parent().expect("a blob path has a parent");
+        fs::create_dir_all(parent)
+            .io_context(|| format!("failed to create blob directory {}", parent.display()))?;
+        persist_blob(temp, &target, id)?
+    };
+    let durability = &root_shared(root).durability;
+    let ticket = durability.register(&paths::blob_root(root), &target, created)?;
+    Ok((ticket, created))
+}
+
+/// Record the check of blob `id` when this process wrote it from bytes it
+/// hashed and it is durable and unchanged since, so the first check of it
+/// does not read it again.
+pub(crate) fn record_hashed_stamp(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    id: &BlobId,
+) -> Result<()> {
+    let path = root.join(paths::blob_path(id));
+    let Some(stamp) = root_shared(root).durability.hashed_stamp(&path) else {
+        return Ok(());
+    };
+    let current = open_regular_file(&path).ok().flatten().and_then(|file| {
+        let meta = file.metadata().ok()?;
+        crate::pin::file_stamp(&file, &meta)
+    });
+    if current.as_deref() == Some(stamp.as_str()) {
+        index::set_checked_stamp(conn, id, &stamp)?;
+    }
     Ok(())
 }
 
-/// Atomically publish `src` at `target` via `hard_link(2) + unlink(2)`. The
-/// link call refuses to overwrite an existing inode (POSIX "noclobber rename"
-/// pattern), so a concurrent writer who beat us to the punch keeps their
-/// bytes; we verify their hash and report `BlobOrigin::Existed` in that case.
-fn publish_noclobber(
-    src: &Path,
-    target: &Path,
-    expected_id: &BlobId,
-    on_success: BlobOrigin,
-) -> Result<(BlobId, BlobOrigin)> {
-    match fs::hard_link(src, target) {
-        Ok(()) => {
-            // hard_link succeeded: `src` is now an extra link to the same
-            // inode. Unlink the temp path; if it fails we still have the
-            // published file in place, so just log.
-            if let Err(e) = fs::remove_file(src) {
-                tracing::debug!(
-                    path = %src.display(),
-                    error = %e,
-                    "failed to unlink temp source after hard_link"
-                );
-            }
-            Ok((expected_id.clone(), on_success))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another writer won the publish race. Verify their bytes and
-            // adopt their inode.
-            let result = verify_blob_at_path(target, expected_id);
-            let _ = fs::remove_file(src);
-            match result {
-                Ok(id) => Ok((id, BlobOrigin::Existed)),
-                Err(err) => Err(err),
-            }
-        }
-        Err(e) => {
-            // hard_link can fail with EXDEV on cross-device temp dirs
-            // (which shouldn't happen for our sibling TMP_DIR) or with
-            // permission errors on filesystems that disallow links (FAT,
-            // some FUSE mounts). Fall back to rename but never silently
-            // clobber a target that already has content; verify it first.
-            tracing::debug!(
-                src = %src.display(),
-                target = %target.display(),
-                error = %e,
-                "hard_link failed, falling back to rename"
-            );
-            // `fs::metadata` follows symlinks, so a dangling symlink at
-            // `target` returns Err here and we fall through to the rename;
-            // a regular file at `target` (or a symlink to one) is detected
-            // and gets the verify-then-adopt treatment that prevents a
-            // silent overwrite of someone else's bytes. `symlink_metadata`
-            // would instead treat a dangling symlink as a non-file and let
-            // `fs::rename` clobber it.
-            if let Ok(meta) = fs::metadata(target)
-                && meta.is_file()
-            {
-                let verify = verify_blob_at_path(target, expected_id);
-                let _ = fs::remove_file(src);
-                return match verify {
-                    Ok(id) => Ok((id, BlobOrigin::Existed)),
-                    Err(err) => Err(err),
-                };
-            }
-            match fs::rename(src, target) {
-                Ok(()) => {}
-                Err(rename_err) if rename_err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // On Windows, `fs::rename` returns `ERROR_ALREADY_EXISTS`
-                    // when the destination exists (unlike POSIX which atomically
-                    // replaces it). This is a legitimate CAS race: another
-                    // writer published the same content between our pre-flight
-                    // metadata check and this rename. Verify the winner's bytes
-                    // and adopt their inode rather than erroring.
-                    let verify = verify_blob_at_path(target, expected_id);
-                    let _ = fs::remove_file(src);
-                    return match verify {
-                        Ok(id) => Ok((id, BlobOrigin::Existed)),
-                        Err(err) => Err(err),
-                    };
-                }
-                Err(rename_err) => {
-                    let _ = fs::remove_file(src);
-                    return Err(StoreError::IoError(std::io::Error::other(format!(
-                        "failed to publish blob from {} to {}: {}",
-                        src.display(),
-                        target.display(),
-                        rename_err
-                    ))));
-                }
-            }
-            Ok((expected_id.clone(), on_success))
-        }
-    }
+pub(crate) async fn blocking<T: Send + 'static>(
+    task: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
 }
 
-/// Persist a tempfile via `persist_noclobber` so concurrent writers with the
-/// same bytes keep their inode. On collision, verify the existing file; if it
-/// hashes wrong it is treated as corrupt and the write is retried (repair).
-fn persist_blob_with_repair(
-    temp_file: NamedTempFile,
-    target: &Path,
-    expected_id: &BlobId,
-) -> Result<BlobId> {
-    match temp_file.persist_noclobber(target) {
-        Ok(_) => Ok(expected_id.clone()),
-        Err(persist_err) => {
-            if persist_err.error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(StoreError::IoError(std::io::Error::other(format!(
-                    "failed to persist blob to {}: {}",
-                    target.display(),
-                    persist_err
-                ))));
-            }
-
-            // File already exists: verify it has the correct hash.
-            match verify_blob_at_path(target, expected_id) {
-                Ok(id) => Ok(id),
-                Err(StoreError::IntegrityError(msg)) => {
-                    // Corrupt file detected; repair by deleting and retrying.
-                    // Use `persist_noclobber` on the retry: if another writer
-                    // raced us between the `remove_file` and the retry,
-                    // overwriting their fresh inode with ours could publish a
-                    // half-flushed file. Verify their bytes instead.
-                    tracing::warn!(
-                        path = %target.display(),
-                        "detected corrupt blob, repairing: {}",
-                        msg
-                    );
-                    fs::remove_file(target).io_context(|| {
-                        format!("failed to remove corrupt blob at {}", target.display())
-                    })?;
-                    match persist_err.file.persist_noclobber(target) {
-                        Ok(_) => Ok(expected_id.clone()),
-                        Err(retry_err)
-                            if retry_err.error.kind() == std::io::ErrorKind::AlreadyExists =>
-                        {
-                            verify_blob_at_path(target, expected_id)
-                        }
-                        Err(retry_err) => Err(StoreError::IoError(std::io::Error::other(format!(
-                            "failed to persist blob after repair to {}: {}",
-                            target.display(),
-                            retry_err
-                        )))),
-                    }
-                }
-                Err(StoreError::IoError(io_err))
-                    if io_err.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    // TOCTOU: file was deleted between persist failure and
-                    // verify. Same race window as the repair branch above:
-                    // use `persist_noclobber` so a winning concurrent writer
-                    // keeps their bytes.
-                    tracing::debug!(
-                        path = %target.display(),
-                        "blob deleted during persist, retrying"
-                    );
-                    match persist_err.file.persist_noclobber(target) {
-                        Ok(_) => Ok(expected_id.clone()),
-                        Err(retry_err)
-                            if retry_err.error.kind() == std::io::ErrorKind::AlreadyExists =>
-                        {
-                            verify_blob_at_path(target, expected_id)
-                        }
-                        Err(retry_err) => Err(StoreError::IoError(std::io::Error::other(format!(
-                            "failed to persist blob after TOCTOU retry to {}: {}",
-                            target.display(),
-                            retry_err
-                        )))),
-                    }
-                }
-                Err(e) => Err(e),
-            }
-        }
-    }
+/// The repository a coordinate's bytes were downloaded from, recorded by
+/// [`Store::record_origins`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The repository URL as raeva.lock records it: the declared repository,
+    /// not a mirror that served it.
+    pub repo_url: String,
+    /// The repository or mirror URL that served the bytes.
+    pub endpoint_url: String,
+    /// Whether the bytes matched the repository's checksum file.
+    pub checksum_verified: bool,
+    /// Whether this repository served these bytes, rather than a lockfile
+    /// recording it as their origin after they came from elsewhere.
+    pub served: bool,
 }
 
-/// Similar to `persist_blob_with_repair` but for `TempPath` instead of `NamedTempFile`.
-/// Note: TempPath's persist error doesn't retain the file handle, so we need the
-/// temp_path reference to be convertible back to the source path for retry.
-fn persist_blob_path_with_repair(
-    temp_path: tempfile::TempPath,
-    target: &Path,
-    expected_id: &BlobId,
-) -> Result<(BlobId, BlobOrigin)> {
-    // Use `persist_noclobber` so we can detect when a blob with this content
-    // hash is already present on disk and avoid clobbering it. `TempPath::persist`
-    // would unconditionally overwrite, which prevents the dedup signal that
-    // callers rely on for safe rollback.
-    match temp_path.persist_noclobber(target) {
-        Ok(_) => Ok((expected_id.clone(), BlobOrigin::Created)),
-        Err(persist_err) => {
-            if persist_err.error.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(StoreError::IoError(std::io::Error::other(format!(
-                    "failed to persist blob to {}: {}",
-                    target.display(),
-                    persist_err
-                ))));
-            }
-
-            // File already exists: verify it has the correct hash.
-            // The temp file (persist_err.path) still exists since persist failed.
-            let temp_source = persist_err.path;
-
-            match verify_blob_at_path(target, expected_id) {
-                Ok(id) => {
-                    // Target is valid; clean up the temp file.
-                    let _ = fs::remove_file(&temp_source);
-                    Ok((id, BlobOrigin::Existed))
-                }
-                Err(StoreError::IntegrityError(msg)) => {
-                    // Corrupt file detected; repair by deleting and retrying.
-                    // We are overwriting the corrupt on-disk blob with the
-                    // freshly streamed bytes, so the caller now owns it.
-                    tracing::warn!(
-                        path = %target.display(),
-                        "detected corrupt blob, repairing: {}",
-                        msg
-                    );
-                    if let Err(remove_err) = fs::remove_file(target) {
-                        // Drop our temp bytes so we don't leak an inode on
-                        // the way out.
-                        let _ = fs::remove_file(&temp_source);
-                        return Err(StoreError::IoError(std::io::Error::other(format!(
-                            "failed to remove corrupt blob at {}: {}",
-                            target.display(),
-                            remove_err
-                        ))));
-                    }
-                    // Noclobber publish: if a third writer raced us between
-                    // remove_file and link, the link fails with AlreadyExists
-                    // and we verify-and-reuse their inode.
-                    publish_noclobber(&temp_source, target, expected_id, BlobOrigin::Created)
-                }
-                Err(StoreError::IoError(io_err))
-                    if io_err.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    // TOCTOU: file was deleted between persist failure and
-                    // verify. Retry the write with noclobber semantics so a
-                    // concurrent winner is preserved.
-                    tracing::debug!(
-                        path = %target.display(),
-                        "blob deleted during persist, retrying"
-                    );
-                    publish_noclobber(&temp_source, target, expected_id, BlobOrigin::Created)
-                }
-                Err(e) => {
-                    // Clean up temp file on other errors
-                    let _ = fs::remove_file(&temp_source);
-                    Err(e)
-                }
-            }
-        }
-    }
-}
-
-/// Content-addressed artifact store backed by SHA-256 hashed blobs and a SQLite index.
-///
-/// Blobs are stored in a directory tree keyed by their SHA-256 hash. A SQLite database
-/// maps Maven coordinates (`ArtifactKey`) to blob IDs. Concurrent access is safe via
-/// file locking and connection pooling.
+/// Content-addressed artifact store: blobs named by the SHA-256 of their
+/// bytes, and a SQLite index from Maven coordinates to blobs. Concurrent use
+/// from several processes is safe through a file lock.
 #[derive(Clone)]
 pub struct Store {
-    root: PathBuf,
-    pool: Arc<Pool<SqliteConnectionManager>>,
-}
-
-/// Summary statistics for the content-addressed store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CacheStats {
-    pub blob_count: usize,
-    pub total_bytes: u64,
-}
-
-/// Result of a garbage collection or clean operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GcSummary {
-    pub removed_blobs: usize,
-    pub removed_bytes: u64,
-}
-
-/// Whether a CAS insertion landed on a fresh blob or hit an existing one.
-///
-/// Callers that perform a post-insert verification step (e.g. comparing a
-/// sidecar checksum against the streamed bytes) must only delete the blob
-/// when they created it; deleting a pre-existing blob would orphan every
-/// other artifact-key row that references it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlobOrigin {
-    /// The blob did not exist on disk and was just written.
-    Created,
-    /// The blob was already in the store; the streamed bytes were discarded.
-    Existed,
-}
-
-struct BlobEntry {
-    id: BlobId,
-    path: PathBuf,
-    size: u64,
+    pub(crate) root: PathBuf,
+    pub(crate) pool: Arc<sqlite::Db>,
 }
 
 impl Store {
-    /// Opens or creates a content-addressed store at the given path.
-    ///
-    /// Uses a connection pool with 8 connections by default.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - The directory cannot be created
-    /// - The SQLite index database cannot be opened or initialized
+    /// Opens or creates the store at `path`.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_pool_size(path, DEFAULT_POOL_SIZE)
-    }
-
-    /// Opens a store with a custom SQLite connection pool size.
-    pub fn open_with_pool_size(path: &Path, pool_size: u32) -> Result<Self> {
-        fs::create_dir_all(path)
-            .io_context(|| format!("failed to create store directory {}", path.display()))?;
-        fs::create_dir_all(paths::blob_root(path)).io_context(|| {
-            format!(
-                "failed to create blob directory {}",
-                paths::blob_root(path).display()
-            )
-        })?;
-        fs::create_dir_all(path.join(TMP_DIR)).io_context(|| {
-            format!(
-                "failed to create temp directory {}",
-                path.join(TMP_DIR).display()
-            )
-        })?;
+        let blob_root = paths::blob_root(path);
+        let tmp = path.join(TMP_DIR);
+        for (dir, what) in [(path, "store"), (&blob_root, "blob"), (&tmp, "temp")] {
+            fs::create_dir_all(dir)
+                .io_context(|| format!("failed to create {what} directory {}", dir.display()))?;
+        }
 
         let db_path = path.join(INDEX_DB);
-
-        // Cross-process serialise WAL bootstrap + schema initialization.
-        // Two `rv` processes calling `Store::open` concurrently must not race
-        // on `PRAGMA journal_mode=WAL` (database-scoped, requires exclusive
-        // lock to flip) or on `CREATE TABLE` / `ALTER TABLE` migrations.
-        // Same advisory lock writers use; any in-flight writer also serialises
-        // us behind it.
+        // Two processes must not race on switching to WAL or creating the
+        // schema.
         let bootstrap_lock = StoreLock::acquire(path)?;
 
-        // Fast-fail on a clearly corrupt SQLite file before we hand it to the
-        // pool. Without this check, a non-SQLite file (or a truncated one)
-        // still sees the connection initializer run, and `busy_timeout` makes
-        // the header-validation probe wait up to 30 s before erroring. Run
-        // this AFTER acquiring bootstrap_lock so a concurrent bootstrap that
-        // just touched index.sqlite (zero bytes, header not yet written) is
-        // never misread as a corrupt file; an empty / short-read file is
-        // treated as "not yet initialised" and the open proceeds.
-        if let Ok(meta) = fs::metadata(&db_path)
-            && meta.is_file()
-            && meta.len() > 0
-        {
-            let mut header = [0u8; 16];
-            let mut f = File::open(&db_path)
-                .io_context(|| format!("failed to open index file {}", db_path.display()))?;
-            let n = f
-                .read(&mut header)
-                .io_context(|| format!("failed to read index header from {}", db_path.display()))?;
-            const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-            if n == SQLITE_MAGIC.len() && &header != SQLITE_MAGIC {
-                return Err(StoreError::DbError(db_error_with_context(anyhow::anyhow!(
-                    "index file {} is not a valid SQLite database (bad header)",
-                    db_path.display()
-                ))));
-            }
-            // n < SQLITE_MAGIC.len(): file is being initialised by a peer
-            // who beat us to bootstrap_lock; SQLite::open below will block
-            // on the file lock as usual.
-        }
-
-        // Set WAL/synchronous mode on a single bootstrap connection BEFORE
-        // building the r2d2 pool. r2d2 eagerly opens `max_size` connections
-        // and runs `with_init` on each in parallel; if every connection tries
-        // to flip `journal_mode=WAL` concurrently, the losers log
-        // `database is locked` through rusqlite's `log` callback. Doing the
-        // mode switch once up-front makes the per-connection initializer a
-        // no-op write of session-scoped pragmas only.
-        {
-            let bootstrap = rusqlite::Connection::open(&db_path)
-                .with_context(|| {
-                    format!(
-                        "failed to open index for WAL bootstrap at {}",
-                        db_path.display()
-                    )
-                })
-                .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-            bootstrap
-                .busy_timeout(std::time::Duration::from_secs(5))
-                .with_context(|| "failed to set busy_timeout on bootstrap connection")
-                .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-            bootstrap
-                .pragma_update(None, "journal_mode", "WAL")
-                .with_context(|| "failed to set journal_mode=WAL")
-                .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-            // Verify the mode actually flipped. SQLite can silently
-            // fall back to DELETE if the filesystem refuses WAL (network
-            // mounts, etc.); a silent fallback would erase the concurrency
-            // guarantees the rest of the store relies on.
-            let mode: String = bootstrap
-                .pragma_query_value(None, "journal_mode", |row| row.get(0))
-                .with_context(|| "failed to read back journal_mode")
-                .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-            if !mode.eq_ignore_ascii_case("wal") {
-                return Err(StoreError::DbError(db_error_with_context(anyhow::anyhow!(
-                    "SQLite refused to enable WAL journal mode at {}: got journal_mode={}. \
-                     Network filesystems (NFS, SMB) frequently reject WAL; move the store to local storage.",
-                    db_path.display(),
-                    mode
-                ))));
-            }
-            bootstrap
-                .pragma_update(None, "synchronous", "NORMAL")
-                .with_context(|| "failed to set synchronous=NORMAL")
-                .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-            // Drop closes the connection so the pool can take over cleanly.
-        }
-
-        let manager = SqliteConnectionManager::file(&db_path).with_init(|conn| {
-            // journal_mode is database-scoped (set on the bootstrap connection
-            // above). synchronous is stored per-connection by SQLite, so a
-            // pooled connection that skips the pragma falls back to FULL and
-            // the durability-vs-throughput tradeoff splits across the pool.
-            // foreign_keys is per-connection and OFF by default; turn it on
-            // so any future FK constraints are actually enforced. temp_store
-            // pushes temp B-trees into memory instead of /tmp, which both
-            // speeds up sorts and avoids leaking temp files on crash.
-            conn.execute_batch(
-                "PRAGMA busy_timeout=5000;
-                 PRAGMA cache_size=-32000;
-                 PRAGMA synchronous=NORMAL;
-                 PRAGMA foreign_keys=ON;
-                 PRAGMA temp_store=MEMORY;",
-            )?;
-            Ok(())
-        });
-
-        let pool = Pool::builder()
-            .max_size(pool_size)
-            .build(manager)
-            .with_context(|| format!("failed to create connection pool for {}", db_path.display()))
-            .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-
-        {
-            let conn = pool
-                .get()
-                .with_context(|| "failed to get connection from pool for initialization")
-                .map_err(|err| StoreError::DbError(db_error_with_context(err)))?;
-            index::init_db(&conn)?;
-        }
-
-        // Release the bootstrap lock before the synchronous temp sweep:
-        // the sweep takes its own non-blocking try_lock and would otherwise
-        // always fail (we hold the lock).
+        let pool = sqlite::open(&db_path, INDEX)?;
+        // The sweep takes the lock with a try-lock of its own.
         drop(bootstrap_lock);
-
-        let store = Self {
-            root: path.to_path_buf(),
-            pool: Arc::new(pool),
-        };
-
         sweep_temp_dir(path);
-
         tracing::debug!(path = %path.display(), "store opened");
 
-        Ok(store)
+        Ok(Self {
+            root: path.to_path_buf(),
+            pool,
+        })
     }
 
-    /// If content already exists, returns the existing blob ID without re-storing.
+    /// Stores `bytes` and returns their blob id. Content already stored,
+    /// and hashing to its id, is not written again.
+    ///
+    /// The blob is published without an fsync; the next index write makes
+    /// it durable first (see the `durability` module).
     pub async fn put_bytes(&self, bytes: &[u8]) -> Result<BlobId> {
-        let size = bytes.len();
-
-        let root = self.root.clone();
-        // `Arc::from(&[u8])` copies the slice into a fresh owned allocation
-        // (it is not zero-copy); the Arc then lets us move ownership across the
-        // `spawn_blocking` boundary cheaply. We do this because SHA-256 of
-        // multi-MB payloads can stall the tokio runtime if computed on the
-        // async worker, so the hash runs inside `spawn_blocking` below.
         let bytes: Arc<[u8]> = Arc::from(bytes);
-
-        tokio::task::spawn_blocking(move || {
-            // Hash on the blocking pool, not the async worker.
+        let store = self.clone();
+        // Hashing multi-MB payloads would stall an async worker.
+        blocking(move || {
             let id = BlobId::from_bytes(&bytes);
-            tracing::debug!(sha256 = %id, size, "storing blob");
-            let target = root.join(paths::blob_path(&id));
-
-            let tmp_dir = root.join(TMP_DIR);
-            fs::create_dir_all(&tmp_dir)
-                .io_context(|| format!("failed to create temp directory {}", tmp_dir.display()))?;
-
-            // Write to temp file WITHOUT holding the lock
-            let mut temp_file = NamedTempFile::new_in(&tmp_dir)
-                .io_context(|| "failed to create temp file".to_string())?;
-
-            temp_file
-                .write_all(&bytes)
-                .io_context(|| "failed to write blob content".to_string())?;
-
-            temp_file
-                .as_file()
-                .sync_all()
-                .io_context(|| "failed to sync blob".to_string())?;
-
-            set_blob_readonly(temp_file.path());
-
-            // Only acquire lock for the final persist operation
-            let _lock = StoreLock::acquire(&root)?;
-
-            let parent = target.parent().ok_or_else(|| {
-                StoreError::IntegrityError("blob path missing parent directory".to_string())
-            })?;
-            fs::create_dir_all(parent)
-                .io_context(|| format!("failed to create blob directory {}", parent.display()))?;
-
-            let result = persist_blob_with_repair(temp_file, &target, &id)?;
-            fsync_blob_dirs(&paths::blob_root(&root), &target)?;
-            Ok(result)
+            store.put_bytes_blocking(id, &bytes)
         })
         .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
     }
 
-    /// Stores a blob from an async byte stream, computing the SHA-256 hash incrementally.
-    ///
-    /// Reachable only inside this crate so that out-of-tree callers cannot
-    /// reopen the GC race that the two-step `put_stream` + `add_artifact`
-    /// sequence allowed. Use [`Store::put_stream_and_index`] for the
-    /// atomic put-and-index path, or [`Store::put_stream_with_origin`] when
-    /// you only need the blob without an index row.
-    #[cfg(test)]
-    pub(crate) async fn put_stream<S, E>(&self, stream: S) -> Result<BlobId>
-    where
-        S: Stream<Item = std::result::Result<Bytes, E>>,
-        E: std::fmt::Display,
-    {
-        self.put_stream_with_origin(stream).await.map(|(id, _)| id)
+    /// Like [`Self::put_bytes`], but reuses a caller-computed `id` so the
+    /// same bytes are not hashed twice.
+    pub async fn put_bytes_with_id(&self, id: BlobId, bytes: &[u8]) -> Result<BlobId> {
+        let bytes: Arc<[u8]> = Arc::from(bytes);
+        let store = self.clone();
+        blocking(move || store.put_bytes_blocking(id, &bytes)).await
     }
 
-    /// Like `put_stream`, but also reports whether the blob was created by
-    /// this call or already existed (deduplicated).
-    ///
-    /// Callers that perform a post-insert verification step (sidecar checksum,
-    /// signature, etc.) should rely on this signal: deleting a blob that was
-    /// already in the store on a verification failure corrupts every other
-    /// artifact-key row pointing at it.
-    pub async fn put_stream_with_origin<S, E>(&self, stream: S) -> Result<(BlobId, BlobOrigin)>
-    where
-        S: Stream<Item = std::result::Result<Bytes, E>>,
-        E: std::fmt::Display,
-    {
-        let tmp_dir = self.root.join(TMP_DIR);
-        tokio_fs::create_dir_all(&tmp_dir)
-            .await
-            .io_context(|| format!("failed to create temp directory {}", tmp_dir.display()))?;
-
-        let temp_file = tokio::task::spawn_blocking(move || {
-            NamedTempFile::new_in(&tmp_dir).io_context(|| "failed to create temp file".to_string())
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))??;
-
-        let (std_file, temp_path) = temp_file.into_parts();
-        let mut async_file = tokio_fs::File::from_std(std_file);
-
-        let mut hasher = Sha256::new();
-        futures_util::pin_mut!(stream);
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    return Err(StoreError::IoError(std::io::Error::other(err.to_string())));
-                }
-            };
-            hasher.update(&chunk);
-            async_file
-                .write_all(&chunk)
-                .await
-                .io_context(|| "failed to write blob chunk".to_string())?;
+    fn put_bytes_blocking(&self, id: BlobId, bytes: &[u8]) -> Result<BlobId> {
+        let target = self.root.join(paths::blob_path(&id));
+        // A file already at the path is reused only if it hashes to the
+        // id; one torn by a crash goes through the repair.
+        if self
+            .stored_blob(&id)
+            .is_ok_and(|stored| stored == StoredBlob::Intact)
+        {
+            tracing::debug!(sha256 = %id, size = bytes.len(), "blob already stored");
+            let durability = &root_shared(&self.root).durability;
+            durability.register(&paths::blob_root(&self.root), &target, false)?;
+            return Ok(id);
         }
-
-        async_file
-            .sync_all()
-            .await
-            .io_context(|| "failed to sync temp blob".to_string())?;
-
-        drop(async_file);
-
-        set_blob_readonly(&temp_path);
-
-        let digest = hasher.finalize();
-        let id = BlobId::from_str(&hex::encode(digest)).map_err(StoreError::InvalidBlobId)?;
-
-        let target = self.get_path(&id);
-
-        let root = self.root.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let _lock = StoreLock::acquire(&root)?;
-
-            let parent = target.parent().ok_or_else(|| {
-                StoreError::IntegrityError("blob path missing parent directory".to_string())
-            })?;
-            fs::create_dir_all(parent)
-                .io_context(|| format!("failed to create blob directory {}", parent.display()))?;
-
-            let result = persist_blob_path_with_repair(temp_path, &target, &id)?;
-            fsync_blob_dirs(&paths::blob_root(&root), &target)?;
-            Ok(result)
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
-    }
-
-    /// Stores a blob from a stream and atomically indexes it under the given
-    /// Maven coordinate, holding the store lock across both steps.
-    ///
-    /// This is the race-free alternative to calling `put_stream` followed by
-    /// `add_artifact`. Between those two calls, a concurrent `prune_blobs`
-    /// (GC) sweep could observe the freshly-persisted blob without an index
-    /// row pointing at it and delete it, leaving the eventual artifact row
-    /// dangling. By holding the store lock for the entire persist + index
-    /// step, this method makes the put-and-index transition atomic with
-    /// respect to GC.
-    ///
-    /// Returns the blob id along with whether this call created the blob or
-    /// found it already present in the store.
-    pub async fn put_stream_and_index<S, E>(
-        &self,
-        key: &ArtifactKey,
-        stream: S,
-    ) -> Result<(BlobId, BlobOrigin)>
-    where
-        S: Stream<Item = std::result::Result<Bytes, E>>,
-        E: std::fmt::Display,
-    {
+        tracing::debug!(sha256 = %id, size = bytes.len(), "storing blob");
         let tmp_dir = self.root.join(TMP_DIR);
-        tokio_fs::create_dir_all(&tmp_dir)
-            .await
+        fs::create_dir_all(&tmp_dir)
             .io_context(|| format!("failed to create temp directory {}", tmp_dir.display()))?;
-
-        let temp_file = tokio::task::spawn_blocking(move || {
-            NamedTempFile::new_in(&tmp_dir).io_context(|| "failed to create temp file".to_string())
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))??;
-
-        let (std_file, temp_path) = temp_file.into_parts();
-        let mut async_file = tokio_fs::File::from_std(std_file);
-
-        let mut hasher = Sha256::new();
-        futures_util::pin_mut!(stream);
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    return Err(StoreError::IoError(std::io::Error::other(err.to_string())));
-                }
-            };
-            hasher.update(&chunk);
-            async_file
-                .write_all(&chunk)
-                .await
-                .io_context(|| "failed to write blob chunk".to_string())?;
-        }
-
-        async_file
-            .sync_all()
-            .await
-            .io_context(|| "failed to sync temp blob".to_string())?;
-
-        drop(async_file);
-
-        set_blob_readonly(&temp_path);
-
-        let digest = hasher.finalize();
-        let id = BlobId::from_str(&hex::encode(digest)).map_err(StoreError::InvalidBlobId)?;
-
-        let target = self.get_path(&id);
-        let root = self.root.clone();
-        let pool = self.pool.clone();
-        let key = key.clone();
-        let id_for_blocking = id.clone();
-
-        tokio::task::spawn_blocking(move || {
-            // Hold the store lock across BOTH the blob persist and the
-            // index insert. This closes the GC race window where a sweep
-            // could observe a just-persisted blob with no index row and
-            // delete it before the caller had a chance to record the
-            // mapping.
-            let _lock = StoreLock::acquire(&root)?;
-
-            let parent = target.parent().ok_or_else(|| {
-                StoreError::IntegrityError("blob path missing parent directory".to_string())
-            })?;
-            fs::create_dir_all(parent)
-                .io_context(|| format!("failed to create blob directory {}", parent.display()))?;
-
-            let (blob_id, origin) =
-                persist_blob_path_with_repair(temp_path, &target, &id_for_blocking)?;
-            // A dirent that is not durable must not gain an index row; the
-            // error return here skips the add_artifact below.
-            fsync_blob_dirs(&paths::blob_root(&root), &target)?;
-
-            // Stat the just-published blob so we can record size_bytes.
-            // We just wrote it under the lock, so the stat is essentially free
-            // and the row is guaranteed to point at a real file.
-            let size_bytes = fs::symlink_metadata(&target).map(|m| m.len()).unwrap_or(0);
-
-            let conn = pool
-                .get()
-                .map_err(|err| StoreError::PoolError(err.to_string()))?;
-            index::add_artifact(&conn, &key, &blob_id, size_bytes)?;
-
-            Ok((blob_id, origin))
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
-    }
-
-    /// Stores a file from the filesystem into the content-addressed store.
-    ///
-    /// The file is read in 128KB chunks to avoid loading large files into memory.
-    /// The hash is computed incrementally while streaming to a temp file, then
-    /// the temp file is atomically renamed to its final content-addressed path.
-    pub async fn put_file(&self, path: &Path) -> Result<BlobId> {
-        let root = self.root.clone();
-        let source_path = path.to_path_buf();
-
-        tokio::task::spawn_blocking(move || {
-            let tmp_dir = root.join(TMP_DIR);
-            fs::create_dir_all(&tmp_dir)
-                .io_context(|| format!("failed to create temp directory {}", tmp_dir.display()))?;
-
-            let mut temp_file = NamedTempFile::new_in(&tmp_dir)
-                .io_context(|| "failed to create temp file".to_string())?;
-
-            let mut source = fs::File::open(&source_path)
-                .io_context(|| format!("failed to open source file {}", source_path.display()))?;
-
-            let mut hasher = Sha256::new();
-            let mut buf = [0u8; 128 * 1024];
-            loop {
-                let n = source
-                    .read(&mut buf)
-                    .io_context(|| "failed to read source file".to_string())?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                temp_file
-                    .write_all(&buf[..n])
-                    .io_context(|| "failed to write temp blob".to_string())?;
-            }
-
-            temp_file
-                .as_file()
-                .sync_all()
-                .io_context(|| "failed to sync temp blob".to_string())?;
-
-            set_blob_readonly(temp_file.path());
-
-            let digest = hasher.finalize();
-            let id = BlobId::from_str(&hex::encode(digest)).map_err(StoreError::InvalidBlobId)?;
-
-            let target = root.join(crate::paths::blob_path(&id));
-
-            let _lock = StoreLock::acquire(&root)?;
-
-            let parent = target.parent().ok_or_else(|| {
-                StoreError::IntegrityError("blob path missing parent directory".to_string())
-            })?;
-            fs::create_dir_all(parent)
-                .io_context(|| format!("failed to create blob directory {}", parent.display()))?;
-
-            let result = persist_blob_with_repair(temp_file, &target, &id)?;
-            fsync_blob_dirs(&paths::blob_root(&root), &target)?;
-            Ok(result)
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
+        let mut temp = NamedTempFile::new_in(&tmp_dir)
+            .io_context(|| "failed to create temp file".to_string())?;
+        temp.write_all(bytes)
+            .io_context(|| "failed to write blob content".to_string())?;
+        sync_before_publish(temp.as_file())?;
+        set_blob_readonly(temp.path());
+        publish_blob(&self.root, temp.into_temp_path(), &id)?;
+        Ok(id)
     }
 
     /// Returns the filesystem path for a blob by its content hash.
@@ -1004,222 +428,288 @@ impl Store {
         self.root.join(paths::blob_path(id))
     }
 
-    // Test-only synchronous probe. Production code uses `exists_async`; this
-    // shorthand exists for in-crate unit tests that need a quick boolean
-    // without paying for a tokio task hop.
-    #[cfg(test)]
-    fn exists(&self, id: &BlobId) -> bool {
-        let found = self.get_path(id).is_file();
-        tracing::debug!(sha256 = %id, hit = found, "blob lookup");
-        found
-    }
-
-    /// Async version of `exists` using `tokio::fs::metadata` so the runtime
-    /// stays on its async I/O path instead of paying for a thread hop.
+    /// Whether the blob's file exists. The bytes are not re-hashed.
     pub async fn exists_async(&self, id: &BlobId) -> bool {
-        let path = self.get_path(id);
-        let found = match tokio::fs::metadata(&path).await {
-            Ok(meta) => meta.is_file(),
-            Err(_) => false,
-        };
+        let found = tokio::fs::symlink_metadata(self.get_path(id))
+            .await
+            .is_ok_and(|meta| meta.is_file());
         tracing::debug!(sha256 = %id, hit = found, "blob lookup (async)");
         found
     }
 
     /// Records a mapping from a Maven coordinate to a blob in the index.
-    pub async fn add_artifact(&self, key: &ArtifactKey, id: &BlobId) -> Result<()> {
-        tracing::debug!(
-            group_id = %key.group_id,
-            artifact_id = %key.artifact_id,
-            version = %key.version,
-            sha256 = %id,
-            "indexing artifact"
-        );
-        let pool = self.pool.clone();
-        let root = self.root.clone();
-        let key = key.clone();
-        let id = id.clone();
-        tokio::task::spawn_blocking(move || {
-            // Acquire the store lock so add_artifact and prune_blobs (which
-            // also takes the lock) cannot interleave and observe a state
-            // where a blob file exists but has no index row, or the reverse.
-            let _lock = StoreLock::acquire(&root)?;
-            // Verify the blob file exists before writing the row. Stat
-            // only (no re-hash): a hash recompute would dominate the hot
-            // path, but a missing inode is cheap to detect and avoids
-            // writing a row that no caller could ever follow.
-            let path = root.join(paths::blob_path(&id));
-            let size_bytes = match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_file() => meta.len(),
-                Ok(_) => {
-                    return Err(StoreError::IntegrityError(format!(
-                        "refusing to index {key} -> {id}: path {} is not a regular file",
-                        path.display()
-                    )));
-                }
-                Err(e) => {
-                    return Err(StoreError::IntegrityError(format!(
-                        "refusing to index {key} -> {id}: blob file {} not present ({})",
-                        path.display(),
-                        e
-                    )));
-                }
-            };
-            let conn = pool
-                .get()
-                .map_err(|err| StoreError::PoolError(err.to_string()))?;
-            index::add_artifact(&conn, &key, &id, size_bytes)
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
+    pub async fn add_artifact(&self, key: &ArtifactCoord, id: &BlobId) -> Result<()> {
+        tracing::debug!(%key, sha256 = %id, "indexing artifact");
+        self.add_artifacts(vec![(key.clone(), id.clone())]).await
     }
 
-    /// Remove the index row for `key`, if any.
-    ///
-    /// Used to repair a row that was committed before its checksum sidecar
-    /// verification failed: dropping the row makes the next sync re-fetch and
-    /// re-verify the artifact instead of trusting the unverified bytes forever
-    /// (which mattered most for unpinned companion POMs, whose `needs_download`
-    /// fast-path does not re-hash). Does NOT delete the content-addressed blob.
-    /// It may be shared with other coordinates; blob lifecycle is GC's job.
-    pub async fn remove_artifact(&self, key: &ArtifactKey) -> Result<()> {
+    /// Records several coordinate to blob mappings in one transaction, in
+    /// order, so a coordinate listed twice ends up naming its last blob.
+    /// Every blob must be a regular file in the store.
+    pub async fn add_artifacts(&self, rows: Vec<(ArtifactCoord, BlobId)>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let pool = self.pool.clone();
         let root = self.root.clone();
-        let key = key.clone();
-        tokio::task::spawn_blocking(move || {
-            // Same lock ordering as add_artifact/prune_blobs so the row delete
-            // cannot interleave with GC.
-            let _lock = StoreLock::acquire(&root)?;
-            let conn = pool
-                .get()
-                .map_err(|err| StoreError::PoolError(err.to_string()))?;
-            index::remove_artifact(&conn, &key)
+        blocking(move || {
+            // A row may name a blob another process published and has not
+            // synced, so every blob a row names is synced first, with
+            // everything this process published so far.
+            let durability = &root_shared(&root).durability;
+            let mut ticket = durability.registered();
+            for (_, id) in &rows {
+                let path = root.join(paths::blob_path(id));
+                if is_regular_file(&path) {
+                    let queued = durability.register(&paths::blob_root(&root), &path, false)?;
+                    ticket = ticket.max(queued);
+                }
+            }
+            durability.make_durable(ticket)?;
+            // The store lock keeps lock-holding writers out between the file
+            // check and the row write.
+            pool.run_locked(|conn| {
+                for (key, id) in &rows {
+                    let path = root.join(paths::blob_path(id));
+                    match fs::symlink_metadata(&path) {
+                        Ok(meta) if meta.is_file() => {}
+                        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(err)
+                                .io_context(|| format!("failed to stat blob {}", path.display()));
+                        }
+                        _ => {
+                            return Err(StoreError::IntegrityError(format!(
+                                "refusing to index {key} -> {id}: blob file {} is not a regular file",
+                                path.display()
+                            )));
+                        }
+                    }
+                }
+                let tx = conn
+                    .transaction()
+                    .db_context(|| "failed to begin index transaction")?;
+                for (key, id) in &rows {
+                    index::add_artifact(&tx, key, id)?;
+                    record_hashed_stamp(&tx, &root, id)?;
+                }
+                tx.commit()
+                    .db_context(|| "failed to commit index transaction")
+            })
         })
         .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
+    }
+
+    /// Whether `key` is indexed as `id` and the blob file is present. The
+    /// bytes are not re-hashed: an index row is only written for a durable
+    /// blob that hashed to its id.
+    pub async fn is_indexed(&self, key: &ArtifactCoord, id: &BlobId) -> Result<bool> {
+        let pool = self.pool.clone();
+        let path = self.get_path(id);
+        let (key, id) = (key.clone(), id.clone());
+        blocking(move || {
+            Ok(pool
+                .run(|conn| index::lookup_artifact(conn, &key))?
+                .as_ref()
+                == Some(&id)
+                && is_regular_file(&path))
+        })
+        .await
+    }
+
+    /// Whether the index names `id` for `key` with its file present, as
+    /// [`Self::is_indexed`] says, and the routes [`Self::served_by`] lists,
+    /// in one index read.
+    pub async fn indexed_and_served(
+        &self,
+        key: &ArtifactCoord,
+        id: &BlobId,
+    ) -> Result<(bool, Vec<(String, String)>)> {
+        let pool = self.pool.clone();
+        let path = self.get_path(id);
+        let (key, id) = (key.clone(), id.clone());
+        blocking(move || {
+            let (found, served_by) = pool.run(|conn| -> Result<_> {
+                Ok((
+                    index::lookup_artifact(conn, &key)?,
+                    index::served_by(conn, &key, &id)?,
+                ))
+            })?;
+            Ok((
+                found.as_ref() == Some(&id) && is_regular_file(&path),
+                served_by,
+            ))
+        })
+        .await
+    }
+
+    /// Keep as evidence that each (repository, endpoint) served the blob for
+    /// its coordinate, as a [served](Origin::served) origin does, without
+    /// recording it as that route's answer.
+    pub async fn record_served(
+        &self,
+        rows: Vec<(ArtifactCoord, BlobId, String, String)>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let pool = self.pool.clone();
+        blocking(move || {
+            pool.run(|conn| {
+                let tx = conn
+                    .transaction()
+                    .db_context(|| "failed to begin origin transaction")?;
+                for (key, id, repo_url, endpoint_url) in &rows {
+                    index::add_served(&tx, key, id, repo_url, endpoint_url)?;
+                }
+                tx.commit()
+                    .db_context(|| "failed to commit origin transaction")
+            })
+        })
+        .await
+    }
+
+    /// Record which repository served each coordinate's blob, for
+    /// [`Self::lookup_artifact_from`]. A row is a hint: the blob may be gone
+    /// or changed, so a reader verifies it before use.
+    pub async fn record_origins(&self, rows: Vec<(ArtifactCoord, BlobId, Origin)>) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let pool = self.pool.clone();
+        blocking(move || {
+            pool.run(|conn| {
+                let tx = conn
+                    .transaction()
+                    .db_context(|| "failed to begin origin transaction")?;
+                for (key, id, origin) in &rows {
+                    index::add_origin(&tx, key, id, origin)?;
+                }
+                tx.commit()
+                    .db_context(|| "failed to commit origin transaction")
+            })
+        })
+        .await
+    }
+
+    /// The repository and endpoint URLs [`Self::record_origins`] recorded
+    /// as having [served](Origin::served) `id` for `key`. A hint, like
+    /// [`Self::lookup_artifact`].
+    pub async fn served_by(
+        &self,
+        key: &ArtifactCoord,
+        id: &BlobId,
+    ) -> Result<Vec<(String, String)>> {
+        let pool = self.pool.clone();
+        let (key, id) = (key.clone(), id.clone());
+        blocking(move || pool.run(|conn| index::served_by(conn, &key, &id))).await
+    }
+
+    /// Each row whose origin [`Self::record_origins`] has not recorded as its
+    /// blob, in place, and `None` for one it has, in one index read.
+    pub async fn unrecorded_origins(
+        &self,
+        rows: Vec<(ArtifactCoord, BlobId, Origin)>,
+    ) -> Result<Vec<Option<(ArtifactCoord, BlobId, Origin)>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pool = self.pool.clone();
+        blocking(move || {
+            let found = pool.run(|conn| {
+                (rows.iter())
+                    .map(|(key, _, origin)| {
+                        index::lookup_origin(
+                            conn,
+                            key,
+                            &origin.repo_url,
+                            &origin.endpoint_url,
+                            true,
+                            true,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            Ok((rows.into_iter().zip(found))
+                .map(|(row, found)| (found.as_ref() != Some(&row.1)).then_some(row))
+                .collect())
+        })
+        .await
+    }
+
+    /// The blob `endpoint_url` served for `key` under `repo_url`, as [`Self::record_origins`]
+    /// recorded it, skipping one admitted without a checksum unless
+    /// `allow_unverified`, and one a lockfile recorded rather than the
+    /// repository [served](Origin::served) unless `allow_recorded`. Unlike
+    /// [`Self::lookup_artifact`], another repository or mirror's bytes for the
+    /// coordinate never answer. A hint, like [`Self::lookup_artifact`].
+    pub async fn lookup_artifact_from(
+        &self,
+        key: &ArtifactCoord,
+        repo_url: &str,
+        endpoint_url: &str,
+        allow_unverified: bool,
+        allow_recorded: bool,
+    ) -> Result<Option<BlobId>> {
+        let pool = self.pool.clone();
+        let (key, repo_url, endpoint_url) =
+            (key.clone(), repo_url.to_string(), endpoint_url.to_string());
+        blocking(move || {
+            pool.run(|conn| {
+                index::lookup_origin(
+                    conn,
+                    &key,
+                    &repo_url,
+                    &endpoint_url,
+                    allow_unverified,
+                    allow_recorded,
+                )
+            })
+        })
+        .await
     }
 
     /// Looks up the blob ID for a Maven coordinate, returning `None` if not indexed.
     ///
-    /// This API does NOT hold the store lock between the index lookup and
-    /// any subsequent file access by the caller; a concurrent GC pass can
-    /// delete the blob in that window. For the read-modify-validate
-    /// pattern, prefer [`Self::lookup_artifact_locked`], which acquires the
-    /// same lock GC takes and stat-verifies the file before returning.
-    /// Callers that keep using this method must be prepared to treat a
-    /// returned id as a cache hint and retry on stale-blob errors.
-    pub async fn lookup_artifact(&self, key: &ArtifactKey) -> Result<Option<BlobId>> {
+    /// This does not hold the store lock or check the file, so the returned
+    /// id can name a blob that is missing or about to be removed by another
+    /// process. Treat it as a cache hint, or use
+    /// [`Self::lookup_artifact_locked`].
+    pub async fn lookup_artifact(&self, key: &ArtifactCoord) -> Result<Option<BlobId>> {
         let pool = self.pool.clone();
-        let key_clone = key.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let conn = pool
-                .get()
-                .map_err(|err| StoreError::PoolError(err.to_string()))?;
-            index::lookup_artifact(&conn, &key_clone)
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?;
-        let found = result?;
-        tracing::debug!(
-            group_id = %key.group_id,
-            artifact_id = %key.artifact_id,
-            version = %key.version,
-            hit = found.is_some(),
-            "artifact lookup"
-        );
+        let owned = key.clone();
+        let found = blocking(move || pool.run(|conn| index::lookup_artifact(conn, &owned))).await?;
+        tracing::debug!(%key, hit = found.is_some(), "artifact lookup");
         Ok(found)
     }
 
-    /// Race-free lookup that takes the store lock for the duration of the
-    /// index query and on-disk stat. Returns `Some(id)` only if a row
-    /// points at a blob that exists on disk at lookup time. A concurrent GC
-    /// sweep is serialised behind this call's lock, so the returned id is
-    /// safe to hand to a downstream `Store::get_path` + `open` without a
-    /// TOCTOU retry. Returns `None` if the row is absent OR the row points
-    /// at a blob whose file is missing (a dangling row, which a follow-up
-    /// GC sweep will scrub).
-    pub async fn lookup_artifact_locked(&self, key: &ArtifactKey) -> Result<Option<BlobId>> {
+    /// Lookup that takes the store lock for the index query and a stat of
+    /// the file: `Some(id)` only if a row names a blob that exists on disk at
+    /// lookup time. Another process can still remove the file after the lock
+    /// is released, but raeva removes a blob file only when its bytes fail
+    /// verification.
+    pub async fn lookup_artifact_locked(&self, key: &ArtifactCoord) -> Result<Option<BlobId>> {
         let pool = self.pool.clone();
         let root = self.root.clone();
-        let key_clone = key.clone();
-        tokio::task::spawn_blocking(move || {
-            let _lock = StoreLock::acquire(&root)?;
-            let conn = pool
-                .get()
-                .map_err(|err| StoreError::PoolError(err.to_string()))?;
-            let Some(id) = index::lookup_artifact(&conn, &key_clone)? else {
-                return Ok(None);
-            };
-            let path = root.join(paths::blob_path(&id));
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_file() => Ok(Some(id)),
-                Ok(_) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        blob_id = %id,
-                        "indexed blob path is not a regular file; treating as miss"
-                    );
-                    Ok(None)
+        let key = key.clone();
+        blocking(move || {
+            pool.run_locked(|conn| {
+                let Some(id) = index::lookup_artifact(conn, &key)? else {
+                    return Ok(None);
+                };
+                match fs::symlink_metadata(root.join(paths::blob_path(&id))) {
+                    Ok(meta) => Ok(meta.is_file().then_some(id)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(StoreError::IoError(e)),
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    tracing::debug!(
-                        path = %path.display(),
-                        blob_id = %id,
-                        "indexed blob missing on disk; treating as miss"
-                    );
-                    Ok(None)
-                }
-                Err(e) => Err(StoreError::IoError(e)),
-            }
+            })
         })
         .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
     }
 
-    /// Missing artifacts are not included in the returned map.
-    pub async fn lookup_artifacts_batch(
-        &self,
-        keys: &[ArtifactKey],
-    ) -> Result<HashMap<ArtifactKey, BlobId>> {
-        let pool = self.pool.clone();
-        // Arc allows sharing keys across thread boundary without cloning each key
-        let keys: Arc<[ArtifactKey]> = Arc::from(keys);
-        tokio::task::spawn_blocking(move || {
-            let conn = pool
-                .get()
-                .map_err(|err| StoreError::PoolError(err.to_string()))?;
-            // `index::lookup_artifacts_batch` already chunks the input into
-            // 100-key SQL statements; the outer chunk loop was redundant.
-            index::lookup_artifacts_batch(&conn, &keys)
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
-    }
-
-    /// Recommended default parallelism for [`Self::verify_blobs`] when the
-    /// caller has no user-configured value to thread through (e.g.
-    /// `network.concurrency`). Derived from `available_parallelism()` and
-    /// clamped to a small range so it stays useful on tiny VMs and bounded
-    /// on large machines where saturating the spawn_blocking pool with
-    /// SHA-256 work hurts more than it helps.
-    pub fn default_verification_parallelism() -> usize {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(1, 32)
-    }
-
-    /// Async wrapper using buffer_unordered for concurrent verification.
-    ///
-    /// Uses tokio's spawn_blocking for each blob verification, running them
-    /// concurrently with bounded parallelism via buffer_unordered. This avoids
-    /// the inefficiency of nesting Rayon's thread pool inside spawn_blocking.
-    ///
-    /// `parallelism` controls the maximum number of concurrent re-hash tasks.
-    /// Callers should thread `network.concurrency` (or a similar
-    /// user-configured knob) through here; pass
-    /// [`Self::default_verification_parallelism`] when no such value is
-    /// available. Values <= 0 are clamped to 1.
+    /// The ids among `ids` whose files hash to them, checking at most
+    /// `parallelism` files at once. A file unchanged since it last hashed to
+    /// its id is not read again (see [`Store::check_pin_unless_unchanged`]).
+    /// The first error in `ids` order is returned.
     pub async fn verify_blobs(
         &self,
         ids: &[BlobId],
@@ -1227,588 +717,132 @@ impl Store {
     ) -> Result<HashSet<BlobId>> {
         use futures_util::stream::{self, StreamExt};
 
-        if ids.is_empty() {
-            return Ok(HashSet::new());
-        }
-
-        let root = self.root.clone();
-        let parallelism = parallelism.max(1);
-
-        let results: Vec<Result<Option<BlobId>>> = stream::iter(ids.iter().cloned())
-            .map(|id| {
-                let root = root.clone();
+        let mut results: Vec<(usize, Result<Option<BlobId>>)> = stream::iter(ids.iter().cloned())
+            .enumerate()
+            .map(|(index, id)| {
+                let store = self.clone();
                 async move {
-                    tokio::task::spawn_blocking(move || {
-                        let path = root.join(paths::blob_path(&id));
-                        // No is_file() probe: between the probe and the
-                        // open below a concurrent GC can unlink the file.
-                        // Open directly inside from_file; treat NotFound
-                        // as "blob absent" rather than an error.
-                        match BlobId::from_file(&path) {
-                            Ok(actual) => {
-                                if actual == id {
-                                    Ok(Some(id))
-                                } else {
-                                    Ok(None)
-                                }
-                            }
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                            Err(e) => Err(StoreError::IoError(e)),
-                        }
-                    })
-                    .await
-                    .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
+                    let verified = blocking(move || {
+                        Ok((store.stored_blob(&id)? == StoredBlob::Intact).then_some(id))
+                    });
+                    (index, verified.await)
                 }
             })
-            .buffer_unordered(parallelism)
+            .buffer_unordered(parallelism.max(1))
             .collect()
             .await;
-
-        let mut verified = HashSet::with_capacity(results.len());
-        for result in results {
-            if let Some(id) = result? {
-                verified.insert(id);
-            }
-        }
-        Ok(verified)
-    }
-
-    /// Computes aggregate statistics (blob count and total size) for the store.
-    ///
-    /// This walks the on-disk blob tree (via `list_blob_entries`) rather than
-    /// reading a SQL aggregate: the index only knows about blobs associated
-    /// with an artifact row, so a store that mixes indexed artifacts with raw
-    /// `put_bytes` / `put_stream` blobs would be undercounted by an index-only
-    /// query. Walking the disk counts every blob exactly once regardless of how
-    /// it was written. The cost is O(n) syscalls in the number of blobs; this
-    /// is a library-internal stats/GC path, not a hot lookup path.
-    pub async fn cache_stats(&self) -> Result<CacheStats> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || {
-            // Walk the disk, not the index, so raw `put_bytes` blobs count too.
-            let entries = store.list_blob_entries()?;
-            let total_bytes = entries.iter().map(|entry| entry.size).sum();
-            Ok(CacheStats {
-                blob_count: entries.len(),
-                total_bytes,
-            })
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
-    }
-
-    /// Removes blobs not in the `keep` set. Pass `dry_run=true` to preview without deleting.
-    ///
-    /// `keep` is the caller's snapshot of "blobs I still need", typically
-    /// computed from a lockfile BEFORE this call. The snapshot can be stale:
-    /// between when the caller built it and when GC actually runs, a
-    /// concurrent sync may have indexed a brand-new blob. To avoid
-    /// collecting that new blob as garbage, this method unions
-    /// `keep` with `referenced_blob_ids(index)` computed UNDER `StoreLock`.
-    /// Any blob referenced by an index row at lock-acquire time is
-    /// protected, even if the caller didn't list it in `keep`.
-    pub async fn prune_blobs(&self, keep: &HashSet<BlobId>, dry_run: bool) -> Result<GcSummary> {
-        let store = self.clone();
-        let caller_keep = keep.clone();
-        tokio::task::spawn_blocking(move || {
-            let _lock = StoreLock::acquire(&store.root)?;
-
-            // Re-derive the protected set under the lock so a
-            // concurrent sync that indexed a fresh blob between snapshot
-            // and prune cannot lose it. Union with caller's `keep` (which
-            // may include uncommitted blobs the caller is about to add).
-            let mut keep: HashSet<BlobId> = caller_keep;
-            {
-                let conn = store
-                    .pool
-                    .get()
-                    .map_err(|err| StoreError::PoolError(err.to_string()))?;
-                let referenced = index::referenced_blob_ids(&conn)?;
-                keep.extend(referenced);
-            }
-
-            let entries = store.list_blob_entries()?;
-            let mut removed_blobs = 0usize;
-            let mut removed_bytes = 0u64;
-
-            let mut removed_entries = Vec::new();
-
-            for entry in entries {
-                if keep.contains(&entry.id) {
-                    continue;
-                }
-                removed_blobs = removed_blobs.saturating_add(1);
-                removed_bytes = removed_bytes.saturating_add(entry.size);
-                removed_entries.push(entry);
-            }
-
-            if !dry_run {
-                // Remove index rows BEFORE deleting blob files. Concurrent
-                // readers (lookup_artifact, lookup_artifacts_batch) do not
-                // hold StoreLock, so the invariant they rely on ("a row
-                // returned by lookup points at a file on disk") requires
-                // the row to disappear no later than the file. A crash
-                // between row delete and file delete leaves orphan files
-                // (no row points at them); the next sweep finds them via
-                // list_blob_entries and removes them since their hash is
-                // not in `keep`.
-                let mut conn = store
-                    .pool
-                    .get()
-                    .map_err(|err| StoreError::PoolError(err.to_string()))?;
-
-                let ids_to_remove: Vec<BlobId> =
-                    removed_entries.iter().map(|e| e.id.clone()).collect();
-                if !ids_to_remove.is_empty() {
-                    index::remove_artifacts_for_blobs(&mut conn, &ids_to_remove)?;
-                }
-
-                let mut failed_count = 0usize;
-                for entry in removed_entries {
-                    match fs::remove_file(&entry.path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => {
-                            failed_count += 1;
-                            tracing::warn!(
-                                path = %entry.path.display(),
-                                blob_id = %entry.id,
-                                error = %e,
-                                "failed to remove blob file during GC; the next sweep will retry"
-                            );
-                        }
-                    }
-                }
-
-                if failed_count > 0 {
-                    tracing::warn!(
-                        failed_count,
-                        "GC left {failed_count} orphan blob file(s) on disk. Run `rv store gc` again."
-                    );
-                }
-
-                // Recovery sweep: scrub any index rows that point at blob
-                // files which no longer exist on disk. These rows are
-                // typically left behind by a crash between the file-delete
-                // and row-delete halves of an earlier GC. We look at every
-                // referenced blob (not filtered by `keep`) because a row
-                // whose file is missing is dangling regardless of how the
-                // caller classified it.
-                //
-                // Two-phase approach: collect candidate ids via a
-                // short-lived non-transactional SELECT (we hold StoreLock,
-                // no concurrent writer can race), then only open an
-                // IMMEDIATE transaction for the DELETE. Holding an IMMEDIATE
-                // write txn open across a per-row `is_file()` syscall loop
-                // would block every pool connection for the duration of
-                // every stat.
-                //
-                // Filesystem probing distinguishes definitive NotFound from
-                // transient errors (EACCES, EMFILE, EIO). Only definitive
-                // NotFound marks a row as dangling; transient errors are
-                // logged and the row is left in place for the next sweep.
-                // Rows whose blob_id does not parse can never resolve to a
-                // file; scrub them along with the dangling rows instead of
-                // skipping them, otherwise they would survive every sweep.
-                let mut dangling: Vec<String> = Vec::new();
-                let candidate_ids: Vec<BlobId> = {
-                    let mut stmt = conn
-                        .prepare("SELECT DISTINCT blob_id FROM artifacts")
-                        .map_err(StoreError::DbError)?;
-                    let rows = stmt
-                        .query_map([], |row| row.get::<_, String>(0))
-                        .map_err(StoreError::DbError)?;
-                    let mut ids = Vec::new();
-                    for row in rows {
-                        let s = row.map_err(StoreError::DbError)?;
-                        match BlobId::from_str(&s) {
-                            Ok(id) => ids.push(id),
-                            Err(_) => {
-                                tracing::warn!(
-                                    blob_id = %s,
-                                    "index row has unparseable blob_id; scrubbing"
-                                );
-                                dangling.push(s);
-                            }
-                        }
-                    }
-                    ids
-                };
-
-                for id in candidate_ids {
-                    let path = store.get_path(&id);
-                    match fs::symlink_metadata(&path) {
-                        Ok(meta) if meta.is_file() => {
-                            // File is fine, skip.
-                        }
-                        Ok(_) => {
-                            // Path exists but is not a regular file. Unusual,
-                            // so leave the row alone and warn.
-                            tracing::warn!(
-                                path = %path.display(),
-                                blob_id = %id,
-                                "indexed blob path is not a regular file; not deleting row"
-                            );
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            dangling.push(id.as_str().to_string());
-                        }
-                        Err(e) => {
-                            // Transient errors (EACCES, EMFILE, EIO) must
-                            // not be treated as definitive NotFound; the
-                            // file may still exist. Log and skip; the next
-                            // sweep retries.
-                            tracing::warn!(
-                                path = %path.display(),
-                                blob_id = %id,
-                                error = %e,
-                                "transient stat error during dangling sweep; skipping"
-                            );
-                        }
-                    }
-                }
-
-                if !dangling.is_empty() {
-                    let tx = conn
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                        .map_err(StoreError::DbError)?;
-                    const BATCH: usize = 500;
-                    for chunk in dangling.chunks(BATCH) {
-                        let placeholders: String = std::iter::repeat_n("?", chunk.len())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let sql = format!(
-                            "DELETE FROM artifacts WHERE blob_id IN ({})",
-                            placeholders
-                        );
-                        let params: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                        tx.execute(&sql, rusqlite::params_from_iter(params))
-                            .map_err(StoreError::DbError)?;
-                    }
-                    tx.commit().map_err(StoreError::DbError)?;
-                }
-
-                // Truncate the WAL so it doesn't grow unboundedly across
-                // GC cycles. TRUNCATE is best-effort; failures are
-                // logged at debug and don't fail the GC.
-                if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
-                    tracing::debug!(error = %e, "WAL checkpoint TRUNCATE failed after prune");
-                }
-            }
-
-            Ok(GcSummary {
-                removed_blobs,
-                removed_bytes,
-            })
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
-    }
-
-    /// Removes all blobs and clears the artifact index. Pass `dry_run=true` to preview.
-    pub async fn clean_blobs(&self, dry_run: bool) -> Result<GcSummary> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let _lock = StoreLock::acquire(&store.root)?;
-            let entries = store.list_blob_entries()?;
-            let removed_blobs = entries.len();
-            let removed_bytes = entries.iter().map(|entry| entry.size).sum();
-
-            if !dry_run {
-                // Clear the index first so a crash between the SQL DELETE
-                // and the directory rm-rf leaves the store consistent: with
-                // no index rows, whatever partial filesystem state survives
-                // is harmless. The reverse order would leave rows pointing
-                // at blobs that have just vanished.
-                let conn = store
-                    .pool
-                    .get()
-                    .map_err(|err| StoreError::PoolError(err.to_string()))?;
-                index::clear_artifacts(&conn)?;
-
-                let blob_root = paths::blob_root(&store.root);
-                if blob_root.exists() {
-                    fs::remove_dir_all(&blob_root).io_context(|| {
-                        format!("failed to remove blob directory {}", blob_root.display())
-                    })?;
-                }
-                fs::create_dir_all(&blob_root).io_context(|| {
-                    format!("failed to create blob directory {}", blob_root.display())
-                })?;
-
-                // Truncate the WAL after the bulk delete so the journal
-                // doesn't retain now-discarded rows indefinitely.
-                if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
-                    tracing::debug!(error = %e, "WAL checkpoint TRUNCATE failed after clean");
-                }
-            }
-
-            Ok(GcSummary {
-                removed_blobs,
-                removed_bytes,
-            })
-        })
-        .await
-        .map_err(|e| StoreError::IoError(std::io::Error::other(e)))?
-    }
-
-    fn list_blob_entries(&self) -> Result<Vec<BlobEntry>> {
-        let raw_root = paths::blob_root(&self.root);
-        if !raw_root.is_dir() {
-            return Ok(Vec::new());
-        }
-        // Canonicalize the blob root once and assert every discovered entry
-        // stays under it before recording. Guards against symlink-based
-        // path traversal that an attacker could plant in the blob tree.
-        // Fail closed: if the root cannot be canonicalised, refuse to walk
-        // rather than defeating the traversal guard with raw_root. NotFound
-        // means the root vanished since the is_dir probe (lock-free
-        // cache_stats can race a clean), which is an empty store; any other
-        // error propagates so stats/GC report the unreadable store instead
-        // of silently claiming it is empty.
-        let canonical_root = match fs::canonicalize(&raw_root) {
-            Ok(p) => p,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => {
-                return Err(e).io_context(|| {
-                    format!("failed to canonicalize blob root {}", raw_root.display())
-                });
-            }
-        };
-        let mut entries = Vec::new();
-        // Hard cap on directory recursion. The sharded blob layout never
-        // exceeds three levels deep; 100 protects against a corrupted store
-        // without affecting real workloads. Symlinks are skipped entirely,
-        // so symlink loops are not a concern.
-        const MAX_DEPTH: usize = 100;
-        let mut stack = vec![(canonical_root.clone(), 0usize)];
-
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > MAX_DEPTH {
-                continue;
-            }
-
-            // The lock-free cache_stats path can race a concurrent prune or
-            // clean; entries (or whole shard directories) that vanish between
-            // listing and stat are skipped rather than failing the walk.
-            let dir_entries = match fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(e)
-                        .io_context(|| format!("failed to read directory {}", dir.display()));
-                }
-            };
-            for entry in dir_entries {
-                let entry =
-                    entry.io_context(|| format!("failed to read entry in {}", dir.display()))?;
-                let path = entry.path();
-                // Use file_type() instead of metadata() so we don't follow
-                // symlinks. metadata() resolves the target, which would
-                // otherwise let the walk descend into symlinked directories.
-                let file_type = match entry.file_type() {
-                    Ok(t) => t,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        return Err(e).io_context(|| {
-                            format!("failed to read file type for {}", path.display())
-                        });
-                    }
-                };
-
-                // Skip symlinks entirely. Blob storage never legitimately
-                // contains them, and following them is the entire bug.
-                if file_type.is_symlink() {
-                    continue;
-                }
-
-                if file_type.is_dir() {
-                    stack.push((path, depth + 1));
-                    continue;
-                }
-                if !file_type.is_file() {
-                    continue;
-                }
-
-                // Verify the entry's path stays under the canonicalized blob
-                // root before we record it for deletion. We canonicalize
-                // the root exactly once (above) and never traverse symlinks
-                // during the walk, so `path` is built entirely from canonical
-                // components: a lexical `starts_with` is sufficient and avoids
-                // an O(n) `canonicalize` syscall per blob on every GC/stats
-                // call. `fs::canonicalize` resolves symlinks, not
-                // hardlinks, so it would not catch a hardlinked blob anyway.
-                if !path.starts_with(&canonical_root) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        root = %canonical_root.display(),
-                        "blob entry resolved outside canonical blob root; skipping"
-                    );
-                    continue;
-                }
-
-                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                    continue;
-                };
-                let Ok(id) = BlobId::from_str(name) else {
-                    continue;
-                };
-                // Stat via symlink_metadata so we don't follow links. A blob
-                // unlinked by a concurrent prune between read_dir and this
-                // stat is skipped, not an error.
-                let size = match fs::symlink_metadata(&path) {
-                    Ok(meta) => meta.len(),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => {
-                        return Err(e)
-                            .io_context(|| format!("failed to stat blob {}", path.display()));
-                    }
-                };
-                entries.push(BlobEntry { id, path, size });
-            }
-        }
-        Ok(entries)
+        results.sort_unstable_by_key(|(index, _)| *index);
+        results
+            .into_iter()
+            .filter_map(|(_, result)| result.transpose())
+            .collect()
     }
 }
 
-/// Cross-process exclusive lock on the store's `.lock` file.
+/// Cross-process exclusive lock on the store's `.lock` file. A query takes
+/// it through [`sqlite::Db::run_locked`], never around [`sqlite::Db::run`].
 ///
-/// Acquired before any r2d2 SQLite pool connection is taken out. Lock order
-/// is: `StoreLock` first, then a pooled `Connection`. Releasing happens in
-/// reverse via `Drop` (connection returned to pool, then lock unlocked).
-///
-/// Uses `fs2::FileExt` which wraps `flock(2)` on Unix and `LockFileEx` on
-/// Windows behind a safe API.
-///
-/// Linux `flock(2)` locks belong to open file descriptions, so separate opens
-/// of `.lock` contend within one process. The `_intra` mutex serializes callers
-/// by canonical store root before they acquire the file lock. Both waits share a deadline.
-struct StoreLock {
+/// `flock(2)` locks belong to open file descriptions, so separate opens of
+/// `.lock` do not exclude each other within one process. The `_intra` guard
+/// serializes this process's callers per store root first. Both waits share
+/// one deadline.
+pub(crate) struct StoreLock {
     file: File,
-    _intra: std::sync::MutexGuard<'static, ()>,
+    _intra: IntraGuard,
 }
 
-// WHY: leak a `Box<Mutex<()>>` per store root so we get a genuine `'static`
-// reference, no `unsafe` transmute and no Arc lifetime gymnastics. Entries in
-// this map MUST never be removed: the leaked allocation has to outlive every
-// `StoreLock` it ever produced, and removing the map entry would lose the
-// only reference we keep to the live `&'static Mutex`. The growth is bounded
-// by the number of distinct store roots a process touches over its lifetime,
-// which is at most a handful in any real workload.
-static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, &'static Mutex<()>>>> = OnceLock::new();
+/// State shared by every handle on one store root in this process: the
+/// in-process half of the store lock and the queue of blobs to sync.
+pub(crate) struct RootShared {
+    lock: IntraLock,
+    pub(crate) durability: Durability,
+}
 
-fn intra_process_mutex_for(root: &Path) -> &'static Mutex<()> {
+/// One leaked entry per store root, never removed: an entry must outlive
+/// every `StoreLock` it produced. A process touches a handful of roots.
+static STORE_ROOTS: OnceLock<Mutex<HashMap<PathBuf, &'static RootShared>>> = OnceLock::new();
+
+pub(crate) fn root_shared(root: &Path) -> &'static RootShared {
     let key = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let map = STORE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
-    guard
-        .entry(key)
-        .or_insert_with(|| Box::leak(Box::new(Mutex::new(()))))
+    let map = STORE_ROOTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = lock(map);
+    guard.entry(key).or_insert_with(|| {
+        Box::leak(Box::new(RootShared {
+            lock: IntraLock::default(),
+            durability: Durability::for_blob_root(&paths::blob_root(root)),
+        }))
+    })
 }
 
-/// Default lock acquisition timeout. 60s tolerates other rv processes that
-/// are mid-write without blocking forever on a stale lock holder.
-const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
-/// Initial sleep between try-lock attempts. Doubles on every retry up to
-/// `LOCK_RETRY_MAX`, with ±25% jitter so two contenders don't lockstep.
-const LOCK_RETRY_INITIAL: Duration = Duration::from_millis(50);
-const LOCK_RETRY_MAX: Duration = Duration::from_secs(1);
+#[derive(Default)]
+struct IntraLock {
+    held: Mutex<bool>,
+    released: Condvar,
+}
 
-/// Doubles `current` (capped at `LOCK_RETRY_MAX`) and perturbs by ±25% so
-/// racing callers don't lockstep.
-fn next_retry_delay(current: Duration) -> Duration {
-    let base = (current * 2).min(LOCK_RETRY_MAX);
-    let base_nanos = base.as_nanos() as u64;
-    let pct = getrandom::u64().map_or(0, |n| (n % 51) as i64 - 25);
-    let delta_nanos = (base_nanos as i64).saturating_mul(pct) / 100;
-    let jittered = (base_nanos as i64).saturating_add(delta_nanos).max(1) as u64;
-    Duration::from_nanos(jittered)
+struct IntraGuard(&'static IntraLock);
+
+impl IntraLock {
+    fn acquire(&'static self, deadline: Instant) -> Option<IntraGuard> {
+        let mut held = lock(&self.held);
+        while *held {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            held = self
+                .released
+                .wait_timeout(held, deadline - now)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        *held = true;
+        Some(IntraGuard(self))
+    }
+}
+
+impl Drop for IntraGuard {
+    fn drop(&mut self) {
+        *lock(&self.0.held) = false;
+        self.0.released.notify_one();
+    }
 }
 
 impl StoreLock {
-    fn acquire(root: &Path) -> Result<Self> {
+    pub(crate) fn acquire(root: &Path) -> Result<Self> {
         Self::acquire_with_timeout(root, LOCK_TIMEOUT)
     }
 
     fn acquire_with_timeout(root: &Path, timeout: Duration) -> Result<Self> {
-        use fs2::FileExt;
-
         let lock_path = root.join(LOCK_FILE);
-
-        let intra_static = intra_process_mutex_for(root);
-        let deadline = std::time::Instant::now() + timeout;
-        let mut backoff = LOCK_RETRY_INITIAL;
-        let intra_guard = loop {
-            match intra_static.try_lock() {
-                Ok(g) => break g,
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(StoreError::LockTimeout {
-                            path: lock_path,
-                            holder_info: "another thread in this process".to_string(),
-                        });
-                    }
-                    std::thread::sleep(backoff);
-                    backoff = next_retry_delay(backoff);
-                }
-                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
-            }
-        };
-
-        // Open without truncate so a second contender does not destroy
-        // the lock file contents before it has acquired the lock. Truncation is
-        // performed only after the lock is held.
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
+        let deadline = Instant::now() + timeout;
+        let intra =
+            root_shared(root)
+                .lock
+                .acquire(deadline)
+                .ok_or_else(|| StoreError::LockTimeout {
+                    path: lock_path.clone(),
+                    holder_info: "another thread in this process".to_string(),
+                })?;
+        // Not truncated on open: a contender must not wipe the holder's info.
+        let mut file = open_lock_file(&lock_path)
             .io_context(|| format!("failed to open lock file {}", lock_path.display()))?;
-
-        // Retry-with-timeout loop around try_lock_exclusive instead of
-        // an infinite-blocking lock_exclusive call.
-        let mut flock_backoff = LOCK_RETRY_INITIAL;
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        // Read holder info from the lock file for the error message.
-                        // Seek to start before reading since we may have positioned past 0.
-                        let holder_info = {
-                            use std::io::{Read, Seek, SeekFrom};
-                            let mut buf = String::new();
-                            let mut f = &file;
-                            let _ = f.seek(SeekFrom::Start(0));
-                            let _ = f.read_to_string(&mut buf);
-                            if buf.trim().is_empty() {
-                                "unknown".to_string()
-                            } else {
-                                buf.trim().to_string()
-                            }
-                        };
-                        return Err(StoreError::LockTimeout {
-                            path: lock_path,
-                            holder_info,
-                        });
-                    }
-                    std::thread::sleep(flock_backoff);
-                    flock_backoff = next_retry_delay(flock_backoff);
-                }
-                Err(e) => {
-                    return Err(StoreError::IoError(e));
-                }
+        match lock_exclusive_until(&mut file, deadline) {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                let mut info = String::new();
+                let _ = (&file).read_to_string(&mut info);
+                let info = info.trim();
+                return Err(StoreError::LockTimeout {
+                    path: lock_path,
+                    holder_info: if info.is_empty() { "unknown" } else { info }.to_string(),
+                });
             }
+            Err(fs::TryLockError::Error(e)) => return Err(StoreError::IoError(e)),
         }
-
-        // Write the full metadata buffer first, then truncate to its length.
-        // A set_len(0)+writeln pattern would leave an empty file on SIGKILL
-        // between the two calls, and a follow-up contender would read
-        // "unknown" instead of useful holder info. Writing first means the
-        // file always contains some valid content (either the previous
-        // holder's, or ours), never zero bytes.
-        let metadata = format!(
+        // Written before truncating, so a kill between the two calls never
+        // leaves the file empty.
+        let info = format!(
             "pid={} time={}\n",
             std::process::id(),
             SystemTime::now()
@@ -1816,996 +850,620 @@ impl StoreLock {
                 .unwrap_or_default()
                 .as_secs()
         );
-        {
-            use std::io::{Seek, SeekFrom};
-            let mut writer = &file;
-            writer
-                .seek(SeekFrom::Start(0))
-                .io_context(|| format!("failed to seek lock file {}", lock_path.display()))?;
-            writer
-                .write_all(metadata.as_bytes())
-                .io_context(|| format!("failed to write lock info to {}", lock_path.display()))?;
-        }
-        file.set_len(metadata.len() as u64)
-            .io_context(|| format!("failed to truncate lock file {}", lock_path.display()))?;
-
+        (&file)
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| (&file).write_all(info.as_bytes()))
+            .and_then(|()| file.set_len(info.len() as u64))
+            .io_context(|| format!("failed to write lock info to {}", lock_path.display()))?;
         Ok(Self {
             file,
-            _intra: intra_guard,
+            _intra: intra,
         })
     }
 }
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        // flock first (cross-process), then drop the intra-process guard.
-        let _ = fs2::FileExt::unlock(&self.file);
+        // The file lock first, then the in-process guard.
+        let _ = self.file.unlock();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use futures_util::stream;
+    use rv_maven_types::{ArtifactCoord, Digest, Sha1};
     use tempfile::tempdir;
 
-    use super::Store;
+    use super::{LOCK_FILE, Store, StoreLock, TMP_DIR, root_shared};
+    use crate::BlobId;
     use crate::error::StoreError;
-    use rv_config::{ArtifactKey, BlobId};
+    use crate::verified::{Expect, Expectation, PutError};
 
-    #[test]
-    fn open_creates_index_and_blob_directories() {
-        let dir = tempdir().expect("tempdir");
-        let store_root = dir.path().join("fresh-store");
-
-        assert!(!store_root.exists());
-        let _store = Store::open(&store_root).expect("open");
-
-        assert!(store_root.join("index.sqlite").is_file());
-        assert!(crate::paths::blob_root(&store_root).is_dir());
+    fn coord(artifact: &str, classifier: Option<&str>) -> ArtifactCoord {
+        ArtifactCoord::new("com.example", artifact, "1.0.0", "jar", classifier)
     }
 
+    /// Another handle holding the file lock, as a second `raeva` process does,
+    /// times the store out, and threads of one process take turns.
     #[test]
-    fn open_existing_store_reuses_existing_data() {
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let dir = tempdir().expect("tempdir");
-        let store_root = dir.path().join("store");
-
-        let key = ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
-        let expected_id = BlobId::from_bytes(b"persisted");
-
-        rt.block_on(async {
-            let store = Store::open(&store_root).expect("open first");
-            let id = store.put_bytes(b"persisted").await.expect("put");
-            store.add_artifact(&key, &id).await.expect("add");
-        });
-
-        rt.block_on(async {
-            let reopened = Store::open(&store_root).expect("open second");
-            assert_eq!(
-                reopened.lookup_artifact(&key).await.expect("lookup"),
-                Some(expected_id.clone())
-            );
-            assert!(reopened.exists(&expected_id));
-        });
-    }
-
-    #[test]
-    fn temp_cleanup_runs_for_each_distinct_store_path() {
-        // A process that opens two stores at different paths must
-        // schedule cleanup for both temp dirs, not just the first.
-        use std::time::{Duration, SystemTime};
-
-        let dir = tempdir().expect("tempdir");
-        let root_a = dir.path().join("store-a");
-        let root_b = dir.path().join("store-b");
-
-        // Files older than 24h are removed by the synchronous sweep at open.
-        let stale = SystemTime::now() - Duration::from_secs(48 * 3600);
-        for root in [&root_a, &root_b] {
-            let tmp = root.join(super::TMP_DIR);
-            std::fs::create_dir_all(&tmp).expect("mkdir tmp");
-            let stale_path = tmp.join("stale.tmp");
-            std::fs::write(&stale_path, b"x").expect("seed");
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&stale_path)
-                .expect("open stale");
-            f.set_modified(stale).expect("set mtime");
-        }
-
-        let _a = Store::open(&root_a).expect("open a");
-        let _b = Store::open(&root_b).expect("open b");
-
-        for _ in 0..50 {
-            let a_gone = !root_a.join(super::TMP_DIR).join("stale.tmp").exists();
-            let b_gone = !root_b.join(super::TMP_DIR).join("stale.tmp").exists();
-            if a_gone && b_gone {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        panic!(
-            "expected stale temp files in both stores to be cleaned; \
-             a_exists={} b_exists={}",
-            root_a.join(super::TMP_DIR).join("stale.tmp").exists(),
-            root_b.join(super::TMP_DIR).join("stale.tmp").exists(),
+    fn store_lock_excludes_other_handles_and_threads() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let holder = super::open_lock_file(&root.join(LOCK_FILE)).unwrap();
+        holder.lock().unwrap();
+        let err = StoreLock::acquire_with_timeout(&root, Duration::from_millis(100)).err();
+        assert!(
+            matches!(err, Some(StoreError::LockTimeout { .. })),
+            "{err:?}"
         );
-    }
+        holder.unlock().unwrap();
 
-    #[test]
-    fn open_allows_concurrent_access() {
-        let dir = tempdir().expect("tempdir");
-        let store_root = dir.path().join("store");
-        let barrier = Arc::new(Barrier::new(3));
-
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let barrier = barrier.clone();
-            let root = store_root.clone();
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                Store::open(&root).map(|_| ())
-            }));
-        }
-
-        barrier.wait();
-        for handle in handles {
-            let result = handle.join().expect("thread join");
-            result.expect("concurrent open");
-        }
+        let (inside, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (root, inside, most) = (root.clone(), inside.clone(), most.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        let _lock = StoreLock::acquire(&root).unwrap();
+                        most.fetch_max(inside.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(1));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        assert_eq!(most.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn batch_lookup_round_trips_empty_classifier() {
-        // A key whose classifier is `Some("")` is normalized to `None`,
-        // and the index stores/reconstructs it as "" <-> None consistently, so
-        // the batch lookup must return a hit keyed by the (normalized) key the
-        // caller passed in. A reconstructed key that kept `None` while a
-        // `Some("")` query key did not would drop the entry.
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"classifier-payload").await.expect("put");
-
-        // Add under a key built with an explicit empty classifier.
-        let added_key =
-            ArtifactKey::new("com.example", "demo", "1.0.0", "jar", Some(String::new()));
-        store.add_artifact(&added_key, &id).await.expect("add");
-
-        // Query with both an empty-string classifier and an explicit None; both
-        // must resolve to the same stored blob.
-        let query_empty =
-            ArtifactKey::new("com.example", "demo", "1.0.0", "jar", Some(String::new()));
-        let query_none = ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
-
-        let found = store
-            .lookup_artifacts_batch(&[query_empty.clone(), query_none.clone()])
-            .await
-            .expect("batch lookup");
-
-        // Both query keys normalize to the same key, so there is exactly one
-        // entry and both lookups hit it.
-        assert_eq!(found.get(&query_empty), Some(&id));
-        assert_eq!(found.get(&query_none), Some(&id));
-        assert_eq!(found.len(), 1);
+    async fn only_unrecorded_origins_are_returned() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let blob = store.put_bytes(b"bytes").await.unwrap();
+        let other = store.put_bytes(b"other").await.unwrap();
+        let row = |name, blob: &BlobId| {
+            let origin = crate::Origin {
+                repo_url: "https://repo.example/".into(),
+                endpoint_url: "https://repo.example/".into(),
+                checksum_verified: false,
+                served: true,
+            };
+            (coord(name, None), blob.clone(), origin)
+        };
+        store.record_origins(vec![row("a", &blob)]).await.unwrap();
+        let rows = vec![row("a", &blob), row("a", &other), row("b", &blob)];
+        let unrecorded = store.unrecorded_origins(rows).await.unwrap();
+        let unrecorded: Vec<_> = unrecorded.iter().map(Option::is_some).collect();
+        assert_eq!(unrecorded, [false, true, true]);
     }
 
+    /// A row a lockfile recorded names no repository that served the bytes,
+    /// and a later answer at a route keeps the evidence of the earlier one,
+    /// as two generations of a non-unique SNAPSHOT need.
     #[tokio::test]
-
-    async fn put_bytes_round_trip() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-        let payload = b"round-trip";
-
-        let id = store.put_bytes(payload).await.expect("put");
-        let path = store.get_path(&id);
-
-        assert!(store.exists(&id));
-        assert_eq!(path, dir.path().join(crate::paths::blob_path(&id)));
-        let stored = std::fs::read(&path).expect("read");
-        assert_eq!(stored, payload);
-    }
-
-    #[tokio::test]
-    async fn put_bytes_empty_data_succeeds() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"").await.expect("put");
-        assert_eq!(id, BlobId::from_bytes(b""));
-        assert!(store.exists(&id));
-        assert_eq!(
-            std::fs::metadata(store.get_path(&id))
-                .expect("metadata")
-                .len(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn put_bytes_and_lookup() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-        let id = store.put_bytes(b"hello").await.expect("put");
-
-        assert!(store.exists(&id));
-        assert_eq!(
-            store.get_path(&id),
-            dir.path().join(crate::paths::blob_path(&id))
-        );
-
-        let key = ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
-        store.add_artifact(&key, &id).await.expect("add");
-        let found = store.lookup_artifact(&key).await.expect("lookup");
-        assert_eq!(found, Some(id));
-    }
-
-    #[tokio::test]
-    async fn put_stream_round_trip() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-        let expected = b"streamed-bytes";
-
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from_static(b"streamed-")),
-            Ok(Bytes::from_static(b"bytes")),
+    async fn served_by_leaves_out_origins_a_lock_recorded() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let key = coord("demo", None);
+        let blob = store.put_bytes(b"bytes").await.unwrap();
+        let row = |repo: &str, served| {
+            let origin = crate::Origin {
+                repo_url: repo.into(),
+                endpoint_url: format!("{repo}mirror/"),
+                checksum_verified: false,
+                served,
+            };
+            (key.clone(), blob.clone(), origin)
+        };
+        let rows = vec![
+            row("https://a.example/", true),
+            row("https://b.example/", false),
         ];
-        let id = store
-            .put_stream(stream::iter(chunks))
-            .await
-            .expect("put stream");
-
-        assert_eq!(id, BlobId::from_bytes(expected));
-        assert!(store.exists(&id));
-        let stored = std::fs::read(store.get_path(&id)).expect("read");
-        assert_eq!(stored, expected);
-    }
-
-    #[tokio::test]
-    async fn duplicate_content_returns_same_blob_id() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let first = store.put_bytes(b"dup").await.expect("put");
-        let second = store.put_bytes(b"dup").await.expect("put");
-
-        assert_eq!(first, second);
-        assert_eq!(store.cache_stats().await.expect("stats").blob_count, 1);
-    }
-
-    /// A symlink planted in the blob tree must be skipped by the
-    /// directory walk and never counted by `cache_stats` / collected by GC.
-    /// Symlinks must be skipped during traversal: lexical containment alone
-    /// cannot prevent following them outside the blob tree.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn list_blob_entries_skips_symlinks() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        // One legitimate blob.
-        let id = store.put_bytes(b"real-blob").await.expect("put");
-        assert!(store.exists(&id));
-
-        // A target file outside the blob tree that a symlink will point at.
-        let outside = dir.path().join("outside.bin");
-        std::fs::write(&outside, b"outside-content").expect("write outside");
-
-        // Plant a symlink inside the sharded blob layout. Its name is a valid
-        // blob id so the only thing that can exclude it is the symlink check.
-        let fake_id = BlobId::from_bytes(b"outside-content");
-        let link_path = store.get_path(&fake_id);
-        std::fs::create_dir_all(link_path.parent().expect("parent")).expect("mkdir shard");
-        std::os::unix::fs::symlink(&outside, &link_path).expect("symlink");
-
-        // Only the real blob is counted; the symlink is skipped.
-        let stats = store.cache_stats().await.expect("stats");
-        assert_eq!(stats.blob_count, 1, "symlinked entry must not be counted");
-
-        // And a GC sweep with an empty keep set must not delete the symlink's
-        // target (it never even sees the symlink as a collectable blob).
-        store
-            .prune_blobs(&HashSet::new(), false)
-            .await
-            .expect("prune");
-        assert!(outside.exists(), "symlink target must be untouched by GC");
-    }
-
-    #[tokio::test]
-    async fn different_content_returns_different_blob_ids() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let first = store.put_bytes(b"one").await.expect("put");
-        let second = store.put_bytes(b"two").await.expect("put");
-
-        assert_ne!(first, second);
-    }
-
-    #[tokio::test]
-    async fn put_file_matches_hash() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let file_path = dir.path().join("artifact.jar");
-        std::fs::write(&file_path, b"artifact").expect("write");
-
-        let id = store.put_file(&file_path).await.expect("put");
-        let expected = BlobId::from_bytes(b"artifact");
-
-        assert_eq!(id, expected);
-        assert!(store.exists(&id));
-    }
-
-    #[tokio::test]
-    async fn put_file_missing_path_returns_error() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-        let missing = dir.path().join("does-not-exist.jar");
-
-        let err = store
-            .put_file(&missing)
-            .await
-            .expect_err("missing file should error");
-        assert!(matches!(err, StoreError::IoError(_)));
-    }
-
-    #[tokio::test]
-    async fn exists_false_for_missing_blob() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = BlobId::from_bytes(b"missing");
-        assert!(!store.exists(&id));
-    }
-
-    #[tokio::test]
-    async fn cache_stats_counts_blobs() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        store.put_bytes(b"one").await.expect("put");
-        store.put_bytes(b"two").await.expect("put");
-
-        let stats = store.cache_stats().await.expect("stats");
-        assert_eq!(stats.blob_count, 2);
-        assert_eq!(stats.total_bytes, 6);
-    }
-
-    #[tokio::test]
-    async fn add_artifact_duplicate_key_overwrites_existing_mapping() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let key = ArtifactKey::new("com.example", "demo", "1.0.0", "jar", None);
-        let first = store.put_bytes(b"first").await.expect("put");
-        let second = store.put_bytes(b"second").await.expect("put");
-
-        store.add_artifact(&key, &first).await.expect("add first");
-        store.add_artifact(&key, &second).await.expect("add second");
-
+        store.record_origins(rows).await.unwrap();
         assert_eq!(
-            store.lookup_artifact(&key).await.expect("lookup"),
-            Some(second)
+            store.served_by(&key, &blob).await.unwrap(),
+            [(
+                "https://a.example/".into(),
+                "https://a.example/mirror/".into()
+            )]
         );
-    }
+        let other = BlobId::from_bytes(b"other");
+        assert!(store.served_by(&key, &other).await.unwrap().is_empty());
 
-    #[tokio::test]
-    async fn prune_removes_unreferenced_blobs() {
-        // `prune_blobs` protects every blob referenced by
-        // the index at lock-acquire time so a concurrent indexer's row
-        // can't be stranded. To exercise the "remove this blob" path, the
-        // caller must remove the row first (or never index it). Here we
-        // only index `keep_id`; `remove_id` is an orphan blob and gets
-        // collected.
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let keep_id = store.put_bytes(b"keep").await.expect("put");
-        let remove_id = store.put_bytes(b"remove").await.expect("put");
-        let keep_key = ArtifactKey::new("com.example", "keep", "1.0.0", "jar", None);
-        store.add_artifact(&keep_key, &keep_id).await.expect("add");
-        // intentionally NOT indexing remove_id
-
-        let mut keep = HashSet::new();
-        keep.insert(keep_id.clone());
-
-        let summary = store.prune_blobs(&keep, true).await.expect("prune dry run");
-        assert_eq!(summary.removed_blobs, 1);
-        assert!(store.exists(&remove_id));
-
-        let summary = store.prune_blobs(&keep, false).await.expect("prune");
-        assert_eq!(summary.removed_blobs, 1);
-        assert!(store.exists(&keep_id));
-        assert!(!store.exists(&remove_id));
-        assert_eq!(
-            store.lookup_artifact(&keep_key).await.expect("lookup"),
-            Some(keep_id)
-        );
-    }
-
-    #[tokio::test]
-    async fn prune_all_referenced_removes_nothing() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id1 = store.put_bytes(b"artifact1").await.expect("put");
-        let id2 = store.put_bytes(b"artifact2").await.expect("put");
-
-        let mut keep = HashSet::new();
-        keep.insert(id1.clone());
-        keep.insert(id2.clone());
-
-        let summary = store.prune_blobs(&keep, false).await.expect("prune");
-        assert_eq!(summary.removed_blobs, 0);
-        assert_eq!(summary.removed_bytes, 0);
-        assert!(store.exists(&id1));
-        assert!(store.exists(&id2));
-    }
-
-    #[tokio::test]
-    async fn clean_blobs_dry_run_does_not_delete() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"dry").await.expect("put");
-        let key = ArtifactKey::new("com.example", "dry", "1.0.0", "jar", None);
-        store.add_artifact(&key, &id).await.expect("add");
-
-        let summary = store.clean_blobs(true).await.expect("clean dry run");
-        assert_eq!(summary.removed_blobs, 1);
-        assert!(store.exists(&id));
-        assert_eq!(store.lookup_artifact(&key).await.expect("lookup"), Some(id));
-        assert_eq!(store.cache_stats().await.expect("stats").blob_count, 1);
-    }
-
-    #[tokio::test]
-    async fn clean_removes_all_blobs() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"clean").await.expect("put");
-        let key = ArtifactKey::new("com.example", "clean", "1.0.0", "jar", None);
-        store.add_artifact(&key, &id).await.expect("add");
-
-        let summary = store.clean_blobs(false).await.expect("clean");
-        assert_eq!(summary.removed_blobs, 1);
-        assert_eq!(store.cache_stats().await.expect("stats").blob_count, 0);
-        assert_eq!(store.lookup_artifact(&key).await.expect("lookup"), None);
-    }
-
-    #[test]
-    fn open_fails_with_corrupt_index() {
-        let dir = tempdir().expect("tempdir");
-        let db_path = dir.path().join("index.sqlite");
-        std::fs::write(&db_path, b"not a sqlite database").expect("write");
-
-        // With the header-magic pre-check the failure path is microseconds.
-        // We allow up to a second for slow CI hosts. Without the pre-check the
-        // open would instead wait the full 30s busy_timeout.
-        let started = std::time::Instant::now();
-        let err = Store::open(dir.path()).err().expect("error");
-        let elapsed = started.elapsed();
-        assert!(matches!(err, StoreError::DbError(_)));
-        assert!(
-            elapsed < std::time::Duration::from_secs(1),
-            "Store::open on corrupt index should fail fast, took {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn batch_lookup_finds_stored_artifacts() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id1 = store.put_bytes(b"artifact1").await.expect("put");
-        let id2 = store.put_bytes(b"artifact2").await.expect("put");
-        let key1 = ArtifactKey::new("com.example", "first", "1.0.0", "jar", None);
-        let key2 = ArtifactKey::new("com.example", "second", "2.0.0", "jar", None);
-        let missing_key = ArtifactKey::new("com.example", "missing", "1.0.0", "jar", None);
-
-        store.add_artifact(&key1, &id1).await.expect("add");
-        store.add_artifact(&key2, &id2).await.expect("add");
-
-        let keys = vec![key1.clone(), key2.clone(), missing_key.clone()];
-        let found = store
-            .lookup_artifacts_batch(&keys)
-            .await
-            .expect("batch lookup");
-
-        assert_eq!(found.len(), 2);
-        assert_eq!(found.get(&key1), Some(&id1));
-        assert_eq!(found.get(&key2), Some(&id2));
-        assert_eq!(found.get(&missing_key), None);
-    }
-
-    #[tokio::test]
-    async fn remove_artifact_drops_only_the_index_row() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"companion-pom-bytes").await.expect("put");
-        let key = ArtifactKey::new("com.example", "demo", "1.0.0", "pom", None);
-        store.add_artifact(&key, &id).await.expect("add");
-        assert_eq!(
-            store.lookup_artifact(&key).await.expect("lookup"),
-            Some(id.clone())
-        );
-
-        store.remove_artifact(&key).await.expect("remove row");
-
-        // The index row is gone (so the next sync re-fetches+re-verifies)...
-        assert_eq!(store.lookup_artifact(&key).await.expect("lookup"), None);
-        // ...but the content-addressed blob is left in place for GC / other refs.
-        assert!(store.get_path(&id).is_file());
-
-        // Removing a key that has no row is a no-op, not an error.
-        store
-            .remove_artifact(&key)
-            .await
-            .expect("idempotent remove");
-    }
-
-    #[tokio::test]
-    async fn batch_lookup_empty_input_returns_empty_map() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let found = store
-            .lookup_artifacts_batch(&[])
-            .await
-            .expect("batch lookup");
-        assert!(found.is_empty());
-    }
-
-    #[tokio::test]
-    async fn verify_blobs_accepts_valid_blob() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"verified").await.expect("put");
-        let verified = store
-            .verify_blobs(
-                std::slice::from_ref(&id),
-                Store::default_verification_parallelism(),
+        let newer = store.put_bytes(b"newer").await.unwrap();
+        let (_, _, origin) = row("https://a.example/", true);
+        let lookup = |allow_recorded| {
+            store.lookup_artifact_from(
+                &key,
+                "https://b.example/",
+                "https://b.example/mirror/",
+                true,
+                allow_recorded,
             )
-            .await
-            .expect("verify");
-        assert!(verified.contains(&id));
-    }
-
-    #[tokio::test]
-    async fn verify_blobs_detects_corruption() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"good").await.expect("put");
-        let blob_path = store.get_path(&id);
-        // Published blobs are 0o444; remove the read-only file before
-        // overwriting it with corrupt bytes.
-        let _ = std::fs::remove_file(&blob_path);
-        std::fs::write(&blob_path, b"corrupt").expect("corrupt write");
-
-        let verified = store
-            .verify_blobs(
-                std::slice::from_ref(&id),
-                Store::default_verification_parallelism(),
-            )
-            .await
-            .expect("verify");
-        assert!(!verified.contains(&id));
-    }
-
-    /// GC can remove an unindexed blob between `put_stream` and `add_artifact`;
-    /// the latter must reject the missing file without creating an index row.
-    /// `put_stream_and_index` holds the lock across both steps, preventing GC
-    /// from interleaving. Its index row then protects the blob from later GC,
-    /// even with an empty keep set.
-    #[tokio::test]
-    async fn put_stream_and_index_survives_concurrent_gc() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let key = ArtifactKey::new("com.example", "atomic", "1.0.0", "jar", None);
-        let payload = b"atomic-put-and-index";
-
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from_static(payload))];
-        let (id, _origin) = store
-            .put_stream_and_index(&key, stream::iter(chunks))
-            .await
-            .expect("put_stream_and_index");
-
-        // Blob must be present and indexed atomically. A GC over an empty
-        // `keep` set CANNOT have interleaved between the persist and the
-        // index insert, because both happened under the store lock.
-        assert!(store.exists(&id), "blob must exist after atomic put+index");
-        assert_eq!(
-            store.lookup_artifact(&key).await.expect("lookup"),
-            Some(id.clone()),
-            "artifact must be indexed after atomic put+index"
-        );
-
-        // GC can delete an unindexed blob between put_stream and add_artifact.
-        // add_artifact checks for the file under the lock and rejects a missing
-        // blob instead of creating a dangling row.
-        let key2 = ArtifactKey::new("com.example", "legacy", "1.0.0", "jar", None);
-        let chunks2: Vec<Result<Bytes, std::io::Error>> =
-            vec![Ok(Bytes::from_static(b"legacy-payload"))];
-        let legacy_id = store
-            .put_stream(stream::iter(chunks2))
-            .await
-            .expect("put_stream legacy");
+        };
+        assert_eq!(lookup(false).await.unwrap(), None);
+        assert_eq!(lookup(true).await.unwrap(), Some(blob.clone()));
         store
-            .prune_blobs(&HashSet::new(), false)
+            .record_origins(vec![(key.clone(), newer.clone(), origin)])
             .await
-            .expect("prune");
-        assert!(
-            !store.exists(&legacy_id),
-            "legacy two-step API loses the blob to a concurrent GC sweep"
-        );
-        let err = store
-            .add_artifact(&key2, &legacy_id)
-            .await
-            .expect_err("add_artifact must refuse missing blobs (#11)");
-        assert!(
-            matches!(err, StoreError::IntegrityError(_)),
-            "expected IntegrityError refusing to index a missing blob, got {err:?}"
-        );
-        assert_eq!(
-            store.lookup_artifact(&key2).await.expect("lookup legacy"),
-            None,
-            "no row should be written for a missing blob under the #11 fix"
-        );
-
-        // Now do the same scenario through the new API: a GC with an empty
-        // keep set running AFTER an atomic put+index must not delete a blob
-        // that is referenced by an index row that the caller will include in
-        // `keep`. (We test the typical caller pattern: build `keep` from the
-        // current index.)
-        let key3 = ArtifactKey::new("com.example", "atomic-survives-gc", "1.0.0", "jar", None);
-        let chunks3: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from_static(b"safe"))];
-        let (id3, _) = store
-            .put_stream_and_index(&key3, stream::iter(chunks3))
-            .await
-            .expect("put_stream_and_index 3");
-        let mut keep = HashSet::new();
-        keep.insert(id3.clone());
-        store.prune_blobs(&keep, false).await.expect("prune keep");
-        assert!(
-            store.exists(&id3),
-            "atomic put+index plus keep-set GC must preserve the blob"
-        );
-        assert_eq!(
-            store.lookup_artifact(&key3).await.expect("lookup"),
-            Some(id3)
-        );
+            .unwrap();
+        assert_eq!(store.served_by(&key, &blob).await.unwrap().len(), 1);
+        assert_eq!(store.served_by(&key, &newer).await.unwrap().len(), 1);
     }
 
-    /// GC must scrub dangling index rows even with an empty `keep` set.
-    /// Simulate a missing blob by deleting its file while retaining the row.
     #[tokio::test]
-    async fn gc_recovers_from_crash_between_file_delete_and_row_delete() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let key = ArtifactKey::new("com.example", "crash", "1.0.0", "jar", None);
-        let id = store.put_bytes(b"will-be-crashed").await.expect("put");
-        store.add_artifact(&key, &id).await.expect("add");
-
-        // Step (2): simulate the file-delete half of a partial GC.
-        let blob_path = store.get_path(&id);
-        std::fs::remove_file(&blob_path).expect("simulated crash file delete");
-
-        // Step (3): the row is still there, pointing at a now-missing file.
-        assert!(!blob_path.exists(), "file deleted (crash sim)");
+    async fn artifact_evidence_requires_the_declared_repository_and_serving_endpoint() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let key = coord("demo", None);
+        let declared = "https://repo.example/";
+        let mirror = "https://mirror.example/";
+        for (endpoint, bytes) in [
+            (mirror, b"mirror".as_slice()),
+            (declared, b"origin".as_slice()),
+        ] {
+            let blob = store.put_bytes(bytes).await.unwrap();
+            store
+                .record_origins(vec![(
+                    key.clone(),
+                    blob,
+                    crate::Origin {
+                        repo_url: declared.into(),
+                        endpoint_url: endpoint.into(),
+                        checksum_verified: true,
+                        served: true,
+                    },
+                )])
+                .await
+                .unwrap();
+        }
+        for (endpoint, bytes) in [
+            (mirror, b"mirror".as_slice()),
+            (declared, b"origin".as_slice()),
+        ] {
+            assert_eq!(
+                store
+                    .lookup_artifact_from(&key, declared, endpoint, false, false)
+                    .await
+                    .unwrap(),
+                Some(BlobId::from_bytes(bytes))
+            );
+        }
         assert_eq!(
             store
-                .lookup_artifact(&key)
+                .lookup_artifact_from(&key, mirror, mirror, false, false)
                 .await
-                .expect("lookup post-crash"),
-            Some(id.clone()),
-            "dangling index row from simulated crash"
-        );
-
-        // The recovery sweep removes the row after observing the missing file.
-        store
-            .prune_blobs(&HashSet::new(), false)
-            .await
-            .expect("recovery prune");
-
-        assert_eq!(
-            store
-                .lookup_artifact(&key)
-                .await
-                .expect("lookup after recovery"),
-            None,
-            "dangling index row must be removed by the next GC after a crash"
-        );
-        assert!(!blob_path.exists(), "file is still gone after recovery GC");
-    }
-
-    /// `prune_blobs` protects indexed blobs; an unindexed blob is collectible.
-    #[tokio::test]
-    async fn gc_removes_index_row_after_file_delete() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let id = store.put_bytes(b"order-test").await.expect("put");
-
-        let blob_path = store.get_path(&id);
-        assert!(blob_path.exists());
-        store
-            .prune_blobs(&HashSet::new(), false)
-            .await
-            .expect("prune");
-
-        assert!(!blob_path.exists(), "file must be deleted");
-    }
-
-    /// Inject an index row whose blob_id is not a parseable hash, bypassing
-    /// the typed API the way on-disk corruption or an external writer would.
-    fn inject_corrupt_blob_id_row(store: &Store, key: &ArtifactKey, corrupt_blob_id: &str) {
-        let conn = store.pool.get().expect("conn");
-        conn.execute(
-            "INSERT OR REPLACE INTO artifacts
-             (group_id, artifact_id, version, packaging, classifier, blob_id, size_bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            rusqlite::params![
-                &key.group_id,
-                &key.artifact_id,
-                &key.version,
-                &key.packaging,
-                key.classifier_key(),
-                corrupt_blob_id
-            ],
-        )
-        .expect("inject corrupt row");
-    }
-
-    fn count_rows_for_artifact(store: &Store, artifact_id: &str) -> i64 {
-        let conn = store.pool.get().expect("conn");
-        conn.query_row(
-            "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ?1",
-            rusqlite::params![artifact_id],
-            |row| row.get(0),
-        )
-        .expect("count rows")
-    }
-
-    /// A row with an unparseable blob_id must read as a miss (not a permanent
-    /// hard error), be scrubbed from the index, and leave the key re-indexable.
-    #[tokio::test]
-    async fn lookup_treats_unparseable_blob_id_row_as_miss_and_scrubs_it() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let key = ArtifactKey::new("com.example", "corrupt", "1.0.0", "jar", None);
-        inject_corrupt_blob_id_row(&store, &key, "not-a-valid-blob-id");
-
-        assert_eq!(
-            store.lookup_artifact(&key).await.expect("lookup"),
-            None,
-            "corrupt row must be a miss, not an error"
-        );
-        assert_eq!(
-            count_rows_for_artifact(&store, "corrupt"),
-            0,
-            "corrupt row must be scrubbed by lookup"
-        );
-
-        // The locked variant shares the same repair path.
-        inject_corrupt_blob_id_row(&store, &key, "also-not-valid");
-        assert_eq!(
-            store
-                .lookup_artifact_locked(&key)
-                .await
-                .expect("locked lookup"),
+                .unwrap(),
             None
         );
-        assert_eq!(count_rows_for_artifact(&store, "corrupt"), 0);
-
-        // The key is usable again after the scrub.
-        let id = store.put_bytes(b"replacement").await.expect("put");
-        store.add_artifact(&key, &id).await.expect("add");
-        assert_eq!(store.lookup_artifact(&key).await.expect("lookup"), Some(id));
-    }
-
-    /// Batch lookup must skip and scrub unparseable rows instead of failing
-    /// the whole batch, and still return hits for the healthy keys.
-    #[tokio::test]
-    async fn batch_lookup_skips_and_scrubs_unparseable_blob_id_rows() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
-
-        let good_key = ArtifactKey::new("com.example", "good", "1.0.0", "jar", None);
-        let good_id = store.put_bytes(b"good-bytes").await.expect("put");
-        store.add_artifact(&good_key, &good_id).await.expect("add");
-
-        let bad_key = ArtifactKey::new("com.example", "bad", "1.0.0", "jar", None);
-        inject_corrupt_blob_id_row(&store, &bad_key, "garbage");
-
-        let found = store
-            .lookup_artifacts_batch(&[good_key.clone(), bad_key.clone()])
-            .await
-            .expect("batch lookup");
-        assert_eq!(found.get(&good_key), Some(&good_id));
-        assert_eq!(found.get(&bad_key), None, "corrupt row must be a miss");
         assert_eq!(
-            count_rows_for_artifact(&store, "bad"),
-            0,
-            "corrupt row must be scrubbed by batch lookup"
+            store
+                .lookup_artifact_from(&key, declared, "https://other.example/", false, false)
+                .await
+                .unwrap(),
+            None
         );
     }
 
-    /// The GC dangling sweep must scrub rows with unparseable blob_ids
-    /// instead of skipping them forever.
     #[tokio::test]
-    async fn gc_scrubs_unparseable_blob_id_rows() {
-        let dir = tempdir().expect("tempdir");
-        let store = Store::open(dir.path()).expect("open");
+    async fn stores_and_indexes_blobs_across_reopens() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("store");
+        let store = Store::open(&root).unwrap();
+        assert!(root.join("index.sqlite").is_file());
 
-        let key = ArtifactKey::new("com.example", "gc-corrupt", "1.0.0", "jar", None);
-        inject_corrupt_blob_id_row(&store, &key, "zzzz-not-a-hash");
+        let id = store.put_bytes(b"hello").await.unwrap();
+        assert_eq!(id, BlobId::from_bytes(b"hello"));
+        assert_eq!(store.put_bytes(b"hello").await.unwrap(), id);
+        assert_eq!(std::fs::read(store.get_path(&id)).unwrap(), b"hello");
+        let empty = store.put_bytes(b"").await.unwrap();
+        assert!(store.exists_async(&empty).await);
+        assert!(!store.exists_async(&BlobId::from_bytes(b"missing")).await);
 
-        store
-            .prune_blobs(&HashSet::new(), false)
-            .await
-            .expect("prune");
-
+        // An empty classifier and none are the same coordinate.
+        let (blank, none) = (coord("demo", Some("")), coord("demo", None));
+        store.add_artifact(&blank, &empty).await.unwrap();
+        store.add_artifact(&none, &id).await.unwrap();
+        drop(store);
+        let store = Store::open(&root).unwrap();
         assert_eq!(
-            count_rows_for_artifact(&store, "gc-corrupt"),
-            0,
-            "GC must scrub rows with unparseable blob_ids"
+            store.lookup_artifact(&blank).await.unwrap(),
+            Some(id.clone())
         );
+        assert_eq!(store.lookup_artifact_locked(&none).await.unwrap(), Some(id));
     }
 
-    /// Two store handles pointing at the same directory both write the same artifact
-    /// concurrently. After both writes complete, the artifact on disk must have the
-    /// correct SHA-256; the exclusive fs2 lock prevents corruption.
-    #[test]
-    fn concurrent_writes_same_artifact_no_corruption() {
-        use std::sync::Barrier;
+    #[tokio::test]
+    async fn verify_and_put_bytes_catch_a_torn_blob() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let id = store.put_bytes(b"whole content").await.unwrap();
+        let good = store.put_bytes(b"good").await.unwrap();
+        let path = store.get_path(&id);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"whole").unwrap();
+        let missing = BlobId::from_bytes(b"missing");
+        let all = [id.clone(), good.clone(), missing];
+        assert_eq!(store.verify_blobs(&all, 2).await.unwrap(), [good].into());
 
-        let dir = tempdir().expect("tempdir");
-        let store_root = dir.path().join("concurrent-store");
-        let barrier = Arc::new(Barrier::new(2));
-        let payload = b"concurrent-artifact-content";
-        let expected_id = BlobId::from_bytes(payload);
+        assert_eq!(store.put_bytes(b"whole content").await.unwrap(), id);
+        assert_eq!(std::fs::read(&path).unwrap(), b"whole content");
+    }
 
-        let mut handles = Vec::new();
-        for _ in 0..2 {
-            let barrier = barrier.clone();
-            let root = store_root.clone();
-            handles.push(std::thread::spawn(move || {
-                // Both threads open their own handle to the same store root
-                let store = Store::open(&root).expect("store open");
-                barrier.wait(); // synchronise so both start writing simultaneously
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("runtime");
-                rt.block_on(async move { store.put_bytes(payload).await.expect("put") })
-            }));
+    /// A damaged index, as a partial CI cache restore leaves, is replaced
+    /// at once instead of failing every later run.
+    #[tokio::test]
+    async fn open_replaces_a_damaged_index() {
+        let dir = tempdir().unwrap();
+        let index = dir.path().join("index.sqlite");
+        std::fs::write(&index, b"not a sqlite database").unwrap();
+        let started = std::time::Instant::now();
+        let store = Store::open(dir.path()).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let id = store.put_bytes(b"bytes").await.unwrap();
+        for n in 0..500 {
+            store
+                .add_artifact(&coord(&format!("a{n}"), None), &id)
+                .await
+                .unwrap();
         }
+        drop(store);
+        let len = std::fs::metadata(&index).unwrap().len();
+        std::fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_len(len / 2)
+            .unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.add_artifact(&coord("b", None), &id).await.unwrap();
+        assert_eq!(
+            store.lookup_artifact(&coord("b", None)).await.unwrap(),
+            Some(id)
+        );
+    }
 
-        let ids: Vec<BlobId> = handles
-            .into_iter()
-            .map(|h| h.join().expect("thread join"))
-            .collect();
-
-        // Both threads must have received the correct blob ID
-        for id in &ids {
+    /// An index cut short on a page boundary keeps an intact first page;
+    /// SQLite compares the page count it records with the file.
+    #[tokio::test]
+    async fn open_replaces_an_index_cut_on_a_page_boundary() {
+        let dir = tempdir().unwrap();
+        let index = dir.path().join("index.sqlite");
+        let store = Store::open(dir.path()).unwrap();
+        let id = store.put_bytes(b"bytes").await.unwrap();
+        let rows = (0..3000).map(|n| (coord(&format!("a{n}"), None), id.clone()));
+        store.add_artifacts(rows.collect()).await.unwrap();
+        drop(store);
+        let len = std::fs::metadata(&index).unwrap().len();
+        assert!(len >= 16 * 4096, "{len}");
+        std::fs::File::options()
+            .write(true)
+            .open(&index)
+            .unwrap()
+            .set_len(len / 2 / 4096 * 4096)
+            .unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        for n in (0..3000).step_by(25) {
             assert_eq!(
-                id, &expected_id,
-                "each writer must receive the correct blob ID"
+                store
+                    .lookup_artifact(&coord(&format!("a{n}"), None))
+                    .await
+                    .unwrap(),
+                None
             );
         }
+    }
 
-        // The blob on disk must have exactly the right content (no corruption)
-        let store = Store::open(&store_root).expect("store open for verify");
-        let blob_path = store.get_path(&expected_id);
+    /// Damage past the schema page passes the check at open, so the first
+    /// query that reads it recreates the index, for every handle on it.
+    #[tokio::test]
+    async fn a_query_that_finds_the_index_damaged_recreates_it() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let id = store.put_bytes(b"bytes").await.unwrap();
+        let rows = (0..3000).map(|n| (coord(&format!("a{n}"), None), id.clone()));
+        store.add_artifacts(rows.collect()).await.unwrap();
+        drop(store);
+        crate::sqlite::damage_past_schema(&dir.path().join("index.sqlite"));
+        let (store, other) = (
+            Store::open(dir.path()).unwrap(),
+            Store::open(dir.path()).unwrap(),
+        );
+        assert_eq!(
+            store.lookup_artifact(&coord("a7", None)).await.unwrap(),
+            None
+        );
+        other.add_artifact(&coord("b", None), &id).await.unwrap();
+        assert_eq!(
+            store.lookup_artifact(&coord("b", None)).await.unwrap(),
+            Some(id)
+        );
+    }
+
+    /// A damaged index that another process has open, or that a
+    /// connection outside the pool still reads, is not deleted under it;
+    /// a later handle recreates it once it is alone.
+    #[tokio::test]
+    async fn a_damaged_index_in_use_is_kept() {
+        let dir = tempdir().unwrap();
+        let index = dir.path().join("index.sqlite");
+        let store = Store::open(dir.path()).unwrap();
+        let id = store.put_bytes(b"bytes").await.unwrap();
+        let rows = (0..3000).map(|n| (coord(&format!("a{n}"), None), id.clone()));
+        store.add_artifacts(rows.collect()).await.unwrap();
+        drop(store);
+        crate::sqlite::damage_past_schema(&index);
+        let damaged = std::fs::read(&index).unwrap();
+        let corrupt = |result: Result<Option<BlobId>, StoreError>| {
+            let err = result.unwrap_err();
+            assert_eq!(err.db_failure(), Some(crate::DbFailure::Corrupt), "{err}");
+        };
+
+        let peer = std::fs::File::open(dir.path().join("index.sqlite.users")).unwrap();
+        peer.lock_shared().unwrap();
+        let mut header = damaged.clone();
+        header[..16].fill(0x5a);
+        std::fs::write(&index, &header).unwrap();
+        assert!(Store::open(dir.path()).is_err());
+        assert_eq!(std::fs::read(&index).unwrap(), header);
+        std::fs::write(&index, &damaged).unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        corrupt(store.lookup_artifact(&coord("a7", None)).await);
+        drop((store, peer));
+        assert_eq!(std::fs::read(&index).unwrap(), damaged);
+
+        let store = Store::open(dir.path()).unwrap();
+        let outside = store.pool.conn();
+        corrupt(store.lookup_artifact(&coord("a7", None)).await);
+        assert_eq!(std::fs::read(&index).unwrap(), damaged);
+        drop(store);
+        let users = std::fs::File::open(dir.path().join("index.sqlite.users")).unwrap();
         assert!(
-            blob_path.is_file(),
-            "blob file must exist after concurrent writes"
+            users.try_lock().is_err(),
+            "the outside connection keeps it open"
         );
-        let on_disk = std::fs::read(&blob_path).expect("read blob");
+        drop((outside, users));
+
+        let store = Store::open(dir.path()).unwrap();
         assert_eq!(
-            on_disk, payload,
-            "blob content must not be corrupted by concurrent writes"
-        );
-        let actual_id = BlobId::from_bytes(&on_disk);
-        assert_eq!(
-            actual_id, expected_id,
-            "SHA-256 of stored blob must match expected hash"
+            store.lookup_artifact(&coord("a7", None)).await.unwrap(),
+            None
         );
     }
 
+    /// A query waiting for the store lock holds no connection, so the
+    /// queries that need no lock run meanwhile.
     #[test]
-    fn store_lock_serialises_threads_in_same_process() {
-        // On Linux, flock(2) is per-open-file-description: two threads in
-        // the same process can both acquire the file lock independently.
-        // The intra-process Mutex registry must serialise them before the
-        // flock is even attempted.
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    fn a_wait_for_the_store_lock_holds_no_connection() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let lookup = |conn: &mut rusqlite::Connection| {
+            crate::index::lookup_artifact(conn, &coord("a", None))
+        };
+        let lock = StoreLock::acquire(dir.path()).unwrap();
+        let waiting: Vec<_> = (0..super::POOL_SIZE)
+            .map(|_| {
+                let pool = Arc::clone(&store.pool);
+                std::thread::spawn(move || pool.run_locked(lookup))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        assert_eq!(store.pool.run(lookup).unwrap(), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(lock);
+        for thread in waiting {
+            assert_eq!(thread.join().unwrap().unwrap(), None);
+        }
+    }
 
-        let dir = tempdir().expect("tempdir");
-        let store_root = dir.path().join("locked-store");
-        let _store = Store::open(&store_root).expect("open");
+    /// A blob that cannot be published keeps the cause's kind, so a full
+    /// volume or a permission problem is reported as such.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_publish_keeps_the_error_kind() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let parent = store.get_path(&BlobId::from_bytes(b"bytes"));
+        let parent = parent.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes anyway.
+        let writable = std::fs::write(parent.join("probe"), b"").is_ok();
+        let result = store.put_bytes(b"bytes").await;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            return;
+        }
+        match result {
+            Err(StoreError::IoError(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
-        let in_section = Arc::new(AtomicUsize::new(0));
-        let max_observed = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(4));
+    #[test]
+    fn open_sweeps_stale_temp_files() {
+        let dir = tempdir().unwrap();
 
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            let root = store_root.clone();
-            let in_section = in_section.clone();
-            let max_observed = max_observed.clone();
-            let barrier = barrier.clone();
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                for _ in 0..5 {
-                    let _lock = super::StoreLock::acquire(&root).expect("lock");
-                    let cur = in_section.fetch_add(1, Ordering::SeqCst) + 1;
-                    max_observed.fetch_max(cur, Ordering::SeqCst);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    in_section.fetch_sub(1, Ordering::SeqCst);
+        let root = dir.path().join("store");
+        let stale = root.join(TMP_DIR).join("nested").join("stale.tmp");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"x").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(48 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let fresh = root.join(TMP_DIR).join("fresh.tmp");
+        std::fs::write(&fresh, b"x").unwrap();
+        Store::open(&root).unwrap();
+        assert!(!stale.exists() && !stale.parent().unwrap().exists());
+        assert!(fresh.exists());
+    }
+
+    async fn put(
+        store: &Store,
+        body: &'static [u8],
+        expect: Expect<'_>,
+        key: Option<&ArtifactCoord>,
+    ) -> Result<crate::Verified, PutError<std::io::Error>> {
+        let chunks = vec![Ok(Bytes::from_static(body))];
+        store
+            .put_stream_verified(stream::iter(chunks), expect, key)
+            .await
+    }
+
+    #[tokio::test]
+    async fn verified_put_indexes_only_matching_bytes() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let body = b"served bytes";
+        let sha1 = Digest::Sha1(Sha1::from_bytes(body));
+        let sha256 = Digest::Sha256(BlobId::from_bytes(body));
+        let other = Digest::Sha256(BlobId::from_bytes(b"locked bytes"));
+
+        let bad = coord("bad", None);
+        for (sidecar, pin, failed) in [
+            (&other, None, Expectation::Sidecar),
+            (&sha1, Some(&other), Expectation::Pin),
+        ] {
+            let expect = Expect {
+                sidecar: Some(sidecar),
+                pin,
+            };
+            match put(&store, body, expect, Some(&bad)).await {
+                Err(PutError::Mismatch {
+                    against,
+                    expected,
+                    actual,
+                }) => {
+                    assert_eq!((against, &expected, &actual), (failed, &other, &sha256));
                 }
-            }));
+                other => panic!("expected a mismatch, got {other:?}"),
+            }
         }
-        for h in handles {
-            h.join().expect("thread");
-        }
+        // A failed check leaves no blob, row or temporary file behind.
+        assert!(!store.get_path(&BlobId::from_bytes(body)).exists());
+        assert_eq!(store.lookup_artifact(&bad).await.unwrap(), None);
         assert_eq!(
-            max_observed.load(Ordering::SeqCst),
-            1,
-            "StoreLock must serialise threads in the same process"
+            std::fs::read_dir(dir.path().join(TMP_DIR)).unwrap().count(),
+            0
+        );
+
+        let good = coord("good", None);
+        let expect = Expect {
+            sidecar: Some(&sha1),
+            pin: Some(&sha256),
+        };
+        let verified = put(&store, body, expect, Some(&good)).await.unwrap();
+        assert_eq!(verified.size, body.len() as u64);
+        assert_eq!(
+            store.lookup_artifact(&good).await.unwrap(),
+            Some(verified.blob)
         );
     }
 
-    /// Simulate the Windows `fs::rename` → `AlreadyExists` race in
-    /// `publish_noclobber`. When the target already contains the correct bytes,
-    /// `publish_noclobber` must return `BlobOrigin::Existed` rather than an error.
-    ///
-    /// On POSIX this path is normally unreachable (rename is atomic-replace),
-    /// but the logic is cross-platform and the test exercises it on all
-    /// platforms via `publish_noclobber`'s pre-flight metadata guard: we
-    /// pre-populate the target so the pre-flight branch fires and returns
-    /// `Existed` before reaching the rename; this is the same code path Windows hits
-    /// when the OS returns `ERROR_ALREADY_EXISTS` from `MoveFileExW`.
+    #[tokio::test]
+    async fn index_writes_sync_found_blobs_and_refuse_missing_ones() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // A blob another process published and did not sync.
+        let found = BlobId::from_bytes(b"published elsewhere");
+        let path = store.get_path(&found);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"published elsewhere").unwrap();
+        let durability = &root_shared(&store.root).durability;
+        let before = durability.registered();
+
+        let (key, other) = (coord("demo", None), coord("other", None));
+        let first = store.put_bytes(b"first").await.unwrap();
+        store
+            .add_artifacts(vec![
+                (key.clone(), first.clone()),
+                (other.clone(), found.clone()),
+                (key.clone(), found.clone()),
+            ])
+            .await
+            .unwrap();
+        assert!(durability.registered() > before);
+        assert!(durability.synced() >= durability.registered());
+        assert!(store.is_indexed(&key, &found).await.unwrap());
+        assert!(!store.is_indexed(&key, &first).await.unwrap());
+
+        let missing = BlobId::from_bytes(b"never stored");
+        let err = store.add_artifact(&other, &missing).await.unwrap_err();
+        assert!(matches!(err, StoreError::IntegrityError(_)), "{err:?}");
+        assert!(store.is_indexed(&other, &found).await.unwrap());
+        std::fs::remove_file(&path).unwrap();
+        assert!(!store.is_indexed(&other, &found).await.unwrap());
+        assert_eq!(store.lookup_artifact_locked(&other).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn lookup_scrubs_an_unparseable_blob_id_row() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let key = coord("corrupt", None);
+        let rows = || -> i64 {
+            let conn = store.pool.conn();
+            conn.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+                .unwrap()
+        };
+        let id = store.put_bytes(b"replacement").await.unwrap();
+        for locked in [false, true] {
+            store.pool.conn().execute(
+                "INSERT OR REPLACE INTO artifacts VALUES ('com.example', 'corrupt', '1.0.0', 'jar', '', 'not-a-blob-id')",
+                [],
+            )
+            .unwrap();
+            let found = if locked {
+                store.lookup_artifact_locked(&key).await
+            } else {
+                store.lookup_artifact(&key).await
+            };
+            assert_eq!(found.unwrap(), None);
+            assert_eq!(rows(), 0);
+        }
+        store.add_artifact(&key, &id).await.unwrap();
+        assert_eq!(store.lookup_artifact(&key).await.unwrap(), Some(id));
+    }
+
     #[test]
-    fn publish_noclobber_rename_already_exists_returns_existed() {
-        let dir = tempdir().expect("tempdir");
-        let root = dir.path();
-
-        let payload = b"windows-cas-race-test";
-        let id = BlobId::from_bytes(payload);
-
-        // Write the "winning" copy at the target path.
-        let target = root.join("target_blob");
-        std::fs::write(&target, payload).expect("write target");
-
-        // The src copy (what we'd normally rename).
-        let src = root.join("src_blob");
-        std::fs::write(&src, payload).expect("write src");
-
-        // publish_noclobber should detect the existing valid target and
-        // return Existed without touching it.
-        let (returned_id, origin) =
-            super::publish_noclobber(&src, &target, &id, super::BlobOrigin::Created)
-                .expect("publish_noclobber");
-
-        assert_eq!(returned_id, id, "returned id must match expected");
-        assert_eq!(
-            origin,
-            super::BlobOrigin::Existed,
-            "pre-existing valid target must yield BlobOrigin::Existed"
-        );
-        // Target still exists with correct bytes.
-        assert_eq!(std::fs::read(&target).expect("read target"), payload);
+    fn concurrent_opens_and_writers_of_one_blob_agree() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("store");
+        let barrier = Arc::new(Barrier::new(2));
+        let payload = b"concurrent-artifact-content";
+        let writers: Vec<_> = (0..2)
+            .map(|_| {
+                let (root, barrier) = (root.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = Store::open(&root).unwrap();
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    rt.block_on(store.put_bytes(payload)).unwrap()
+                })
+            })
+            .collect();
+        for writer in writers {
+            assert_eq!(writer.join().unwrap(), BlobId::from_bytes(payload));
+        }
+        let store = Store::open(&root).unwrap();
+        let path = store.get_path(&BlobId::from_bytes(payload));
+        assert_eq!(std::fs::read(path).unwrap(), payload);
     }
 }

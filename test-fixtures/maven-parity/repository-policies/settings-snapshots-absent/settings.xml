@@ -1,0 +1,1 @@
+<settings><profiles><profile><id>p</id><repositories><repository><id>tested</id><url>@BASE@/tested/</url></repository></repositories></profile></profiles><activeProfiles><activeProfile>p</activeProfile></activeProfiles></settings>

@@ -1,0 +1,14 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# As idless-child-over-parent, with the parent's ry declared with an id: both are kept.
+# org.scope:c:1 came from rx, which has no id (">=" in _remote.repositories), so its artifact= line names
+# rx, the last segment of the URL, which is how the harness names a raeva repository; d came from ry.
+result=success
+module=org.scope:idless-child-and-parent-with-id:1
+# org.scope:a:jar:1:compile
+artifact=org.scope:a:1:r1
+# org.scope:c:jar:1:compile
+artifact=org.scope:c:1:rx
+# org.scope:d:jar:1:compile
+artifact=org.scope:d:1:ry

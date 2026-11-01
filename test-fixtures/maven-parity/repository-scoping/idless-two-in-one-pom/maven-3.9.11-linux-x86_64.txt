@@ -1,0 +1,8 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# org.scope:a:1 declares two repositories without an id, rx and then ry; its parent p is in rx, c in rx, d in ry.
+# The parent is found in rx: the model resolver keeps the first repository per id. The effective model keeps ry,
+# the later entry with the same (absent) id, so c is not found.
+result=failure
+missing=org.scope:c:1

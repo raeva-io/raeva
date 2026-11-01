@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  
+  <groupId>org.f4</groupId><artifactId>profile-bom-after-own-management</artifactId><version>1.0</version>
+  <repositories><repository><id>repo</id><url>file://${project.basedir}/repo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+<dependencyManagement><dependencies><dependency><groupId>org.f4</groupId><artifactId>bom-a</artifactId><version>1.0</version><type>pom</type><scope>import</scope></dependency><dependency><groupId>org.f4</groupId><artifactId>explicit</artifactId><version>1.0</version></dependency></dependencies></dependencyManagement><profiles><profile><id>extra</id><activation><activeByDefault>true</activeByDefault></activation><dependencyManagement><dependencies><dependency><groupId>org.f4</groupId><artifactId>bom-b</artifactId><version>1.0</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement></profile></profiles><dependencies><dependency><groupId>org.f4</groupId><artifactId>managed</artifactId></dependency><dependency><groupId>org.f4</groupId><artifactId>explicit</artifactId></dependency></dependencies>
+</project>

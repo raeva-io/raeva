@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.test</groupId><artifactId>root</artifactId><version>1</version></parent>
+  <groupId>org.test</groupId><artifactId>m1</artifactId><version>1</version>
+  <properties><os.detection.classifierWithLikes>fedora,rhel,centos,suse,debian,ubuntu,arch,alpine</os.detection.classifierWithLikes></properties>
+  <repositories><repository><id>project-local</id><url>file://${project.basedir}/../repository/</url></repository></repositories><dependencies><dependency><groupId>org.test</groupId><artifactId>native</artifactId><version>1.0</version><classifier>${os.detected.classifier}</classifier></dependency></dependencies>
+</project>

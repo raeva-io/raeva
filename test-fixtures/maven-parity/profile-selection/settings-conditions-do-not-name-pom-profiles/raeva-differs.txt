@@ -1,0 +1,5 @@
+# Maven's help:active-profiles lists the settings.xml profiles extra and fallback (source: external).
+# They select no project profile, so raeva's model_profiles, which lists the profiles that shape
+# the models, is empty. The resolution is Maven's: c and d are not dependencies.
+result=success
+module=org.ps:settings-conditions-do-not-name-pom-profiles:1.0

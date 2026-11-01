@@ -1,0 +1,211 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "bomFormat": "CycloneDX",
+    "components": [
+      {
+        "bom-ref": "pkg:maven/org.golden/api-spec@1.0",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "21ae27f125a21fe84a0c9750295e3aebc596f73c6bfd5470d794dae9cc75a521"
+          }
+        ],
+        "name": "api-spec",
+        "purl": "pkg:maven/org.golden/api-spec@1.0",
+        "type": "library",
+        "version": "1.0"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/core@1.1",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "da046b16d5e771f0135be2a01a91443d90debda6c64fe2042da4acb2d26650da"
+          }
+        ],
+        "name": "core",
+        "purl": "pkg:maven/org.golden/core@1.1",
+        "type": "library",
+        "version": "1.1"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/lib@1.0",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "4ffa4d7c06816bb0e0dc7f963d299d53c3a089479ebac9287352a57ba413f533"
+          }
+        ],
+        "name": "lib",
+        "purl": "pkg:maven/org.golden/lib@1.0",
+        "type": "library",
+        "version": "1.0"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/lib@1.0?classifier=jdk11",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "c07ea2612252ab35fd36eadef62ff684574138f0fe641bb8c22664720ed5db38"
+          }
+        ],
+        "name": "lib",
+        "purl": "pkg:maven/org.golden/lib@1.0?classifier=jdk11",
+        "type": "library",
+        "version": "1.0"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/lib@1.0?classifier=tests",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "6627b325e0b91d1e9634728f5debdafb16454b614b800718a6bb1b560b5d83eb"
+          }
+        ],
+        "name": "lib",
+        "purl": "pkg:maven/org.golden/lib@1.0?classifier=tests",
+        "type": "library",
+        "version": "1.0"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/runtime-only@1.0",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "407227943b0fed6aa04b0345ff64aaeacd181f65bccaab9a6037e8c7ecf5bea8"
+          }
+        ],
+        "name": "runtime-only",
+        "purl": "pkg:maven/org.golden/runtime-only@1.0",
+        "type": "library",
+        "version": "1.0"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/testlib@1.0",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "7bc8759ff5c474d884adea23031c800f854f4dda0fe1cfe8a2c03819bbdbb240"
+          }
+        ],
+        "name": "testlib",
+        "purl": "pkg:maven/org.golden/testlib@1.0",
+        "type": "library",
+        "version": "1.0"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/util@1.0",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "ecff2cca714af60194891bf55cd1683f0d4430daf2566002c384ad7bb046a917"
+          }
+        ],
+        "name": "util",
+        "purl": "pkg:maven/org.golden/util@1.0",
+        "type": "library",
+        "version": "1.0"
+      },
+      {
+        "bom-ref": "pkg:maven/org.golden/vendored@0.9",
+        "group": "org.golden",
+        "hashes": [
+          {
+            "alg": "SHA-256",
+            "content": "f4b6afab6ff07a0a94aa34417f29118f031289a097a10b4456c3ec4f9aa9ae14"
+          }
+        ],
+        "name": "vendored",
+        "purl": "pkg:maven/org.golden/vendored@0.9",
+        "type": "library",
+        "version": "0.9"
+      }
+    ],
+    "dependencies": [
+      {
+        "dependsOn": [
+          "pkg:maven/org.golden/api-spec@1.0",
+          "pkg:maven/org.golden/core@1.1",
+          "pkg:maven/org.golden/lib@1.0",
+          "pkg:maven/org.golden/lib@1.0?classifier=jdk11",
+          "pkg:maven/org.golden/lib@1.0?classifier=tests",
+          "pkg:maven/org.golden/runtime-only@1.0",
+          "pkg:maven/org.golden/testlib@1.0",
+          "pkg:maven/org.golden/vendored@0.9"
+        ],
+        "ref": "pkg:maven/org.golden.app/single@1.0"
+      },
+      {
+        "ref": "pkg:maven/org.golden/api-spec@1.0"
+      },
+      {
+        "dependsOn": [
+          "pkg:maven/org.golden/util@1.0"
+        ],
+        "ref": "pkg:maven/org.golden/core@1.1"
+      },
+      {
+        "ref": "pkg:maven/org.golden/lib@1.0"
+      },
+      {
+        "ref": "pkg:maven/org.golden/lib@1.0?classifier=jdk11"
+      },
+      {
+        "ref": "pkg:maven/org.golden/lib@1.0?classifier=tests"
+      },
+      {
+        "ref": "pkg:maven/org.golden/runtime-only@1.0"
+      },
+      {
+        "dependsOn": [
+          "pkg:maven/org.golden/util@1.0"
+        ],
+        "ref": "pkg:maven/org.golden/testlib@1.0"
+      },
+      {
+        "ref": "pkg:maven/org.golden/util@1.0"
+      },
+      {
+        "ref": "pkg:maven/org.golden/vendored@0.9"
+      }
+    ],
+    "metadata": {
+      "component": {
+        "bom-ref": "pkg:maven/org.golden.app/single@1.0",
+        "group": "org.golden.app",
+        "name": "single",
+        "purl": "pkg:maven/org.golden.app/single@1.0",
+        "type": "application",
+        "version": "1.0"
+      },
+      "properties": [
+        {
+          "name": "raeva:target",
+          "value": "<host-platform>"
+        }
+      ],
+      "tools": {
+        "components": [
+          {
+            "group": "raeva",
+            "name": "raeva",
+            "type": "application",
+            "version": "<raeva-version>"
+          }
+        ]
+      }
+    },
+    "serialNumber": "urn:uuid:<document-identity>",
+    "specVersion": "1.5",
+    "version": 1
+  }
+}

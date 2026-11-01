@@ -1,0 +1,5 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate
+result=success
+module=org.ci:root:2.5-SNAPSHOT
+module=org.ci:child:2.5-SNAPSHOT

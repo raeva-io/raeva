@@ -1,0 +1,9 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64, os-maven-plugin 1.7.1
+# mvn dependency:list
+# Maven sorts root first, so os-maven-plugin reads root's
+# os.detection.classifierWithLikes, none-such, for the whole build: m1's own
+# list, which names arch and the other common releases, adds no suffix.
+result=success
+module=org.test:root:1
+module=org.test:m1:1
+classifier=linux-x86_64

@@ -1,110 +1,112 @@
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::SbomError;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One package to list in an SBOM.
+///
+/// The generator checks every component before rendering anything, and
+/// returns [`SbomError::InvalidComponent`] on the first failure:
+///
+/// - `name` and `version` are not blank.
+/// - `purl` parses and equals the form [`rv_maven_types::canonicalize_purl`]
+///   returns for it, and no two components in one document share a purl.
+/// - each hash is hex of the length its algorithm produces.
+/// - each `dependencies` entry is the purl of a component in the same
+///   document.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Component {
+    /// Package name (the Maven artifactId), written as CycloneDX `name`.
     pub name: String,
+    /// Package version, written as CycloneDX `version`.
     pub version: String,
+    /// Maven groupId, written as CycloneDX `group`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Package URL in canonical form. It is the CycloneDX `bom-ref` and the
+    /// key `dependencies` entries refer to.
     pub purl: String,
-    /// SPDX license expression supplied by the caller.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub license_expression: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    /// Digests of the package artifact, written as CycloneDX `hashes`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hashes: Vec<Hash>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    /// Licenses from the effective POM, written as CycloneDX `licenses`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub licenses: Vec<crate::License>,
+    /// Purls of the components this one depends on directly, written as a
+    /// CycloneDX `dependsOn` list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One digest of a component's artifact.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Hash {
+    /// Algorithm that produced `value`.
     pub algorithm: HashAlgorithm,
+    /// Hex digest of the length `algorithm` produces. Either letter case is
+    /// accepted, and the value is written as given.
     pub value: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Digest algorithm of a [`Hash`](struct@Hash).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum HashAlgorithm {
+    /// SHA-256, 64 hex digits.
     Sha256,
+    /// SHA-512, 128 hex digits.
     Sha512,
+    /// MD5, 32 hex digits.
     Md5,
+    /// SHA-1, 40 hex digits.
     Sha1,
 }
 
-pub fn validate_components(components: &[Component]) -> Result<(), SbomError> {
-    let mut seen = std::collections::HashSet::with_capacity(components.len());
-    for component in components {
+pub(crate) fn validate_components<'a>(
+    components: impl Iterator<Item = &'a Component> + Clone,
+) -> Result<(), SbomError> {
+    let invalid = |message: String| Err(SbomError::InvalidComponent(message));
+    let mut seen = std::collections::HashSet::new();
+    for component in components.clone() {
+        let purl = &component.purl;
         if component.name.trim().is_empty() {
-            return Err(SbomError::InvalidComponent(format!(
-                "component {} has empty name",
-                component.purl
-            )));
+            return invalid(format!("component {purl} has empty name"));
         }
         if component.version.trim().is_empty() {
-            return Err(SbomError::InvalidComponent(format!(
-                "component {} has empty version",
-                component.name
-            )));
+            return invalid(format!("component {} has empty version", component.name));
         }
-        let canonical_purl = crate::purl::canonicalize_purl(&component.purl).ok_or_else(|| {
-            SbomError::InvalidComponent(format!("invalid purl: {}", component.purl))
-        })?;
-        if canonical_purl != component.purl {
-            return Err(SbomError::InvalidComponent(format!(
-                "non-canonical purl: {}",
-                component.purl
-            )));
+        match rv_maven_types::canonicalize_purl(purl) {
+            None => return invalid(format!("invalid purl: {purl}")),
+            Some(canonical) if canonical != *purl => {
+                return invalid(format!("non-canonical purl: {purl}"));
+            }
+            Some(_) => {}
         }
-        if !seen.insert(component.purl.as_str()) {
-            return Err(SbomError::InvalidComponent(format!(
-                "duplicate purl: {}",
-                component.purl
-            )));
-        }
-        if component
-            .license_expression
-            .as_ref()
-            .is_some_and(|expression| expression.trim().is_empty())
-        {
-            return Err(SbomError::InvalidComponent(format!(
-                "component {} has empty license expression",
-                component.name
-            )));
+        if !seen.insert(purl.as_str()) {
+            return invalid(format!("duplicate purl: {purl}"));
         }
         for hash in &component.hashes {
-            validate_hash(component, hash)?;
-        }
-    }
-
-    for component in components {
-        for dependency in &component.dependencies {
-            if !seen.contains(dependency.as_str()) {
-                return Err(SbomError::InvalidComponent(format!(
-                    "component {} references unknown dependency {}",
-                    component.purl, dependency
-                )));
+            let length = match hash.algorithm {
+                HashAlgorithm::Sha256 => 64,
+                HashAlgorithm::Sha512 => 128,
+                HashAlgorithm::Md5 => 32,
+                HashAlgorithm::Sha1 => 40,
+            };
+            if hash.value.len() != length || !hash.value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return invalid(format!(
+                    "component {purl} has invalid {:?} hash",
+                    hash.algorithm
+                ));
             }
         }
     }
-
-    Ok(())
-}
-
-fn validate_hash(component: &Component, hash: &Hash) -> Result<(), SbomError> {
-    let expected_length = match hash.algorithm {
-        HashAlgorithm::Sha256 => 64,
-        HashAlgorithm::Sha512 => 128,
-        HashAlgorithm::Md5 => 32,
-        HashAlgorithm::Sha1 => 40,
-    };
-    if hash.value.len() != expected_length
-        || !hash.value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(SbomError::InvalidComponent(format!(
-            "component {} has invalid {:?} hash",
-            component.purl, hash.algorithm
-        )));
+    for component in components {
+        for dependency in &component.dependencies {
+            if !seen.contains(dependency.as_str()) {
+                return invalid(format!(
+                    "component {} references unknown dependency {dependency}",
+                    component.purl
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -113,94 +115,61 @@ fn validate_hash(component: &Component, hash: &Hash) -> Result<(), SbomError> {
 mod tests {
     use super::{Component, Hash, HashAlgorithm, validate_components};
 
-    fn component_with_purl(name: &str, purl: &str) -> Component {
+    fn component(purl: &str) -> Component {
         Component {
-            name: name.to_string(),
+            name: "a".to_string(),
             version: "1.0.0".to_string(),
             group: None,
             purl: purl.to_string(),
-            license_expression: None,
             hashes: vec![],
+            licenses: vec![],
             dependencies: vec![],
         }
     }
 
-    #[test]
-    fn validate_components_accepts_unique_purls() {
-        let components = vec![
-            component_with_purl("a", "pkg:maven/org.example/a@1.0.0"),
-            component_with_purl("b", "pkg:maven/org.example/b@1.0.0"),
-        ];
-        assert!(validate_components(&components).is_ok());
+    fn error(components: &[Component]) -> String {
+        validate_components(components.iter())
+            .expect_err("invalid components")
+            .to_string()
     }
 
     #[test]
-    fn validate_components_rejects_empty_purl() {
-        let components = vec![component_with_purl("a", "   ")];
-        let err = validate_components(&components).unwrap_err();
-        assert!(err.to_string().contains("invalid purl"));
-    }
+    fn validation_rejects_each_defect() {
+        let purl = "pkg:maven/org.example/a@1.0.0";
+        let ok = component(purl);
+        assert!(validate_components([ok.clone()].iter()).is_ok());
 
-    #[test]
-    fn validate_components_rejects_duplicate_purls() {
-        let components = vec![
-            component_with_purl("a", "pkg:maven/org.example/dup@1.0.0"),
-            component_with_purl("b", "pkg:maven/org.example/dup@1.0.0"),
-        ];
-        let err = validate_components(&components).unwrap_err();
-        assert!(
-            err.to_string().contains("duplicate purl"),
-            "expected duplicate purl error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn component_clone_and_fields() {
-        let component = Component {
-            name: "example".to_string(),
-            version: "1.0.0".to_string(),
-            group: Some("org.example".to_string()),
-            purl: "pkg:maven/org.example/example@1.0.0".to_string(),
-            license_expression: Some("Apache-2.0".to_string()),
-            hashes: vec![Hash {
-                algorithm: HashAlgorithm::Sha256,
-                value: "d".repeat(64),
-            }],
-            dependencies: vec!["pkg:maven/org.example/dep@2.0.0".to_string()],
+        let blank_name = Component {
+            name: " ".into(),
+            ..ok.clone()
         };
-
-        let cloned = component.clone();
-        assert_eq!(component, cloned);
+        let blank_version = Component {
+            version: " ".into(),
+            ..ok.clone()
+        };
+        let dangling = Component {
+            dependencies: vec!["pkg:maven/org.example/missing@1.0.0".into()],
+            ..ok.clone()
+        };
+        let cases = [
+            (vec![blank_name], "empty name"),
+            (vec![blank_version], "empty version"),
+            (vec![component("not-a-purl")], "invalid purl"),
+            (
+                vec![component(&format!("{purl}?type=jar&classifier=tests"))],
+                "non-canonical purl",
+            ),
+            (vec![ok.clone(), ok.clone()], "duplicate purl"),
+            (vec![dangling], "unknown dependency"),
+        ];
+        for (components, expected) in cases {
+            let message = error(&components);
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
     }
 
     #[test]
-    fn validate_components_rejects_empty_name_and_version() {
-        let mut component = component_with_purl(" ", "pkg:maven/org.example/a@1.0.0");
-        let error = validate_components(&[component.clone()]).expect_err("empty name must fail");
-        assert!(error.to_string().contains("empty name"));
-
-        component.name = "a".to_string();
-        component.version = " ".to_string();
-        let error = validate_components(&[component]).expect_err("empty version must fail");
-        assert!(error.to_string().contains("empty version"));
-    }
-
-    #[test]
-    fn validate_components_rejects_invalid_and_noncanonical_purls() {
-        let invalid = component_with_purl("a", "not-a-purl");
-        let error = validate_components(&[invalid]).expect_err("invalid purl must fail");
-        assert!(error.to_string().contains("invalid purl"));
-
-        let noncanonical = component_with_purl(
-            "a",
-            "pkg:maven/org.example/a@1.0.0?type=jar&classifier=tests",
-        );
-        let error = validate_components(&[noncanonical]).expect_err("non-canonical purl must fail");
-        assert!(error.to_string().contains("non-canonical purl"));
-    }
-
-    #[test]
-    fn validate_components_checks_hash_encoding_and_length() {
+    fn validation_checks_hash_encoding_and_length() {
         let cases = [
             (HashAlgorithm::Sha256, 64),
             (HashAlgorithm::Sha512, 128),
@@ -208,26 +177,18 @@ mod tests {
             (HashAlgorithm::Sha1, 40),
         ];
         for (algorithm, length) in cases {
-            let mut component = component_with_purl("a", "pkg:maven/org.example/a@1.0.0");
-            component.hashes = vec![Hash {
-                algorithm: algorithm.clone(),
-                value: "a".repeat(length - 1),
-            }];
-            assert!(validate_components(&[component.clone()]).is_err());
-
-            component.hashes[0].value = format!("{}g", "a".repeat(length - 1));
-            assert!(validate_components(&[component.clone()]).is_err());
-
-            component.hashes[0].value = "A".repeat(length);
-            assert!(validate_components(&[component]).is_ok());
+            let mut component = component("pkg:maven/org.example/a@1.0.0");
+            for (value, valid) in [
+                ("a".repeat(length - 1), false),
+                (format!("{}g", "a".repeat(length - 1)), false),
+                ("A".repeat(length), true),
+            ] {
+                component.hashes = vec![Hash {
+                    algorithm: algorithm.clone(),
+                    value,
+                }];
+                assert_eq!(validate_components([&component].into_iter()).is_ok(), valid);
+            }
         }
-    }
-
-    #[test]
-    fn validate_components_rejects_unknown_dependency_target() {
-        let mut component = component_with_purl("a", "pkg:maven/org.example/a@1.0.0");
-        component.dependencies = vec!["pkg:maven/org.example/missing@1.0.0".to_string()];
-        let error = validate_components(&[component]).expect_err("unknown dependency must fail");
-        assert!(error.to_string().contains("unknown dependency"));
     }
 }

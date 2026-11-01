@@ -1,0 +1,14 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# The project declares old (compile), which relocates to new, and then new itself in test
+# scope. The first direct declaration of the node sets its scope, so new and its own
+# dependency y are compile.
+result=success
+module=org.ds:first-direct-declaration-sets-the-scope:1.0
+# org.ds:new:jar:1.0:compile
+artifact=org.ds:new:1.0:repo
+scope=org.ds:new:1.0:compile
+# org.ds:y:jar:1.0:compile
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:compile

@@ -1,0 +1,15 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.sel</groupId>
+  <artifactId>pom-property-before-user-property</artifactId>
+  <version>1.0</version>
+  <properties>
+    <selector>pom</selector>
+  </properties>
+  <profiles>
+    <profile>
+      <id>selected-by-pom-value</id>
+      <activation><property><name>${selector}</name></property></activation>
+    </profile>
+  </profiles>
+</project>

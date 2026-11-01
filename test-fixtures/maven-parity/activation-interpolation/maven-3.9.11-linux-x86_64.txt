@@ -1,0 +1,8 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o help:active-profiles: none for org.act:root, these for org.act:child
+active=own-value
+active=packaging-jar
+active=packaging-not-pom
+active=basedir-file
+active=project-basedir-file
+active=root-pk

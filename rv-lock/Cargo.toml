@@ -1,0 +1,37 @@
+[package]
+name = "rv-lock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The raeva.lock model and codec for Raeva"
+readme = "README.md"
+documentation = "https://docs.rs/rv-lock"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude = ["tests/"]
+
+[lints]
+workspace = true
+
+[dependencies]
+rv-config.workspace = true
+rv-fs.workspace = true
+rv-maven-types.workspace = true
+
+dunce.workspace = true
+foldhash.workspace = true
+hex.workspace = true
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+rv-test-support.workspace = true
+tempfile.workspace = true

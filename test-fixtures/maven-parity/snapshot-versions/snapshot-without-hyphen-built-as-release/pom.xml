@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.snap</groupId>
+  <artifactId>snapshot-without-hyphen-built-as-release</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>both</id>
+      <url>file://${project.basedir}/both/</url>
+      <releases><enabled>true</enabled></releases>
+      <snapshots><enabled>true</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.snap</groupId><artifactId>no-hyphen</artifactId><version>1.0SNAPSHOT</version></dependency>
+  </dependencies>
+</project>

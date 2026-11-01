@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  
+  <groupId>org.f4</groupId><artifactId>profile-repository-order</artifactId><version>1.0</version>
+  <repositories><repository><id>pomrepo</id><url>file://${project.basedir}/pomrepo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+<profiles><profile><id>extra</id><activation><activeByDefault>true</activeByDefault></activation><repositories><repository><id>profrepo</id><url>file://${project.basedir}/profrepo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories></profile></profiles><dependencies><dependency><groupId>org.f4</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies>
+</project>

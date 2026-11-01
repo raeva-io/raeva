@@ -4,9 +4,42 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
+
+/// Reads from `stream` until the request head ends with a blank line.
+///
+/// Returns the bytes read so far, which can include the start of a body, or
+/// `None` when the peer closes or fails first. For raw test servers that
+/// need byte-level control of the response; [`StubServer`] covers the rest.
+pub async fn read_request_head(stream: &mut (impl AsyncRead + Unpin)) -> Option<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut buf = [0_u8; 4096];
+    while !head_complete(&head) {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    Some(head)
+}
+
+pub fn read_request_head_blocking(stream: &mut impl std::io::Read) -> Option<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut buf = [0_u8; 4096];
+    while !head_complete(&head) {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    Some(head)
+}
+
+fn head_complete(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|window| window == b"\r\n\r\n")
+}
 
 #[derive(Clone, Debug)]
 pub struct Request {

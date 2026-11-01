@@ -1,0 +1,18 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.ds</groupId>
+  <artifactId>direct-scope-wins-over-a-wider-path</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.ds</groupId><artifactId>a</artifactId><version>1.0</version></dependency>
+    <dependency><groupId>org.ds</groupId><artifactId>x</artifactId><version>1.0</version><scope>test</scope></dependency>
+    <dependency><groupId>org.ds</groupId><artifactId>r</artifactId><version>1.0</version><scope>runtime</scope></dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,15 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>build-parent</artifactId>
+    <version>1</version>
+    <relativePath>build-parent/pom.xml</relativePath>
+  </parent>
+  <artifactId>legacy-crlf</artifactId>
+  <packaging>pom</packaging>
+  <modules>
+    <module>lib</module>
+    <module>app</module>
+  </modules>
+</project>

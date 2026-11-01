@@ -1,0 +1,14 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.golden</groupId>
+  <artifactId>util-user</artifactId>
+  <version>1.0</version>
+  <packaging>jar</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>org.golden</groupId>
+      <artifactId>util</artifactId>
+      <version>2.0</version>
+    </dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,1 @@
+<settings><mirrors><mirror><id>other</id><url>@BASE@/absent/</url><mirrorOf>*</mirrorOf></mirror></mirrors></settings>

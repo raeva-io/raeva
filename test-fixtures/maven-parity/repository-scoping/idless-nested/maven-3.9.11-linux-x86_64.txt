@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# org.scope:a:1 declares rx without an id; e, in rx, declares ry without an id and depends on f, in ry only.
+# The resolution keeps rx, the first repository without an id along the path, so f is not found.
+result=failure
+missing=org.scope:f:1

@@ -1,0 +1,91 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "modules": [
+        {
+          "dependencies": [
+            {
+              "children": [],
+              "coordinate": "org.golden:api-spec:1.0:jar",
+              "optional": false,
+              "scope": "provided",
+              "workspace": false
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "coordinate": "org.golden:util:1.0:jar",
+                  "optional": false,
+                  "scope": "compile",
+                  "workspace": false
+                }
+              ],
+              "coordinate": "org.golden:core:1.1:jar",
+              "optional": false,
+              "scope": "compile",
+              "workspace": false
+            },
+            {
+              "children": [],
+              "coordinate": "org.golden:lib:1.0:jar",
+              "optional": false,
+              "scope": "compile",
+              "workspace": false
+            },
+            {
+              "children": [],
+              "coordinate": "org.golden:lib:1.0:jar:jdk11",
+              "optional": false,
+              "scope": "compile",
+              "workspace": false
+            },
+            {
+              "children": [],
+              "coordinate": "org.golden:lib:1.0:jar:tests",
+              "optional": false,
+              "scope": "test",
+              "workspace": false
+            },
+            {
+              "children": [],
+              "coordinate": "org.golden:runtime-only:1.0:jar",
+              "optional": false,
+              "scope": "runtime",
+              "workspace": false
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "coordinate": "org.golden:util:1.0:jar",
+                  "optional": false,
+                  "scope": "compile",
+                  "workspace": false
+                }
+              ],
+              "coordinate": "org.golden:testlib:1.0:jar",
+              "optional": false,
+              "scope": "test",
+              "workspace": false
+            },
+            {
+              "children": [],
+              "coordinate": "org.golden:vendored:0.9:jar",
+              "optional": false,
+              "scope": "system",
+              "workspace": false
+            }
+          ],
+          "gav": "org.golden.app:single:1.0",
+          "module": "pom.xml"
+        }
+      ],
+      "platform": "<host-platform>",
+      "project": "project",
+      "warnings": []
+    },
+    "success": true
+  }
+}

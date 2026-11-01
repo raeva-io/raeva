@@ -1,153 +1,80 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use indexmap::IndexSet;
 
-use packageurl::PackageUrl;
+use crate::{FailedFetch, OsvClient, Result, VulnResult};
 
-use crate::{OsvClient, Result, SeverityBand, VulnCache, VulnResult, Vulnerability};
-
+/// Looks up a set of [`Dependency`] coordinates in OSV.
 pub struct VulnScanner {
     client: OsvClient,
-    cache: Option<VulnCache>,
 }
 
 impl VulnScanner {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            client: OsvClient::new()?,
-            cache: Some(VulnCache::default()),
-        })
-    }
-
-    pub fn without_cache() -> Result<Self> {
-        Ok(Self {
-            client: OsvClient::new()?,
-            cache: None,
-        })
-    }
-
-    pub fn with_cache(cache: VulnCache) -> Result<Self> {
-        Ok(Self {
-            client: OsvClient::new()?,
-            cache: Some(cache),
-        })
-    }
-
+    /// A scanner over a configured client (endpoint, proxies, retries).
     pub fn from_client(client: OsvClient) -> Self {
-        Self {
-            client,
-            cache: None,
-        }
+        Self { client }
     }
 
+    /// Query OSV once per distinct purl among `dependencies` and report
+    /// every vulnerability found, whatever its severity.
+    ///
+    /// One distinct purl uses OSV `/query`; more use `/querybatch`, in
+    /// chunks of 100, and then fetch each named record once from
+    /// `/vulns/{id}`. A coordinate that cannot be written as a purl fails
+    /// with [`VulnError::InvalidPurl`](crate::VulnError::InvalidPurl) before
+    /// any request, and a failed query fails the scan. A record the
+    /// batch names but that cannot be fetched does not: the report keeps the
+    /// records that were fetched and lists it in
+    /// [`ScanReport::failed_fetches`], and the scan is incomplete.
     pub async fn scan(&self, dependencies: &[Dependency]) -> Result<ScanReport> {
-        self.scan_with_threshold(dependencies, 0.0).await
-    }
+        let unique_purls: Vec<String> = dependencies
+            .iter()
+            .map(Dependency::purl)
+            .collect::<Result<IndexSet<_>>>()?
+            .into_iter()
+            .collect();
 
-    pub async fn scan_with_threshold(
-        &self,
-        dependencies: &[Dependency],
-        min_severity: f32,
-    ) -> Result<ScanReport> {
-        let total_dependencies = dependencies.len();
-
-        // Deduplicate PURLs and separate cached from uncached in one pass
-        let mut unique_purls: Vec<Arc<str>> = Vec::new();
-        let mut results_map: HashMap<Arc<str>, Vec<Vulnerability>> = HashMap::new();
-        let mut to_query: Vec<Arc<str>> = Vec::new();
-        let mut seen: HashSet<Arc<str>> = HashSet::new();
-
-        for dependency in dependencies {
-            let purl: Arc<str> = dependency.purl()?.into();
-            if !seen.insert(purl.clone()) {
-                continue;
-            }
-
-            unique_purls.push(purl.clone());
-            if let Some(vulnerabilities) = self.cache.as_ref().and_then(|c| c.get(&purl)) {
-                results_map.insert(purl, vulnerabilities);
-            } else {
-                to_query.push(purl);
-            }
-        }
-
-        if !to_query.is_empty() {
-            let query_strings: Vec<String> = to_query.iter().map(|p| p.to_string()).collect();
-            let query_count = query_strings.len();
-
-            let fetched = if query_count == 1 {
-                let purl = query_strings[0].clone();
-                let vulnerabilities = self.client.query(&purl).await?;
-                vec![VulnResult {
-                    purl,
+        let (fetched, failed_fetches) = match unique_purls.as_slice() {
+            [] => (Vec::new(), Vec::new()),
+            [purl] => {
+                let vulnerabilities = self.client.query(purl).await?;
+                let result = VulnResult {
+                    purl: purl.clone(),
                     vulnerabilities,
-                }]
-            } else {
-                let batch_result = self.client.query_batch(&query_strings).await?;
-                if !batch_result.failed_fetches.is_empty() {
-                    return Err(crate::VulnError::InvalidResponse(format!(
-                        "failed to fetch {} vulnerability record(s)",
-                        batch_result.failed_fetches.len()
-                    )));
-                }
-                batch_result.results
-            };
-
-            // Build a HashMap for O(1) lookup of Arc<str> by purl string
-            let purl_map: HashMap<&str, Arc<str>> = to_query
-                .iter()
-                .map(|arc| (arc.as_ref(), arc.clone()))
-                .collect();
-
-            // Only cache results when we have a complete response (one result per queried PURL).
-            // A partial response means some results may be missing. Caching "no vulns" for
-            // those PURLs would be a false negative.
-            let is_complete_response = fetched.len() == query_count;
-
-            // Reuse Arc<str> from to_query to avoid redundant allocations
-            for result in fetched {
-                let arc_purl = purl_map
-                    .get(result.purl.as_str())
-                    .cloned()
-                    .unwrap_or_else(|| result.purl.as_str().into());
-
-                if is_complete_response && let Some(c) = self.cache.as_ref() {
-                    c.insert(arc_purl.to_string(), result.vulnerabilities.clone());
-                }
-                results_map.insert(arc_purl, result.vulnerabilities);
+                };
+                (vec![result], Vec::new())
             }
-        }
+            purls => self.client.query_batch(purls).await?,
+        };
 
-        let mut filtered_results = Vec::new();
-
-        for purl in unique_purls {
-            let vulnerabilities = results_map.remove(&purl).unwrap_or_default();
-            let filtered = filter_vulnerabilities(vulnerabilities, min_severity);
-            if filtered.is_empty() {
-                continue;
-            }
-            filtered_results.push(VulnResult {
-                purl: purl.to_string(),
-                vulnerabilities: filtered,
-            });
-        }
-
-        Ok(ScanReport::from_results(
-            total_dependencies,
-            filtered_results,
-        ))
+        // Both queries answer each purl once, in the order asked.
+        Ok(ScanReport {
+            total_dependencies: unique_purls.len(),
+            vulnerabilities: (fetched.into_iter())
+                .filter(|result| !result.vulnerabilities.is_empty())
+                .collect(),
+            failed_fetches,
+        })
     }
 }
 
+/// One Maven coordinate to look up.
 #[derive(Debug, Clone)]
 pub struct Dependency {
+    /// Maven `groupId`, the purl namespace.
     pub group_id: String,
+    /// Maven `artifactId`, the purl name.
     pub artifact_id: String,
+    /// Resolved version, the purl version.
     pub version: String,
+    /// Artifact type. Anything other than `jar` or empty becomes the purl
+    /// `type` qualifier.
     pub packaging: String,
+    /// Maven classifier, written as the purl `classifier` qualifier when
+    /// present and not empty.
     pub classifier: Option<String>,
 }
 
 impl Dependency {
+    /// A `jar` dependency without a classifier.
     pub fn new(
         group_id: impl Into<String>,
         artifact_id: impl Into<String>,
@@ -162,391 +89,138 @@ impl Dependency {
         }
     }
 
+    /// The canonical Maven purl, the same string `rv-sbom` writes for this coordinate.
     pub fn purl(&self) -> Result<String> {
-        if self.group_id.trim().is_empty() {
-            return Err(crate::VulnError::InvalidPurl(
-                "Maven group cannot be empty".to_string(),
-            ));
-        }
-        if self.artifact_id.trim().is_empty() {
-            return Err(crate::VulnError::InvalidPurl(
-                "Maven artifact cannot be empty".to_string(),
-            ));
-        }
-        if self.version.trim().is_empty() {
-            return Err(crate::VulnError::InvalidPurl(
-                "Maven version cannot be empty".to_string(),
-            ));
-        }
-
-        let mut purl = PackageUrl::new("maven", self.artifact_id.as_str())
-            .map_err(|err| crate::VulnError::InvalidPurl(err.to_string()))?;
-        purl.with_namespace(self.group_id.as_str())
-            .and_then(|purl| purl.with_version(self.version.as_str()))
-            .map_err(|err| crate::VulnError::InvalidPurl(err.to_string()))?;
-
-        if !self.packaging.is_empty() && self.packaging != "jar" {
-            purl.add_qualifier("type", self.packaging.as_str())
-                .map_err(|err| crate::VulnError::InvalidPurl(err.to_string()))?;
-        }
-        if let Some(classifier) = self.classifier.as_deref()
-            && !classifier.is_empty()
-        {
-            purl.add_qualifier("classifier", classifier)
-                .map_err(|err| crate::VulnError::InvalidPurl(err.to_string()))?;
-        }
-
-        purl.validate()
-            .map_err(|err| crate::VulnError::InvalidPurl(err.to_string()))?;
-
-        Ok(canonical_purl_string(&purl))
+        rv_maven_types::maven_purl_with_qualifiers(
+            &self.group_id,
+            &self.artifact_id,
+            &self.version,
+            &self.packaging,
+            self.classifier.as_deref(),
+        )
+        .map_err(|err| crate::VulnError::InvalidPurl(err.to_string()))
     }
 }
 
-fn canonical_purl_string(purl: &PackageUrl<'_>) -> String {
-    let rendered = purl.to_string();
-    let base = rendered
-        .split_once('?')
-        .map_or(rendered.as_str(), |(base, _)| base);
-    let base = if let Some((path, version)) = base.rsplit_once('@') {
-        format!("{path}@{}", version.replace('/', "%2F"))
-    } else {
-        base.to_string()
-    };
-    if purl.qualifiers().is_empty() {
-        return base;
-    }
-
-    let mut qualifiers = purl.qualifiers().iter().collect::<Vec<_>>();
-    qualifiers.sort();
-    let qualifiers = qualifiers
-        .into_iter()
-        .map(|(key, value)| format!("{key}={}", encode_qualifier_value(value)))
-        .collect::<Vec<_>>()
-        .join("&");
-    format!("{base}?{qualifiers}")
-}
-
-fn encode_qualifier_value(value: &str) -> String {
-    let mut probe = PackageUrl::new("generic", "probe").expect("valid probe purl");
-    probe
-        .add_qualifier("value", value)
-        .expect("valid probe qualifier");
-    probe
-        .to_string()
-        .split_once("?value=")
-        .expect("probe qualifier")
-        .1
-        .replace('&', "%26")
-}
-
+/// The outcome of [`VulnScanner::scan`]. A report with
+/// [`ScanReport::failed_fetches`] is incomplete: a purl may have more
+/// findings than it lists.
 #[derive(Debug, Clone)]
 pub struct ScanReport {
+    /// Number of distinct purls scanned. Dependencies with the same purl
+    /// count once.
     pub total_dependencies: usize,
-    pub vulnerable_dependencies: usize,
+    /// One entry per vulnerable purl, in first-seen input order. Purls
+    /// without findings are left out.
     pub vulnerabilities: Vec<VulnResult>,
-    pub critical_count: usize,
-    pub high_count: usize,
-    pub medium_count: usize,
-    pub low_count: usize,
-    pub unknown_count: usize,
+    /// Records OSV named for the scanned purls that could not be fetched,
+    /// so their findings are missing from this report.
+    pub failed_fetches: Vec<FailedFetch>,
 }
 
 impl ScanReport {
-    fn from_results(total_dependencies: usize, results: Vec<VulnResult>) -> Self {
-        let mut critical_count = 0;
-        let mut high_count = 0;
-        let mut medium_count = 0;
-        let mut low_count = 0;
-        let mut unknown_count = 0;
-
-        for result in &results {
-            for vulnerability in &result.vulnerabilities {
-                match vulnerability.severity_band() {
-                    SeverityBand::Unknown => unknown_count += 1,
-                    SeverityBand::Low => low_count += 1,
-                    SeverityBand::Medium => medium_count += 1,
-                    SeverityBand::High => high_count += 1,
-                    SeverityBand::Critical => critical_count += 1,
-                }
-            }
-        }
-
-        Self {
-            total_dependencies,
-            vulnerable_dependencies: results.len(),
-            vulnerabilities: results,
-            critical_count,
-            high_count,
-            medium_count,
-            low_count,
-            unknown_count,
-        }
+    /// Whether every record OSV named was fetched.
+    pub fn is_complete(&self) -> bool {
+        self.failed_fetches.is_empty()
     }
-}
-
-fn filter_vulnerabilities(
-    vulnerabilities: Vec<Vulnerability>,
-    min_severity: f32,
-) -> Vec<Vulnerability> {
-    vulnerabilities
-        .into_iter()
-        .filter(|vulnerability| {
-            severity_score(vulnerability).is_none_or(|score| score >= min_severity)
-        })
-        .collect()
-}
-
-fn severity_score(vulnerability: &Vulnerability) -> Option<f32> {
-    vulnerability
-        .severity
-        .as_ref()
-        .and_then(|severity| severity.score_value())
 }
 
 #[cfg(test)]
 mod tests {
     use rv_test_support::http::{Response, StubServer};
-    use std::sync::Mutex;
 
-    use packageurl::PackageUrl;
-
-    use super::ScanReport;
-    use crate::{
-        Dependency, OsvClient, Severity, VulnError, VulnResult, VulnScanner, Vulnerability,
-    };
+    use crate::{Dependency, OsvClient, OsvSettings, VulnError, VulnScanner};
 
     #[test]
-    fn dependency_to_purl() {
-        let dependency = crate::Dependency::new("org.example", "demo", "1.0.0");
-        assert_eq!(
-            dependency.purl().expect("purl"),
-            "pkg:maven/org.example/demo@1.0.0"
-        );
-    }
-
-    #[test]
-    fn dependency_purl_includes_non_default_artifact_identity() {
-        let dependency = crate::Dependency {
-            packaging: "test-jar".to_string(),
-            classifier: Some("tests".to_string()),
-            ..crate::Dependency::new("org.example", "demo", "1.0.0")
-        };
-        assert_eq!(
-            dependency.purl().expect("purl"),
-            "pkg:maven/org.example/demo@1.0.0?classifier=tests&type=test-jar"
-        );
-    }
-
-    #[test]
-    fn dependency_purl_round_trips_reserved_characters_in_every_field() {
-        const VALUES: &[&str] = &["%", "@", "/", "&", "=", "?", "#", " ", "é"];
-
-        for value in VALUES {
-            let mut dependency = Dependency::new(format!("g{value}x"), "a", "1");
-            assert_dependency_fields(&dependency);
-
-            dependency = Dependency::new("g", format!("a{value}x"), "1");
-            assert_dependency_fields(&dependency);
-
-            dependency = Dependency::new("g", "a", format!("1{value}x"));
-            assert_dependency_fields(&dependency);
-
-            dependency.packaging = format!("type{value}value");
-            dependency.classifier = Some("tests".to_string());
-            assert_dependency_fields(&dependency);
-
-            dependency.packaging = "zip".to_string();
-            dependency.classifier = Some(format!("class{value}value"));
-            assert_dependency_fields(&dependency);
+    fn a_dependency_without_a_purl_names_the_field() {
+        for (dependency, reason) in [
+            (
+                Dependency::new("", "demo", "1.0.0"),
+                "invalid group '': group cannot be empty",
+            ),
+            (
+                Dependency::new("org.example", "", "1.0.0"),
+                "invalid artifact name '': name cannot be empty",
+            ),
+            (
+                Dependency::new("org.example", "demo", " "),
+                "invalid version '': version cannot be empty",
+            ),
+        ] {
+            let error = dependency.purl().expect_err("no purl");
+            assert!(matches!(error, VulnError::InvalidPurl(_)), "{error:?}");
+            assert_eq!(error.to_string(), format!("invalid purl: {reason}"));
         }
     }
 
-    #[test]
-    fn dependency_purl_does_not_collapse_percent_encoded_lookalikes() {
-        assert_ne!(
-            Dependency::new("g@x", "a", "1").purl().expect("purl"),
-            Dependency::new("g%40x", "a", "1").purl().expect("purl")
-        );
-        assert_ne!(
-            Dependency::new("g", "a@x", "1").purl().expect("purl"),
-            Dependency::new("g", "a%40x", "1").purl().expect("purl")
-        );
-        assert_ne!(
-            Dependency::new("g", "a", "v@x").purl().expect("purl"),
-            Dependency::new("g", "a", "v%40x").purl().expect("purl")
-        );
-
-        let mut type_at = Dependency::new("g", "a", "1");
-        type_at.packaging = "t@x".to_string();
-        let mut type_percent = type_at.clone();
-        type_percent.packaging = "t%40x".to_string();
-        assert_ne!(
-            type_at.purl().expect("purl"),
-            type_percent.purl().expect("purl")
-        );
-
-        let mut classifier_at = Dependency::new("g", "a", "1");
-        classifier_at.classifier = Some("c@x".to_string());
-        let mut classifier_percent = classifier_at.clone();
-        classifier_percent.classifier = Some("c%40x".to_string());
-        assert_ne!(
-            classifier_at.purl().expect("purl"),
-            classifier_percent.purl().expect("purl")
-        );
-    }
-
-    #[test]
-    fn dependency_purl_rejects_empty_artifact() {
-        let error = Dependency::new("g", " ", "1")
-            .purl()
-            .expect_err("empty artifact must fail");
-        assert!(error.to_string().contains("artifact"));
-    }
-
-    fn assert_dependency_fields(dependency: &Dependency) {
-        let purl = dependency.purl().expect("purl");
-        let parsed: PackageUrl = purl.parse().expect("parse purl");
-        assert_eq!(parsed.namespace(), Some(dependency.group_id.as_str()));
-        assert_eq!(parsed.name(), dependency.artifact_id);
-        assert_eq!(parsed.version(), Some(dependency.version.as_str()));
-        if dependency.packaging != "jar" {
-            assert_eq!(
-                parsed.qualifiers().get("type").map(|value| value.as_ref()),
-                Some(dependency.packaging.as_str())
-            );
-        }
-        if let Some(classifier) = dependency.classifier.as_deref() {
-            assert_eq!(
-                parsed
-                    .qualifiers()
-                    .get("classifier")
-                    .map(|value| value.as_ref()),
-                Some(classifier)
-            );
-        }
-        let rebuilt = Dependency {
-            group_id: parsed.namespace().unwrap().to_string(),
-            artifact_id: parsed.name().to_string(),
-            version: parsed.version().unwrap().to_string(),
-            packaging: parsed
-                .qualifiers()
-                .get("type")
-                .map_or_else(|| "jar".to_string(), ToString::to_string),
-            classifier: parsed
-                .qualifiers()
-                .get("classifier")
-                .map(ToString::to_string),
-        }
-        .purl()
-        .expect("rebuild purl");
-        assert_eq!(rebuilt, purl);
-    }
-
-    #[test]
-    fn scan_report_counts_severity() {
-        let vulnerabilities = vec![
-            vulnerability_with_score("9.8"),
-            vulnerability_with_score("7.0"),
-            vulnerability_with_score("5.0"),
-            vulnerability_with_score("2.0"),
-        ];
-        let results = vec![VulnResult {
-            purl: "pkg:maven/org.example/demo@1.0.0".to_string(),
-            vulnerabilities,
-        }];
-
-        let report = ScanReport::from_results(3, results);
-        assert_eq!(report.total_dependencies, 3);
-        assert_eq!(report.vulnerable_dependencies, 1);
-        assert_eq!(report.critical_count, 1);
-        assert_eq!(report.high_count, 1);
-        assert_eq!(report.medium_count, 1);
-        assert_eq!(report.low_count, 1);
-        assert_eq!(report.unknown_count, 0);
-    }
-
-    #[test]
-    fn scan_report_counts_unknown_severity_separately() {
-        let mut unknown = vulnerability_with_score("invalid");
-        unknown.severity = None;
-        let report = ScanReport::from_results(
-            1,
-            vec![VulnResult {
-                purl: "pkg:maven/org.example/demo@1.0.0".to_string(),
-                vulnerabilities: vec![unknown],
-            }],
-        );
-        assert_eq!(report.unknown_count, 1);
-        assert_eq!(report.low_count, 0);
-    }
-
-    #[test]
-    fn severity_filter_keeps_unknown_findings_at_high_thresholds() {
-        let mut unknown = vulnerability_with_score("invalid");
-        unknown.severity = None;
-        assert_eq!(super::filter_vulnerabilities(vec![unknown], 10.0).len(), 1);
-    }
-
+    /// Dependency counts are over distinct purls, and a record OSV names but
+    /// does not serve makes the scan incomplete.
     #[tokio::test]
-    async fn scan_rejects_incomplete_batch_results() {
-        let responses = [
-            (
-                "/v1/querybatch",
-                200,
-                r#"{"results":[{"vulns":[{"id":"OSV-MISSING"}]},{"vulns":[]}] }"#,
-            ),
-            (
-                "/v1/vulns/OSV-MISSING",
-                400,
-                r#"{"message":"missing record"}"#,
-            ),
-        ];
-        let responses = Mutex::new(responses.into_iter());
-        let server = StubServer::start(move |request| {
-            let (path, status, body) = responses
-                .lock()
-                .expect("responses")
-                .next()
-                .expect("expected request");
-            let request = &request.raw;
-            assert!(request.contains(path), "request={request}");
-            Response::new(status, body).header("Content-Type", "application/json")
+    async fn scan_counts_distinct_purls_and_bands() {
+        let server = StubServer::start(|request| {
+            let json =
+                |body: String| Response::new(200, body).header("Content-Type", "application/json");
+            match request.path.as_str() {
+                "/v1/querybatch" => {
+                    let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    let results: Vec<_> = body["queries"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|query| {
+                            let purl = query["package"]["purl"].as_str().unwrap();
+                            if purl.starts_with("pkg:maven/org.example/one@") {
+                                serde_json::json!({ "vulns": [
+                                    {"id": "OSV-HIGH"}, {"id": "OSV-NONE"}, {"id": "OSV-MISSING"}
+                                ]})
+                            } else {
+                                serde_json::json!({})
+                            }
+                        })
+                        .collect();
+                    json(serde_json::json!({ "results": results }).to_string())
+                }
+                "/v1/vulns/OSV-HIGH" => json(
+                    r#"{"id":"OSV-HIGH","severity":[{"type":"CVSS_V3","score":"1.0"},{"type":"CVSS_V3","score":"8.0"}]}"#.to_string(),
+                ),
+                "/v1/vulns/OSV-NONE" => json(r#"{"id":"OSV-NONE"}"#.to_string()),
+                _ => Response::new(400, r#"{"message":"missing record"}"#),
+            }
         });
-        let address = server.addr();
-
-        let scanner = VulnScanner::from_client(
-            OsvClient::with_base_url(format!("http://{address}/v1")).expect("OSV client"),
-        );
+        let client = OsvClient::with_settings(
+            format!("http://{}/v1", server.addr()),
+            OsvSettings::default(),
+        )
+        .expect("OSV client");
         let dependencies = [
             Dependency::new("org.example", "one", "1.0.0"),
             Dependency::new("org.example", "two", "1.0.0"),
+            Dependency::new("org.example", "one", "1.0.0"),
         ];
-        let error = scanner
+        let report = VulnScanner::from_client(client)
             .scan(&dependencies)
             .await
-            .expect_err("scan must fail");
-        assert!(matches!(
-            error,
-            VulnError::InvalidResponse(ref details)
-                if details.contains("OSV-MISSING")
-        ));
-        assert_eq!(server.answered(), 2);
-        server.stop();
-    }
+            .expect("scan");
 
-    fn vulnerability_with_score(score: &str) -> Vulnerability {
-        Vulnerability {
-            id: "OSV-TEST".to_string(),
-            aliases: Vec::new(),
-            summary: "test".to_string(),
-            details: None,
-            severity: Some(Severity {
-                type_: "CVSS_V3".to_string(),
-                score: score.to_string(),
-            }),
-            references: Vec::new(),
-            affected: Vec::new(),
-        }
+        assert_eq!(report.total_dependencies, 2);
+        assert_eq!(report.vulnerabilities.len(), 1);
+        assert_eq!(
+            report.vulnerabilities[0].purl,
+            "pkg:maven/org.example/one@1.0.0"
+        );
+        let severity = report.vulnerabilities[0].vulnerabilities[0]
+            .severity
+            .as_ref();
+        assert_eq!(severity.map(|s| s.score.as_str()), Some("8.0"));
+        let bands: Vec<_> = (report.vulnerabilities[0].vulnerabilities.iter())
+            .map(crate::Vulnerability::severity_band)
+            .collect();
+        assert_eq!(
+            bands,
+            [crate::SeverityBand::High, crate::SeverityBand::Unknown]
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.failed_fetches[0].id, "OSV-MISSING");
+        server.stop();
     }
 }

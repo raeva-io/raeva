@@ -1,0 +1,1 @@
+<settings><mirrors><mirror><id>corp-mirror</id><url>@BASE@/repo/</url><mirrorOf>corp</mirrorOf></mirror></mirrors></settings>

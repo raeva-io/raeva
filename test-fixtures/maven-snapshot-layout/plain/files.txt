@@ -1,0 +1,13 @@
+maven-metadata-snaps.xml
+maven-metadata-snaps.xml.sha1
+_remote.repositories
+resolver-status.properties
+snaplib-1.0-20261017.210153-2.jar
+snaplib-1.0-20261017.210153-2.jar.sha1
+snaplib-1.0-20261017.210153-2.pom
+snaplib-1.0-20261017.210153-2.pom.sha1
+snaplib-1.0-20261017.210153-2-sources.jar
+snaplib-1.0-20261017.210153-2-sources.jar.sha1
+snaplib-1.0-SNAPSHOT.jar
+snaplib-1.0-SNAPSHOT.pom
+snaplib-1.0-SNAPSHOT-sources.jar

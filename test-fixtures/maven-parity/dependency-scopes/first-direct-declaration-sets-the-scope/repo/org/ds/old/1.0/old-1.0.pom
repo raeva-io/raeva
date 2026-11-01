@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.ds</groupId><artifactId>old</artifactId><version>1.0</version><distributionManagement><relocation><artifactId>new</artifactId></relocation></distributionManagement></project>

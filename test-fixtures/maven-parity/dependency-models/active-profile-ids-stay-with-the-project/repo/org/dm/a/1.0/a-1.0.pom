@@ -1,0 +1,1 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.dm</groupId><artifactId>a</artifactId><version>1.0</version><profiles><profile><id>extra</id><dependencies><dependency><groupId>org.dm</groupId><artifactId>b</artifactId><version>1.0</version></dependency></dependencies></profile></profiles></project>

@@ -1,0 +1,11 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.mc</groupId>
+  <artifactId>profile-option-interpolated</artifactId>
+  <version>1.0</version>
+  <profiles>
+    <profile><id>extra</id></profile>
+    <profile><id>arch-amd64</id></profile>
+    <profile><id>arch-aarch64</id></profile>
+  </profiles>
+</project>

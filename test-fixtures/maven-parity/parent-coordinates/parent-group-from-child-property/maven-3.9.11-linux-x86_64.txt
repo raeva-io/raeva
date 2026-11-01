@@ -1,0 +1,5 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate
+# [FATAL] Non-resolvable parent POM for ${cg}:child:1.0: The following artifacts could not be resolved: ${cg}:base:pom:1.0 (absent): (offline) and 'parent.relativePath' points at wrong local POM @ line 2, column 9
+result=failure
+parent=${cg}:base:1.0

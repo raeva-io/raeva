@@ -1,0 +1,155 @@
+schema_version = 8
+config_hash = "c0ec4de46cce1cc336386a86ba9b89d893e4aab61fd7cf166d3875ccd0ea97e1"
+
+[resolution]
+ambient_inputs = ["user-property:os.detection.classifierWithLikes"]
+
+[[platforms]]
+targets = ["linux-x86_64"]
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "379c530f1f28292609ef3f2502551a992a66cc93c5f7af92a56a4b8237327f07"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "api-spec"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "21ae27f125a21fe84a0c9750295e3aebc596f73c6bfd5470d794dae9cc75a521"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "8bdc0eb0181d3bb1335c2b67cea552bfe0040899b34ad7ceb75b0bf12b2b2612"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "core"
+version = "1.1"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "da046b16d5e771f0135be2a01a91443d90debda6c64fe2042da4acb2d26650da"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "e55f3739f1c8ae638a7b08793bd3a4e6c1bd8c4cc15572965b4a892c5df22323"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "lib"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "4ffa4d7c06816bb0e0dc7f963d299d53c3a089479ebac9287352a57ba413f533"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "e55f3739f1c8ae638a7b08793bd3a4e6c1bd8c4cc15572965b4a892c5df22323"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "lib"
+version = "1.0"
+packaging = "jar"
+classifier = "jdk11"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "c07ea2612252ab35fd36eadef62ff684574138f0fe641bb8c22664720ed5db38"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "e55f3739f1c8ae638a7b08793bd3a4e6c1bd8c4cc15572965b4a892c5df22323"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "lib"
+version = "1.0"
+packaging = "jar"
+classifier = "tests"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "6627b325e0b91d1e9634728f5debdafb16454b614b800718a6bb1b560b5d83eb"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "59badf27e2b0e13336d7e54bb3c29830e00a085758f0ae6cef49b6ce8393d186"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "runtime-only"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "407227943b0fed6aa04b0345ff64aaeacd181f65bccaab9a6037e8c7ecf5bea8"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "8957fd02b1039b517e7b193ad876beca412efce11d27fb0efc8341a601072bdb"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "testlib"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "7bc8759ff5c474d884adea23031c800f854f4dda0fe1cfe8a2c03819bbdbb240"
+
+[[platforms.artifacts]]
+repo_url = "./repository/"
+pom_sha256 = "9cb6318751371cccee15444ca8df987af5a7ca07b7361f098f5adf3b1ceda924"
+
+[platforms.artifacts.coordinate]
+group = "org.golden"
+artifact = "util"
+version = "1.0"
+packaging = "jar"
+
+[[platforms.artifacts.checksums]]
+algorithm = "sha256"
+digest = "ecff2cca714af60194891bf55cd1683f0d4430daf2566002c384ad7bb046a917"
+
+[[platforms.modules]]
+path = "pom.xml"
+gav = "org.golden.app:single:1.0"
+packaging = "jar"
+packages = """
+org.golden:api-spec:1.0\tjar\tprovided
+org.golden:core:1.1\tjar\tcompile
+org.golden:lib:1.0\tjar\tcompile
+org.golden:lib:1.0\tjar:jdk11\tcompile
+org.golden:lib:1.0\tjar:tests\ttest
+org.golden:runtime-only:1.0\tjar\truntime
+org.golden:testlib:1.0\tjar\ttest
+org.golden:util:1.0\tjar
+org.golden:vendored:0.9\tjar\tsystem\t\t\tlib/vendored-0.9.jar\tf4b6afab6ff07a0a94aa34417f29118f031289a097a10b4456c3ec4f9aa9ae14"""
+edges = """
+1 7 compile
+6 7 test"""
+
+[[inputs]]
+target = "linux-x86_64"
+profiles = []
+ambient_inputs = ["user-property:os.detection.classifierWithLikes"]
+
+[[inputs.poms]]
+path = "pom.xml"
+sha256 = "200e815658dafaad79507f338ce02b5de8d3894830a2c890b50a831186432cba"
+graph = "5fa63e87cfafd602022b5290811d1f0fad2f4b941f13a15514c0a268835201a4"
+
+[metadata]
+repo_ids = """
+./repository/\tfixture
+https://repo1.maven.org/maven2/\tcentral"""

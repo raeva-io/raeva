@@ -1,0 +1,21 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.ds</groupId>
+  <artifactId>a-cycle-does-not-widen-an-ancestor</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencyManagement>
+    <dependencies>
+      <dependency><groupId>org.ds</groupId><artifactId>y</artifactId><version>1.0</version><scope>compile</scope></dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency><groupId>org.ds</groupId><artifactId>t</artifactId><version>1.0</version><scope>test</scope></dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,24 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "last_modified": "<string>",
+      "latest_schema_version": 8,
+      "path": "<tmp>/project/raeva.lock",
+      "platform_count": 1,
+      "platforms": [
+        {
+          "external_artifacts": 8,
+          "modules": 1,
+          "packages": 9,
+          "platform": "<host-platform>"
+        }
+      ],
+      "schema_version": 8,
+      "total_packages": 9,
+      "unique_artifacts": 8,
+      "warnings": []
+    },
+    "success": true
+  }
+}

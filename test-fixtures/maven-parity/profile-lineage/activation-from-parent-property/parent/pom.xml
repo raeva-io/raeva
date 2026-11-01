@@ -1,0 +1,6 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  
+  <groupId>org.f4</groupId><artifactId>parent</artifactId><version>1.0</version><packaging>pom</packaging>
+<properties><expected>on</expected></properties><profiles><profile><id>parent-own-property</id><activation><property><name>flag</name><value>${expected}</value></property></activation><dependencies><dependency><groupId>org.f4</groupId><artifactId>from-parent</artifactId><version>1.0</version></dependency></dependencies></profile></profiles>
+</project>

@@ -1,0 +1,24 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "count": 14,
+      "maven_properties": [
+        "-Daether.artifactResolver.postProcessor.trustedChecksums=true",
+        "-Daether.artifactResolver.postProcessor.trustedChecksums.snapshots=true",
+        "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
+        "-Daether.trustedChecksumsSource.summaryFile=true",
+        "-Daether.trustedChecksumsSource.summaryFile.basedir=<tmp>/project/.mvn/checksums",
+        "-Daether.trustedChecksumsSource.summaryFile.originAware=false"
+      ],
+      "path": "<tmp>/project/.mvn/checksums/checksums.sha256",
+      "paths": [
+        "<tmp>/project/.mvn/checksums/checksums.sha256"
+      ],
+      "sha1_count": 0,
+      "sha256_count": 14,
+      "warnings": []
+    },
+    "success": true
+  }
+}

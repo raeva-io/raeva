@@ -1,0 +1,5 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn -o validate
+# [FATAL] Non-resolvable parent POM for com.rp:child:1: The following artifacts could not be resolved: com.rp:parent:pom:1 (absent): (offline) and 'parent.relativePath' points at no local POM @ line 1, column 52
+result=failure
+parent=com.rp:parent:1

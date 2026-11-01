@@ -1,0 +1,31 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "found": true,
+      "modules": [
+        {
+          "found": true,
+          "gav": "org.golden.app:single:1.0",
+          "module": "pom.xml",
+          "paths": [
+            [
+              "org.golden:core:1.1:jar",
+              "org.golden:util:1.0:jar"
+            ],
+            [
+              "org.golden:testlib:1.0:jar",
+              "org.golden:util:1.0:jar"
+            ]
+          ],
+          "truncated": false
+        }
+      ],
+      "platform": "<host-platform>",
+      "target": "org.golden:util",
+      "truncated": false,
+      "warnings": []
+    },
+    "success": true
+  }
+}

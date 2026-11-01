@@ -1,0 +1,8 @@
+# Maven's help:active-profiles lists the settings.xml profile pin (source: external).
+# raeva.lock's model_profiles lists the project's active profiles and the ids
+# <activeProfiles>, raeva.toml and config.toml name, so a settings.xml profile
+# that only -P selects is not in it. The resolution is Maven's: pin's lib.version
+# wins over the POM's.
+result=success
+module=org.cl:settings-profile-selected-by-p:1.0
+artifact=org.cl:lib:2.0:repo

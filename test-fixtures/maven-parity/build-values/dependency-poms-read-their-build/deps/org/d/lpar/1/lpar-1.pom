@@ -1,0 +1,3 @@
+<project><modelVersion>4.0.0</modelVersion><groupId>org.d</groupId><artifactId>lpar</artifactId><version>1</version><packaging>pom</packaging>
+  <build><directory>pdir</directory><finalName>${project.artifactId}-pfn</finalName>
+  <defaultGoal>install</defaultGoal></build></project>

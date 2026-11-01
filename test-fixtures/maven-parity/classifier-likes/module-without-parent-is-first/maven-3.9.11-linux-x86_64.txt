@@ -1,0 +1,11 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64, os-maven-plugin 1.7.1
+# mvn dependency:list
+# The first module, bom, has no parent and no dependencies, so Maven sorts
+# it first and os-maven-plugin reads its os.detection.classifierWithLikes,
+# which it does not set: the list root and m1 set, which names arch and the
+# other common releases, adds no suffix.
+result=success
+module=org.test:root:1
+module=org.test:bom:1
+module=org.test:m1:1
+classifier=linux-x86_64

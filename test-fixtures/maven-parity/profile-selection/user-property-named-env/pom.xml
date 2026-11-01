@@ -1,0 +1,16 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.sel</groupId>
+  <artifactId>env-name-from-user-property</artifactId>
+  <version>1.0</version>
+  <profiles>
+    <profile>
+      <id>env-name-set-by-define</id>
+      <activation><property><name>env.RAEVA_PARITY_SELECTED</name><value>yes</value></property></activation>
+    </profile>
+    <profile>
+      <id>env-name-not-defined</id>
+      <activation><property><name>env.RAEVA_PARITY_UNSET</name></property></activation>
+    </profile>
+  </profiles>
+</project>

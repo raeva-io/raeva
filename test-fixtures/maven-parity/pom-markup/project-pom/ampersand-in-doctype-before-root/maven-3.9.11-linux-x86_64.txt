@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list and mvn -q -o validate; artifact= is group:artifact:version:repository id from _remote.repositories
+# The project's pom.xml has a DOCTYPE before the root whose internal subset has "AT&T", an & that starts no reference.
+# [ERROR] Non-parseable POM .../pom.xml: entity reference name can not contain character "'
+# raeva words the error in its own way; error= is the part of its message that names the defect.
+result=failure
+error=is not well-formed XML

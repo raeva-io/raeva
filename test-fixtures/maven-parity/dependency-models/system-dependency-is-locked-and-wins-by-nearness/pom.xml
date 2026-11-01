@@ -1,0 +1,27 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.dm</groupId>
+  <artifactId>system-dependency-is-locked-and-wins-by-nearness</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>org.dm</groupId>
+      <artifactId>lib</artifactId>
+      <version>1.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.dm</groupId>
+      <artifactId>tools</artifactId>
+      <version>1.0</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/lib/tools.jar</systemPath>
+    </dependency>
+  </dependencies>
+</project>

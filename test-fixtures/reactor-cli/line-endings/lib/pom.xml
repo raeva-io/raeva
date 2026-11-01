@@ -1,0 +1,9 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>legacy-crlf</artifactId>
+    <version>1</version>
+  </parent>
+  <artifactId>lib</artifactId>
+</project>

@@ -1,0 +1,7 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# srv/ served over HTTP, @BASE@ standing for its address; the project's central is srv/empty/
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# org.scope:a:1 declares rx with an empty <id></id> and ry without an id. The effective model keeps both,
+# but the resolution aggregates them under one key and keeps rx, the first, so d, in ry only, is not found.
+result=failure
+missing=org.scope:d:1

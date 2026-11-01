@@ -1,0 +1,17 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.ds</groupId>
+  <artifactId>first-direct-declaration-sets-the-scope</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.ds</groupId><artifactId>old</artifactId><version>1.0</version></dependency>
+    <dependency><groupId>org.ds</groupId><artifactId>new</artifactId><version>1.0</version><scope>test</scope></dependency>
+  </dependencies>
+</project>

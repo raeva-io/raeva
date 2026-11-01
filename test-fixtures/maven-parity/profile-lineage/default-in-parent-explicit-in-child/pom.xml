@@ -1,0 +1,7 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>org.f4</groupId><artifactId>parent</artifactId><version>1.0</version><relativePath>parent/pom.xml</relativePath></parent>
+  <artifactId>default-in-parent-explicit-in-child</artifactId>
+  <repositories><repository><id>repo</id><url>file://${project.basedir}/repo/</url><releases><enabled>true</enabled></releases><snapshots><enabled>false</enabled></snapshots></repository></repositories>
+<profiles><profile><id>child-default</id><activation><activeByDefault>true</activeByDefault></activation><dependencies><dependency><groupId>org.f4</groupId><artifactId>from-child-default</artifactId><version>1.0</version></dependency></dependencies></profile><profile><id>child-condition</id><activation><property><name>go</name></property></activation><dependencies><dependency><groupId>org.f4</groupId><artifactId>from-child-condition</artifactId><version>1.0</version></dependency></dependencies></profile></profiles>
+</project>

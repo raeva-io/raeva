@@ -1,0 +1,8 @@
+# Maven 3.9.11 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list help:active-profiles; artifact= is group:artifact:version:repository id from _remote.repositories
+# org.enc:a:1.0's POM uses &unknownentity;. Maven's reader fails ("could not resolve entity
+# named 'unknownentity'"), warns that the POM is invalid, and lists a without its dependency c.
+result=success
+module=org.enc:unknown-entity-in-dependency-pom:1.0
+# org.enc:a:jar:1.0:compile
+artifact=org.enc:a:1.0:repo

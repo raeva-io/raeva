@@ -1,0 +1,6 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list
+# A range reads only <versions>, never <release> or <latest>, and an empty listing has none.
+result=failure
+error=no available version for org.t:dep matching [1.0,2.0)
+# Maven: No versions available for org.t:dep:jar:[1.0,2.0) within specified range

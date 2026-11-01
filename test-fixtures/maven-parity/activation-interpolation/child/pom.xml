@@ -1,0 +1,11 @@
+<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.act</groupId><artifactId>root</artifactId><version>1</version></parent><artifactId>child</artifactId>
+<properties><own>val</own></properties>
+<profiles>
+ <profile><id>inherited-value</id><activation><property><name>x</name><value>${pv}</value></property></activation></profile>
+ <profile><id>own-value</id><activation><property><name>x</name><value>${own}</value></property></activation></profile>
+ <profile><id>packaging-jar</id><activation><property><name>packaging</name><value>jar</value></property></activation></profile>
+ <profile><id>packaging-not-pom</id><activation><property><name>packaging</name><value>!pom</value></property></activation></profile>
+ <profile><id>project-field-value</id><activation><property><name>y</name><value>${project.artifactId}</value></property></activation></profile>
+ <profile><id>basedir-file</id><activation><file><exists>${basedir}/marker.txt</exists></file></activation><dependencyManagement><dependencies><dependency><groupId>org.act</groupId><artifactId>managed</artifactId><version>1</version></dependency></dependencies></dependencyManagement></profile>
+ <profile><id>project-basedir-file</id><activation><file><exists>${project.basedir}/marker.txt</exists></file></activation><dependencyManagement><dependencies><dependency><groupId>org.act</groupId><artifactId>managed</artifactId><version>1</version></dependency></dependencies></dependencyManagement></profile>
+</profiles></project>

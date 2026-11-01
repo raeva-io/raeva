@@ -1,0 +1,16 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>legacy-crlf</artifactId>
+    <version>1</version>
+  </parent>
+  <artifactId>app</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>lib</artifactId>
+      <version>1</version>
+    </dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,15 @@
+{
+  "exit_code": 3,
+  "stdout": {
+    "code": "LOCKFILE_INVALID",
+    "data": {
+      "warnings": []
+    },
+    "error": "raeva.lock cannot be used: failed to parse lockfile <tmp>/project/raeva.lock: key with no value, expected `=` (line 1, column 5)",
+    "exit_code": 3,
+    "hints": [
+      "Run 'raeva sync' without --frozen to regenerate it"
+    ],
+    "success": false
+  }
+}

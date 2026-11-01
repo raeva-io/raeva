@@ -1,0 +1,27 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.ms</groupId>
+  <artifactId>managed-system-scope-brings-the-managed-path</artifactId>
+  <version>1.0</version>
+  <repositories>
+    <repository>
+      <id>repo</id>
+      <url>file://${project.basedir}/repo/</url>
+      <snapshots><enabled>false</enabled></snapshots>
+    </repository>
+  </repositories>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.ms</groupId>
+        <artifactId>tools</artifactId>
+        <version>2.0</version>
+        <scope>system</scope>
+        <systemPath>${project.basedir}/lib/tools.jar</systemPath>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency><groupId>org.ms</groupId><artifactId>lib</artifactId><version>1.0</version></dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,36 @@
+<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.golden</groupId>
+  <artifactId>jdk-modern</artifactId>
+  <version>1.0</version>
+  <properties>
+    <bom.version>1.0</bom.version>
+  </properties>
+  <profiles>
+    <profile>
+      <id>modern</id>
+      <activation><jdk>[17,)</jdk></activation>
+      <dependencyManagement><dependencies><dependency><groupId>org.golden</groupId><artifactId>bom</artifactId><version>${bom.version}</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>
+    </profile>
+    <profile>
+      <id>not-eight</id>
+      <activation><jdk>!1.8</jdk></activation>
+      <properties><bom.version>1.0</bom.version></properties>
+    </profile>
+    <profile>
+      <id>old</id>
+      <activation><jdk>(,11)</jdk></activation>
+      <dependencyManagement><dependencies><dependency><groupId>org.golden</groupId><artifactId>bom</artifactId><version>${bom.version}</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>
+    </profile>
+    <profile>
+      <id>modern-again</id>
+      <activation><jdk>[17,)</jdk></activation>
+      <dependencyManagement><dependencies><dependency><groupId>org.golden</groupId><artifactId>bom</artifactId><version>${bom.version}</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement>
+    </profile>
+    <profile>
+      <id>build-only</id>
+      <activation><jdk>[21,)</jdk></activation>
+      <properties><maven.compiler.release>21</maven.compiler.release></properties>
+    </profile>
+  </profiles>
+</project>

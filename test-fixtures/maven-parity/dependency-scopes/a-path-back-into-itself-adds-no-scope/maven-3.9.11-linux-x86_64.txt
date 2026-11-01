@@ -1,0 +1,24 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# u (test) reaches x, and t (test) reaches a, which x reaches too. a reaches b, managed
+# to compile, and x, and b reaches a back. Maven picks x before a and b, gathering
+# through them, but a path stops where it comes back to a node on it, so b's compile
+# scope never reaches x or a, which stay test.
+result=success
+module=org.ds:a-path-back-into-itself-adds-no-scope:1.0
+# org.ds:a:jar:1.0:test
+artifact=org.ds:a:1.0:repo
+scope=org.ds:a:1.0:test
+# org.ds:b:jar:1.0:compile
+artifact=org.ds:b:1.0:repo
+scope=org.ds:b:1.0:compile
+# org.ds:t:jar:1.0:test
+artifact=org.ds:t:1.0:repo
+scope=org.ds:t:1.0:test
+# org.ds:u:jar:1.0:test
+artifact=org.ds:u:1.0:repo
+scope=org.ds:u:1.0:test
+# org.ds:x:jar:1.0:test
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:test

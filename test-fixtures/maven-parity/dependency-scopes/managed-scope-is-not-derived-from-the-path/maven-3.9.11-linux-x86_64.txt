@@ -1,0 +1,38 @@
+# Maven 3.9.12 on OpenJDK 27, Arch Linux x86_64
+# mvn dependency:list; artifact= is group:artifact:version:repository id from _remote.repositories,
+# scope= is group:artifact:version:scope as dependency:list gives it
+# The project manages x to runtime, w to compile, m to test and k to provided. x and w below
+# t (test) take the managed scope as it is, not test, and the children of each derive from
+# its managed scope.
+result=success
+module=org.ds:managed-scope-is-not-derived-from-the-path:1.0
+# org.ds:a:jar:1.0:compile
+artifact=org.ds:a:1.0:repo
+scope=org.ds:a:1.0:compile
+# org.ds:k:jar:1.0:provided
+artifact=org.ds:k:1.0:repo
+scope=org.ds:k:1.0:provided
+# org.ds:m:jar:1.0:test
+artifact=org.ds:m:1.0:repo
+scope=org.ds:m:1.0:test
+# org.ds:n:jar:1.0:test
+artifact=org.ds:n:1.0:repo
+scope=org.ds:n:1.0:test
+# org.ds:q:jar:1.0:provided
+artifact=org.ds:q:1.0:repo
+scope=org.ds:q:1.0:provided
+# org.ds:t:jar:1.0:test
+artifact=org.ds:t:1.0:repo
+scope=org.ds:t:1.0:test
+# org.ds:v:jar:1.0:compile
+artifact=org.ds:v:1.0:repo
+scope=org.ds:v:1.0:compile
+# org.ds:w:jar:1.0:compile
+artifact=org.ds:w:1.0:repo
+scope=org.ds:w:1.0:compile
+# org.ds:x:jar:1.0:runtime
+artifact=org.ds:x:1.0:repo
+scope=org.ds:x:1.0:runtime
+# org.ds:y:jar:1.0:runtime
+artifact=org.ds:y:1.0:repo
+scope=org.ds:y:1.0:runtime

@@ -1,0 +1,15 @@
+{
+  "exit_code": 3,
+  "stdout": {
+    "code": "LOCKFILE_MISSING",
+    "data": {
+      "warnings": []
+    },
+    "error": "lockfile not found: <tmp>/project/raeva.lock",
+    "exit_code": 3,
+    "hints": [
+      "Run 'raeva sync' to create it and commit raeva.lock; CI checks it with 'raeva sync --frozen'"
+    ],
+    "success": false
+  }
+}

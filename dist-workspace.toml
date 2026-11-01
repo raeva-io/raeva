@@ -26,3 +26,7 @@ install-updater = false
 github-attestations = true
 # release.yml gates the host job on the `release` environment by hand.
 allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+# GitHub retires the macos-14 image that dist 0.32 picks for this target.
+aarch64-apple-darwin = "macos-15"

@@ -13,15 +13,19 @@ are not locked or exported. For an offline build, fill a second local
 repository with one online Maven run and pass it as a read-only tail:
 
 ```sh
-raeva export-m2 --m2-path /build/deps
-mvn -Dmaven.repo.local=/build/plugins -DskipTests package
-mvn -o -Dmaven.repo.local=/build/deps -Dmaven.repo.local.tail=/build/plugins -DskipTests package
+raeva export-m2 --m2-path "$PWD/.offline/deps"
+mvn -Dmaven.repo.local="$PWD/.offline/plugins" -DskipTests package
+mvn -o -Dmaven.repo.local="$PWD/.offline/deps" -Dmaven.repo.local.tail="$PWD/.offline/plugins" -DskipTests package
 ```
 
+Run them at the project root and add `.offline/` to `.gitignore`; outside
+`target/`, `mvn clean` keeps it.
 Use the same phase for both runs, and in both the profiles and
 `settings.xml` that `raeva sync` used; pass `raeva export-m2` the same `-s`
 and `-P` too, since it reads the mirrors and repositories from them. Maven
-resolves only the plugins that phase needs.
+resolves only the plugins that phase needs. Skip tests in both runs or in
+neither: Surefire resolves its test provider only when tests run, so a
+warm-up run with `-DskipTests` leaves an offline run with tests without it.
 
 The online run resolves the dependencies too, from the repositories as they
 are that day, and leaves them and their version lists in the plugin

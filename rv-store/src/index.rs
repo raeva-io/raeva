@@ -93,7 +93,9 @@ pub(crate) fn lookup_artifact(conn: &Connection, key: &ArtifactCoord) -> Result<
     // unlocked lookup runs without the store lock, so only a row still
     // holding the bad value is deleted: a concurrent upsert survives.
     tracing::debug!(%key, blob_id = %value, "index row has unparseable blob_id; deleting it");
-    conn.execute(
+    let path = std::path::Path::new(conn.path().unwrap_or_default());
+    let tx = crate::sqlite::write_transaction(conn, path, crate::store::INDEX.generation)?;
+    tx.execute(
         &format!("DELETE FROM artifacts WHERE {KEY_MATCHES} AND blob_id = ?6"),
         params![
             key.group_id(),
@@ -105,6 +107,8 @@ pub(crate) fn lookup_artifact(conn: &Connection, key: &ArtifactCoord) -> Result<
         ],
     )
     .db_context(|| format!("failed to scrub corrupt index row for {key}"))?;
+    tx.commit()
+        .db_context(|| format!("failed to scrub corrupt index row for {key}"))?;
     Ok(None)
 }
 

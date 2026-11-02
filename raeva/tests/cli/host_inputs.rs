@@ -1343,6 +1343,138 @@ fn a_missing_likes_classifier_hints_at_the_override() {
     );
 }
 
+/// os-maven-plugin's classifier likes are an input only of a build that
+/// reads `${os.detected.classifier}`: a Linux lock of a project that never
+/// reads it records them no more than a macOS one, and a `-D` value for
+/// them is no drift. A project that reads it records them.
+#[test]
+fn classifier_likes_are_recorded_only_when_read() {
+    const LIKES: &str = "user-property:os.detection.classifierWithLikes";
+    let project = Project::synced();
+    let root = project.root();
+    let release = [(rv_maven_model::OS_RELEASE_TEST_ENV, "ID=debian\n")];
+    let sync = |extra: &[&str]| {
+        let mut args = vec!["sync", "--offline", "--platforms", "linux-x86_64"];
+        args.extend(extra);
+        project.raeva_with(&release, &args)
+    };
+    let inputs = || fs::read_to_string(root.join("raeva.lock")).expect("read lock");
+
+    assert_success(&sync(&[]), "sync for Linux");
+    assert!(!inputs().contains(LIKES), "{}", inputs());
+    assert_success(
+        &sync(&["--frozen", "-Dos.detection.classifierWithLikes=debian"]),
+        "an unread -D value is no drift",
+    );
+
+    let pom_path = root.join("pom.xml");
+    let original = fs::read_to_string(&pom_path).expect("read pom");
+    fs::write(
+        &pom_path,
+        original.replace(
+            "<artifactId>lib</artifactId><version>1.0</version>",
+            "<artifactId>lib</artifactId><version>1.0</version>\
+             <classifier>${os.detected.classifier}</classifier>",
+        ),
+    )
+    .expect("write pom");
+    let dir = root.join("repository/org/test/lib/1.0");
+    let name = "lib-1.0-linux-x86_64.jar";
+    fs::write(dir.join(name), "native").unwrap();
+    fs::write(
+        dir.join(format!("{name}.sha256")),
+        crate::common::sha256_hex(b"native"),
+    )
+    .unwrap();
+    assert_success(&sync(&[]), "sync a reader for Linux");
+    assert!(inputs().contains(LIKES), "{}", inputs());
+    assert_status(
+        &sync(&["--frozen", "-Dos.detection.classifierWithLikes=debian"]),
+        7,
+        "a -D value a reader reads is drift",
+    );
+}
+
+/// Classifier likes an active settings.xml profile sets are an input only
+/// of a build that reads `${os.detected.classifier}`, as a `-D` value for
+/// them is.
+#[test]
+fn settings_classifier_likes_are_recorded_only_when_read() {
+    const LIKES: &str = "settings-property:os.detection.classifierWithLikes";
+    let project = Project::synced();
+    let root = project.root();
+    let release = [(rv_maven_model::OS_RELEASE_TEST_ENV, "ID=debian\n")];
+    let sync = |extra: &[&str]| {
+        let mut args = vec!["sync", "--offline", "--platforms", "linux-x86_64"];
+        args.extend(extra);
+        project.raeva_with(&release, &args)
+    };
+    let write_settings = |likes: &str| {
+        fs::write(
+            project.m2_settings(),
+            format!(
+                "<settings><profiles><profile><id>likes</id>\
+                 <activation><activeByDefault>true</activeByDefault></activation>\
+                 <properties><os.detection.classifierWithLikes>{likes}\
+                 </os.detection.classifierWithLikes></properties></profile></profiles>\
+                 </settings>"
+            ),
+        )
+        .unwrap();
+    };
+    let inputs = || fs::read_to_string(root.join("raeva.lock")).expect("read lock");
+
+    write_settings("debian");
+    assert_success(&sync(&[]), "sync for Linux");
+    assert!(!inputs().contains(LIKES), "{}", inputs());
+    write_settings("fedora");
+    assert_success(&sync(&["--frozen"]), "unread likes are no drift");
+
+    let pom_path = root.join("pom.xml");
+    let original = fs::read_to_string(&pom_path).expect("read pom");
+    fs::write(
+        &pom_path,
+        original.replace(
+            "<artifactId>lib</artifactId><version>1.0</version>",
+            "<artifactId>lib</artifactId><version>1.0</version>\
+             <classifier>${os.detected.classifier}</classifier>",
+        ),
+    )
+    .expect("write pom");
+    let dir = root.join("repository/org/test/lib/1.0");
+    let name = "lib-1.0-linux-x86_64.jar";
+    fs::write(dir.join(name), "native").unwrap();
+    fs::write(
+        dir.join(format!("{name}.sha256")),
+        crate::common::sha256_hex(b"native"),
+    )
+    .unwrap();
+    assert_success(&sync(&[]), "sync a reader for Linux");
+    assert!(inputs().contains(LIKES), "{}", inputs());
+    write_settings("debian");
+    assert_status(&sync(&["--frozen"]), 7, "likes a reader reads are drift");
+
+    // A profile that sets them counts while inactive too: its likes win
+    // over a `-D` value once it activates.
+    let marker = root.join("marker");
+    fs::write(
+        project.m2_settings(),
+        format!(
+            "<settings><profiles><profile><id>likes</id>\
+             <activation><file><exists>{}</exists></file></activation>\
+             <properties><os.detection.classifierWithLikes>debian\
+             </os.detection.classifierWithLikes></properties></profile></profiles>\
+             </settings>",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let user = "-Dos.detection.classifierWithLikes=fedora";
+    assert_success(&sync(&[user]), "sync with the profile inactive");
+    fs::write(&marker, "").unwrap();
+    assert_status(&sync(&["--frozen", user]), 7, "the profile activates");
+}
+
 #[test]
 fn explicit_target_jdks_do_not_record_host_reads_from_option_validation() {
     let (project, home) = crate::common::temp_project();

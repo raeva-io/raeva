@@ -766,12 +766,14 @@ impl ReactorModel {
 }
 
 /// Refuse a project whose POMs declare a repository URL with userinfo, a
-/// query or a fragment, as configuration with one is refused: raeva.lock would
-/// record it. The message names the module, never the URL, which may be
-/// inherited from a local parent.
+/// query or a fragment, as configuration with one is refused, or whose path
+/// holds the value of one of `secrets` ([`Config::secret_named_inputs`]):
+/// raeva.lock would record it. The message names the module and the input,
+/// never the URL, which may be inherited from a local parent, or the value.
 fn refuse_secret_repository_urls(
     root: &Path,
     modules: &[&rv_resolver::WorkspaceModule],
+    secrets: &[(String, String)],
 ) -> Result<()> {
     for module in modules {
         let declared = module
@@ -780,16 +782,21 @@ fn refuse_secret_repository_urls(
             .iter()
             .filter(|repo| repo.root_declared);
         for repo in declared {
-            if let Some(part) = rv_config::secret_url_part(&repo.url) {
-                return Err(CliError::InvalidProjectInput {
-                    path: root.join(&module.pom_path),
-                    reason: format!(
-                        "a <repository> URL it declares or inherits has {part}, which raeva.lock \
-                         would record; remove it, and put credentials in an [[auth]] entry in \
-                         config.toml or a <server> in settings.xml with the repository's id"
-                    ),
-                });
-            }
+            let Some(refusal) = rv_repo::secret_url_refusal(&repo.url, secrets) else {
+                continue;
+            };
+            let entry = repo.id.as_deref().map_or_else(
+                || "a repository without an id".to_string(),
+                |id| {
+                    let id = rv_config::without_secret_values(id, secrets);
+                    format!("repository '{}'", rv_maven_types::bounded(id))
+                },
+            );
+            let reason = format!("the URL of {entry} it declares or inherits {refusal}");
+            return Err(CliError::InvalidProjectInput {
+                path: root.join(&module.pom_path),
+                reason,
+            });
         }
     }
     Ok(())
@@ -833,6 +840,7 @@ fn warn_unknown_profiles(config: &Config, models: &[ReactorModel]) {
 }
 
 pub(crate) fn discover_reactor_model(config: &Config, platform: &Platform) -> Result<ReactorModel> {
+    let secrets = config.secret_named_inputs();
     let reads = HostReads::default();
     let config = &(config.recording_into(&reads)).for_platforms([(
         platform.os(),
@@ -844,7 +852,7 @@ pub(crate) fn discover_reactor_model(config: &Config, platform: &Platform) -> Re
 
     let mut modules: Vec<_> = workspace.modules().iter().collect();
     modules.sort_by(|left, right| left.pom_path.cmp(&right.pom_path));
-    refuse_secret_repository_urls(workspace.root(), &modules)?;
+    refuse_secret_repository_urls(workspace.root(), &modules, &secrets)?;
 
     // The settings.xml profiles a condition activates add only repositories,
     // which config_hash covers, so only the explicit ids count.

@@ -330,6 +330,18 @@ impl HostSnapshot {
         snapshot
     }
 
+    /// This snapshot, whose environments record what they read in `reads`
+    /// alone, apart from the record of the run.
+    #[must_use]
+    pub fn recording_only_into(&self, reads: &HostReads) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.0.consulted = Consulted {
+            inputs: Arc::clone(&reads.0),
+            ..Consulted::default()
+        };
+        snapshot
+    }
+
     /// The host values the model builds of this snapshot's environments
     /// read so far. A value a POM's own property or a `-D` value shadowed is
     /// not among them, nor is a variable outside the allowlist.
@@ -542,10 +554,50 @@ struct EnvironmentInner {
     allow_all_env: bool,
     linux_release: Option<LinuxRelease>,
     /// os-maven-plugin's `os.detection.classifierWithLikes` for the build.
-    classifier_likes: Option<String>,
+    classifier_likes: Option<ClassifierLikes>,
     consulted: Consulted,
     defaulted_java: Warned,
 }
+
+/// os-maven-plugin's `os.detection.classifierWithLikes` for a build, with a
+/// flag that turns true once a build reads `${os.detected.classifier}` where
+/// the likes can give it a suffix. Clones share the flag, and two values
+/// compare equal by their likes alone. A read whose other host reads a
+/// build later drops, as for a dependency resolution does not follow,
+/// still sets it: the likes are then recorded as an input they are not.
+#[derive(Debug, Clone, Default)]
+pub struct ClassifierLikes {
+    likes: Option<String>,
+    read: Arc<AtomicBool>,
+}
+
+impl ClassifierLikes {
+    /// The likes `likes`, or none, not read yet.
+    pub fn new(likes: Option<&str>) -> Self {
+        Self {
+            likes: likes.map(str::to_string),
+            read: Arc::default(),
+        }
+    }
+
+    /// The likes, as the build sets them.
+    pub fn value(&self) -> Option<&str> {
+        self.likes.as_deref()
+    }
+
+    /// Whether a build read them.
+    pub fn read(&self) -> bool {
+        self.read.load(Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for ClassifierLikes {
+    fn eq(&self, other: &Self) -> bool {
+        self.likes == other.likes
+    }
+}
+
+impl Eq for ClassifierLikes {}
 
 /// Set once a build read the stand-in `java.version`, shared by every
 /// environment of a snapshot. Two flags always compare equal.
@@ -803,12 +855,13 @@ impl ModelEnvironment {
     /// `os.detection.classifierWithLikes`, which the plugin reads once for
     /// the whole build: from the first project of the reactor, else from
     /// the user properties. `${os.detected.classifier}` on Linux then takes
-    /// the first entry the build machine's release is like as a suffix.
+    /// the first entry the build machine's release is like as a suffix, and
+    /// marks the likes read.
     #[must_use]
-    pub fn with_classifier_likes(&self, likes: Option<&str>) -> Self {
+    pub fn with_classifier_likes(&self, likes: Option<&ClassifierLikes>) -> Self {
         Self {
             inner: Arc::new(EnvironmentInner {
-                classifier_likes: likes.map(str::to_string),
+                classifier_likes: likes.cloned(),
                 ..EnvironmentInner::clone(&self.inner)
             }),
             consulted: self.consulted.clone(),
@@ -821,9 +874,17 @@ impl ModelEnvironment {
         self.inner
             .classifier_likes
             .iter()
+            .filter_map(ClassifierLikes::value)
             .flat_map(|likes| likes.split(','))
             .map(str::trim)
             .filter(|like| !like.is_empty())
+    }
+
+    /// Mark the likes of [`Self::with_classifier_likes`] read.
+    pub(crate) fn note_classifier_likes_read(&self) {
+        if let Some(likes) = &self.inner.classifier_likes {
+            likes.read.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Whether a build for this environment's platform can take a
@@ -930,6 +991,11 @@ impl ModelEnvironment {
     /// Record a user-property lookup without retaining its value.
     pub fn record_user_property(&self, name: &str) {
         self.record(HostInput::UserProperty(name.to_string()));
+    }
+
+    /// Record a read of the settings.xml profile property `name`.
+    pub fn record_settings_property(&self, name: &str) {
+        self.record(HostInput::SettingsProperty(name.to_string()));
     }
 
     pub(crate) fn record(&self, input: HostInput) {
@@ -1679,7 +1745,7 @@ mod tests {
         let ubuntu = HostSnapshot::for_testing(&[]).with_os_release("ID=ubuntu\nID_LIKE=debian\n");
         let like = |host: &HostSnapshot, os: &str| {
             host.environment(os, "x86_64")
-                .with_classifier_likes(Some("fedora, debian,ubuntu"))
+                .with_classifier_likes(Some(&ClassifierLikes::new(Some("fedora, debian,ubuntu"))))
                 .classifier_like()
                 .map(|(classifier, like)| format!("{classifier} {like}"))
         };

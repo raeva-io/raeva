@@ -480,8 +480,9 @@ impl RepoError {
 
     /// Whether the request never reached a server: the host name did not
     /// resolve, or the connection was refused or had no route
-    /// ([`rv_http::transient::transport_is_unreachable`]). Not retried, but
-    /// a network failure all the same.
+    /// ([`rv_http::transient::transport_is_unreachable`]). A network
+    /// failure all the same, though not retried, except that a host name
+    /// that did not resolve is looked up once more.
     pub fn is_unreachable(&self) -> bool {
         matches!(self.cause(), RepoError::Http(err) if transport_is_unreachable(err))
     }

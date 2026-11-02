@@ -768,6 +768,60 @@ fn a_database_damaged_past_its_schema_page_is_recreated_mid_run() {
     }
 }
 
+/// A store index or metadata cache that a newer raeva stamped with a later
+/// generation fails the run with an error that names the file, and the
+/// file keeps its bytes. The hint says to run the newer raeva, and to
+/// delete only the metadata cache, which is not the store's index.
+#[test]
+fn a_database_a_newer_raeva_wrote_is_named_and_kept() {
+    let (_server, project) = stub_libraries(1);
+    for database in ["store/index.sqlite", "metadata.db"] {
+        let home = tempfile::TempDir::new().unwrap();
+        let sync = |args: &[&str]| crate::common::run_raeva(project.path(), home.path(), args);
+        let _ = fs::remove_file(project.path().join("raeva.lock"));
+        assert_success(&sync(&["sync"]), "cold sync");
+        let path = database
+            .split('/')
+            .fold(home.path().to_path_buf(), |path, part| path.join(part));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        let bytes = fs::read(&path).unwrap();
+        for args in [&["sync", "--update"][..], &["--json", "sync", "--update"]] {
+            let output = sync(args);
+            let what = format!("{database} {args:?}");
+            assert!(!output.status.success(), "{what}");
+            // The JSON document escapes the backslashes of a Windows path.
+            let text = if args.contains(&"--json") {
+                let failed = envelope(&output);
+                let hints = failed["hints"].as_array().expect("hints");
+                (std::iter::once(&failed["error"]).chain(hints))
+                    .map(|line| line.as_str().expect("a string"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                text(&output)
+            };
+            let name = fs::canonicalize(&path).unwrap_or(path.clone());
+            assert!(
+                text.contains("written by a newer raeva")
+                    && (text.contains(&path.display().to_string())
+                        || text.contains(&name.display().to_string())),
+                "{what}: {text}"
+            );
+            assert!(text.contains("Run the newer raeva"), "{what}: {text}");
+            let deletes = "and its -wal and -shm files while no raeva runs: it is a cache";
+            assert_eq!(
+                text.contains("delete"),
+                database == "metadata.db" && text.contains(deletes),
+                "{what}: {text}"
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{database}");
+    }
+}
+
 /// Rows written before a query read the damage go with the recreated
 /// database: the index rows of the files a restore found, which an offline
 /// run needs, and the POMs it seeded into the metadata cache.

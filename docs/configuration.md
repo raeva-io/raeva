@@ -27,8 +27,13 @@ another `RAEVA_HOME` or `XDG_CACHE_HOME`, do not wait for each other and
 can overwrite each other's `raeva.lock`, so give concurrent syncs of one
 checkout the same cache directory.
 
-`metadata.db` only speeds up fetches. Delete it while no `raeva` is running.
-It also records the POMs and `maven-metadata.xml` files a repository
+`metadata.db` only speeds up fetches. Delete it, with its `-wal` and `-shm`
+files, while no `raeva` is running.
+A raeva older than the one that last changed the schema of `metadata.db`,
+or of the store index, refuses to open that file rather than replace it.
+Run the newer raeva. For `metadata.db` alone, deleting it as above also
+works; the store index is not a cache, so do not delete it.
+`metadata.db` also records the POMs and `maven-metadata.xml` files a repository
 answered 404, 401 or 403 for, with an HMAC-SHA256 digest of the credential
 sent, and a later sync does not ask
 for them again until the repository's update policy expires, as Maven does
@@ -38,7 +43,9 @@ serving the file. The digest key is in `cache-key`, an owner-only file
 beside `metadata.db`. Keep it out of shared caches: with it, the digests
 in `metadata.db` let a guessed credential be checked. Without it, raeva
 makes a new key and the recorded misses no longer match.
-An online `raeva sync --update` fetches again what the project needs.
+An online `raeva sync --update` fetches again what the project needs. A
+row dated after the current time, as a clock that ran ahead or a cache
+copied from one leaves it, counts as expired.
 
 ## `raeva.toml` and `config.toml`
 
@@ -148,8 +155,12 @@ raeva ignores `-s` and `-gs` in `.mvn/maven.config`, with a
 `SETTING_IGNORED` warning: a settings file brings mirrors, proxies,
 credentials, every environment variable and the local repository, which a
 cloned project must not choose. Declare the project's repositories in
-`raeva.toml`, or pass its settings file with `-s` after reviewing it. Raeva
-reads no global settings file. `-f` (`--file`) in `.mvn/maven.config`, with
+`raeva.toml`, or pass its settings file with `-s` after reviewing it, as in
+`raeva -s <file> sync`. Raeva
+reads no global settings file. It ignores `-pl`, `-am` and `-amd` there too,
+with the same warning, and locks the whole reactor, so a module the build
+skips can still fail the sync. On the command line they are a usage error
+(exit 2). `-f` (`--file`) in `.mvn/maven.config`, with
 which `mvn` builds another POM, fails the load (exit 3). Everything this
 page says about `-D` and `-P` in
 `.mvn/maven.config` holds for the command-line options too.
@@ -187,12 +198,18 @@ A `[[repositories]]` entry has `url` and optionally `id`, `releases`,
   the URL: `raeva.lock` would record it. Use `[[auth]]` or a
   `settings.xml` `<server>`. A dependency POM with such a URL is ignored
   (`REPO_URL_SECRET_REFUSED`).
-- A `settings.xml` repository URL may not take a variable named like a
-  secret (`TOKEN`, `SECRET`, `PASS`, `KEY`, `AUTH`, `CREDENTIAL` or
-  `ENTITLEMENT` in its name) into its path, where some services put a
-  token, since `raeva.lock` records the expanded URL (exit 3). Give such a
-  URL to a `<mirror>`, whose URL the lock does not record. Keep any other
-  secret out of repository URLs too.
+- A repository URL may not take an input named like a secret (`TOKEN`,
+  `SECRET`, `PASS`, `KEY`, `AUTH`, `CREDENTIAL` or `ENTITLEMENT` in its
+  name) into its path, where some services put a token, since `raeva.lock`
+  records the expanded URL (exit 3): in `settings.xml`, an `${env.NAME}`;
+  in a project POM, a `-D` value (command line or `.mvn/maven.config`), an
+  active `settings.xml` profile property or an allowlisted `${env.NAME}`
+  whose value makes up whole segments of the path, with any `${...}` left
+  in it standing for any text. The error names the input, not its value.
+  A fetched POM's repository with such a path is ignored
+  (`REPO_URL_SECRET_REFUSED`). Give such a URL to a `<mirror>`, whose URL
+  the lock does not record. When the value is not a secret, rename the
+  input. Keep any other secret out of repository URLs too.
 - External HTTP repositories declared by any POM are ignored, as with
   Maven's default HTTP blocker. One the project or its parents declare is
   reported (`HTTP_REPO_BLOCKED`); a dependency POM's only under `-v`, or in
@@ -470,8 +487,12 @@ spend their own retries on it. A `Retry-After` over 60 s fails the request
 at once, since asking sooner than the server said cannot succeed. One request's waits add up to at most one
 `timeout` per attempt, plus 5 seconds. Each wait prints a line on stderr
 (not with `--quiet` or `--json`), and an error after retries says how many
-attempts were made. An unresolvable host, a refused connection, or no route
-is not retried. When the retries run out, the
+attempts were made. A host name that does not resolve is looked up once
+more, after the same backoff as a timeout, unless its last lookup failed
+too; after two failed lookups in a row, the host gets no second lookup
+until a request to it gets past the lookup. A refused connection or no
+route is not retried. Neither failure stops the search as the retried ones
+below do: it goes on at the next repository. When the retries run out, the
 sync fails with a network error (exit 4) rather than take the file, version
 list or SNAPSHOT build from the next repository, so `raeva.lock` and
 `--frozen` never depend on a passing failure. Maven moves on to the next

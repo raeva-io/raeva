@@ -434,6 +434,14 @@ mod workspace_resolution {
         )
     }
 
+    /// The classifier likes `resolver` finds for `workspace`.
+    async fn likes_of(resolver: &PlatformResolver, workspace: &Arc<Workspace>) -> Option<String> {
+        let likes = resolver
+            .classifier_likes(workspace, &Arc::default())
+            .await?;
+        likes.likes.value().map(str::to_string)
+    }
+
     fn reactor_dependency(artifact: &str, version: &str) -> String {
         format!(
             "<dependencies><dependency><groupId>t</groupId><artifactId>{artifact}</artifactId>\
@@ -595,18 +603,14 @@ mod workspace_resolution {
             let (resolver, _store) =
                 ubuntu_resolver(&workspace, &HashMap::new(), "linux-x86_64", None);
             assert_eq!(
-                resolver
-                    .classifier_likes(&workspace, &Arc::default())
-                    .await
-                    .as_deref(),
+                likes_of(&resolver, &workspace).await.as_deref(),
                 expected,
                 "{name}"
             );
             let (resolver, _store) =
                 ubuntu_resolver(&workspace, &HashMap::new(), "macos-aarch64", None);
-            assert_eq!(
-                resolver.classifier_likes(&workspace, &Arc::default()).await,
-                None,
+            assert!(
+                (resolver.classifier_likes(&workspace, &Arc::default()).await).is_none(),
                 "{name}"
             );
         }
@@ -667,8 +671,7 @@ mod workspace_resolution {
                 .with_pom_source(source.clone());
             let resolver = PlatformResolver::new(context);
             let log = rv_test_support::capture_warnings(|| {
-                let likes =
-                    runtime.block_on(resolver.classifier_likes(&workspace, &Arc::default()));
+                let likes = runtime.block_on(likes_of(&resolver, &workspace));
                 assert_eq!(likes.as_deref(), Some("root"));
             });
             let bom_reads = (source.requests().iter())
@@ -714,10 +717,7 @@ mod workspace_resolution {
         );
         let (resolver, _store) = ubuntu_resolver(&workspace, &HashMap::new(), "linux-x86_64", None);
         assert_eq!(
-            resolver
-                .classifier_likes(&workspace, &Arc::default())
-                .await
-                .as_deref(),
+            likes_of(&resolver, &workspace).await.as_deref(),
             Some("debian")
         );
     }
@@ -746,10 +746,7 @@ mod workspace_resolution {
             let (resolver, _store) =
                 ubuntu_resolver(&workspace, &HashMap::new(), "linux-x86_64", Some(jdk));
             assert_eq!(
-                resolver
-                    .classifier_likes(&workspace, &Arc::default())
-                    .await
-                    .as_deref(),
+                likes_of(&resolver, &workspace).await.as_deref(),
                 Some(expected),
                 "JDK {jdk}"
             );
@@ -807,10 +804,8 @@ mod workspace_resolution {
         );
         let workspace = Arc::new(workspace);
         let (resolver, _store) = ubuntu_resolver(&workspace, &routes, "linux-x86_64", None);
-        let likes = resolver
-            .classifier_likes(&workspace, &Arc::default())
-            .await
-            .map(Arc::from);
+        let likes =
+            (resolver.classifier_likes(&workspace, &Arc::default()).await).map(|likes| likes.likes);
         let module = PlatformResolver::new(resolver.ctx.clone().with_classifier_likes(likes));
         for (path, own) in [("m1/pom.xml", "n1"), ("m2/pom.xml", "n2")] {
             let graph = resolve_graph(&module, &workspace, path)
@@ -1494,8 +1489,8 @@ mod workspace_resolution {
                 .expect_err("the two winners disagree on the POM");
             drop(dir);
             assert!(
-                matches!(&error, ResolveError::ConflictingResolvedPomBytes { coord, .. }
-                    if coord == "fx:x:1"),
+                matches!(&error, ResolveError::ConflictingResolvedPomBytes(pom)
+                    if pom.coord == "fx:x:1"),
                 "{deps_xml}: {error:?}"
             );
         }
@@ -3034,6 +3029,178 @@ mod workspace_resolution {
             let key = rv_maven_types::ArtifactCoord::new("lib", "ok", "1", extension, None);
             assert!(store.lookup_artifact(&key).await.unwrap().is_some());
         }
+    }
+
+    /// A module that fails its graph fails the pass before any module
+    /// downloads a jar, also when it resolves after the modules before it
+    /// have their graphs: on camel, the modules ahead of one with an
+    /// undefined classifier downloaded theirs first.
+    #[tokio::test]
+    async fn a_failed_graph_downloads_no_jar_of_an_earlier_module() {
+        let mut routes = HashMap::new();
+        routes.insert("/lib/ok/1/ok-1.pom".to_string(), pom("lib", "ok", "1", ""));
+        routes.insert("/lib/ok/1/ok-1.jar".to_string(), b"ok jar".to_vec());
+        let (url, server) = spawn_repository_with_routes(routes);
+        let module = |name: &str, classifier: &str| {
+            String::from_utf8(pom(
+                "t",
+                name,
+                "1",
+                &format!(
+                    "<dependencies><dependency><groupId>lib</groupId>\
+                     <artifactId>ok</artifactId><version>1</version>{classifier}\
+                     </dependency></dependencies>"
+                ),
+            ))
+            .unwrap()
+        };
+        let names: Vec<String> = (0..12).map(|index| format!("m{index}")).collect();
+        let mut files: Vec<(String, String)> = names
+            .iter()
+            .map(|name| (format!("{name}/pom.xml"), module(name, "")))
+            .collect();
+        files.push((
+            "z/pom.xml".to_string(),
+            module("z", "<classifier>${undefined.classifier}</classifier>"),
+        ));
+        let modules: String = (names.iter().chain([&"z".to_string()]))
+            .map(|name| format!("<module>{name}</module>"))
+            .collect();
+        let root = format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules>{modules}</modules></project>"
+        );
+        files.push(("pom.xml".to_string(), root));
+        let files: Vec<(&str, &str)> = (files.iter())
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let (_dir, workspace) = reactor(&files);
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+
+        let error = resolver
+            .resolve_workspace(&workspace)
+            .await
+            .expect_err("z's classifier is undefined");
+        assert!(
+            (error.to_string()).starts_with("property undefined.classifier is not defined"),
+            "{error}"
+        );
+        let jars: Vec<String> = (server.requests().into_iter())
+            .map(|request| request.path)
+            .filter(|path| path.ends_with(".jar"))
+            .collect();
+        assert!(jars.is_empty(), "{jars:?}");
+    }
+
+    /// A pom-packaged dependency's artifact is the POM its model was read
+    /// from, so it is not downloaded again beside the resolution.
+    #[tokio::test]
+    async fn a_pom_typed_dependency_is_fetched_once() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/lib/bom/1/bom-1.pom".to_string(),
+            pom("lib", "bom", "1", ""),
+        );
+        let (url, server) = spawn_repository_with_routes(routes);
+        let app = String::from_utf8(pom(
+            "t",
+            "app",
+            "1",
+            "<dependencies><dependency><groupId>lib</groupId><artifactId>bom</artifactId>\
+             <version>1</version><type>pom</type></dependency></dependencies>",
+        ))
+        .unwrap();
+        let (_dir, workspace) = reactor(&[("pom.xml", &app)]);
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        resolver
+            .resolve_workspace(&workspace)
+            .await
+            .expect("resolve");
+
+        let reads = || {
+            (server.requests().iter())
+                .filter(|request| request.path == "/lib/bom/1/bom-1.pom")
+                .count()
+        };
+        // A second read would come from a download still running.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while reads() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert_eq!(reads(), 1);
+    }
+
+    /// A module whose own dependency has a version raeva cannot read fails
+    /// the pass before any module downloads a jar, also when a slow POM it
+    /// declares first keeps its graph from reaching that dependency.
+    #[tokio::test]
+    async fn an_unreadable_version_downloads_no_jar_of_an_earlier_module() {
+        let mut routes = HashMap::new();
+        routes.insert("/lib/ok/1/ok-1.pom".to_string(), pom("lib", "ok", "1", ""));
+        routes.insert("/lib/ok/1/ok-1.jar".to_string(), b"ok jar".to_vec());
+        let (url, server) = spawn_repository_with_routes(routes);
+        // A server of its own, as its handler holds up every request to it.
+        let slow = StubServer::start(|request| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            match request.path.as_str() {
+                "/lib/slow/1/slow-1.pom" => Response::new(200, pom("lib", "slow", "1", "")),
+                _ => Response::new(404, ""),
+            }
+        });
+        let module = |name: &str, rest: &str| String::from_utf8(pom("t", name, "1", rest)).unwrap();
+        let dependency = |artifact: &str, version: &str| {
+            format!(
+                "<dependency><groupId>lib</groupId><artifactId>{artifact}</artifactId>\
+                 <version>{version}</version></dependency>"
+            )
+        };
+        let mut files: Vec<(String, String)> = (0..4)
+            .map(|index| {
+                let rest = format!("<dependencies>{}</dependencies>", dependency("ok", "1"));
+                (
+                    format!("m{index}/pom.xml"),
+                    module(&format!("m{index}"), &rest),
+                )
+            })
+            .collect();
+        let rest = format!(
+            "<repositories><repository><id>slow</id><url>http://{}/</url></repository>\
+             </repositories><dependencies>{}{}</dependencies>",
+            slow.addr(),
+            dependency("slow", "1"),
+            dependency("ok", "1.+"),
+        );
+        files.push(("z/pom.xml".to_string(), module("z", &rest)));
+        files.push((
+            "pom.xml".to_string(),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules><module>m0</module><module>m1</module><module>m2</module>\
+             <module>m3</module><module>z</module></modules></project>"
+                .to_string(),
+        ));
+        let files: Vec<(&str, &str)> = (files.iter())
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let (_dir, workspace) = reactor(&files);
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+
+        let error = resolver
+            .resolve_workspace(&workspace)
+            .await
+            .expect_err("z's version 1.+ is not a Maven version");
+        assert_eq!(
+            error.to_string(),
+            "invalid version requirement for lib:ok: 1.+"
+        );
+        let jars: Vec<String> = (server.requests().into_iter())
+            .map(|request| request.path)
+            .filter(|path| path.ends_with(".jar"))
+            .collect();
+        assert!(jars.is_empty(), "{jars:?}");
     }
 
     /// The store is shared by every project, but a resolution reuses only

@@ -6,7 +6,9 @@ use indexmap::{IndexMap, IndexSet};
 use reqwest::StatusCode;
 use rv_http::body::{BodyError, read_limited};
 use rv_http::retry::{Cooldown, Outcome, RetryPolicy};
-use rv_http::transient::{status_is_transient, transport_is_retryable};
+use rv_http::transient::{
+    status_is_transient, transport_is_lookup_failure, transport_is_retryable,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -380,6 +382,9 @@ fn outcome(error: VulnError) -> Outcome<VulnError> {
             let retry_after = *retry_after;
             return Outcome::Busy { error, retry_after };
         }
+        VulnError::Http(source) if transport_is_lookup_failure(source) => {
+            return Outcome::Unresolved(error);
+        }
         VulnError::Http(source) => transport_is_retryable(source),
         VulnError::HttpStatus { status, .. } => status_is_transient(*status),
         _ => false,
@@ -602,6 +607,8 @@ fn safe_error_message(error: &VulnError) -> String {
 mod tests {
     use std::io::Write;
     use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use rv_test_support::http::{Response, StubServer};
@@ -784,6 +791,61 @@ mod tests {
         let error = block_on(client.query(PURL)).expect_err("401 fails");
         handle.join().expect("server thread");
         assert!(matches!(error, VulnError::HttpStatus { status, .. } if status == 401));
+    }
+
+    /// Fails the first `fails` lookups, as a resolver that cannot answer
+    /// does, then resolves every name to `addr`.
+    struct FlakyResolver {
+        addr: std::net::SocketAddr,
+        fails: AtomicUsize,
+        lookups: AtomicUsize,
+    }
+
+    impl reqwest::dns::Resolve for FlakyResolver {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let fail = (self.fails)
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            let addr = self.addr;
+            Box::pin(async move {
+                if fail {
+                    return Err(
+                        std::io::Error::other("temporary failure in name resolution").into(),
+                    );
+                }
+                Ok(Box::new(std::iter::once(addr)) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    /// A host name that fails to resolve once is looked up again; one that
+    /// fails twice fails the query.
+    #[test]
+    fn a_failed_lookup_is_tried_once_more() {
+        let (_, server) = osv(|_, _| json(ONE_VULN_PAGE));
+        for fails in [1, 2] {
+            let resolver = Arc::new(FlakyResolver {
+                addr: server.addr(),
+                fails: AtomicUsize::new(fails),
+                lookups: AtomicUsize::new(0),
+            });
+            let base = format!("http://osv.example:{}/v1", server.addr().port());
+            let mut client = client(base);
+            client.client = rv_http::client_defaults()
+                .no_proxy()
+                .dns_resolver(Arc::clone(&resolver))
+                .build()
+                .expect("client");
+            let result = block_on(client.query(PURL));
+            assert_eq!(resolver.lookups.load(Ordering::SeqCst), 2);
+            match result {
+                Ok(page) if fails == 1 => assert_eq!(ids(&page), ["OSV-A"]),
+                Err(VulnError::Http(err)) if fails == 2 => assert!(err.is_dns(), "{err:?}"),
+                other => panic!("{fails} failed lookups: {other:?}"),
+            }
+        }
+        assert_eq!(server.answered(), 1);
     }
 
     /// A batch answer that breaks off mid-body is asked for again.

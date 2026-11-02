@@ -20,6 +20,12 @@ pub enum ConfigError {
     /// [`ConfigError::Invalid`] with the path.
     #[error("invalid settings.xml: {0}")]
     InvalidSettings(String),
+    /// A `settings.xml` value refused by a message that says what to do
+    /// instead. [`Config::load`](crate::Config::load) reports it as
+    /// [`ConfigError::Invalid`] with the path, without the "fix or remove
+    /// it" an [`ConfigError::InvalidSettings`] gets.
+    #[error("invalid settings.xml: {0}")]
+    RefusedSettings(String),
     /// A value or file that was read but rejected.
     #[error("invalid {origin}: {message}")]
     Invalid {

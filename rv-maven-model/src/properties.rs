@@ -798,6 +798,7 @@ impl PropertyMap {
         match key {
             "os.detected.classifier" => {
                 let classifier = platform.get(key)?;
+                environment.note_classifier_likes_read();
                 let mut likes = environment.classifier_likes().peekable();
                 likes.peek()?;
                 let release = release()?;
@@ -1631,7 +1632,8 @@ mod tests {
     /// like to the classifier, in every model alike, unless a dependency's
     /// model has the classifier from a `-D` value. A model's own
     /// `os.detection.classifierWithLikes` property does not change it. Only
-    /// a read that depends on the release records it.
+    /// a read that depends on the release records it, and only a read of
+    /// the classifier the likes can change marks them read.
     #[test]
     fn os_detected_release_follows_the_linux_release() {
         let release = "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=\"debian\"\nVERSION_ID=\"24.04\"\n";
@@ -1716,10 +1718,12 @@ mod tests {
             ),
         ] {
             let host = crate::HostSnapshot::for_testing(&[]).with_os_release(release);
+            let likes = crate::ClassifierLikes::new(Some(likes));
             let mut ctx = crate::ActivationContext::new(
                 host.environment(rust_os, "x86_64")
-                    .with_classifier_likes(Some(likes)),
+                    .with_classifier_likes(Some(&likes)),
             );
+            let overridden = !system.is_empty();
             ctx.system_properties = system;
             let project = ProjectInfo {
                 basedir: basedir.clone(),
@@ -1733,6 +1737,11 @@ mod tests {
             assert_eq!(
                 host.consulted().contains(&crate::HostInput::OsRelease),
                 recorded,
+                "{rust_os} {likes:?}"
+            );
+            assert_eq!(
+                likes.read(),
+                rust_os == "linux" && expression == classifier && !overridden,
                 "{rust_os} {likes:?}"
             );
         }

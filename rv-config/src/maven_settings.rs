@@ -276,60 +276,56 @@ fn interpolate_xml(settings: &mut SettingsXml) -> Result<(), ConfigError> {
 }
 
 /// Refuse a remote repository URL that takes a variable named like a
-/// secret into its path, where services such as Cloudsmith take a token:
-/// raeva.lock records the expanded URL. Other variables, as in
+/// secret into its path, where services such as Cloudsmith take a token,
+/// or into its query or fragment: raeva.lock records the expanded URL. Other variables, as in
 /// `projects/${env.CI_PROJECT_ID}/`, a host, a `file:` URL and a mirror's
 /// URL, which the lock does not record, stay allowed.
 fn refuse_env_in_url_path(id: Option<&str>, url: &str) -> Result<(), ConfigError> {
-    const SECRET: &str = "\u{1}";
-    let secret_named = |name: &str| {
-        let upper = name.to_ascii_uppercase();
-        [
-            "TOKEN",
-            "SECRET",
-            "PASS",
-            "KEY",
-            "AUTH",
-            "CREDENTIAL",
-            "ENTITLEMENT",
-        ]
-        .iter()
-        .any(|word| upper.contains(word))
-    };
+    const SECRET: char = '\u{1}';
     // Other references are expanded first, as a scheme or host may come
-    // from the environment too.
-    let mut secret = None;
+    // from the environment too. Each secret-named one becomes a marker
+    // that names it.
+    let mut secrets = Vec::new();
     let marked = replace_env_refs(url, |name| {
-        if !secret_named(name) {
+        if !crate::redact::secret_named(name) {
             return std::env::var(name).ok();
         }
-        secret.get_or_insert_with(|| name.to_string());
-        Some(SECRET.to_string())
+        secrets.push(name.to_string());
+        Some(format!("{SECRET}{}{SECRET}", secrets.len() - 1))
     });
-    let Some(name) = secret else {
-        return Ok(());
-    };
-    let file = marked.split_once(':');
-    if file.is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file")) {
+    if secrets.is_empty() {
         return Ok(());
     }
-    let path = match marked.split_once("://") {
-        // A backslash ends an http(s) authority too.
-        Some((_, rest)) => rest.find(['/', '\\']).map_or("", |slash| &rest[slash..]),
-        // Without a scheme in sight, the reference may land anywhere.
-        None => &marked,
-    };
-    if !path.contains(SECRET) {
+    let Some(rest) = crate::redact::repository_url_path(&marked) else {
         return Ok(());
-    }
+    };
+    let (path, query) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    let taken = |part: &str| {
+        (secrets.iter().enumerate())
+            .find(|(index, _)| part.contains(&format!("{SECRET}{index}{SECRET}")))
+            .map(|(_, name)| name.clone())
+    };
     let entry = id.map_or_else(
         || "a repository without an id".to_string(),
         |id| format!("repository '{id}'"),
     );
-    Err(ConfigError::InvalidSettings(format!(
+    // A query or fragment is refused whatever it holds, a mirror's too.
+    if let Some(name) = taken(query) {
+        return Err(ConfigError::RefusedSettings(format!(
+            "the URL of {entry} takes ${{env.{name}}} into its query or fragment, which \
+             raeva.lock would record expanded; put the credential in a <server> with the \
+             repository's id, not in the URL"
+        )));
+    }
+    let Some(name) = taken(path) else {
+        return Ok(());
+    };
+    Err(ConfigError::RefusedSettings(format!(
         "the URL path of {entry} takes ${{env.{name}}}, which raeva.lock would record \
-         expanded; give that URL to a <mirror> of the repository, whose URL raeva.lock \
-         does not record, or put the credential in a <server> with the repository's id"
+         expanded, and that name looks like a secret's; if the value is a token, give that \
+         URL to a <mirror> of the repository, whose URL raeva.lock does not record, or put \
+         the credential in a <server> with the repository's id; if it is not a secret, \
+         rename {name}"
     )))
 }
 
@@ -1037,16 +1033,51 @@ mod tests {
                  </profiles></settings>"
             )
         };
-        for repository in [
-            "https://dl.example/${env.REPO_TOKEN}/acme/maven/",
-            "https://dl.example\\${env.REPO_TOKEN}",
-            "${env.RAEVA_TEST_UNSET_BASE}/${env.REPO_TOKEN}/maven/",
+        for (repository, remedy) in [
+            (
+                "https://dl.example/${env.REPO_TOKEN}/acme/maven/",
+                "<mirror>",
+            ),
+            ("https://dl.example\\${env.REPO_TOKEN}", "<mirror>"),
+            (
+                "${env.RAEVA_TEST_UNSET_BASE}/${env.REPO_TOKEN}/maven/",
+                "<mirror>",
+            ),
+            (
+                "https://dl.example/maven/?token=${env.REPO_TOKEN}",
+                "query or fragment",
+            ),
+            (
+                "https://dl.example/maven/#${env.REPO_TOKEN}",
+                "query or fragment",
+            ),
+            // With several, the remedy and the name are the query's.
+            (
+                "https://dl.example/${env.OTHER_TOKEN}/maven/?token=${env.REPO_TOKEN}",
+                "query or fragment",
+            ),
+            (
+                "https://${env.OTHER_TOKEN_HOST}/maven/?token=${env.REPO_TOKEN}",
+                "query or fragment",
+            ),
+            (
+                "https://${env.OTHER_TOKEN_HOST}/${env.REPO_TOKEN}/maven/",
+                "<mirror>",
+            ),
         ] {
             let err = MavenSettings::parse(&settings(repository, "https://m.example/"))
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains("repository 'corp'") && err.contains("${env.REPO_TOKEN}"),
+                err.contains("repository 'corp'")
+                    && err.contains("${env.REPO_TOKEN}")
+                    && !err.contains("OTHER")
+                    && err.contains(remedy),
+                "{repository}: {err}"
+            );
+            assert_eq!(
+                err.contains("<mirror>"),
+                remedy == "<mirror>",
                 "{repository}: {err}"
             );
         }

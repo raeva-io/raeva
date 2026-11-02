@@ -44,4 +44,4 @@ Examples:
   raeva lock diff old.lock            # old.lock against the project's raeva.lock
   raeva lock diff old.lock new.lock
   raeva -v lock diff old.lock         # also list each support POM added or removed
-  git show main:raeva.lock > main.lock && raeva lock diff main.lock
+  git show main:raeva.lock > "${TMPDIR:-/tmp}/main.lock" && raeva lock diff "${TMPDIR:-/tmp}/main.lock"

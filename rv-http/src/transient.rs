@@ -28,7 +28,8 @@ pub fn transport_is_transient(err: &reqwest::Error) -> bool {
 }
 
 /// The transient failures worth retrying: all but an unreachable host and
-/// a proxy that refused the tunnel.
+/// a proxy that refused the tunnel. A failed host name lookup is retried
+/// once ([`transport_is_lookup_failure`]).
 pub fn transport_is_retryable(err: &reqwest::Error) -> bool {
     transport_is_transient(err) && !transport_is_unreachable(err) && tunnel_refusal(err).is_none()
 }
@@ -113,21 +114,13 @@ fn causes<'a>(
 /// A connection that failed before reaching a server: the host name did not
 /// resolve, or the connection was refused or had no route. A retry seconds
 /// later meets the same network, so it is not retried, as Maven's resolver
-/// does not retry an unknown host or a refused connection. A temporary DNS
-/// failure counts as one too. A connection that timed out, or that found no
-/// free local port, is not one of these.
+/// does not retry an unknown host or a refused connection, except for a
+/// failed lookup ([`transport_is_lookup_failure`]). A connection that timed
+/// out, or that found no free local port, is not one of these.
 pub fn transport_is_unreachable(err: &reqwest::Error) -> bool {
     use std::io::ErrorKind;
-    fn has_io(err: &reqwest::Error, pred: impl Fn(&std::io::Error) -> bool) -> bool {
-        causes(err)
-            .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
-            .any(pred)
-    }
-    // hyper-util reports a failed lookup as `DnsError`. The address screen
-    // also fails the lookup, with an error of its own and no `io::Error`,
-    // which is a refusal, not this.
-    if err.is_dns() {
-        return has_io(err, |_| true);
+    if transport_is_lookup_failure(err) {
+        return true;
     }
     if !err.is_connect() {
         return false;
@@ -143,6 +136,22 @@ pub fn transport_is_unreachable(err: &reqwest::Error) -> bool {
                 | ErrorKind::NotConnected
         )
     })
+}
+
+/// The host name lookup failed. A flaky resolver, as on some CI runners,
+/// can fail one lookup and answer the next, so the retry rule tries a
+/// failed lookup once more ([`crate::retry::Outcome::Unresolved`]). The
+/// address screen also fails the lookup, with an error of its own and no
+/// `io::Error`, which is a refusal, not this.
+pub fn transport_is_lookup_failure(err: &reqwest::Error) -> bool {
+    // hyper-util reports a failed lookup as `DnsError`.
+    err.is_dns() && has_io(err, |_| true)
+}
+
+fn has_io(err: &reqwest::Error, pred: impl Fn(&std::io::Error) -> bool) -> bool {
+    causes(err)
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(pred)
 }
 
 #[cfg(test)]
@@ -189,6 +198,39 @@ mod tests {
             assert!(transport_is_unreachable(&err), "{url}: {err:?}");
             assert!(transport_is_transient(&err), "{url}: {err:?}");
             assert!(!transport_is_retryable(&err), "{url}: {err:?}");
+            assert_eq!(transport_is_lookup_failure(&err), url != refused, "{err:?}");
+        }
+    }
+
+    /// A lookup the resolver could not make is a lookup failure; a refusal
+    /// of its answer, as the address screen makes, is not.
+    #[tokio::test]
+    async fn only_a_failed_lookup_is_a_lookup_failure() {
+        struct Failing(bool);
+        impl reqwest::dns::Resolve for Failing {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                let io = self.0;
+                Box::pin(async move {
+                    Err(if io {
+                        std::io::Error::other("no answer").into()
+                    } else {
+                        "resolves to non-global address 10.0.0.1".into()
+                    })
+                })
+            }
+        }
+        for io in [true, false] {
+            let err = crate::client_builder()
+                .no_proxy()
+                .dns_resolver(std::sync::Arc::new(Failing(io)))
+                .build()
+                .unwrap()
+                .get("http://repo.example/")
+                .send()
+                .await
+                .unwrap_err();
+            assert!(err.is_dns(), "{err:?}");
+            assert_eq!(transport_is_lookup_failure(&err), io, "{err:?}");
         }
     }
 

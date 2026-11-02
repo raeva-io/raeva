@@ -20,7 +20,7 @@ use rv_repo::{
 use rv_store::BlobId;
 
 use crate::context::{MetadataKey, RepoContext, ResolveContext};
-use crate::error::{DroppedRepo, RepoSearchStatus, ResolveError, Result};
+use crate::error::{ConflictingPom, DroppedRepo, RepoSearchStatus, ResolveError, Result};
 use crate::graph::{ExactCoord, RepoRef};
 use crate::parent_resolver::LocalParents;
 use crate::solver::{Backend, PathNode, ResolvedProject, ResolvedVersion};
@@ -166,6 +166,8 @@ pub(super) struct CompanionPomOrigin {
 
 type ModelParentRanges = HashMap<(ExactCoord, RepoContext), Vec<rv_lock::ParentRange>>;
 type ReleasePomRepos = HashMap<(PomGav, RepoContext), Arc<str>>;
+/// A POM's bytes and the repository that served them, if one did.
+pub(super) type ServedPom = (BlobId, Option<Arc<str>>);
 
 pub(super) fn pom_gav(coord: &Coord) -> PomGav {
     (
@@ -245,11 +247,15 @@ impl SupportPomProvenance {
     /// coordinate's `_remote.repositories` marker.
     pub(super) fn absorb(&mut self, coord: &str, other: &Self) -> Result<()> {
         if self.sha256 != other.sha256 {
-            return Err(ResolveError::ConflictingResolvedPomBytes {
-                coord: coord.to_string(),
-                first_sha256: self.sha256.clone(),
-                second_sha256: other.sha256.clone(),
-            });
+            return Err(ResolveError::ConflictingResolvedPomBytes(Box::new(
+                ConflictingPom {
+                    coord: coord.to_string(),
+                    first_origin: self.repo_url.clone(),
+                    second_origin: other.repo_url.clone(),
+                    first_sha256: self.sha256.clone(),
+                    second_sha256: other.sha256.clone(),
+                },
+            )));
         }
         if self.repo_id.is_empty() && !other.repo_id.is_empty() {
             self.clone_from(other);
@@ -366,8 +372,9 @@ pub(super) struct ModelService {
     /// by the time the export runs.
     pub(super) support_pom_provenance: Arc<RwLock<HashMap<String, SupportPomProvenance>>>,
     /// SHA-256 of the companion POM bytes this resolution actually parsed for
-    /// each graph coordinate, recorded where those bytes are in hand.
-    /// `None` records that no repository has the POM.
+    /// each graph coordinate, recorded where those bytes are in hand, with
+    /// the repository that served them. `None` records that no repository
+    /// has the POM.
     ///
     /// The lockfile's `pom_sha256` comes from here and never from the store's
     /// coordinate index: the index is last-writer-wins, so between the fetch
@@ -375,7 +382,7 @@ pub(super) struct ModelService {
     /// project sharing the store can repoint `(g, a, v, pom)` at different
     /// bytes. Pinning the index entry would name a POM the graph was never
     /// resolved against.
-    pub(super) companion_pom_blobs: Arc<RwLock<HashMap<PomGav, Option<BlobId>>>>,
+    pub(super) companion_pom_blobs: Arc<RwLock<HashMap<PomGav, Option<ServedPom>>>>,
     /// The reused support POMs this service recorded, by address, each held
     /// so its address is not reused. See [`Self::recorded`].
     recorded_support_poms: Arc<Mutex<HashMap<usize, Arc<SupportPom>>>>,
@@ -986,41 +993,43 @@ impl ModelService {
         if let Some(blob) = lock(&self.winner_poms).get(gav) {
             return Some(blob.clone());
         }
-        self.companion_pom_blobs
+        let recorded = self
+            .companion_pom_blobs
             .read()
-            .expect("companion_pom_blobs lock poisoned")
-            .get(gav)
-            .cloned()
+            .expect("companion_pom_blobs lock poisoned");
+        (recorded.get(gav)).map(|served| served.as_ref().map(|(blob, _)| blob.clone()))
     }
 
-    /// Record the bytes a POM fetch produced for `gav`, `None` when no
-    /// repository had it.
+    /// Record the bytes a POM fetch produced for `gav` and the repository
+    /// that served them, `None` when no repository had it.
     ///
     /// A second observation with a different digest is an error rather than a
     /// winner: both were used to build this graph, and one lockfile row (and
     /// one `~/.m2` path) can only carry one of them, so keeping either would
     /// leave part of the resolution pinned to bytes it never saw.
-    fn record_companion_pom_blob(&self, gav: PomGav, blob: Option<&BlobId>) -> Result<()> {
+    fn record_companion_pom_blob(&self, gav: PomGav, served: Option<ServedPom>) -> Result<()> {
         let mut recorded = self
             .companion_pom_blobs
             .write()
             .expect("companion_pom_blobs lock poisoned");
-        match (recorded.get(&gav), blob) {
-            (Some(Some(existing)), Some(blob)) if existing != blob => {
-                Err(ResolveError::ConflictingResolvedPomBytes {
+        match (recorded.get(&gav), served) {
+            (Some(Some((existing, first))), Some((blob, second))) if *existing != blob => Err(
+                ResolveError::ConflictingResolvedPomBytes(Box::new(ConflictingPom {
                     coord: format!("{}:{}:{}", gav.0, gav.1, gav.2),
+                    first_origin: first.as_deref().unwrap_or_default().to_string(),
+                    second_origin: second.as_deref().unwrap_or_default().to_string(),
                     first_sha256: pom_digest_text(Some(existing)),
-                    second_sha256: pom_digest_text(Some(blob)),
-                })
-            }
+                    second_sha256: pom_digest_text(Some(&blob)),
+                })),
+            ),
             (Some(Some(_)), _) => Ok(()),
-            (Some(None), Some(blob)) => {
-                recorded.insert(gav, Some(blob.clone()));
+            (Some(None), Some(served)) => {
+                recorded.insert(gav, Some(served));
                 Ok(())
             }
             (Some(None), None) => Ok(()),
-            (None, _) => {
-                recorded.insert(gav, blob.cloned());
+            (None, served) => {
+                recorded.insert(gav, served);
                 Ok(())
             }
         }
@@ -1219,32 +1228,39 @@ impl ModelService {
     /// it. The URL is not shown at all: its host is no help without the
     /// part that was refused.
     fn warn_secret_urls(&self, refused: &[Repository], declared_by: Option<&str>) {
+        if refused.is_empty() {
+            return;
+        }
+        let secrets = self.ctx.config.secret_named_inputs();
         for repo in refused {
             let refused_urls = Arc::clone(&self.refused_lineage_urls);
-            let (url, id) = (repo.url.clone(), repo.id.clone().unwrap_or_default());
+            let id = repo.id.as_deref().unwrap_or_default();
+            let (url, id) = (
+                repo.url.clone(),
+                rv_config::without_secret_values(id, &secrets).to_string(),
+            );
             let declared_by = declared_by.map(str::to_string);
+            let Some(refusal) = rv_repo::secret_url_refusal(&url, &secrets) else {
+                continue;
+            };
             rv_maven_model::held::when_shown(move || {
                 if !lock(&refused_urls).insert(url.clone()) {
                     return;
                 }
-                let part = rv_config::secret_url_part(&url).unwrap_or("userinfo");
                 let id = rv_maven_types::bounded(&id);
-                let advice = "which may hold a credential and which raeva.lock would record; \
-                              credentials go in an [[auth]] entry or a settings.xml <server> \
-                              with the repository's id";
                 match declared_by.as_deref().map(rv_maven_types::bounded) {
                     Some(declared_by) => tracing::warn!(
                         sec_code = "REPO_URL_SECRET_REFUSED",
                         repository = %id,
                         declared_by = %declared_by,
                         "ignoring repository '{id}' that {declared_by} declares because its URL \
-                         has {part}, {advice}"
+                         {refusal}"
                     ),
                     None => tracing::warn!(
                         sec_code = "REPO_URL_SECRET_REFUSED",
                         repository = %id,
                         "ignoring repository '{id}' that a fetched POM declares because its URL \
-                         has {part}, {advice}"
+                         {refusal}"
                     ),
                 }
             });
@@ -2064,7 +2080,8 @@ impl ModelService {
         } else {
             recorded
         };
-        self.record_companion_pom_blob(pom_gav(coord), blob.as_ref())?;
+        let served = blob.clone().map(|blob| (blob, project.repo_url.clone()));
+        self.record_companion_pom_blob(pom_gav(coord), served)?;
         if blob.is_none() {
             lock(&self.missing_poms).insert((ExactCoord(coord.clone()), repos.clone()));
         }
@@ -2189,7 +2206,8 @@ impl ModelService {
             // another backend that did the fetch, and this graph is built from
             // the cached model, so the pin has to name the bytes that model
             // came from.
-            self.record_companion_pom_blob(pom_gav(coord), cached.pom_blob.as_ref())?;
+            let served = (cached.pom_blob.clone()).map(|blob| (blob, cached.repo_url.clone()));
+            self.record_companion_pom_blob(pom_gav(coord), served)?;
             if cached.pom_blob.is_none() {
                 lock(&self.missing_poms).insert((ExactCoord(coord.clone()), repos.clone()));
             }
@@ -2395,7 +2413,8 @@ impl ModelService {
         };
         self.store_pom_bytes(&pom_key(coord), &pom.bytes, pom_blob, &route)
             .await?;
-        self.record_companion_pom_blob(pom_gav(coord), Some(pom_blob))?;
+        let served = (pom_blob.clone(), Some(Arc::clone(&repo_url)));
+        self.record_companion_pom_blob(pom_gav(coord), Some(served))?;
         self.ctx.insert_project(
             coord.clone(),
             repos,
@@ -2865,19 +2884,19 @@ impl Backend for ModelService {
     /// refused as two fetches with different bytes are.
     fn note_winner(&self, coord: &Coord, path: &Arc<PathNode>) -> Result<()> {
         let gav = pom_gav(coord);
+        let recorded = self
+            .companion_pom_blobs
+            .read()
+            .expect("companion_pom_blobs lock poisoned")
+            .get(&gav)
+            .cloned();
         let seen = if lock(&self.missing_poms)
             .contains(&(ExactCoord(coord.clone()), path.repos.clone()))
         {
             None
         } else {
-            let recorded = self
-                .companion_pom_blobs
-                .read()
-                .expect("companion_pom_blobs lock poisoned")
-                .get(&gav)
-                .cloned();
-            match recorded {
-                Some(blob) => blob,
+            match &recorded {
+                Some(served) => served.as_ref().map(|(blob, _)| blob.clone()),
                 None => return Ok(()),
             }
         };
@@ -2885,11 +2904,22 @@ impl Backend for ModelService {
             let mut winners = lock(&self.winner_poms);
             match winners.get(&gav) {
                 Some(first) if *first != seen => {
-                    return Err(ResolveError::ConflictingResolvedPomBytes {
-                        coord: format!("{}:{}:{}", gav.0, gav.1, gav.2),
-                        first_sha256: pom_digest_text(first.as_ref()),
-                        second_sha256: pom_digest_text(seen.as_ref()),
-                    });
+                    // One side has the one POM recorded for `gav`, and the
+                    // other none.
+                    let served_by = (recorded.flatten()).and_then(|(_, repo)| repo);
+                    let repo = |blob: &Option<BlobId>| match (blob, &served_by) {
+                        (Some(_), Some(repo)) => repo.to_string(),
+                        _ => String::new(),
+                    };
+                    return Err(ResolveError::ConflictingResolvedPomBytes(Box::new(
+                        ConflictingPom {
+                            coord: format!("{}:{}:{}", gav.0, gav.1, gav.2),
+                            first_origin: repo(first),
+                            second_origin: repo(&seen),
+                            first_sha256: pom_digest_text(first.as_ref()),
+                            second_sha256: pom_digest_text(seen.as_ref()),
+                        },
+                    )));
                 }
                 Some(_) => {}
                 None => {
@@ -3005,7 +3035,10 @@ impl Backend for ModelService {
             return;
         };
         let request = ArtifactRequest::from_coord(coord);
-        if request.is_snapshot() || self.workspace_module_for_coord(coord).is_some() {
+        // A pom-packaged artifact is the POM the model was read from.
+        let model =
+            request.packaging == "pom" && request.classifier.as_deref().is_none_or(str::is_empty);
+        if model || request.is_snapshot() || self.workspace_module_for_coord(coord).is_some() {
             return;
         }
         // The repository the artifact pass tries first: the one that served

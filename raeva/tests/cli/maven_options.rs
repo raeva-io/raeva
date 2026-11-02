@@ -335,6 +335,60 @@ fn frozen_follows_the_settings_content_not_its_path() {
     );
 }
 
+/// raeva locks the whole reactor, so the project selection of
+/// `.mvn/maven.config` is ignored with `SETTING_IGNORED`.
+#[test]
+fn a_reactor_selection_in_maven_config_is_ignored() {
+    let project = Project::new();
+    project.write(".mvn/maven.config", "--projects=app\n-am\n-amd\n");
+    let output = project.raeva(&["--json", "sync", "--offline"]);
+    assert_success(&output, "maven.config -pl");
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let warnings = envelope["data"]["warnings"].as_array().expect("warnings");
+    for option in ["-pl", "-am", "-amd"] {
+        let ignoring = format!("ignoring {option} in ");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning["code"] == "SETTING_IGNORED"
+                    && warning["message"].as_str().is_some_and(|message| {
+                        message.contains(&ignoring)
+                            && message.contains(
+                                "the whole reactor, whatever projects a build selects, so a \
+                                 module this build skips can still fail the sync",
+                            )
+                    })
+            }),
+            "{option}: {envelope}"
+        );
+    }
+}
+
+/// On the command line, `-pl`, `-am` and `-amd` are usage errors (exit 2)
+/// whose tip says why, where clap alone names an unknown `-p` or `-a`.
+#[test]
+fn a_reactor_selection_on_the_command_line_gets_a_tip() {
+    let project = Project::new();
+    for args in [
+        &["sync", "-pl", "app"][..],
+        &["tree", "-am"],
+        &["sync", "--projects=app"],
+    ] {
+        let output = project.raeva(args);
+        assert_status(&output, 2, &format!("{args:?}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(
+                "raeva locks the whole reactor and takes no -pl, -am or -amd; tree, why, vuln, \
+                 sbom and lock verify take --module to report on one module"
+            ),
+            "{args:?}: {stderr}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&project.raeva(&["sync", "--bogus"]).stderr).into_owned();
+    assert!(!stderr.contains("whole reactor"), "{stderr}");
+}
+
 /// A project cannot pick the settings file: a `-s` in `.mvn/maven.config`
 /// would bring mirrors, proxies, every environment variable and the local
 /// repository that the project's own files may not set, so it is ignored
@@ -355,9 +409,8 @@ fn a_settings_option_in_maven_config_is_ignored() {
         warnings
             .iter()
             .any(|warning| warning["code"] == "SETTING_IGNORED"
-                && warning["message"]
-                    .as_str()
-                    .is_some_and(|m| m.contains("-s"))),
+                && warning["message"].as_str().is_some_and(|m| m.contains("-s")
+                    && m.ends_with("review the file and pass it as raeva -s <file> sync"))),
         "{envelope}"
     );
 
@@ -463,7 +516,11 @@ fn an_undefined_property_in_a_coordinate_names_it() {
     );
     let hint = envelope["hints"][0].as_str().expect("hint");
     assert!(
-        hint.contains("raeva sync -Dnisse.os.classifier=<value>"),
+        hint.contains("raeva sync -Dnisse.os.classifier=<value>")
+            && hint.ends_with(
+                "raeva resolves every reactor module, so one a build skips with -pl can \
+                 still fail the sync"
+            ),
         "{hint}"
     );
 

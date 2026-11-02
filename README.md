@@ -40,6 +40,9 @@ Linux and macOS:
 curl -fsSL https://raeva.io/install.sh | sh
 ```
 
+To check the archive's SHA-256 yourself, download it from the release
+instead, as [Installation](docs/installation.md) describes.
+
 Homebrew on Linux and macOS:
 
 ```bash
@@ -69,6 +72,11 @@ commit `raeva.lock`:
 raeva sync        # resolve dependencies and write raeva.lock
 ```
 
+Set `JAVA_HOME` to the JDK the build uses: without it or `JAVA_VERSION`,
+raeva assumes Java 17. `raeva sync` locks the platform it runs on, so when
+CI runs on another OS, lock both once, as in
+`raeva sync --platforms linux-x86_64,macos-aarch64`; later syncs keep them.
+
 Your Maven build stays as it is. In CI, add a step that runs
 `raeva sync --frozen`: it downloads the locked artifacts and fails when a
 plain `raeva sync` would change the lock, after an edit to a POM,
@@ -86,14 +94,15 @@ For an offline build, use separate repositories for locked dependencies and
 Maven's build plugins:
 
 ```bash
-raeva export-m2 --m2-path /build/deps
-mvn -Dmaven.repo.local=/build/plugins -DskipTests package
-mvn -o -Dmaven.repo.local=/build/deps -Dmaven.repo.local.tail=/build/plugins -DskipTests package
+raeva export-m2 --m2-path "$PWD/.offline/deps"
+mvn -Dmaven.repo.local="$PWD/.offline/plugins" -DskipTests package
+mvn -o -Dmaven.repo.local="$PWD/.offline/deps" -Dmaven.repo.local.tail="$PWD/.offline/plugins" -DskipTests package
 ```
 
-Use the same phase in both Maven runs, and in both the profiles and
-settings `raeva sync` used. Plugins, plugin dependencies, and build
-extensions are not locked. The online run resolves the dependencies too
+Run them at the project root and add `.offline/` to `.gitignore`; outside
+`target/`, `mvn clean` keeps it. Use the same phase in both Maven runs, and
+in both the profiles and settings `raeva sync` used. Plugins, plugin
+dependencies, and build extensions are not locked. The online run resolves the dependencies too
 and leaves them in the plugin repository, which the offline run reads as a
 tail for what the export lacks. The export writes a version list under
 every repository id it knows the build reads, empty where the lock takes
@@ -106,8 +115,9 @@ See [Offline builds](docs/offline-builds.md#scope) for the limits.
 Dependencies come only from POMs. For each locked platform, `raeva.lock`
 records one graph per active module and one list of external artifacts; a
 reactor has one `raeva.lock` at its root. The optional `raeva.toml` holds
-tool settings such as repositories, mirrors and network limits, never
-dependencies (see [Configuration](docs/configuration.md)). `raeva` also reads
+tool settings such as repositories and network limits, never dependencies
+(see [Configuration](docs/configuration.md)). Mirrors and proxies belong to
+the machine, in the user `config.toml` or `settings.xml`. `raeva` also reads
 Maven's `~/.m2/settings.xml` for mirrors, proxies, server credentials, active
 profiles and `<localRepository>`.
 
@@ -136,7 +146,7 @@ ln -s "$(command -v raeva)" ~/.local/bin/rv
 | `raeva export-m2` | Export the locked artifacts to the Maven local repository |
 | `raeva tree` | Show the dependency tree from `raeva.lock` |
 | `raeva why <coord>` | Show the shortest paths that bring a dependency in (`--all` for up to 10,000 paths) |
-| `raeva lock info`, `raeva lock verify`, `raeva lock diff` | Show lockfile statistics, compare two locks, or check the locked artifacts in the store |
+| `raeva lock info`, `raeva lock verify`, `raeva lock diff` | Show lockfile statistics, check the locked artifacts in the store, or compare two locks |
 | `raeva doctor` | Check that the store is writable and that the configured repositories, and those the project's POMs declare, can be reached with their credentials |
 | `raeva vuln` | Scan the locked dependencies against OSV (`--vex` applies OpenVEX statements; `raeva vuln triage` records one) |
 | `raeva sbom` | Write a CycloneDX SBOM (`--vex` adds the statements as analyses) |
@@ -187,8 +197,12 @@ a failed command also prints a stable error `code` and its suggestions as
 
 Raeva Cloud is a hosted private Maven registry for `raeva`, Maven, and Gradle.
 It is in private beta, with a waitlist at [raeva.io](https://raeva.io). `raeva`
-needs no special support for it: point a repository or mirror at the
-registry URL.
+needs no special support for it. It does not proxy Maven Central, so add it as
+a repository next to Central, not as a mirror of `central` or `*`, and give
+its read token to a `settings.xml` `<server>` with the repository's id
+([Authentication](docs/authentication.md)). On GitHub Actions, start from
+setup-raeva's
+[`examples/private.yml`](https://github.com/raeva-io/setup-raeva/blob/main/examples/private.yml).
 
 ## License
 

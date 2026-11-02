@@ -304,6 +304,44 @@ fn fresh_companion_pom_conflict_names_both_origins() {
     }
 }
 
+/// Two modules that read different bytes for one parent or BOM name the
+/// repository each read it from.
+#[test]
+fn support_pom_conflict_names_both_repositories() {
+    let provenance = |repo: &str, bytes: &[u8]| SupportPomProvenance {
+        repo_id: "id".to_string(),
+        repo_url: repo.to_string(),
+        snapshot: None,
+        sha256: BlobId::from_bytes(bytes).to_string(),
+    };
+    let (url, other) = (
+        "https://repo.example/maven2/",
+        "https://other.example/maven2/",
+    );
+    let mut aggregate = BTreeMap::new();
+    let coord = "com.example:parent:1";
+    merge_support_pom(
+        &mut aggregate,
+        coord,
+        &provenance(url, b"first"),
+        "a/pom.xml",
+    )
+    .expect("first observation");
+    let message = merge_support_pom(
+        &mut aggregate,
+        coord,
+        &provenance(other, b"second"),
+        "b/pom.xml",
+    )
+    .expect_err("differing bytes must fail the sync")
+    .to_string();
+    assert!(
+        message.contains(&format!("a/pom.xml from {url} ("))
+            && message.contains(&format!("b/pom.xml from {other} (")),
+        "{message}"
+    );
+}
+
 /// A timestamped snapshot's row keeps the `-SNAPSHOT` coordinate and records
 /// the build it resolved to, which is what reads back as its version.
 #[test]

@@ -1077,7 +1077,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, crate::ResolveError::ConflictingResolvedPomBytes { ref coord, .. } if coord == "g:base:1"),
+            matches!(error, crate::ResolveError::ConflictingResolvedPomBytes(ref pom) if pom.coord == "g:base:1"),
             "{error:?}"
         );
     }

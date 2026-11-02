@@ -1,9 +1,6 @@
 schema_version = 8
 config_hash = "c0ec4de46cce1cc336386a86ba9b89d893e4aab61fd7cf166d3875ccd0ea97e1"
 
-[resolution]
-ambient_inputs = ["user-property:os.detection.classifierWithLikes"]
-
 [[platforms]]
 targets = ["linux-x86_64"]
 
@@ -142,12 +139,11 @@ edges = """
 [[inputs]]
 target = "linux-x86_64"
 profiles = []
-ambient_inputs = ["user-property:os.detection.classifierWithLikes"]
 
 [[inputs.poms]]
 path = "pom.xml"
 sha256 = "200e815658dafaad79507f338ce02b5de8d3894830a2c890b50a831186432cba"
-graph = "5fa63e87cfafd602022b5290811d1f0fad2f4b941f13a15514c0a268835201a4"
+graph = "cdc45255689b97dc036446b604b917d5f5a1ed2c6e90a1174daa0a682cd08196"
 
 [metadata]
 repo_ids = """

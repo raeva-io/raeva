@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::{NamedTempFile, TempPath};
 
 use crate::durability::Durability;
-use crate::error::{DbResultExt, IoResultExt, Result, StoreError};
+use crate::error::{IoResultExt, Result, StoreError};
 use crate::index;
 use crate::paths;
 use crate::pin::StoredBlob;
@@ -26,13 +26,14 @@ const POOL_SIZE: u32 = 8;
 
 // foreign_keys is per connection and OFF by default. temp_store keeps temp
 // B-trees in memory, so a crash leaves no temp files behind.
-const INDEX: sqlite::Spec = sqlite::Spec {
+pub(crate) const INDEX: sqlite::Spec = sqlite::Spec {
     pragmas: "PRAGMA busy_timeout=5000;
               PRAGMA cache_size=-32000;
               PRAGMA synchronous=NORMAL;
               PRAGMA foreign_keys=ON;
               PRAGMA temp_store=MEMORY;",
     max_size: POOL_SIZE,
+    generation: 1,
     init: index::init_db,
     lock: |path| Ok(Box::new(StoreLock::acquire(path.parent().unwrap_or(path))?)),
 };
@@ -468,7 +469,7 @@ impl Store {
             durability.make_durable(ticket)?;
             // The store lock keeps lock-holding writers out between the file
             // check and the row write.
-            pool.run_locked(|conn| {
+            pool.write_locked(|conn| {
                 for (key, id) in &rows {
                     let path = root.join(paths::blob_path(id));
                     match fs::symlink_metadata(&path) {
@@ -485,15 +486,11 @@ impl Store {
                         }
                     }
                 }
-                let tx = conn
-                    .transaction()
-                    .db_context(|| "failed to begin index transaction")?;
                 for (key, id) in &rows {
-                    index::add_artifact(&tx, key, id)?;
-                    record_hashed_stamp(&tx, &root, id)?;
+                    index::add_artifact(conn, key, id)?;
+                    record_hashed_stamp(conn, &root, id)?;
                 }
-                tx.commit()
-                    .db_context(|| "failed to commit index transaction")
+                Ok(())
             })
         })
         .await
@@ -554,15 +551,11 @@ impl Store {
         }
         let pool = self.pool.clone();
         blocking(move || {
-            pool.run(|conn| {
-                let tx = conn
-                    .transaction()
-                    .db_context(|| "failed to begin origin transaction")?;
+            pool.write(|conn| {
                 for (key, id, repo_url, endpoint_url) in &rows {
-                    index::add_served(&tx, key, id, repo_url, endpoint_url)?;
+                    index::add_served(conn, key, id, repo_url, endpoint_url)?;
                 }
-                tx.commit()
-                    .db_context(|| "failed to commit origin transaction")
+                Ok(())
             })
         })
         .await
@@ -577,15 +570,11 @@ impl Store {
         }
         let pool = self.pool.clone();
         blocking(move || {
-            pool.run(|conn| {
-                let tx = conn
-                    .transaction()
-                    .db_context(|| "failed to begin origin transaction")?;
+            pool.write(|conn| {
                 for (key, id, origin) in &rows {
-                    index::add_origin(&tx, key, id, origin)?;
+                    index::add_origin(conn, key, id, origin)?;
                 }
-                tx.commit()
-                    .db_context(|| "failed to commit origin transaction")
+                Ok(())
             })
         })
         .await
@@ -1236,6 +1225,72 @@ mod tests {
             store.lookup_artifact(&coord("a7", None)).await.unwrap(),
             None
         );
+    }
+
+    /// A newer raeva may stamp the index with a later generation while this
+    /// handle has it open, keeping its tables readable. No write through
+    /// the open handle reaches it then.
+    #[tokio::test]
+    async fn no_write_reaches_an_index_a_newer_raeva_stamped() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let id = store.put_bytes(b"bytes").await.unwrap();
+        store.add_artifact(&coord("a", None), &id).await.unwrap();
+        // A value this raeva cannot parse, which it would otherwise delete.
+        store
+            .pool
+            .conn()
+            .execute(
+                "INSERT INTO artifacts VALUES ('com.example', 'b', '1.0.0', 'jar', '', 'sha512:00')",
+                [],
+            )
+            .unwrap();
+        let peer = rusqlite::Connection::open(dir.path().join("index.sqlite")).unwrap();
+        peer.pragma_update(None, "user_version", 2).unwrap();
+        let version = || -> i64 {
+            peer.pragma_query_value(None, "data_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = version();
+        let origin = crate::Origin {
+            repo_url: "https://repo.example/".into(),
+            endpoint_url: "https://repo.example/".into(),
+            checksum_verified: true,
+            served: true,
+        };
+        let url = || "https://repo.example/".to_string();
+        let pin = Digest::Sha256(BlobId::from_bytes(b"other"));
+        let expect = Expect {
+            sidecar: None,
+            pin: None,
+        };
+        let errors = [
+            store
+                .add_artifact(&coord("c", None), &id)
+                .await
+                .unwrap_err(),
+            (store
+                .record_origins(vec![(coord("c", None), id.clone(), origin)])
+                .await)
+                .unwrap_err(),
+            (store
+                .record_served(vec![(coord("c", None), id.clone(), url(), url())])
+                .await)
+                .unwrap_err(),
+            store.lookup_artifact(&coord("b", None)).await.unwrap_err(),
+            store.check_pin(&id, &pin).unwrap_err(),
+            match put(&store, b"more", expect, Some(&coord("c", None))).await {
+                Err(PutError::Store(err)) => err,
+                other => panic!("{:?}", other.map(|verified| verified.blob)),
+            },
+        ];
+        for err in errors {
+            assert!(
+                matches!(err, StoreError::NewerDatabase { found: 2, .. }),
+                "{err}"
+            );
+        }
+        assert_eq!(version(), before);
     }
 
     /// A query waiting for the store lock holds no connection, so the

@@ -106,6 +106,7 @@ const CACHE: crate::sqlite::Spec = crate::sqlite::Spec {
     pragmas: "PRAGMA synchronous=NORMAL;
               PRAGMA busy_timeout=5000;",
     max_size: CACHE_POOL_SIZE,
+    generation: 1,
     init: init_schema,
     lock: |path| Ok(Box::new(bootstrap_lock(path)?)),
 };
@@ -372,7 +373,7 @@ impl MetadataCache {
             table.name()
         );
         let _writer = crate::store::lock(&self.writer);
-        self.pool.run(|conn| {
+        self.pool.write(|conn| {
             conn.execute(&sql, params![scope, path, content])
                 .map_err(|source| CacheError::Db {
                     ctx: format!("failed to drop metadata cache entry {path}"),
@@ -384,7 +385,8 @@ impl MetadataCache {
 
     /// Whether `table` has a row for each `(scope, path, pin, renewed)` that
     /// holds the bytes `pin` names, was written at or after `renewed` when
-    /// given, and has not expired by `now` when given, in one read. The
+    /// given, and is not stale at `now` ([`Self::is_stale`]) when given, in
+    /// one read. The
     /// digest written with the row stands for its bytes, which a read that
     /// returns them hashes again.
     pub fn holds(
@@ -407,9 +409,11 @@ impl MetadataCache {
                 .map(|(scope, path, pin, renewed)| {
                     let held = |row: &rusqlite::Row<'_>| {
                         let (expires_at, fetched_at): (i64, i64) = (row.get(1)?, row.get(2)?);
-                        Ok(now.is_none_or(|now| !Self::is_expired(expires_at, now))
-                            && renewed.is_none_or(|start| fetched_at >= start)
-                            && row.get_ref(0)?.as_str()? == pin.as_str())
+                        Ok(
+                            now.is_none_or(|now| !Self::is_stale(fetched_at, expires_at, now))
+                                && renewed.is_none_or(|start| fetched_at >= start)
+                                && row.get_ref(0)?.as_str()? == pin.as_str(),
+                        )
                     };
                     let held = statement.query_row(params![scope, path], held).optional();
                     Ok(held.map_err(db)? == Some(true))
@@ -448,7 +452,7 @@ impl MetadataCache {
         );
         // The context names the path only: the scope can contain repository
         // credentials.
-        self.pool.run(|conn| {
+        self.pool.write(|conn| {
             conn.execute(
                 &sql,
                 params![
@@ -472,6 +476,15 @@ impl MetadataCache {
     /// Whether a row that expires at `expires_at` is stale at `now`.
     pub fn is_expired(expires_at: i64, now: i64) -> bool {
         expires_at <= now
+    }
+
+    /// Whether a row written at `fetched_at` that expires at `expires_at`
+    /// is stale at `now`. A row dated after `now`, as a clock that ran ahead
+    /// or a cache copied from one leaves it, is stale too: its expiry would
+    /// keep it fresh for as long as that clock was ahead, and `--update`
+    /// would take it for a row written during the run.
+    pub fn is_stale(fetched_at: i64, expires_at: i64, now: i64) -> bool {
+        fetched_at > now || Self::is_expired(expires_at, now)
     }
 }
 
@@ -693,6 +706,76 @@ mod tests {
         }
     }
 
+    /// A cache that a newer raeva stamped with a later generation is not
+    /// opened, and keeps its rows.
+    #[test]
+    fn a_cache_from_a_newer_raeva_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.db");
+        let cache = MetadataCache::new(&path).unwrap();
+        let (scope, pom) = ("https://repo.example/", "g/a/1/a-1.pom");
+        cache
+            .insert_with_ttl(CacheTable::Pom, scope, pom, b"<pom/>", 3600, true)
+            .unwrap();
+        drop(cache);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        drop(conn);
+        let err = MetadataCache::new(&path).err().unwrap();
+        assert!(
+            err.to_string().contains("written by a newer raeva"),
+            "{err}"
+        );
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM pom_cache_v3", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    /// A cache that a newer raeva stamps with a later generation while this
+    /// handle has it open takes no write through the handle: neither a new
+    /// row nor the drop of one whose bytes do not match its digest.
+    #[test]
+    fn an_open_cache_takes_no_write_once_a_newer_raeva_stamped_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.db");
+        let cache = MetadataCache::new(&path).unwrap();
+        let (scope, pom) = ("https://repo.example/", "g/a/1/a-1.pom");
+        cache
+            .insert_with_ttl(CacheTable::Pom, scope, pom, b"<pom/>", 3600, true)
+            .unwrap();
+        let peer = rusqlite::Connection::open(&path).unwrap();
+        peer.execute("UPDATE pom_cache_v3 SET content = x'00'", [])
+            .unwrap();
+        peer.pragma_update(None, "user_version", 2).unwrap();
+        let version = || -> i64 {
+            peer.pragma_query_value(None, "data_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = version();
+        let errors = [
+            cache
+                .insert_with_ttl(
+                    CacheTable::Pom,
+                    scope,
+                    "g/b/1/b-1.pom",
+                    b"<pom/>",
+                    3600,
+                    true,
+                )
+                .unwrap_err(),
+            cache.get(CacheTable::Pom, scope, pom).unwrap_err(),
+        ];
+        for err in errors {
+            assert!(
+                err.to_string().contains("written by a newer raeva"),
+                "{err}"
+            );
+        }
+        assert_eq!(version(), before);
+    }
+
     /// Damage past the schema page passes the check at open; the first
     /// query that reads it recreates the cache.
     #[test]
@@ -716,6 +799,41 @@ mod tests {
             .insert_with_ttl(CacheTable::Pom, scope, pom, b"<pom/>", 3600, true)
             .unwrap();
         assert!(cache.get(CacheTable::Pom, scope, pom).unwrap().is_some());
+    }
+
+    /// A row dated in the future is stale, under `--update` too, where it
+    /// would otherwise pass for a row written during the run.
+    #[test]
+    fn a_row_dated_in_the_future_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.db");
+        let cache = MetadataCache::new(&path).unwrap();
+        let (scope, pom) = ("https://repo.example/", "g/a/1/a-1.pom");
+        cache
+            .insert_with_ttl(CacheTable::Pom, scope, pom, b"<pom/>", 3600, true)
+            .unwrap();
+        let pin = rv_maven_types::Sha256::from_bytes(b"<pom/>");
+        let now = cache
+            .get(CacheTable::Pom, scope, pom)
+            .unwrap()
+            .unwrap()
+            .fetched_at;
+        let holds = |renewed: Option<i64>| {
+            let key = (scope.to_string(), pom.to_string(), pin.clone(), renewed);
+            cache.holds(CacheTable::Pom, &[key], Some(now)).unwrap()[0]
+        };
+        assert!(holds(None) && holds(Some(now)));
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE pom_cache_v3 SET fetched_at = ?1 + 600", [now])
+            .unwrap();
+        assert!(!holds(None) && !holds(Some(now)));
+        let entry = cache.get(CacheTable::Pom, scope, pom).unwrap().unwrap();
+        assert!(MetadataCache::is_stale(
+            entry.fetched_at,
+            entry.expires_at,
+            now
+        ));
+        assert!(!MetadataCache::is_stale(now, entry.expires_at, now));
     }
 
     /// A row whose bytes changed after they were written, as damage inside

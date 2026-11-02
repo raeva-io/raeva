@@ -63,7 +63,10 @@ pub use maven_settings::{expand_local_repository, unset_env_references};
 pub use paths::MAVEN_USER_HOME_TEST_ENV;
 pub use paths::ResolvedPaths;
 pub use proxy_env::{EnvironmentProxy, NoProxy, environment_proxies};
-pub use redact::{UNPARSABLE_URL, redact_url, redacted_url, secret_url_part};
+pub use redact::{
+    UNPARSABLE_URL, redact_url, redacted_url, secret_input_in_path, secret_named, secret_url_part,
+    url_path_holds, without_secret_values,
+};
 pub use settings::{
     AuthConfig, ChecksumPolicy, MirrorConfig, ProxyAuthType, ProxyConfig, RepoConfig, UpdatePolicy,
 };

@@ -224,6 +224,59 @@ impl<'a, B: Backend> Solver<'a, B> {
     }
 
     pub(crate) async fn solve(&self, root: SolverRoot) -> Result<Graph> {
+        let mut walk = self.start(root)?;
+        // Items are read one at a time, in queue order, and each is mediated
+        // before the next is read, as Maven collects: what a read records or
+        // logs, and which reads happen at all, follow from the graph alone.
+        // The backend prefetches the POMs of queued items concurrently.
+        loop {
+            self.hint_queued(&mut walk);
+            let Some(item) = walk.queue.pop() else {
+                if walk.walk_excluded_dependencies(self.backend)? {
+                    continue;
+                }
+                self.refuse_unresolved_winners(&walk)?;
+                return walk.finish(self.backend);
+            };
+            self.hint_queued(&mut walk);
+            let outcome = resolve_item(self, item.clone(), &walk.relocations)
+                .await
+                .map_err(|err| declared_below(err, &item.path));
+            self.mediate(&mut walk, item, outcome).await?;
+        }
+    }
+
+    /// Fail on the first declared winner in the graph whose coordinate still
+    /// names an undefined property.
+    fn refuse_unresolved_winners(&self, walk: &Walk) -> Result<()> {
+        let mut unresolved = (walk.selected.values())
+            .filter_map(|selection| Some((selection.node, selection.winner.as_deref()?)))
+            .filter(|(_, winner)| names_property(&winner.coord))
+            .peekable();
+        if unresolved.peek().is_none() {
+            return Ok(());
+        }
+        let reachable = walk.graph.reachable();
+        let Some((_, winner)) = unresolved
+            .filter(|(node, _)| reachable.contains(node))
+            .min_by_key(|(_, winner)| winner.item.declared_at)
+        else {
+            return Ok(());
+        };
+        let item = &winner.item;
+        let version = resolve_version_str(&self.management, &item.dependency, item.depth)?;
+        refuse_undefined_property(self, item, version)
+            .map_err(|err| declared_below(err, &item.path))
+    }
+
+    /// Fail where [`Self::solve`] fails on `root`'s own dependencies before
+    /// it reads any of them.
+    pub(crate) fn check_root(&self, root: SolverRoot) -> Result<()> {
+        self.start(root).map(drop)
+    }
+
+    /// The walk with `root`'s own dependencies queued.
+    fn start(&self, root: SolverRoot) -> Result<Walk> {
         let SolverRoot {
             coord,
             dependencies,
@@ -260,29 +313,18 @@ impl<'a, B: Backend> Solver<'a, B> {
             // download nothing first.
             let managed = apply_managed_metadata(&self.management, item.clone());
             if managed.dependency.effective_scope() != Scope::Import {
-                let version = resolve_version_str(&self.management, &managed.dependency, 1)?;
+                let dependency = &managed.dependency;
+                let version = resolve_version_str(&self.management, dependency, 1)?;
                 refuse_undefined_property(self, &managed, version)?;
+                parse_requested_requirement(
+                    &dependency.group_id,
+                    &dependency.artifact_id,
+                    version,
+                )?;
             }
             push_queue(&mut walk.queue, item)?;
         }
-        // Items are read one at a time, in queue order, and each is mediated
-        // before the next is read, as Maven collects: what a read records or
-        // logs, and which reads happen at all, follow from the graph alone.
-        // The backend prefetches the POMs of queued items concurrently.
-        loop {
-            self.hint_queued(&mut walk);
-            let Some(item) = walk.queue.pop() else {
-                if walk.walk_excluded_dependencies(self.backend)? {
-                    continue;
-                }
-                return walk.finish(self.backend);
-            };
-            self.hint_queued(&mut walk);
-            let outcome = resolve_item(self, item.clone(), &walk.relocations)
-                .await
-                .map_err(|err| declared_below(err, &item.path));
-            self.mediate(&mut walk, item, outcome).await?;
-        }
+        Ok(walk)
     }
 
     /// Tell the backend which POMs the items queued since the last hint will
@@ -1253,9 +1295,10 @@ impl Walk {
                 .filter(|_| !target.local);
             target.repos = winner.item.path.repos.clone();
             target.workspace_module = project.workspace_module.clone();
-            // A classifier still naming a property fails once the graph is
+            // A coordinate still naming a property fails once the graph is
             // in, and names no file to fetch.
-            let unread = (target.coord.classifier.as_deref()).is_some_and(|c| c.contains("${"));
+            let unread = (target.coord.classifier.as_deref()).is_some_and(|c| c.contains("${"))
+                || names_property(&target.coord);
             if target.workspace_module.is_none() && !target.local && !unread {
                 backend.prefetch_artifact(&target.coord, target.repo_url.as_deref(), &target.repos);
             }
@@ -1652,6 +1695,17 @@ fn coord_of(dependency: &Dependency, version: Version) -> Coord {
     }
 }
 
+/// Whether a `${...}` is left in the group, artifact or version of `coord`.
+fn names_property(coord: &Coord) -> bool {
+    [
+        coord.group_id.as_str(),
+        coord.artifact_id.as_str(),
+        coord.version.as_str(),
+    ]
+    .iter()
+    .any(|part| part.contains("${"))
+}
+
 /// Fail on a `${...}` left in `item`'s coordinate, naming the POM that
 /// declared it. Maven fails only on a dependency it keeps, and a module's
 /// own dependency is always kept, so its type and classifier count too,
@@ -1726,7 +1780,32 @@ async fn resolve_item<B: Backend>(
         return Ok(None);
     }
     let version_str = resolve_version_str(&solver.management, &item.dependency, item.depth)?;
-    refuse_undefined_property(solver, &item, version_str)?;
+    if let Err(error) = refuse_undefined_property(solver, &item, version_str) {
+        // Maven finds no POM for a transitive dependency whose coordinate
+        // names an undefined property, and fails on it only once mediation
+        // keeps it, so it is loaded only then.
+        if item.depth == 1 || dep_scope == Scope::System || version_str.starts_with(['[', '(']) {
+            return Err(error);
+        }
+        let version = Version::unresolved(version_str);
+        let candidate = Candidate {
+            coord: coord_of(&item.dependency, version.clone()),
+            resolved: ResolvedVersion {
+                version,
+                repo: None,
+            },
+            resolved_project: None,
+            hard: None,
+            source: vec![0],
+            inherited: Arc::from([]),
+            item,
+        };
+        return Ok(Some(Resolution {
+            candidate,
+            alternatives: Vec::new(),
+            aliases: Vec::new(),
+        }));
+    }
     let dependency = &item.dependency;
     let (requirement, versions, resolved) = requested_versions(
         solver,
@@ -1898,6 +1977,22 @@ async fn load_candidate<B: Backend>(
         "{}:{}:{}",
         candidate.coord.group_id, candidate.coord.artifact_id, candidate.coord.version
     );
+    // Maven finds no POM for it, and fails on it only once it is selected.
+    if names_property(&candidate.coord) {
+        let project = Project::new(
+            &candidate.coord.group_id,
+            &candidate.coord.artifact_id,
+            candidate.coord.version.as_str(),
+        );
+        return Ok(Load::Ready(Candidate {
+            resolved_project: Some(ResolvedProject {
+                project: Arc::new(project),
+                repo_url: None,
+                workspace_module: None,
+            }),
+            ..candidate
+        }));
+    }
     (load_declared(solver, candidate, relocations).await).map_err(|err| {
         // A fault in the candidate's own model, such as a missing parent,
         // does not name the candidate, nor the relocation target whose

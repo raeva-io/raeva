@@ -2052,3 +2052,65 @@ fn offline_sync_resolves_a_dependency_without_a_pom() {
         assert_eq!(fs::read(&lock_path).expect("read lock"), lock);
     }
 }
+
+/// A failure that turns a module's resolved graph into lock rows, here a
+/// SNAPSHOT build number raeva.lock cannot record, names the module.
+#[test]
+fn a_failure_completing_a_module_names_it() {
+    const VERSION: &str = "1.0-20260720.123253-4294967296";
+    let base = "/maven/com/example/demo/1.0-SNAPSHOT/demo";
+    let demo_pom = format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+         <artifactId>demo</artifactId><version>{VERSION}</version></project>"
+    );
+    let files: HashMap<String, Vec<u8>> = [
+        (format!("{base}-{VERSION}.pom"), demo_pom.into_bytes()),
+        (format!("{base}-{VERSION}.jar"), b"demo jar".to_vec()),
+    ]
+    .into();
+    let server =
+        StubServer::start(move |request| serve(&request.path, |path| files.get(path).cloned()));
+    let project = tempfile::tempdir().expect("project");
+    fs::write(
+        project.path().join("pom.xml"),
+        pom(
+            "root",
+            "<packaging>pom</packaging><modules><module>app</module></modules>",
+        ),
+    )
+    .expect("root pom");
+    fs::create_dir(project.path().join("app")).expect("mkdir app");
+    fs::write(
+        project.path().join("app/pom.xml"),
+        pom(
+            "app",
+            &format!(
+                "<dependencies><dependency><groupId>com.example</groupId>\
+                 <artifactId>demo</artifactId><version>{VERSION}</version></dependency>\
+                 </dependencies>"
+            ),
+        ),
+    )
+    .expect("app pom");
+    fs::write(
+        project.path().join("raeva.toml"),
+        format!(
+            "[[repositories]]\nid = \"central\"\nurl = \"http://{}/maven/\"\n\
+             snapshots = true\n",
+            server.addr()
+        ),
+    )
+    .expect("raeva.toml");
+    let home = tempfile::tempdir().expect("home");
+    let output = raeva_command(project.path(), home.path())
+        .env("RAEVA_RETRIES", "0")
+        .arg("sync")
+        .output()
+        .expect("run raeva sync");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("which raeva.lock cannot record"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("In app/pom.xml"), "{stderr}");
+}

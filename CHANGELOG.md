@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-02
+
+### Changed
+
+- Linux-target locks no longer record `os.detection.classifierWithLikes`,
+  from `-D` or a settings.xml profile, unless the build reads
+  `${os.detected.classifier}`, so they match locks written on macOS, and an
+  unread `-D` no longer fails `--frozen`. A 0.5.0 lock written on Linux for
+  a project that does not read the classifier still passes `--frozen`, and
+  `raeva sync` leaves it as it is. It changes once, the next time raeva
+  resolves the project, such as after a POM edit or under `--update`.
+- A multi-module sync whose later module declares a dependency raeva cannot
+  use, such as an undefined or unreadable version, now fails before
+  downloading any jars.
+- POM conflict errors name the repository behind each copy.
+- `-pl`, `-am` and `-amd` in `.mvn/maven.config` warn that raeva locks the
+  whole reactor.
+- `docs/ci.md` lets Git merge `raeva.lock` with its default driver.
+- `raeva lock diff` says "no dependency changes" when no pin moved, and it
+  and the sync summary name the host inputs a lock gained or lost.
+  `raeva doctor` says what a 404 leaves unchecked. Several errors give a
+  clearer next step, among them a `metadata.db` from a newer raeva, which
+  is a cache you can delete.
+
+### Fixed
+
+- `raeva sync` refuses a project repository URL whose path takes the value
+  of a secret-named `-D`, settings profile property or allowlisted
+  environment variable. The error names the input, never its value. Such a
+  repository in a fetched POM is ignored with `REPO_URL_SECRET_REFUSED`.
+- An undefined-property version that mediation drops no longer fails the
+  sync, as in Maven.
+- A host name lookup that fails is tried once more, for repositories and
+  OSV, so a flaky CI resolver no longer fails the sync.
+- raeva no longer writes to or deletes a `metadata.db` or store index that
+  a newer raeva wrote, even one upgraded during the run. Opening one fails
+  with an error naming the file.
+- Metadata cache entries dated in the future, from clock skew or a copied
+  cache, are fetched again, including under `--update`.
+
 ## [0.5.0] - 2026-11-01
 
 Most of raeva is rewritten for 0.5.0. This is how it works now.
@@ -411,7 +451,8 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
-[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/raeva-io/raeva/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/raeva-io/raeva/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/raeva-io/raeva/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/raeva-io/raeva/compare/v0.3.0...v0.4.0

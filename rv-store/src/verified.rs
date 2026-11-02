@@ -241,7 +241,7 @@ impl Store {
             };
             // A blob that is not durable must not gain an index row.
             root_shared(&root).durability.make_durable(ticket)?;
-            pool.run_locked(|conn| {
+            pool.write_locked(|conn| {
                 // Another writer may have replaced or removed the file since
                 // it was published; index only a regular file.
                 let target = root.join(crate::paths::blob_path(&id));

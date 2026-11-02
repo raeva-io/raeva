@@ -156,15 +156,51 @@ pub(crate) fn command() -> clap::Command {
          raeva sync --frozen  Fail when raeva.lock is out of date, as in CI\n\n\
          Offline build: export the locked dependencies to a repository of their own, and fill \
          another with Maven's plugins (plugins are not locked):\n  \
-         raeva export-m2 --m2-path /build/deps\n  \
-         mvn -Dmaven.repo.local=/build/plugins -DskipTests package\n  \
-         mvn -o -Dmaven.repo.local=/build/deps -Dmaven.repo.local.tail=/build/plugins \
-         -DskipTests package",
+         raeva export-m2 --m2-path \"$PWD/.offline/deps\"\n  \
+         mvn -Dmaven.repo.local=\"$PWD/.offline/plugins\" -DskipTests package\n  \
+         mvn -o -Dmaven.repo.local=\"$PWD/.offline/deps\" \
+         -Dmaven.repo.local.tail=\"$PWD/.offline/plugins\" -DskipTests package\n\n\
+         Run them at the project root and add .offline/ to .gitignore.",
     )
 }
 
+/// Maven's reactor selection reaches clap as an unknown `-p` or `-a`, so
+/// the error gets a tip that says why raeva takes none.
+fn with_reactor_selection_tip(mut err: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    const SELECTIONS: [&str; 6] = [
+        "-pl",
+        "--projects",
+        "-am",
+        "--also-make",
+        "-amd",
+        "--also-make-dependents",
+    ];
+    let selects = std::env::args_os().skip(1).any(|arg| {
+        let arg = arg.to_string_lossy();
+        let name = arg.split_once('=').map_or(&*arg, |(name, _)| name);
+        SELECTIONS.contains(&name)
+    });
+    if err.kind() != ErrorKind::UnknownArgument || !selects {
+        return err;
+    }
+    let mut tips = match err.get(ContextKind::Suggested) {
+        Some(ContextValue::StyledStrs(tips)) => tips.clone(),
+        _ => Vec::new(),
+    };
+    tips.push(
+        "raeva locks the whole reactor and takes no -pl, -am or -amd; tree, why, vuln, sbom \
+         and lock verify take --module to report on one module"
+            .into(),
+    );
+    err.insert(ContextKind::Suggested, ContextValue::StyledStrs(tips));
+    err
+}
+
 pub(crate) async fn raeva() -> (Result<Report>, Output, Option<Session>) {
-    let mut matches = command().get_matches();
+    let mut matches = command()
+        .try_get_matches()
+        .unwrap_or_else(|err| with_reactor_selection_tip(err).exit());
     let maven_options = maven_options(&matches);
     let default_root =
         matches.value_source("project_root") == Some(clap::parser::ValueSource::DefaultValue);

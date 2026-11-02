@@ -203,6 +203,14 @@ fn doctor_probes_the_pom_repository_that_needs_credentials() {
             .is_some_and(|line| line.ends_with("1 check(s) failed")),
         "{stderr}"
     );
+    // The repositories that answer 404 are inconclusive, which a note
+    // under the table does not let pass for a success.
+    assert!(
+        stderr.lines().any(|line| line
+            == "2 inconclusive, which is not a pass, though raeva doctor exits 0 when no check \
+                fails"),
+        "{stderr}"
+    );
 }
 
 /// `io.raeva:lib:1.0` as a POM and jar, with SHA-256 sidecars.

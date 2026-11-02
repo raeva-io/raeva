@@ -902,7 +902,8 @@ impl RepoClient {
                 Some(entry)
                     if unchecked(&entry)
                         || (!offline
-                            && MetadataCache::is_expired(
+                            && MetadataCache::is_stale(
+                                entry.fetched_at,
                                 entry.expires_at,
                                 now_epoch_seconds(),
                             )) =>

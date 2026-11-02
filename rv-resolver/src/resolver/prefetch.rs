@@ -36,7 +36,7 @@ use rv_maven_model::{Pom, parent_has_expression};
 use rv_maven_types::{ArtifactCoord, BlobId, Coord};
 use rv_repo::{ArtifactRequest, Metadata, PomArrival, RepoClient, RepoError, Repository};
 use rv_store::Store;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 
 use super::pom_source::PomSource;
@@ -60,6 +60,17 @@ pub(crate) struct Prefetcher {
     tasks: Mutex<JoinSet<()>>,
 }
 
+/// Whether artifacts the store lacks are downloaded.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Downloads {
+    Open,
+    /// Until released, with whether one was wanted meanwhile.
+    Held {
+        wanted: bool,
+    },
+    Dropped,
+}
+
 struct Shared {
     source: Arc<dyn PomSource>,
     parsed: Arc<ParsedPomCache>,
@@ -73,6 +84,7 @@ struct Shared {
     artifact_permits: Semaphore,
     /// Every repository URL and artifact path hinted so far.
     artifacts_seen: Mutex<HashSet<(String, String)>>,
+    downloads: watch::Sender<Downloads>,
 }
 
 impl Prefetcher {
@@ -97,9 +109,58 @@ impl Prefetcher {
                 artifacts,
                 artifact_permits: Semaphore::new(concurrency),
                 artifacts_seen: Mutex::default(),
+                downloads: watch::Sender::new(Downloads::Open),
             }),
             tasks: Mutex::new(JoinSet::new()),
         }
+    }
+
+    /// Hold back every artifact download, hinted or not, until
+    /// [`Self::release_artifacts`].
+    pub(crate) fn hold_artifacts(&self) {
+        self.shared
+            .downloads
+            .send_replace(Downloads::Held { wanted: false });
+    }
+
+    /// Start the artifact downloads held back, or, unless `start`, drop them
+    /// and any later one. Only the first release counts.
+    pub(crate) fn release_artifacts(&self, start: bool) {
+        self.shared.downloads.send_if_modified(|downloads| {
+            let held = matches!(downloads, Downloads::Held { .. });
+            if held {
+                *downloads = if start {
+                    Downloads::Open
+                } else {
+                    Downloads::Dropped
+                };
+            }
+            held
+        });
+    }
+
+    /// Whether a download was held back before the release, which comes
+    /// first.
+    pub(crate) async fn downloads_wanted(&self) -> bool {
+        let mut downloads = self.shared.downloads.subscribe();
+        let wanted = downloads.wait_for(|now| *now != Downloads::Held { wanted: false });
+        matches!(
+            wanted.await.as_deref(),
+            Ok(Downloads::Held { wanted: true })
+        )
+    }
+
+    /// Once the artifacts are released.
+    pub(crate) async fn downloads_released(&self) {
+        let mut downloads = self.shared.downloads.subscribe();
+        let released = downloads.wait_for(|now| !matches!(now, Downloads::Held { .. }));
+        let _ = released.await;
+    }
+
+    /// Whether an artifact the store lacks may be downloaded, once that is
+    /// decided.
+    pub(crate) async fn may_download(&self) -> bool {
+        self.shared.may_download().await
     }
 
     /// Start downloading the artifact of `request` from `repo`, unless the
@@ -120,8 +181,7 @@ impl Prefetcher {
                 return;
             }
         }
-        let shared = Arc::clone(&self.shared);
-        let repo = repo.clone();
+        let (shared, repo) = (Arc::clone(&self.shared), repo.clone());
         self.spawn(async move { shared.prefetch_artifact(repo, request, key).await });
     }
 
@@ -284,9 +344,24 @@ impl Shared {
         let Ok(_permit) = self.artifact_permits.acquire().await else {
             return;
         };
-        if matches!(client.stored_artifact(store, &repo, &key).await, Ok(None)) {
+        if matches!(client.stored_artifact(store, &repo, &key).await, Ok(None))
+            && self.may_download().await
+        {
             client.prefetch_artifact(&repo, &request, store).await;
         }
+    }
+
+    async fn may_download(&self) -> bool {
+        self.downloads.send_if_modified(|downloads| {
+            let first = *downloads == Downloads::Held { wanted: false };
+            if first {
+                *downloads = Downloads::Held { wanted: true };
+            }
+            first
+        });
+        let mut downloads = self.downloads.subscribe();
+        let decided = downloads.wait_for(|now| !matches!(now, Downloads::Held { .. }));
+        matches!(decided.await.as_deref(), Ok(Downloads::Open))
     }
 
     async fn prefetch(

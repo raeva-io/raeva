@@ -179,8 +179,7 @@ impl CliError {
                 return Diagnostic { message, ..cause };
             }
             CliError::Store(err) => {
-                let message = report::render_store_error(err, env);
-                return Diagnostic::plain(S::Failure, "STORE", message);
+                return Diagnostic::new(S::Failure, "STORE", report::render_store_error(err, env));
             }
             CliError::Export(err) => return diagnose_export(err, env),
             CliError::Vuln(err) => {
@@ -413,7 +412,7 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
             diagnostic
         }
         ResolveError::Store(source) => {
-            Diagnostic::plain(S::Failure, "STORE", report::render_store_error(source, env))
+            Diagnostic::new(S::Failure, "STORE", report::render_store_error(source, env))
         }
         ResolveError::MultipleArtifactErrors { first, rest } => {
             let first_diagnostic = diagnose_resolve(first, env);
@@ -517,7 +516,8 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
                 hints: vec![format!(
                     "Define it in .mvn/maven.config or on the command line: raeva sync \
                      -D{}=<value>. In a Maven build a build extension or plugin that raeva \
-                     does not run may set it",
+                     does not run may set it. raeva resolves every reactor module, so one a \
+                     build skips with -pl can still fail the sync",
                     rv_maven_types::bounded(property)
                 )],
             },
@@ -562,7 +562,7 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
         | ResolveError::WorkspaceDependencyCycle { .. }
         | ResolveError::ConflictingArtifactBytes { .. }
         | ResolveError::ConflictingSupportPomBytes(_)
-        | ResolveError::ConflictingResolvedPomBytes { .. }
+        | ResolveError::ConflictingResolvedPomBytes(_)
         | ResolveError::MissingVersion { .. }
         | ResolveError::InvalidVersionRequirement { .. }
         | ResolveError::VersionNotFound { .. }
@@ -580,8 +580,8 @@ fn diagnose_export(err: &ExportError, env: &HintEnv) -> Diagnostic {
     let sync = "raeva sync";
     let (status, code, hint) = match err {
         ExportError::StoreError(source) => {
-            let message = report::render_store_error(source, env);
-            return Diagnostic::plain(S::Failure, "STORE", message);
+            let rendered = report::render_store_error(source, env);
+            return Diagnostic::new(S::Failure, "STORE", rendered);
         }
         ExportError::PinMismatch { .. } => (
             S::LockMismatch,
@@ -848,6 +848,11 @@ mod tests {
             source: sqlite(code),
         };
         let pool = || Store::PoolError(s("busy"));
+        let newer = |file: &str| Store::NewerDatabase {
+            path: format!("/raeva/{file}").into(),
+            found: 2,
+            supported: 1,
+        };
         let searched =
             |code| RepoSearchStatus::new("https://repo.example/m2/", RepoStatus::Http(code));
         let refused_with = |code, id: Option<&str>, sent| {
@@ -940,6 +945,7 @@ mod tests {
                 holder_info: s("pid 7"),
             }
             .into(),
+            newer("index.sqlite").into(),
             ResolveError::Store(pool()).into(),
             Export::StoreError(pool()).into(),
             RepoError::Cache(Cache::Db {
@@ -951,6 +957,7 @@ mod tests {
             RepoError::Cache(Cache::Io(io(ErrorKind::Other))).into(),
             RepoError::Cache(Cache::Io(io(ErrorKind::StorageFull))).into(),
             RepoError::Cache(Cache::Setup(Box::new(pool()))).into(),
+            RepoError::Cache(Cache::Setup(Box::new(newer("metadata.db")))).into(),
             RepoError::Cache(Cache::Setup(Box::new(db(
                 rusqlite::ffi::SQLITE_IOERR_SHMSIZE,
             ))))

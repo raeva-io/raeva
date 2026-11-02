@@ -57,6 +57,17 @@ impl Version {
         })
     }
 
+    /// `s` as Maven's collector reads a version that still holds a `${...}`,
+    /// which [`Self::parse`] refuses: compared as written. It names no
+    /// artifact.
+    pub fn unresolved(s: &str) -> Self {
+        let trimmed = s.trim();
+        Self {
+            original: trimmed.to_string(),
+            items: parse_items(trimmed),
+        }
+    }
+
     /// The version as given to [`Self::parse`], trimmed.
     pub fn as_str(&self) -> &str {
         &self.original

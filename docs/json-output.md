@@ -124,9 +124,12 @@ records), `module_changes`, `profile_changes`, `changes`, `edge_changes`,
 not set `changed`. `changed_inputs` lists the inputs whose recorded hashes
 differ, so an edit that leaves the dependencies alone (a POM comment, say)
 still shows: `config_hash` for the configuration, then each reactor POM path
-whose hash differs on a platform both locks record. When nothing else
-changed, text prints them on a `changed inputs:` line, which `raeva sync` also
-prints when it updates raeva.lock; more than three POMs are a count. Text also
+whose hash differs on a platform both locks record, then each host input
+name in `[resolution] ambient_inputs` that only one lock records. When
+nothing else changed, text says `no dependency changes` and prints them on a
+`changed inputs:` line, which `raeva sync` also prints when it updates
+raeva.lock; more than three POMs, or host inputs, are a count. Other
+bookkeeping, such as a module's `graph` digest, can still differ. Text also
 counts the support POMs (parents and BOMs) added or removed along with
 dependency changes; `-v` lists each one.
 A lock section for a `[lock] jdks` entry is its own platform, named
@@ -373,8 +376,8 @@ A warning does not change the exit status. Codes are stable. Messages may change
 | `PROJECT_LOCAL_REPOSITORY_IGNORED` | `raeva export-m2` ignored `local_repository` in the project `raeva.toml`, or `-Dmaven.repo.local` in `.mvn/maven.config`. |
 | `PROJECT_REPO_URL_FROM_FETCHED_POM` | A project POM repository URL comes from a fetched parent, so the repository has that parent's trust. |
 | `PROJECT_SECURITY_WIDENING_IGNORED` | Project `raeva.toml` set `[security]` wider than the user `config.toml`. That part was ignored. |
-| `REPO_URL_SECRET_REFUSED` | A POM repository URL has userinfo, a query, or a fragment, which may hold a credential. Ignored, and the URL is not shown. `context` holds `repository` (the id) and `declared_by` (the declaring POM, when known). |
-| `SETTING_IGNORED` | An unusable setting was ignored: an environment variable such as `RAEVA_MAX_ARTIFACT_SIZE`, `RAEVA_HOME`, `SSL_CERT_FILE`, or `SSL_CERT_DIR` with a value `raeva` cannot use; `settings-security.xml` that is not valid XML; a `settings.xml` proxy protocol other than `http`, `https`, or `all`; a `<mirrorOf>` pattern Maven does not know; `-s` or `-gs` in `.mvn/maven.config`, since a project cannot choose the settings file; or an `rv.toml` or `rv.lock`, the names older releases used, where no `raeva.toml` or `raeva.lock` exists. `context.env` names the variable. |
+| `REPO_URL_SECRET_REFUSED` | A fetched POM's repository URL has userinfo, a query, or a fragment, or the value of an input named like a secret in its path (see [Configuration](configuration.md#repositories-and-mirrors)), which may hold a credential. Ignored, and the URL is not shown. `context` holds `repository` (the id) and `declared_by` (the declaring POM, when known). |
+| `SETTING_IGNORED` | An unusable setting was ignored: an environment variable such as `RAEVA_MAX_ARTIFACT_SIZE`, `RAEVA_HOME`, `SSL_CERT_FILE`, or `SSL_CERT_DIR` with a value `raeva` cannot use; `settings-security.xml` that is not valid XML; a `settings.xml` proxy protocol other than `http`, `https`, or `all`; a `<mirrorOf>` pattern Maven does not know; `-s` or `-gs` in `.mvn/maven.config`, since a project cannot choose the settings file; `-pl`, `-am` or `-amd` there, since `raeva` locks the whole reactor; or an `rv.toml` or `rv.lock`, the names older releases used, where no `raeva.toml` or `raeva.lock` exists. `context.env` names the variable. |
 | `STORE_FILE_REFETCHED` | A stored locked file did not match its `raeva.lock` checksum and was downloaded again. Every mode reports it, including `--frozen`. |
 | `SYSTEM_SCOPE` | A `system` dependency names a local file. |
 | `TRANSITIVE_REPO_DROPPED` | A repository dependency POMs declare was ignored. Not reported for Maven Central, which is searched anyway, or for a snapshot-only repository that a release POM declares. One warning per repository: `context` holds `url` (redacted) and `declared_by`, the POMs that declare it, sorted. See `security.transitive_repository_allowlist` in [Configuration](configuration.md). |

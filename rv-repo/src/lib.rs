@@ -41,7 +41,7 @@ pub use client::{
 pub use error::{ErrorClass, IntegritySource, RedirectRejectionKind, RepoError};
 pub use fetch::FetchProgress;
 pub use metadata::{Metadata, Snapshot, SnapshotCandidate, SnapshotVersion};
-pub use policy::{Admission, Declaration, Provenance, RepositoryPolicy};
+pub use policy::{Admission, Declaration, Provenance, RepositoryPolicy, secret_url_refusal};
 pub use proxy::configured_proxies;
 pub use repository::{Repository, fresh_secs, normalize_repo_url};
 pub use restore::{

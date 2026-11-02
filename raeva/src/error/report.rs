@@ -140,7 +140,7 @@ pub(crate) fn render_repo_error(
     }
     match err {
         RepoError::InvalidMetadata(_) => return render_invalid_metadata(err, searched),
-        RepoError::Store(store) => return Rendered::plain(render_store_error(store, env)),
+        RepoError::Store(store) => return render_store_error(store, env),
         RepoError::Cache(cache) => return render_metadata_cache_error(cache, env),
         _ => {}
     }
@@ -202,6 +202,17 @@ fn render_metadata_cache_error(err: &CacheError, env: &HintEnv) -> Rendered {
             "repository metadata cache error: {}",
             shared_memory_failure(&env.metadata_cache_location())
         ));
+    }
+    if let CacheError::Setup(inner) = err
+        && let rv_store::StoreError::NewerDatabase { path, .. } = &**inner
+    {
+        let mut out = Rendered::plain(format!("repository metadata cache error: {inner}"));
+        out.hint(format!(
+            "Run the newer raeva, or delete {} and its -wal and -shm files while no raeva runs: \
+             it is a cache, and this raeva starts a new one",
+            path.display()
+        ));
+        return out;
     }
     let io;
     let what = match err {
@@ -970,7 +981,7 @@ fn shared_memory_failure(database: &str) -> String {
     )
 }
 
-pub(crate) fn render_store_error(err: &StoreError, env: &HintEnv) -> String {
+pub(crate) fn render_store_error(err: &StoreError, env: &HintEnv) -> Rendered {
     use std::io::ErrorKind;
     const DISK_FULL: &str = "disk full; check available space on the store volume";
     let sync = "raeva sync";
@@ -978,7 +989,14 @@ pub(crate) fn render_store_error(err: &StoreError, env: &HintEnv) -> String {
     let detail = match err {
         // Already actionable (process info, advice on NOT deleting the lock
         // file), with no implementation details.
-        StoreError::LockTimeout { .. } => return err.to_string(),
+        StoreError::LockTimeout { .. } => return Rendered::plain(err.to_string()),
+        // The store index is not a cache: deleting it loses what the store
+        // holds.
+        StoreError::NewerDatabase { .. } => {
+            let mut out = Rendered::plain(format!("artifact store error: {err}"));
+            out.hint("Run the newer raeva, or give this one its own RAEVA_HOME");
+            return out;
+        }
         StoreError::IoError(io_err) => match io_err.kind() {
             ErrorKind::StorageFull | ErrorKind::QuotaExceeded | ErrorKind::OutOfMemory => {
                 DISK_FULL.to_string()
@@ -1019,7 +1037,7 @@ pub(crate) fn render_store_error(err: &StoreError, env: &HintEnv) -> String {
         StoreError::IntegrityError(msg) => format!("integrity check failed: {msg}"),
         _ => err.to_string(),
     };
-    format!("artifact store error: {detail}")
+    Rendered::plain(format!("artifact store error: {detail}"))
 }
 #[cfg(test)]
 mod tests {

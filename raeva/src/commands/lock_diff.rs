@@ -17,7 +17,8 @@ const VIA_PATH_CAP: usize = 3;
 
 #[derive(Debug, Clone, Args)]
 #[command(after_long_help = format!(
-    "{}  git show main:raeva.lock > main.lock && raeva lock diff main.lock\n",
+    "{}  git show main:raeva.lock > \"${{TMPDIR:-/tmp}}/main.lock\" && \
+     raeva lock diff \"${{TMPDIR:-/tmp}}/main.lock\"\n",
     crate::commands::util::help_examples(&[
         ("lock diff old.lock", "old.lock against the project's raeva.lock"),
         ("lock diff old.lock new.lock", ""),
@@ -74,6 +75,8 @@ struct LockDiffReport {
     pom_changes: Vec<PomChange>,
     changed_inputs: Vec<String>,
     via_limited: bool,
+    #[serde(skip)]
+    host_inputs: Vec<String>,
     #[serde(skip)]
     lines: Vec<(String, Option<usize>)>,
 }
@@ -273,6 +276,7 @@ impl LockDiffReport {
             edge_changes: diff.edge_changes,
             pom_changes: diff.pom_changes,
             changed_inputs: diff.changed_inputs,
+            host_inputs: diff.host_inputs,
             lines,
         })
     }
@@ -286,9 +290,9 @@ impl CommandOutput for LockDiffReport {
     fn render_human(&self, human: &mut Human<'_>) -> io::Result<()> {
         human.heading("Lockfile diff")?;
         if !self.changed {
-            return human.line(match inputs_line(&self.changed_inputs) {
+            return human.line(match inputs_line(&self.changed_inputs, &self.host_inputs) {
                 Some(inputs) => format!("  no dependency changes;{}", &inputs[1..]),
-                None => "  no changes".to_string(),
+                None => "  no dependency changes".to_string(),
             });
         }
         for (line, index) in &self.lines {
@@ -304,13 +308,14 @@ impl CommandOutput for LockDiffReport {
     }
 }
 
-/// The inputs whose recorded hashes changed, as one line.
-fn inputs_line(inputs: &[String]) -> Option<String> {
+/// The inputs whose recorded hashes changed, then the host inputs a
+/// resolution reads now or no longer reads, as one line.
+fn inputs_line(inputs: &[String], host: &[String]) -> Option<String> {
     const LISTED_POMS: usize = 3;
     let config = inputs.iter().any(|input| input == "config_hash");
     let poms: Vec<&String> = inputs
         .iter()
-        .filter(|input| *input != "config_hash")
+        .filter(|input| *input != "config_hash" && !host.contains(input))
         .collect();
     // A POM's record covers its parents, so a parent edit changes many.
     let poms = if poms.len() > LISTED_POMS {
@@ -319,12 +324,22 @@ fn inputs_line(inputs: &[String]) -> Option<String> {
         poms.into_iter().cloned().collect()
     };
     let config = config.then(|| "the configuration (config_hash)".to_string());
-    let names: Vec<String> = config.into_iter().chain(poms).collect();
+    let host = match host {
+        [] => None,
+        [one] => Some(format!("the host input {one}")),
+        many if many.len() <= LISTED_POMS => Some(format!(
+            "the host inputs {}",
+            join_and(many.iter().cloned())
+        )),
+        many => Some(format!("{} host inputs", many.len())),
+    };
+    let names: Vec<String> = config.into_iter().chain(poms).chain(host).collect();
     (!names.is_empty()).then(|| format!("  changed inputs: {}", join_and(names.into_iter())))
 }
 
 /// `config_hash` when the configuration hashes differ, then each reactor
-/// POM whose recorded hash differs on a platform both locks record.
+/// POM whose recorded hash differs on a platform both locks record, then
+/// the [`host_inputs`].
 fn changed_inputs(
     old: &Lockfile,
     new: &Lockfile,
@@ -345,7 +360,18 @@ fn changed_inputs(
         }
     }
     let config = (old.config_hash != new.config_hash).then(|| "config_hash".to_string());
-    config.into_iter().chain(inputs).collect()
+    (config.into_iter().chain(inputs))
+        .chain(host_inputs(old, new))
+        .collect()
+}
+
+/// The `[resolution] ambient_inputs` names only one of the locks records,
+/// as the lock writes them.
+fn host_inputs(old: &Lockfile, new: &Lockfile) -> Vec<String> {
+    (old.resolution.ambient_inputs)
+        .symmetric_difference(&new.resolution.ambient_inputs)
+        .map(ToString::to_string)
+        .collect()
 }
 
 /// Maximum number of changed entries shown inline in a `--frozen` mismatch
@@ -477,6 +503,8 @@ struct LockChanges {
     edge_changes: Vec<EdgeChange>,
     pom_changes: Vec<PomChange>,
     changed_inputs: Vec<String>,
+    /// The [`host_inputs`], which `changed_inputs` ends with too.
+    host_inputs: Vec<String>,
 }
 
 impl LockChanges {
@@ -509,6 +537,7 @@ impl LockChanges {
             edge_changes,
             pom_changes: pom_pin_changes(old, new, allowed),
             changed_inputs: changed_inputs(old, new, allowed),
+            host_inputs: host_inputs(old, new),
         }
     }
 
@@ -1405,7 +1434,9 @@ pub(super) fn lock_diff(
         .map(|(line, _)| line)
         .collect();
     if lines.is_empty() {
-        inputs_line(&diff.changed_inputs).into_iter().collect()
+        inputs_line(&diff.changed_inputs, &diff.host_inputs)
+            .into_iter()
+            .collect()
     } else {
         lines
     }
@@ -1452,7 +1483,7 @@ mod tests {
             })
         );
         let (stdout, stderr) = render(false, |human| report.render_human(human));
-        assert_eq!(stdout, "  no changes\n");
+        assert_eq!(stdout, "  no dependency changes\n");
         assert_eq!(stderr, "Lockfile diff\n");
     }
 
@@ -2000,6 +2031,42 @@ mod tests {
         assert_eq!(sync, ["  changed inputs: app/pom.xml"]);
     }
 
+    /// A host input a resolution no longer reads, as the 0.5.0 Linux
+    /// classifier likes, rewrites the lock with no dependency change; the
+    /// diff and the sync summary name it instead of saying nothing changed.
+    #[test]
+    fn host_inputs_read_or_no_longer_read_are_named() {
+        use rv_lock::AmbientInput;
+        let likes = "user-property:os.detection.classifierWithLikes";
+        let old = {
+            let mut lock = lock_from("https://repo.example/");
+            lock.resolution.ambient_inputs = [
+                AmbientInput::UserProperty("os.detection.classifierWithLikes".into()),
+                AmbientInput::JavaVersion,
+            ]
+            .into();
+            lock
+        };
+        let mut new = lock_from("https://repo.example/");
+        new.resolution.ambient_inputs = [AmbientInput::JavaVersion].into();
+        let report = report(&old, &new);
+        let json = report.to_json().unwrap();
+        assert_eq!(json["changed"], false);
+        assert_eq!(json["changed_inputs"], json!([likes]));
+        let (stdout, _) = render(false, |human| report.render_human(human));
+        assert_eq!(
+            stdout,
+            format!("  no dependency changes; changed inputs: the host input {likes}\n")
+        );
+        let sync = super::lock_diff(
+            &old,
+            &new,
+            &[Platform::new("linux", "x86_64").unwrap()],
+            true,
+        );
+        assert_eq!(sync, [format!("  changed inputs: the host input {likes}")]);
+    }
+
     /// A `[lock] jdks` section is its own platform: a change in one JDK's
     /// section names that section, and a JDK added to the list is a platform
     /// added.
@@ -2379,12 +2446,25 @@ mod tests {
         .map(str::to_string)
         .into();
         assert_eq!(
-            super::inputs_line(&inputs).unwrap(),
+            super::inputs_line(&inputs, &[]).unwrap(),
             "  changed inputs: the configuration (config_hash) and the records of 4 reactor POMs"
         );
         assert_eq!(
-            super::inputs_line(&inputs[1..3]).unwrap(),
+            super::inputs_line(&inputs[1..3], &[]).unwrap(),
             "  changed inputs: a/pom.xml and b/pom.xml"
         );
+        // Host inputs end changed_inputs, and more than three are a count.
+        let host: Vec<String> = ["env.A", "env.B", "java.version", "os-release"]
+            .map(str::to_string)
+            .into();
+        let with = |host: &[String]| {
+            let all: Vec<String> = inputs[1..2].iter().chain(host).cloned().collect();
+            super::inputs_line(&all, host).unwrap()
+        };
+        assert_eq!(
+            with(&host[..2]),
+            "  changed inputs: a/pom.xml and the host inputs env.A and env.B"
+        );
+        assert_eq!(with(&host), "  changed inputs: a/pom.xml and 4 host inputs");
     }
 }

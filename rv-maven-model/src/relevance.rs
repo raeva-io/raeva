@@ -104,11 +104,6 @@ impl ResolutionKeys {
             }
         }
         let mut pending = Vec::new();
-        if role == LineageRole::Project {
-            // os-maven-plugin reads this from the first sorted project, and
-            // every model's `os.detected.classifier` takes its suffix.
-            keys.read(&format!("${{{LIKES}}}"), &mut pending);
-        }
         for pom in chain {
             keys.read_pom_fields(pom, &mut pending);
             for profile in &pom.profiles {
@@ -163,30 +158,43 @@ impl ResolutionKeys {
         // Only the input POM's: Maven does not inherit `<prerequisites>`.
         let prerequisites =
             (chain.first()).and_then(|pom| pom.prerequisites.as_ref()?.maven.as_deref());
-        while let Some(name) = pending.pop() {
-            for value in definitions.get(name.as_str()).into_iter().flatten() {
-                keys.read(value, &mut pending);
+        let drain = |keys: &mut Self, pending: &mut Vec<String>| {
+            while let Some(name) = pending.pop() {
+                for value in definitions.get(name.as_str()).into_iter().flatten() {
+                    keys.read(value, pending);
+                }
+                if matches!(
+                    name.as_str(),
+                    "project.prerequisites.maven" | "pom.prerequisites.maven"
+                ) && let Some(value) = prerequisites
+                {
+                    keys.read(value, pending);
+                }
+                for value in build_field(&name)
+                    .and_then(|field| build.get(field))
+                    .into_iter()
+                    .flatten()
+                {
+                    keys.read(value, pending);
+                }
             }
-            if matches!(
-                name.as_str(),
-                "project.prerequisites.maven" | "pom.prerequisites.maven"
-            ) && let Some(value) = prerequisites
-            {
-                keys.read(value, &mut pending);
-            }
-            for value in build_field(&name)
-                .and_then(|field| build.get(field))
-                .into_iter()
-                .flatten()
-            {
-                keys.read(value, &mut pending);
-            }
+        };
+        drain(&mut keys, &mut pending);
+        let pom_reads_likes = keys.dynamic || keys.names.contains(LIKES);
+        if role == LineageRole::Project {
+            // os-maven-plugin reads this from the first sorted project, and
+            // every model's `os.detected.classifier` takes its suffix.
+            keys.read(&format!("${{{LIKES}}}"), &mut pending);
+            drain(&mut keys, &mut pending);
         }
         if has_settings_properties {
             for name in &ctx.settings_property_names {
-                // A `-D` value hides a settings value, except the likes.
+                // A `-D` value hides a settings value. The plugin's read of
+                // the likes counts only once a build reads the classifier,
+                // and the search for them records it then.
                 if (keys.dynamic || keys.names.contains(name))
-                    && (!ctx.properties.contains_key(name) || name == LIKES)
+                    && !ctx.properties.contains_key(name)
+                    && (name != LIKES || pom_reads_likes)
                 {
                     ctx.environment
                         .record(crate::HostInput::SettingsProperty(name.clone()));
@@ -995,10 +1003,12 @@ mod tests {
         );
     }
 
-    /// The classifier likes of a settings.xml profile are the model's, so
-    /// they are recorded as read under a `-D` value too.
+    /// The classifier likes of a settings.xml profile are the model's under
+    /// a `-D` value too. A project build records no read of them: the
+    /// search for the first sorted project's likes does, once a build reads
+    /// the classifier.
     #[test]
-    fn settings_classifier_likes_are_recorded_under_a_user_property() {
+    fn settings_classifier_likes_win_over_a_user_property() {
         let pom = Pom::parse(
             "<project><groupId>g</groupId><artifactId>app</artifactId><version>1</version>\
              </project>",
@@ -1018,9 +1028,6 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(project.classifier_with_likes.as_deref(), Some("fedora"));
-        assert_eq!(
-            host.consulted(),
-            BTreeSet::from([HostInput::SettingsProperty(super::LIKES.to_string())])
-        );
+        assert_eq!(host.consulted(), BTreeSet::new());
     }
 }

@@ -5,9 +5,11 @@ Quick start:
   raeva sync --frozen  Fail when raeva.lock is out of date, as in CI
 
 Offline build: export the locked dependencies to a repository of their own, and fill another with Maven's plugins (plugins are not locked):
-  raeva export-m2 --m2-path /build/deps
-  mvn -Dmaven.repo.local=/build/plugins -DskipTests package
-  mvn -o -Dmaven.repo.local=/build/deps -Dmaven.repo.local.tail=/build/plugins -DskipTests package
+  raeva export-m2 --m2-path "$PWD/.offline/deps"
+  mvn -Dmaven.repo.local="$PWD/.offline/plugins" -DskipTests package
+  mvn -o -Dmaven.repo.local="$PWD/.offline/deps" -Dmaven.repo.local.tail="$PWD/.offline/plugins" -DskipTests package
+
+Run them at the project root and add .offline/ to .gitignore.
 
 Usage: raeva [OPTIONS] <COMMAND>
 

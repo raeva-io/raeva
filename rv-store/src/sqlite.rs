@@ -24,6 +24,17 @@ pub(crate) struct Spec {
     /// `synchronous=NORMAL` falls back to `FULL`.
     pub(crate) pragmas: &'static str,
     pub(crate) max_size: u32,
+    /// The schema's generation, kept as the file's `user_version` once
+    /// [`Spec::init`] ran. A file of a later generation was written by a
+    /// newer raeva, which this one may misread as damaged: it neither opens
+    /// nor recreates it, and a handle open on it writes nothing more (see
+    /// [`write_transaction`]). A raeva that changes the schema or the
+    /// meaning of its rows in a way an older one cannot read bumps it,
+    /// under the bootstrap lock and in a transaction that holds the write
+    /// lock, with the change. Raeva 0.5.0 and older never check it, so that
+    /// raeva must also keep their writes out of what it reads, as with new
+    /// table names.
+    pub(crate) generation: i64,
     /// Creates the schema, on open and again after a recreate.
     pub(crate) init: fn(&rusqlite::Connection) -> Result<()>,
     /// Takes the cross-process lock that callers of [`open`] hold, for the
@@ -103,7 +114,7 @@ pub(crate) fn open(path: &Path, spec: Spec) -> Result<Arc<Db>> {
     if let Some(db) = registry().get(&key).and_then(Weak::upgrade) {
         return Ok(db);
     }
-    let user = Arc::new(enable_wal(path)?);
+    let user = Arc::new(enable_wal(path, spec.generation)?);
     let db = Db {
         path: path.to_path_buf(),
         spec,
@@ -118,7 +129,9 @@ pub(crate) fn open(path: &Path, spec: Spec) -> Result<Arc<Db>> {
     {
         // Creating the schema can read damage the check at open missed.
         let mut state = db.state.write().unwrap_or_else(PoisonError::into_inner);
-        if let Err(err) = state.checkout(path).and_then(|conn| (spec.init)(&conn))
+        if let Err(err) = state
+            .checkout(path)
+            .and_then(|conn| set_up(&conn, path, spec))
             && !(err.is_corrupt() && state.close() && db.reset(&mut state, &err)?)
         {
             return Err(err);
@@ -155,6 +168,35 @@ impl Db {
         op: impl FnMut(&mut rusqlite::Connection) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
         self.run_with(true, op)
+    }
+
+    /// [`Db::run`] for an `op` that writes, in one [`write_transaction`].
+    pub(crate) fn write<T, E: DbError>(
+        &self,
+        mut op: impl FnMut(&rusqlite::Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.run(|conn| self.in_write(conn, &mut op))
+    }
+
+    /// [`Db::write`] holding the spec's cross-process lock, as
+    /// [`Db::run_locked`] does.
+    pub(crate) fn write_locked<T, E: DbError>(
+        &self,
+        mut op: impl FnMut(&rusqlite::Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        self.run_locked(|conn| self.in_write(conn, &mut op))
+    }
+
+    fn in_write<T, E: DbError>(
+        &self,
+        conn: &rusqlite::Connection,
+        op: &mut impl FnMut(&rusqlite::Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let tx = write_transaction(conn, &self.path, self.spec.generation)?;
+        let value = op(&tx)?;
+        tx.commit()
+            .db_context(|| format!("failed to commit a write to {}", self.path.display()))?;
+        Ok(value)
     }
 
     fn run_with<T, E: DbError>(
@@ -219,7 +261,7 @@ impl Db {
             if users.try_lock().is_err() {
                 return Ok(false);
             }
-            epoch = recreate_files(&self.path, &users, err)?;
+            epoch = recreate_files(&self.path, self.spec.generation, &users, err)?;
             users
                 .unlock()
                 .io_context(|| format!("failed to unlock {}", users_path.display()))?;
@@ -233,8 +275,18 @@ impl Db {
         });
         state.epoch = epoch;
         state.user = Arc::downgrade(&user);
+        // A peer's new file may be a newer raeva's. A pooled connection's
+        // pragmas load the schema, which may not parse, so this checks first.
+        let conn = rusqlite::Connection::open(&self.path)
+            .db_context(|| format!("failed to open {}", self.path.display()))?;
+        check_generation(&conn, &self.path, self.spec.generation)?;
+        drop(conn);
         state.pool = Some(wal_pool(&self.path, user, self.spec)?);
-        (self.spec.init)(&*state.checkout::<StoreError>(&self.path)?)?;
+        set_up(
+            &*state.checkout::<StoreError>(&self.path)?,
+            &self.path,
+            self.spec,
+        )?;
         state.generation += 1;
         RECREATED.fetch_add(1, Ordering::Relaxed);
         Ok(true)
@@ -316,13 +368,13 @@ fn open_users(path: &Path) -> Result<File> {
 /// That happens only while no other handle, in this process or another,
 /// has the database open: the returned [`DbUser`] marks this one as open,
 /// and [`wal_pool`] keeps it until the last connection closes.
-fn enable_wal(path: &Path) -> Result<DbUser> {
+fn enable_wal(path: &Path, generation: i64) -> Result<DbUser> {
     let users_path = sibling(path, ".users");
     let users = open_users(&users_path)?;
     let alone = users.try_lock().is_ok();
-    match open_wal(path) {
+    match open_wal(path, generation) {
         Err(err) if alone && err.is_corrupt() => {
-            recreate_files(path, &users, &err)?;
+            recreate_files(path, generation, &users, &err)?;
         }
         result => result?,
     }
@@ -365,8 +417,20 @@ fn epoch(users: &File, path: &Path) -> Result<u64> {
 
 /// Deletes the damaged database at `path` with its `-wal` and `-shm` files,
 /// creates it anew, and bumps its [`epoch`], which it returns. The caller
-/// holds the exclusive lock on `users`.
-fn recreate_files(path: &Path, users: &File, err: &dyn std::fmt::Display) -> Result<u64> {
+/// holds the exclusive lock on `users`. A file that still names a later
+/// generation than `generation` is kept: a newer raeva wrote it.
+fn recreate_files(
+    path: &Path,
+    generation: i64,
+    users: &File,
+    err: &dyn std::fmt::Display,
+) -> Result<u64> {
+    if let Ok(conn) = rusqlite::Connection::open(path)
+        && let Err(err @ StoreError::NewerDatabase { .. }) =
+            check_generation(&conn, path, generation)
+    {
+        return Err(err);
+    }
     for suffix in ["", "-wal", "-shm"] {
         let file = sibling(path, suffix);
         match fs::remove_file(&file) {
@@ -383,7 +447,7 @@ fn recreate_files(path: &Path, users: &File, err: &dyn std::fmt::Display) -> Res
         path = %path.display(),
         "deleted a damaged database and started a new one: {err}"
     );
-    open_wal(path)?;
+    open_wal(path, generation)?;
     // Bumped once the new file is set up, so a peer that sees the new epoch
     // opens that file.
     let users_path = sibling(path, ".users");
@@ -456,7 +520,52 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     name.into()
 }
 
-fn open_wal(path: &Path) -> Result<()> {
+/// The generation of the database `conn` has open. Fails with
+/// [`StoreError::NewerDatabase`] when it is later than `generation`.
+/// Reading it loads no schema, which a newer raeva's may not parse.
+fn check_generation(conn: &rusqlite::Connection, path: &Path, generation: i64) -> Result<i64> {
+    let found: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .db_context(|| format!("failed to read the generation of {}", path.display()))?;
+    if found > generation {
+        return Err(StoreError::NewerDatabase {
+            path: path.to_path_buf(),
+            found,
+            supported: generation,
+        });
+    }
+    Ok(found)
+}
+
+/// A transaction on `conn` to the database at `path` that holds SQLite's
+/// write lock from its start, so a newer raeva cannot stamp the file with
+/// its generation before it ends, and that found the file of no later
+/// generation than `generation`. Every write goes through one: a newer raeva
+/// may keep the tables readable while it gives their rows new meaning.
+pub(crate) fn write_transaction<'a>(
+    conn: &'a rusqlite::Connection,
+    path: &Path,
+    generation: i64,
+) -> Result<rusqlite::Transaction<'a>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .db_context(|| format!("failed to begin a write to {}", path.display()))?;
+    check_generation(&tx, path, generation)?;
+    Ok(tx)
+}
+
+/// Runs `spec.init` on `conn` to the database at `path`, then stamps it
+/// with the spec's generation, unless a newer raeva's generation is there.
+fn set_up(conn: &rusqlite::Connection, path: &Path, spec: Spec) -> Result<()> {
+    let found = check_generation(conn, path, spec.generation)?;
+    (spec.init)(conn)?;
+    if found < spec.generation {
+        conn.pragma_update(None, "user_version", spec.generation)
+            .db_context(|| "failed to write the database generation")?;
+    }
+    Ok(())
+}
+
+fn open_wal(path: &Path, generation: i64) -> Result<()> {
     // A file that is not SQLite would otherwise wait out the busy timeout.
     // A shorter one is still being created by another process.
     if fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() >= 16) {
@@ -476,6 +585,7 @@ fn open_wal(path: &Path) -> Result<()> {
         .db_context(|| format!("failed to open {} for WAL bootstrap", path.display()))?;
     conn.busy_timeout(Duration::from_secs(5))
         .db_context(|| "failed to set busy_timeout on bootstrap connection")?;
+    check_generation(&conn, path, generation)?;
     conn.pragma_update(None, "journal_mode", "WAL")
         .db_context(|| "failed to set journal_mode=WAL")?;
     let mode: String = conn
@@ -537,8 +647,9 @@ mod tests {
     use crate::error::DbResultExt;
 
     const SPEC: Spec = Spec {
-        pragmas: "PRAGMA busy_timeout=5000;",
+        pragmas: "PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;",
         max_size: 2,
+        generation: 1,
         init: |conn| {
             conn.execute_batch("CREATE TABLE IF NOT EXISTS t (n BLOB)")
                 .db_context(|| "init")
@@ -595,36 +706,118 @@ mod tests {
 
     /// A peer that recreated the file while this process waited to is not
     /// undone: this process opens the new file and keeps what the peer
-    /// wrote to it.
+    /// wrote to it, unless the peer was a newer raeva.
     #[test]
     fn a_database_a_peer_recreated_is_opened_again() {
+        for newer in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db.sqlite");
+            let peer = damaged_in_use(&path);
+            let lock = (SPEC.lock)(&path).unwrap();
+            let db = open(&path, SPEC).unwrap();
+            drop(lock);
+            let recreates = std::thread::spawn({
+                let path = path.clone();
+                move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    let _lock = (SPEC.lock)(&path).unwrap();
+                    peer.unlock().unwrap();
+                    peer.lock().unwrap();
+                    recreate_files(&path, 1, &peer, &"peer").unwrap();
+                    let conn = rusqlite::Connection::open(&path).unwrap();
+                    (SPEC.init)(&conn).unwrap();
+                    conn.execute("INSERT INTO t VALUES (x'00')", []).unwrap();
+                    drop(conn);
+                    if newer {
+                        write_as_newer_raeva(&path, "CREATE TABLE t (n BLOB) NEWER");
+                    }
+                    drop(peer);
+                }
+            });
+            let counted = db.run(count);
+            recreates.join().unwrap();
+            if newer {
+                let err = counted.unwrap_err();
+                assert!(
+                    matches!(err, StoreError::NewerDatabase { found: 2, .. }),
+                    "{err}"
+                );
+                assert_eq!(generation(&path), 2);
+            } else {
+                assert_eq!(counted.unwrap(), 1);
+            }
+            let users_path = sibling(&path, ".users");
+            assert_eq!(
+                epoch(&open_users(&users_path).unwrap(), &users_path).unwrap(),
+                1
+            );
+        }
+    }
+
+    /// Stands in for a newer raeva: stamps the database at `path` with a
+    /// later generation and gives its table the definition `sql`.
+    fn write_as_newer_raeva(path: &Path, sql: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let cookie: i64 = conn
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA writable_schema = ON;
+             UPDATE sqlite_schema SET sql = '{sql}' WHERE name = 't';
+             PRAGMA schema_version = {};
+             PRAGMA user_version = 2;",
+            cookie + 1
+        ))
+        .unwrap();
+    }
+
+    fn generation(path: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A database is stamped with its generation. One that a newer raeva
+    /// stamped later is neither recreated, though its schema reads as
+    /// damaged, mid-run or at open, nor opened when it reads well.
+    #[test]
+    fn a_newer_generation_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite");
-        let peer = damaged_in_use(&path);
-        let lock = (SPEC.lock)(&path).unwrap();
-        let db = open(&path, SPEC).unwrap();
-        drop(lock);
-        let recreates = std::thread::spawn({
-            let path = path.clone();
-            move || {
-                std::thread::sleep(Duration::from_millis(300));
-                let _lock = (SPEC.lock)(&path).unwrap();
-                peer.unlock().unwrap();
-                peer.lock().unwrap();
-                recreate_files(&path, &peer, &"peer").unwrap();
-                let conn = rusqlite::Connection::open(&path).unwrap();
-                (SPEC.init)(&conn).unwrap();
-                conn.execute("INSERT INTO t VALUES (x'00')", []).unwrap();
-                drop(peer);
-            }
-        });
-        assert_eq!(db.run(count).unwrap(), 1);
-        recreates.join().unwrap();
-        let users_path = sibling(&path, ".users");
-        assert_eq!(
-            epoch(&open_users(&users_path).unwrap(), &users_path).unwrap(),
-            1
-        );
+        let opened = || {
+            let _lock = (SPEC.lock)(&path).unwrap();
+            open(&path, SPEC)
+        };
+        let db = opened().unwrap();
+        let insert = |conn: &mut rusqlite::Connection| {
+            conn.execute("INSERT INTO t VALUES (x'00')", [])
+                .db_context(|| "insert")
+        };
+        db.run(insert).unwrap();
+        assert_eq!(generation(&path), 1);
+
+        write_as_newer_raeva(&path, "CREATE TABLE t (n BLOB) NEWER");
+        let mid_run = db.run(count).unwrap_err();
+        drop(db);
+        let at_open = opened().err().unwrap();
+        write_as_newer_raeva(&path, "CREATE TABLE t (n BLOB)");
+        let readable = opened().err().unwrap();
+        for err in [mid_run, at_open, readable] {
+            assert!(
+                matches!(
+                    err,
+                    StoreError::NewerDatabase {
+                        found: 2,
+                        supported: 1,
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+        }
+        let mut conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(count(&mut conn).unwrap(), 1);
+        assert_eq!(generation(&path), 2);
     }
 
     /// A connection outliving its pool and manager, as one r2d2 still owns
@@ -636,7 +829,7 @@ mod tests {
         let path = dir.path().join("db.sqlite");
         let manager = Manager {
             inner: SqliteConnectionManager::file(&path),
-            user: Arc::new(enable_wal(&path).unwrap()),
+            user: Arc::new(enable_wal(&path, 1).unwrap()),
         };
         let conn = r2d2::ManageConnection::connect(&manager).unwrap();
         drop(manager);
@@ -646,8 +839,8 @@ mod tests {
             .unwrap()
             .write_all(b"not a sqlite header")
             .unwrap();
-        assert!(enable_wal(&path).is_err());
+        assert!(enable_wal(&path, 1).is_err());
         drop(conn);
-        enable_wal(&path).expect("recreated once the connection is closed");
+        enable_wal(&path, 1).expect("recreated once the connection is closed");
     }
 }

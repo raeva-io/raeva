@@ -3,7 +3,7 @@ use std::io;
 
 use rv_maven_types::{ArtifactCoord, BlobId, Digest};
 
-use crate::error::{DbResultExt, IoResultExt, Result};
+use crate::error::{IoResultExt, Result};
 use crate::index;
 use crate::store::{Store, open_regular_file, root_shared};
 
@@ -71,7 +71,7 @@ impl Store {
             Ok(PinCheck::Match)
         } else {
             self.pool
-                .run(|conn| index::clear_checked_stamp(conn, blob))?;
+                .write(|conn| index::clear_checked_stamp(conn, blob))?;
             Ok(PinCheck::Mismatch { actual })
         }
     }
@@ -125,15 +125,11 @@ impl Store {
             return Ok(());
         };
         root_shared(&self.root).durability.make_durable(ticket)?;
-        self.pool.run(|conn| {
-            let tx = conn
-                .transaction()
-                .db_context(|| "failed to begin the blob check transaction")?;
+        self.pool.write(|conn| {
             for check in &checks {
-                index::set_checked_stamp(&tx, &check.blob, &check.stamp)?;
+                index::set_checked_stamp(conn, &check.blob, &check.stamp)?;
             }
-            tx.commit()
-                .db_context(|| "failed to commit the blob check transaction")
+            Ok(())
         })
     }
 
@@ -175,7 +171,7 @@ impl Store {
         };
         if durability.is_durable(&path, &stamp) {
             self.pool
-                .run(|conn| index::set_checked_stamp(conn, blob, &stamp))?;
+                .write(|conn| index::set_checked_stamp(conn, blob, &stamp))?;
             return Ok((StoredBlob::Intact, None));
         }
         let ticket = durability.register(&blob_root, &path, false)?;

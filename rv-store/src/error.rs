@@ -57,6 +57,21 @@ pub enum StoreError {
         /// The journal mode SQLite reported instead.
         mode: String,
     },
+    /// A newer raeva wrote the database, at a later schema generation than
+    /// this one knows. It is left as it is.
+    #[error(
+        "{} was written by a newer raeva (schema generation {found}, this raeva knows up to \
+         {supported}), so this one leaves it alone",
+        path.display()
+    )]
+    NewerDatabase {
+        /// The database file.
+        path: PathBuf,
+        /// The generation the file names.
+        found: i64,
+        /// The latest generation this raeva knows.
+        supported: i64,
+    },
 }
 
 pub(crate) type Result<T> = std::result::Result<T, StoreError>;

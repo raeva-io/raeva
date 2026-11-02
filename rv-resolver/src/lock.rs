@@ -487,8 +487,11 @@ fn merge_support_pom(
         Some(existing) if existing.provenance.sha256 != provenance.sha256 => Err(
             ResolveError::ConflictingSupportPomBytes(Box::new(ConflictingPom {
                 coord: coord.to_string(),
-                first_origin: existing.module_path.clone(),
-                second_origin: module_path.to_string(),
+                first_origin: format!(
+                    "{} from {}",
+                    existing.module_path, existing.provenance.repo_url
+                ),
+                second_origin: format!("{module_path} from {}", provenance.repo_url),
                 first_sha256: existing.provenance.sha256.clone(),
                 second_sha256: provenance.sha256.clone(),
             })),

@@ -592,3 +592,38 @@ fn a_managed_relocation_target_with_a_missing_parent_is_named() {
         "{stderr}"
     );
 }
+
+/// A reactor module that takes its version from a remote parent fails
+/// before dependency resolution when no repository has that parent, and
+/// the error names the module.
+#[test]
+fn a_module_s_missing_remote_parent_names_the_module() {
+    let (repository, _server) = spawn_repository(LIB_POM, |_| Response::new(404, ""));
+    let project = tempfile::tempdir().expect("project dir");
+    std::fs::write(
+        project.path().join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>root</artifactId><version>1.0</version><packaging>pom</packaging>\
+<modules><module>core</module></modules></project>",
+    )
+    .expect("write pom.xml");
+    std::fs::create_dir(project.path().join("core")).expect("mkdir core");
+    std::fs::write(
+        project.path().join("core/pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.example</groupId>\
+<artifactId>lib-parent</artifactId><version>1.0</version><relativePath/></parent>\
+<artifactId>core</artifactId></project>",
+    )
+    .expect("write core/pom.xml");
+    write_repo_toml(project.path(), "fixture", &repository);
+    let home = tempfile::tempdir().expect("home");
+    let output = raeva_command(project.path(), home.path())
+        .env("RAEVA_RETRIES", "0")
+        .arg("sync")
+        .output()
+        .expect("run raeva sync");
+    assert_status(&output, 5, "missing remote parent of a module");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("org.example:lib-parent:1.0"), "{stderr}");
+    assert!(stderr.contains("In core/pom.xml"), "{stderr}");
+}

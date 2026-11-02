@@ -225,7 +225,7 @@ pub(crate) struct ResolveContext {
     pub(crate) reactor_admissions: Arc<Mutex<ReactorAdmissions>>,
     /// os-maven-plugin's `os.detection.classifierWithLikes` for the
     /// reactor; see [`rv_maven_model::ModelEnvironment::with_classifier_likes`].
-    classifier_likes: Option<Arc<str>>,
+    classifier_likes: Option<rv_maven_model::ClassifierLikes>,
     state: Arc<ResolveState>,
     /// Set when a graph of the pass depends on the reactor in a way no
     /// module's declarations show. Every module of the pass shares it.
@@ -271,7 +271,7 @@ impl ResolveContext {
                 self.platform.arch(),
                 self.platform.jdk(),
             )
-            .with_classifier_likes(self.classifier_likes.as_deref())
+            .with_classifier_likes(self.classifier_likes.as_ref())
     }
 
     /// Record `reads` as read by this context's builds; see
@@ -293,8 +293,9 @@ impl ResolveContext {
 
     /// Note that resolution read a reactor module's POM through an external
     /// POM, as a dependency or as a parent or an import, that an import of a
-    /// reactor BOM activated other profiles than its own build, or that the
-    /// first sorted project set the classifier likes: another branch can
+    /// reactor BOM activated other profiles than its own build, or that a
+    /// build read the classifier likes the first sorted project set: another
+    /// branch can
     /// change the outcome by editing any reactor module.
     pub(crate) fn note_reactor_through_dependencies(&self) {
         self.reactor_through_dependencies
@@ -315,8 +316,21 @@ impl ResolveContext {
         }
     }
 
+    /// This context, whose builds record what they read in `reads` alone,
+    /// apart from the record of the run.
+    pub(crate) fn recording_only_into(&self, reads: rv_maven_model::HostReads) -> Self {
+        Self {
+            config: self.config.recording_only_into(&reads),
+            reads: Some(reads),
+            ..self.clone()
+        }
+    }
+
     /// This context with `likes` as the reactor's classifier likes.
-    pub(crate) fn with_classifier_likes(mut self, likes: Option<Arc<str>>) -> Self {
+    pub(crate) fn with_classifier_likes(
+        mut self,
+        likes: Option<rv_maven_model::ClassifierLikes>,
+    ) -> Self {
         self.classifier_likes = likes;
         self
     }

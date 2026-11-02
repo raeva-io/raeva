@@ -9,7 +9,6 @@ ambient_inputs = [
     "jdk:[17,) is true",
     "jdk:[9, 12) is false",
     "user-property:java.version",
-    "user-property:os.detection.classifierWithLikes",
 ]
 
 [[platforms]]
@@ -61,12 +60,11 @@ sha256 = "ffe04faf64ab862e146285d6a1cf70a02ff1087dc3d51ad93380eb36add33804"
 [[inputs]]
 target = "linux-x86_64"
 profiles = []
-ambient_inputs = ["user-property:os.detection.classifierWithLikes"]
 
 [[inputs.poms]]
 path = "pom.xml"
 sha256 = "a5008d239de2bb91eaf6bbebcdb069478c0e00fa7f44f2131db8dc92ea529816"
-graph = "e5681d758524219666a5b1b6a685ba9ee50a2bc2d916b86e644683ea74897468"
+graph = "006d75685071e4efaaa55dbcf5caefc4c3b3f92b22a60cbd345f48b7f4670d04"
 ambient_inputs = ["user-property:java.version"]
 
 [metadata]

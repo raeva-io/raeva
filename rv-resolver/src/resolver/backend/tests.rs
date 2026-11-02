@@ -1343,8 +1343,8 @@ async fn persist_support_pom_records_one_pin_per_coordinate() {
         .await
         .expect_err("different bytes for one coordinate must not be absorbed");
     assert!(
-        matches!(&error, ResolveError::ConflictingResolvedPomBytes { coord, .. }
-            if coord == "com.example:theparent:2.0"),
+        matches!(&error, ResolveError::ConflictingResolvedPomBytes(pom)
+            if pom.coord == "com.example:theparent:2.0"),
         "{error:?}"
     );
     assert_eq!(backend.support_pom_provenance_snapshot(), recorded("corp"));
@@ -1994,8 +1994,9 @@ fn winners_that_disagree_on_a_pom_are_refused() {
         .record_companion_pom_blob(pom_gav(&jar), None)
         .unwrap();
     lock(&backend.missing_poms).insert((ExactCoord(jar.clone()), RepoContext::default()));
+    let served = (blob, Some("https://r.example/".into()));
     backend
-        .record_companion_pom_blob(pom_gav(&tests), Some(&blob))
+        .record_companion_pom_blob(pom_gav(&tests), Some(served))
         .unwrap();
     let with_r = backend.extend_context(
         &RepoContext::default(),
@@ -2010,11 +2011,44 @@ fn winners_that_disagree_on_a_pom_are_refused() {
     backend.note_winner(&jar, &direct).unwrap();
     let error = backend.note_winner(&tests, &through_r).unwrap_err();
     assert!(
-        matches!(&error, ResolveError::ConflictingResolvedPomBytes { coord, first_sha256, .. }
-            if coord == "t:b:1" && first_sha256 == "none"),
+        matches!(&error, ResolveError::ConflictingResolvedPomBytes(pom)
+            if pom.coord == "t:b:1" && pom.first_sha256 == "none"),
         "{error:?}"
     );
+    assert!(
+        (error.to_string()).contains(" from https://r.example/); "),
+        "{error}"
+    );
     assert_eq!(backend.companion_pom_blob(&pom_gav(&jar)), Some(None));
+}
+
+/// A POM read twice with different bytes names the repository behind each
+/// copy, a parent or BOM as well as a dependency's POM.
+#[test]
+fn pom_conflicts_name_the_repositories() {
+    let mut first = provenance("a", b"<project>first</project>");
+    let error = first
+        .absorb("t:parent:1", &provenance("b", b"<project>second</project>"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(" from https://a.example/, ") && error.contains(" from https://b.example/)"),
+        "{error}"
+    );
+
+    let backend = backend(|_| {});
+    let gav = pom_gav(&Coord::parse("t:b:1").unwrap());
+    let served = |bytes: &[u8], repo: &str| Some((BlobId::from_bytes(bytes), Some(repo.into())));
+    (backend.record_companion_pom_blob(gav.clone(), served(b"first", "https://a.example/")))
+        .unwrap();
+    let error = backend
+        .record_companion_pom_blob(gav, served(b"second", "https://b.example/"))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(" from https://a.example/, ") && error.contains(" from https://b.example/)"),
+        "{error}"
+    );
 }
 
 /// Every runtime trust grant must reach the HTTP client's address screen,

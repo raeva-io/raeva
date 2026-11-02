@@ -106,5 +106,7 @@ without its directory fails.
 A check is `ok`, `fail`, `info`, or `inconclusive`. Inconclusive is not a
 pass. A repository that answers 404 for the file `raeva doctor` asks for is
 inconclusive, and some private repositories answer 404 to a wrong
-credential too. `raeva doctor` exits 0 when no check fails, so check such a
-repository with `raeva sync`.
+credential too. Its row says whether credentials were sent. `raeva doctor`
+exits 0 when no check fails, with a note that counts the inconclusive
+checks, so check such a repository with `raeva sync` and a dependency that
+lives there.

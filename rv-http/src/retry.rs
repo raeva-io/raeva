@@ -9,13 +9,18 @@
 //! the retries at once: asking again sooner than the server said only
 //! spends the caller's time and the server's rate limit. A busy answer also
 //! holds back the other requests to that server, within their budgets and
-//! through their shared [`Cooldown`], until the wait ends. Retrying stops after
+//! through their shared [`Cooldown`], until the wait ends. A host name that
+//! did not resolve is looked up once more, after the same backoff as a
+//! timeout, but not after two failed lookups in a row: then the other
+//! requests to that server get no second lookup either, until one gets past
+//! the lookup. Retrying stops after
 //! [`RetryPolicy::retries`] retries, or as soon as the next wait would take
 //! the total time spent waiting past [`RetryPolicy::budget`]; the last error
 //! is returned then without waiting.
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -59,6 +64,9 @@ pub enum Outcome<E> {
     Permanent(E),
     /// The request failed on the way; a later attempt may succeed.
     Transient(E),
+    /// The host name did not resolve. It is looked up once more, for a
+    /// resolver that failed for a moment, unless the last lookup failed too.
+    Unresolved(E),
     /// The server answered that it cannot serve the request now.
     Busy {
         /// The error the attempt failed with.
@@ -87,30 +95,37 @@ impl<E> Outcome<E> {
     /// The error, whichever kind of failure it was.
     pub fn into_error(self) -> E {
         match self {
-            Outcome::Permanent(error) | Outcome::Transient(error) | Outcome::Busy { error, .. } => {
-                error
-            }
+            Outcome::Permanent(error)
+            | Outcome::Transient(error)
+            | Outcome::Unresolved(error)
+            | Outcome::Busy { error, .. } => error,
         }
     }
 }
 
 /// When the requests to one server may next go out. A busy answer to one
 /// of them holds back the others for the wait it set off, so they do not
-/// each spend a retry on the same window.
+/// each spend a retry on the same window. Once two lookups of the host
+/// name failed in a row, a failed lookup gets no retry until an attempt
+/// gets past the lookup, so a repository whose host is gone costs one wait
+/// per run, not one per file.
 #[derive(Debug, Default)]
-pub struct Cooldown(Mutex<Option<Instant>>);
+pub struct Cooldown {
+    until: Mutex<Option<Instant>>,
+    unresolvable: AtomicBool,
+}
 
 impl Cooldown {
     fn hold(&self, wait: Duration) {
         let until = Instant::now() + wait;
-        let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.until.lock().unwrap_or_else(PoisonError::into_inner);
         if held.is_none_or(|held| held < until) {
             *held = Some(until);
         }
     }
 
     fn remaining(&self) -> Duration {
-        self.0
+        self.until
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .map_or(Duration::ZERO, |until| {
@@ -159,6 +174,7 @@ where
         .build();
     let mut retries = 0;
     let mut waited = Duration::ZERO;
+    let mut unresolved = false;
     loop {
         loop {
             let held = cooldown
@@ -170,10 +186,26 @@ where
             tokio::time::sleep(held).await;
             waited += held;
         }
-        let (error, busy) = match attempt().await {
+        let outcome = attempt().await;
+        // Any other outcome got past the lookup, or needed none.
+        let lookup_failed = matches!(outcome, Err(Outcome::Unresolved(_)));
+        let failed_before = std::mem::replace(&mut unresolved, lookup_failed);
+        if !lookup_failed && cooldown.unresolvable.load(Ordering::Relaxed) {
+            cooldown.unresolvable.store(false, Ordering::Relaxed);
+        }
+        let (error, busy) = match outcome {
             Ok(value) => return Ok(value),
             Err(Outcome::Permanent(error)) => return Err(error),
             Err(Outcome::Transient(error)) => (error, None),
+            Err(Outcome::Unresolved(error)) => {
+                if failed_before {
+                    cooldown.unresolvable.store(true, Ordering::Relaxed);
+                }
+                if failed_before || cooldown.unresolvable.load(Ordering::Relaxed) {
+                    return Err(error);
+                }
+                (error, None)
+            }
             Err(Outcome::Busy { error, retry_after }) => (error, Some(retry_after)),
         };
         if retries >= policy.retries {
@@ -230,7 +262,7 @@ mod tests {
         );
         // Retries, budget in seconds, the failure of attempt n (none for
         // success), the attempts made and the milliseconds waited.
-        let cases: [Case; 10] = [
+        let cases: [Case; 15] = [
             (
                 3,
                 600,
@@ -264,6 +296,46 @@ mod tests {
             (3, 600, |_| after(61), 1..=1, 0..=0),
             (5, 10, |_| after(30), 1..=1, 0..=0),
             (usize::MAX, 20, |_| after(1), 2..=3, 5000..=20_000),
+            // A host name that did not resolve is tried once more.
+            (
+                3,
+                600,
+                |n| (n < 1).then_some(Outcome::Unresolved("dns")),
+                2..=2,
+                0..=1000,
+            ),
+            (
+                3,
+                600,
+                |_| Some(Outcome::Unresolved("dns")),
+                2..=2,
+                0..=1000,
+            ),
+            (0, 600, |_| Some(Outcome::Unresolved("dns")), 1..=1, 0..=0),
+            (
+                3,
+                600,
+                |n| {
+                    Some(if n == 0 {
+                        Outcome::transient("busy")
+                    } else {
+                        Outcome::Unresolved("dns")
+                    })
+                },
+                3..=3,
+                0..=3000,
+            ),
+            (
+                3,
+                600,
+                |n| match n {
+                    0 | 2 => Some(Outcome::Unresolved("dns")),
+                    1 => Some(Outcome::transient("busy")),
+                    _ => None,
+                },
+                4..=4,
+                0..=7000,
+            ),
         ];
         for (retries, budget, failure, attempts, waited) in cases {
             let made = AtomicUsize::new(0);
@@ -385,6 +457,49 @@ mod tests {
         assert_eq!(result, Err("busy"));
         assert_eq!(made.load(Ordering::SeqCst), 1);
         assert_eq!(start.elapsed(), Duration::from_secs(10));
+    }
+
+    /// Two failed lookups in a row end a request, and the next request to
+    /// that server gets no second lookup, until an attempt gets past the
+    /// lookup.
+    #[tokio::test(start_paused = true)]
+    async fn a_name_that_failed_twice_gets_no_more_lookups() {
+        type Plan = fn(usize) -> Result<(), Outcome<&'static str>>;
+        let policy = RetryPolicy {
+            retries: 3,
+            budget: Duration::from_secs(600),
+        };
+        let cooldown = Cooldown::default();
+        let attempts = |plan: Plan| {
+            let made = AtomicUsize::new(0);
+            let cooldown = &cooldown;
+            async move {
+                let _ = run(
+                    &policy,
+                    cooldown,
+                    || {
+                        let result = plan(made.fetch_add(1, Ordering::SeqCst));
+                        async move { result }
+                    },
+                    |_, _| {},
+                )
+                .await;
+                made.load(Ordering::SeqCst)
+            }
+        };
+        let dns: Plan = |_| Err(Outcome::Unresolved("dns"));
+        assert_eq!(attempts(dns).await, 2);
+        assert_eq!(attempts(dns).await, 1);
+        assert_eq!(attempts(|_| Err(Outcome::permanent("404"))).await, 1);
+        assert_eq!(attempts(dns).await, 2);
+        assert_eq!(attempts(|_| Ok(())).await, 1);
+        // A lookup that worked in between starts the count again.
+        let plan: Plan = |n| match n {
+            0 | 2 => Err(Outcome::Unresolved("dns")),
+            1 => Err(Outcome::transient("503")),
+            _ => Ok(()),
+        };
+        assert_eq!(attempts(plan).await, 4);
     }
 
     #[test]

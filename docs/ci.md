@@ -55,16 +55,22 @@ See [The JDK version](configuration.md#the-jdk-version).
 
 Downloads go to the store under `RAEVA_HOME`. To cache it between jobs, set
 `RAEVA_HOME` to a directory the CI system caches, and cache
-`$RAEVA_HOME/store` and `$RAEVA_HOME/metadata.db` keyed on `raeva.lock`.
-A job with a warm store downloads no artifact the store already holds.
+`$RAEVA_HOME/store` and `$RAEVA_HOME/metadata.db`. Key the cache on the
+raeva version, the OS and the architecture, then `raeva.lock`, and keep any
+fallback restore within the same version, OS and architecture prefix: a
+raeva refuses a database that a newer one upgraded. A job with a warm store
+downloads no artifact the store already holds.
 
 ## Merge the lock
 
-Tell git not to merge `raeva.lock` line by line:
+Let git merge `raeva.lock` with its default driver. Edits to different
+modules usually merge cleanly, and `raeva sync --frozen` checks the merged
+lock. When the lock conflicts, run `raeva sync` on the merged POMs and add
+the lock. If your `.gitattributes` has the `raeva.lock -merge` line that
+older raeva docs suggested, remove it.
+
+To collapse the lock in GitHub diffs, mark it as generated:
 
 ```sh
-printf 'raeva.lock -merge linguist-generated=true\n' >> .gitattributes
+printf 'raeva.lock linguist-generated=true\n' >> .gitattributes
 ```
-
-With `-merge`, git keeps your side of a conflicted lock without conflict
-markers and still reports the conflict. Run `raeva sync` and add the lock.

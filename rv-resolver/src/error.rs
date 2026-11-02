@@ -172,8 +172,9 @@ pub struct ConflictingPom {
     /// The POM's bare `g:a:v`.
     pub coord: String,
     /// Where the first observation came from: a reactor module path, or a
-    /// `platform/module` pair when the two sides are on different platforms.
-    /// A companion POM's names the repository that served it as well.
+    /// `platform/module` pair when the two sides are on different platforms,
+    /// and the repository that served it. Within one resolution, the
+    /// repository alone, empty where none had the POM.
     pub first_origin: String,
     /// Where the second observation came from, in the same form.
     pub second_origin: String,
@@ -271,17 +272,13 @@ pub enum ResolveError {
     /// One module's resolution fetched a POM more than once and got
     /// different bytes back.
     #[error(
-        "POM {coord} was fetched more than once during resolution and returned different \
-         bytes ({first_sha256}, {second_sha256}); one lockfile cannot pin both"
+        "POM {} was fetched more than once during resolution and returned different \
+         bytes ({}, {}); one lockfile cannot pin both",
+        .0.coord,
+        served_by(&.0.first_sha256, &.0.first_origin),
+        served_by(&.0.second_sha256, &.0.second_origin)
     )]
-    ConflictingResolvedPomBytes {
-        /// The POM's coordinate.
-        coord: String,
-        /// SHA-256 of the bytes seen first.
-        first_sha256: String,
-        /// SHA-256 of the bytes seen later.
-        second_sha256: String,
-    },
+    ConflictingResolvedPomBytes(Box<ConflictingPom>),
     /// No repository had the metadata or the file for `coord`, and none
     /// failed in a way that [`ResolveError::Repo`] reports instead.
     #[error("artifact not found: {coord}")]
@@ -577,6 +574,14 @@ impl ResolveError {
                 error: Box::new(error),
             },
         }
+    }
+}
+
+/// `sha256` and the repository that served those bytes, if one did.
+fn served_by(sha256: &str, repo: &str) -> String {
+    match repo {
+        "" => sha256.to_string(),
+        repo => format!("{sha256} from {repo}"),
     }
 }
 

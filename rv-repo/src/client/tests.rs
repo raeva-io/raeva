@@ -1366,6 +1366,67 @@ async fn update_refetches_mutable_rows_cached_before_the_run() {
     );
 }
 
+/// A row dated in the future, as a clock that ran ahead leaves it, is
+/// fetched again, with `--update` and without, instead of staying fresh
+/// until that clock's time.
+#[tokio::test]
+async fn rows_dated_in_the_future_are_fetched_again() {
+    let server = model_stub(Arc::new(AtomicBool::new(true)));
+    let (client, tmp) = test_client();
+    let repo = http_repo(&server);
+    let release = ArtifactRequest::new("test", "demo", "1.0");
+    let snapshot = ArtifactRequest::new("test", "demo", "1.0-SNAPSHOT");
+    let metadata = coord("test:demo:1.0");
+    let db = tmp.path().join("metadata.db");
+    let run = || {
+        let http = rv_http::client_builder()
+            .no_proxy()
+            .build()
+            .expect("client");
+        RepoClient::for_test(
+            ClientSet::unscreened(http),
+            router(Vec::new(), AuthStore::default()),
+            MetadataCache::new(&db).expect("cache"),
+        )
+    };
+    let read_all = |client: RepoClient| {
+        let (release, snapshot, metadata, repo) = (&release, &snapshot, &metadata, &repo);
+        async move {
+            client.fetch_pom(repo, release).await.unwrap();
+            client.fetch_pom(repo, snapshot).await.unwrap();
+            client.fetch_metadata(repo, metadata).await.unwrap();
+        }
+    };
+    read_all(client).await;
+    for update in [true, false] {
+        let conn = rusqlite::Connection::open(&db).expect("metadata.db");
+        for table in ["pom_cache_v3", "version_list_cache_v3"] {
+            let sql = format!("UPDATE {table} SET fetched_at = unixepoch() + 3600");
+            conn.execute(&sql, []).expect("date rows ahead");
+        }
+        drop(conn);
+        let answered = server.answered();
+        read_all(run().with_update(update)).await;
+        let requests = server.requests();
+        let mut refetched: Vec<&str> = requests[answered..]
+            .iter()
+            .map(|request| request.path.as_str())
+            .filter(|path| !path.ends_with(".sha256"))
+            .collect();
+        refetched.sort_unstable();
+        assert_eq!(
+            refetched,
+            [
+                "/test/demo/1.0-SNAPSHOT/demo-1.0-SNAPSHOT.pom",
+                "/test/demo/1.0-SNAPSHOT/maven-metadata.xml",
+                "/test/demo/1.0/demo-1.0.pom",
+                "/test/demo/maven-metadata.xml",
+            ],
+            "update: {update}"
+        );
+    }
+}
+
 /// A POM or version list a repository lacks or refuses is not asked for
 /// again by a later run that sends the same credential while the update
 /// policy keeps the answer, as Maven does not ask again for a POM it holds,

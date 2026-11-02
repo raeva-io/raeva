@@ -69,6 +69,144 @@ pub fn secret_url_part(url: &str) -> Option<&'static str> {
     (redact_url(url) != parsed.as_str()).then_some("userinfo")
 }
 
+/// Whether a property or environment variable name looks like it holds a
+/// secret: it has `TOKEN`, `SECRET`, `PASS`, `KEY`, `AUTH`, `CREDENTIAL` or
+/// `ENTITLEMENT` in it, in any case.
+pub fn secret_named(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASS",
+        "KEY",
+        "AUTH",
+        "CREDENTIAL",
+        "ENTITLEMENT",
+    ]
+    .iter()
+    .any(|word| upper.contains(word))
+}
+
+/// The path of a repository URL as written, where services such as
+/// Cloudsmith take a token: what follows the authority, or the whole text
+/// when it has no `://`, as the scheme or host may still be unexpanded.
+/// `None` for a `file:` URL, whose path names a local directory.
+pub(crate) fn repository_url_path(url: &str) -> Option<&str> {
+    if url
+        .split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+    {
+        return None;
+    }
+    Some(match url.split_once("://") {
+        // A backslash ends an http(s) authority too.
+        Some((_, rest)) => rest.find(['/', '\\']).map_or("", |slash| &rest[slash..]),
+        None => url,
+    })
+}
+
+/// Whether `value` makes up one or more whole segments of the path of the
+/// repository URL `url`, as a token a service takes there does: what
+/// follows the authority, or the whole text without a `://`. A `${...}`
+/// left in `value`, which only a model can expand, stands for any text, so
+/// such a value counts by the text around it. A value with no text but
+/// separators never counts, nor does a `file:` URL.
+pub fn url_path_holds(url: &str, value: &str) -> bool {
+    repository_url_path(url).is_some_and(|path| holds_value(path, value, true))
+}
+
+/// Whether `text` holds `value`, as whole segments when `segments`, with
+/// each `${...}` in `value` standing for any text.
+fn holds_value(text: &str, value: &str, segments: bool) -> bool {
+    let separator = |c: char| matches!(c, '/' | '\\');
+    let parts = literal_parts(value);
+    if !(parts.iter()).any(|part| part.contains(|c| !separator(c))) {
+        return false;
+    }
+    let edge = |c: Option<char>| !segments || c.is_none_or(separator);
+    let starts_segment =
+        |at: usize, part: &str| edge(text[..at].chars().next_back()) || edge(part.chars().next());
+    let ends_segment = |at: usize, part: &str| {
+        let end = at + part.len();
+        edge(text[end..].chars().next()) || edge(part.chars().next_back())
+    };
+    let found = |from, part| occurrences(text, from, part);
+    let (first, rest) = parts.split_first().expect("a value has a first part");
+    let Some((last, middle)) = rest.split_last() else {
+        return found(0, first).any(|at| starts_segment(at, first) && ends_segment(at, first));
+    };
+    // The earliest start leaves the most room for the rest.
+    let Some(start) = found(0, first).find(|&at| starts_segment(at, first)) else {
+        return false;
+    };
+    let mut at = start + first.len();
+    for part in middle {
+        match text[at..].find(part) {
+            Some(found) => at += found + part.len(),
+            None => return false,
+        }
+    }
+    found(at, last).any(|at| ends_segment(at, last))
+}
+
+/// Each place `part` starts in `text` at or after `from`, overlapping ones
+/// too.
+fn occurrences<'a>(text: &'a str, from: usize, part: &'a str) -> impl Iterator<Item = usize> + 'a {
+    let mut at = from;
+    std::iter::from_fn(move || {
+        let found = at + text.get(at..)?.find(part)?;
+        at = found + text[found..].chars().next().map_or(1, char::len_utf8);
+        Some(found)
+    })
+}
+
+/// The text of `value` around each `${...}` in it, one more than there are
+/// of those. Expressions nest, as in `${${name}}`.
+fn literal_parts(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${")
+        && let Some(end) = closing_brace(&rest[start + 2..])
+    {
+        parts.push(&rest[..start]);
+        rest = &rest[start + 2 + end + 1..];
+    }
+    parts.push(rest);
+    parts
+}
+
+fn closing_brace(text: &str) -> Option<usize> {
+    let mut depth = 1;
+    text.char_indices().find_map(|(at, c)| {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        (depth == 0).then_some(at)
+    })
+}
+
+/// How a message names the first of `secrets`, each a name and a value as
+/// [`crate::Config::secret_named_inputs`] gives them, whose value makes up
+/// whole segments of the path of `url` ([`url_path_holds`]).
+pub fn secret_input_in_path<'a>(url: &str, secrets: &'a [(String, String)]) -> Option<&'a str> {
+    (secrets.iter())
+        .find(|(_, value)| url_path_holds(url, value))
+        .map(|(input, _)| input.as_str())
+}
+
+/// `text`, such as a repository id, for a message, or `***` when it holds
+/// the value of one of `secrets`, read as [`url_path_holds`] reads it but
+/// anywhere in `text`.
+pub fn without_secret_values<'a>(text: &'a str, secrets: &[(String, String)]) -> &'a str {
+    if (secrets.iter()).any(|(_, value)| holds_value(text, value, false)) {
+        REDACTED
+    } else {
+        text
+    }
+}
+
 fn redact_parsed(url: &Url, had_port: bool) -> Url {
     if !url.has_authority() {
         return Url::parse(UNPARSABLE_URL_PLACEHOLDER).expect("placeholder URL parses");
@@ -197,6 +335,81 @@ mod tests {
         ] {
             assert_eq!(secret_url_part(raw), part, "{raw}");
         }
+    }
+
+    #[test]
+    fn secret_names_are_recognised_in_any_case() {
+        use super::secret_named;
+        for name in [
+            "cs.token",
+            "CLOUDSMITH_API_KEY",
+            "nexus.Password",
+            "repo.secret",
+            "auth.header",
+            "aws.credentials",
+            "entitlement",
+        ] {
+            assert!(secret_named(name), "{name}");
+        }
+        for name in ["nexus.url", "CI_PROJECT_ID", "repo.path", "revision"] {
+            assert!(!secret_named(name), "{name}");
+        }
+    }
+
+    /// A value counts when it makes up whole segments of the path, never
+    /// when it is in the host, part of a segment or in a `file:` URL. An
+    /// expression left in it stands for any text.
+    #[test]
+    fn url_path_values_are_whole_segments() {
+        use super::url_path_holds;
+        for (url, value) in [
+            ("https://dl.example/abc123/org/maven/", "abc123"),
+            ("https://dl.example/maven/abc123", "abc123"),
+            ("https://dl.example\\abc123\\maven/", "abc123"),
+            ("https://dl.example/org/abc/123/maven/", "abc/123"),
+            ("https://dl.example/org/abc/123/maven/", "/abc/123/"),
+            ("https://dl.example/xa/a/a/", "a/a"),
+            ("dl.example/abc123/maven/", "abc123"),
+            ("abc123/maven/", "abc123"),
+            (
+                "https://dl.example/amd64/abc123/maven/",
+                "${os.arch}/abc123",
+            ),
+            (
+                "https://dl.example/app-abc123/maven/",
+                "${project.artifactId}-abc123",
+            ),
+            ("https://dl.example/x/abc/y/123/", "abc/${a}/123"),
+            ("https://dl.example/abc123/x/", "abc${a}"),
+            ("https://dl.example/prod/abc123/x/", "${${selector}}/abc123"),
+            ("https://dl.example/ab/abc/", "${a}/abc"),
+        ] {
+            assert!(url_path_holds(url, value), "{url} {value}");
+        }
+        for (url, value) in [
+            ("https://abc123.example/maven/", "abc123"),
+            ("https://dl.example/abc1234/maven/", "abc123"),
+            ("https://dl.example/v1/maven/", "1"),
+            ("https://dl.example/maven/", ""),
+            ("file:///srv/abc123/m2/", "abc123"),
+            ("FILE:/C:/abc123/", "abc123"),
+            ("https://dl.example/xabc123/maven/", "abc123${a}"),
+            ("https://dl.example/abc/maven/", "${a}abc123"),
+            ("https://dl.example/a/b/", "${a}/${b}"),
+            ("https://dl.example/abc/abc12/", "${a}/abc123"),
+        ] {
+            assert!(!url_path_holds(url, value), "{url} {value}");
+        }
+    }
+
+    #[test]
+    fn texts_that_hold_a_secret_value_are_hidden() {
+        use super::without_secret_values;
+        let secrets = [("-Dcs.token".to_string(), "${stage}/abc123".to_string())];
+        assert_eq!(without_secret_values("id-prod/abc123", &secrets), "***");
+        assert_eq!(without_secret_values("id-x/abc123y", &secrets), "***");
+        assert_eq!(without_secret_values("idabc123", &secrets), "idabc123");
+        assert_eq!(without_secret_values("releases", &secrets), "releases");
     }
 
     #[test]

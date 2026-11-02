@@ -5,7 +5,6 @@ config_hash = "56eba141e7ff052d6cdb03e90e9008a80d7a3010ea28d3682bcbc35d89ebc29c"
 ambient_inputs = [
     "user-property:core.version",
     "user-property:native.classifier",
-    "user-property:os.detection.classifierWithLikes",
     "user-property:os.name",
     "user-property:with.extra",
 ]
@@ -280,18 +279,17 @@ profiles = [
     "linux",
     "named",
 ]
-ambient_inputs = [
-    "user-property:core.version",
-    "user-property:native.classifier",
-    "user-property:os.detection.classifierWithLikes",
-    "user-property:os.name",
-    "user-property:with.extra",
-]
 
 [[inputs.poms]]
 path = "pom.xml"
 sha256 = "1a9d332c592f2b1e123611ecca0ce74606e5aa588f5c29239511d2b61d1b7178"
-graph = "f74fb61b6be0e70f09be0c9a9352d88823fe45e23c8ed1a25473694fb02db827"
+graph = "7254e5a7d4e81df1e0aeb29cef1c1585c9608422fab236ad093d0327a97af405"
+ambient_inputs = [
+    "user-property:core.version",
+    "user-property:native.classifier",
+    "user-property:os.name",
+    "user-property:with.extra",
+]
 
 [[inputs]]
 target = "macos-aarch64"

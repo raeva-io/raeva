@@ -1365,14 +1365,20 @@ impl Config {
         let read_maven_config = || {
             let content = crate::read_optional_project_input_string(&maven_config_path)?;
             if let Some(text) = &content {
-                let ignored = crate::maven_config::ignored_settings_options(text)
+                let ignored = crate::maven_config::ignored_options(text)
                     .map_err(|error| file_error(error.to_string()))?;
                 for option in ignored {
-                    let reason = if option == "-gs" {
-                        "raeva reads no global settings file"
-                    } else {
-                        "a project cannot choose the settings file, which can hold mirrors, \
-                         proxies and credentials; declare its repositories in raeva.toml"
+                    let reason = match option {
+                        "-gs" => "raeva reads no global settings file",
+                        "-pl" | "-am" | "-amd" => {
+                            "raeva locks the whole reactor, whatever projects a build selects, \
+                             so a module this build skips can still fail the sync"
+                        }
+                        _ => {
+                            "a project cannot choose the settings file, which can hold mirrors, \
+                             proxies and credentials; declare its repositories in raeva.toml, or \
+                             review the file and pass it as raeva -s <file> sync"
+                        }
                     };
                     tracing::warn!(
                         sec_code = "SETTING_IGNORED",
@@ -1445,12 +1451,13 @@ impl Config {
             Some(path) => MavenSettings::load_optional(path).map_err(|err| {
                 let message = match err {
                     ConfigError::Invalid { .. } => return err,
-                    ConfigError::InvalidSettings(message) => message,
-                    other => other.to_string(),
+                    ConfigError::RefusedSettings(message) => message,
+                    ConfigError::InvalidSettings(message) => format!("{message}; fix or remove it"),
+                    other => format!("{other}; fix or remove it"),
                 };
                 ConfigError::Invalid {
                     origin: ConfigOrigin::MavenSettings(path.clone()),
-                    message: format!("{message}; fix or remove it"),
+                    message,
                 }
             })?,
             None => MavenSettings::default(),
@@ -1650,6 +1657,17 @@ impl Config {
     /// `environment`, in file order, so a later profile overrides an
     /// earlier one on a shared key, as Maven merges external profiles.
     pub fn settings_profile_properties_for(&self, environment: &ModelEnvironment) -> PropertyMap {
+        self.settings_profile_properties_on(environment, &self.host.host_environment())
+    }
+
+    /// [`Self::settings_profile_properties_for`], with `host` as the
+    /// environment of the `.mvn/maven.config` options and `<file>`
+    /// conditions.
+    fn settings_profile_properties_on(
+        &self,
+        environment: &ModelEnvironment,
+        host: &ModelEnvironment,
+    ) -> PropertyMap {
         let Some(settings) = &self.settings else {
             return PropertyMap::new();
         };
@@ -1670,13 +1688,7 @@ impl Config {
             &self.inputs,
             &explicit_active_profiles,
             environment,
-            &settings_file_context(
-                &self.inputs,
-                &self
-                    .host
-                    .host_environment()
-                    .with_java_version_of(environment),
-            ),
+            &settings_file_context(&self.inputs, &host.with_java_version_of(environment)),
             None,
         );
         let mut merged = PropertyMap::new();
@@ -1752,6 +1764,74 @@ impl Config {
             .iter()
             .map(|environment| self.inputs.maven_options(environment))
             .collect()
+    }
+
+    /// The inputs a POM can take into a repository URL that are private to
+    /// this host and named like a secret ([`crate::secret_named`]), on any
+    /// target platform: `-D` options on the command line or in
+    /// `.mvn/maven.config`, the properties of active settings.xml profiles,
+    /// and the allowlisted environment variables. Each comes as how a
+    /// message names it, then its value, expanded as far as these inputs
+    /// go, which no message may show.
+    pub fn secret_named_inputs(&self) -> Vec<(String, String)> {
+        // Read apart from the model builds, whose host reads raeva.lock
+        // records.
+        let host = self.host.host_environment().detached();
+        let env = self.host.env_values();
+        let mut inputs: Vec<_> = (env.iter())
+            .filter(|(name, _)| crate::secret_named(name))
+            .map(|(name, value)| (format!("${{env.{name}}}"), value.clone()))
+            .collect();
+        // A model reads these names from these inputs alone: a POM can set
+        // any other, even `os.arch`, and a model field such as
+        // `project.artifactId` wins over a property of its name.
+        let model_owned = |name: &str| {
+            name.starts_with("project.") || name.starts_with("pom.") || name == "basedir"
+        };
+        // A model reads `${NAME}` as `${env.NAME}` below its properties.
+        let mut with_env = PropertyMap::new();
+        for (name, value) in env {
+            with_env.insert(format!("env.{name}"), value.as_str());
+            if !model_owned(name) {
+                with_env.insert(name.as_str(), value.as_str());
+            }
+        }
+        for environment in self.target_environments() {
+            let environment = environment.detached();
+            let defines = self.inputs.maven_options(&environment).properties;
+            let settings = self.settings_profile_properties_on(&environment, &host);
+            // As the project's model and a dependency's, which reads `-D`
+            // values without the settings.xml properties, read them.
+            let mut project = with_env.clone();
+            let mut dependency = with_env.clone();
+            for (name, value) in settings.iter().chain(&defines) {
+                if !model_owned(name) {
+                    project.insert(name.as_str(), value.as_str());
+                }
+            }
+            for (name, value) in &defines {
+                if !model_owned(name) {
+                    dependency.insert(name.as_str(), value.as_str());
+                }
+            }
+            let defines = (defines.iter()).map(|(name, value)| (format!("-D{name}"), name, value));
+            let settings = (settings.iter())
+                .map(|(name, value)| (format!("settings.xml property {name}"), name, value));
+            for (input, _, value) in defines
+                .chain(settings)
+                .filter(|(_, name, _)| crate::secret_named(name))
+            {
+                for properties in [&project, &dependency] {
+                    if let Ok(expanded) = properties.clone().interpolate_str_no_project(value) {
+                        inputs.push((input.clone(), expanded));
+                    }
+                }
+                inputs.push((input, value.clone()));
+            }
+        }
+        inputs.sort();
+        inputs.dedup();
+        inputs
     }
 
     /// Effective user-property values across supported targets, including absent overrides.
@@ -1966,6 +2046,15 @@ impl Config {
     pub fn recording_into(&self, reads: &rv_maven_model::HostReads) -> Self {
         let mut config = self.clone();
         config.host = self.host.recording_into(reads);
+        config
+    }
+
+    /// This configuration, whose model builds record what they read from
+    /// the host in `reads` alone, apart from the record of the run.
+    #[must_use]
+    pub fn recording_only_into(&self, reads: &rv_maven_model::HostReads) -> Self {
+        let mut config = self.clone();
+        config.host = self.host.recording_only_into(reads);
         config
     }
 
@@ -2749,6 +2838,22 @@ mod tests {
             assert!(message.starts_with(&prefix), "{message}");
             assert!(message.ends_with("; fix or remove it"), "{message}");
 
+            // A refusal that says what to do instead does not get it too.
+            write_settings(
+                home,
+                "<settings><profiles><profile><id>p</id><repositories><repository>\
+                 <id>corp</id><url>https://dl.example/${env.REPO_TOKEN}/maven/</url>\
+                 </repository></repositories></profile></profiles></settings>",
+            );
+            let message = Config::load(project).unwrap_err().to_string();
+            assert!(message.starts_with(&prefix), "{message}");
+            assert!(
+                message.ends_with("if it is not a secret, rename REPO_TOKEN")
+                    && message.contains("looks like a secret's")
+                    && !message.contains("fix or remove it"),
+                "{message}"
+            );
+
             write_settings(
                 home,
                 "<settings><servers><server><id>corp</id><username>user</username>\
@@ -3419,6 +3524,88 @@ mod tests {
             assert_eq!(
                 conditions(),
                 [condition("17", false), condition("21", true)]
+            );
+        });
+    }
+
+    /// The private inputs a POM can take into a repository URL, named like
+    /// a secret, from each source and on any platform, with their values
+    /// expanded; the others are left out.
+    #[test]
+    fn secret_named_inputs_come_from_defines_settings_and_allowlisted_env() {
+        with_homes(|home, project| {
+            write_settings(
+                home,
+                "<settings><activeProfiles><activeProfile>p</activeProfile></activeProfiles>\
+                 <profiles><profile><id>p</id><properties><cs.token>s1</cs.token>\
+                 <nexus.url>https://nexus.example</nexus.url>\
+                 <alias.token>${repo.value}</alias.token><repo.value>s8</repo.value>\
+                 <arch.token>${os.arch}/s9</arch.token>\
+                 <project.artifactId>ignored</project.artifactId>\
+                 <field.token>${chain.alias}</field.token>\
+                 <chain.alias>${project.artifactId}/s10</chain.alias>\
+                 </properties></profile>\
+                 <profile><id>off</id><properties><off.token>s2</off.token></properties>\
+                 </profile><profile><id>windows</id><activation><os><family>windows</family>\
+                 </os></activation><properties><win.token>s7</win.token></properties>\
+                 </profile></profiles></settings>",
+            );
+            fs::write(
+                home.join("config.toml"),
+                "[security]\nallow_env_substitution = [\"CS_API_KEY\", \"CS_ORG\"]\n",
+            )
+            .unwrap();
+            fs::create_dir_all(project.join(".mvn")).unwrap();
+            fs::write(
+                project.join(".mvn/maven.config"),
+                "-Drepo.password=s3\n-Drepo.path=open\n",
+            )
+            .unwrap();
+            let command_line = CommandLine {
+                defines: vec![
+                    "gpg.passphrase=s4".to_string(),
+                    "revision=1".to_string(),
+                    "staged.key=${repo.value}/s12".to_string(),
+                    "ci.token=${CS_ORG}/${env.CS_ORG}/${alias.token}".to_string(),
+                ],
+                ..CommandLine::default()
+            };
+            let config = temp_env::with_vars(
+                [
+                    ("CS_API_KEY", Some("s5")),
+                    ("CS_ORG", Some("acme")),
+                    ("OTHER_TOKEN", Some("s6")),
+                ],
+                || Config::load_with_command_line(project, &command_line).unwrap(),
+            );
+            let inputs = config.secret_named_inputs();
+            let expected = [
+                ("${env.CS_API_KEY}", "s5"),
+                // As a model reads it, `${NAME}` as `${env.NAME}`.
+                ("-Dci.token", "${CS_ORG}/acme/${alias.token}"),
+                ("-Dci.token", "acme/acme/${alias.token}"),
+                ("-Dci.token", "acme/acme/s8"),
+                ("-Dgpg.passphrase", "s4"),
+                ("-Drepo.password", "s3"),
+                // As a dependency's model and the project's read it.
+                ("-Dstaged.key", "${repo.value}/s12"),
+                ("-Dstaged.key", "s8/s12"),
+                ("settings.xml property alias.token", "${repo.value}"),
+                ("settings.xml property alias.token", "s8"),
+                // A POM can set `os.arch`.
+                ("settings.xml property arch.token", "${os.arch}/s9"),
+                ("settings.xml property cs.token", "s1"),
+                // A model field wins over a property of its name.
+                ("settings.xml property field.token", "${chain.alias}"),
+                (
+                    "settings.xml property field.token",
+                    "${project.artifactId}/s10",
+                ),
+                ("settings.xml property win.token", "s7"),
+            ];
+            assert_eq!(
+                inputs,
+                expected.map(|(label, value)| (label.to_string(), value.to_string()))
             );
         });
     }

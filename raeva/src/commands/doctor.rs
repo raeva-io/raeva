@@ -150,7 +150,17 @@ impl CommandOutput for DoctorReport {
         for row in &self.rows {
             table.add_row([&row.check, row.outcome.status(), &row.details]);
         }
-        human.fitted_table(&table)
+        human.fitted_table(&table)?;
+        let inconclusive = (self.rows.iter())
+            .filter(|row| row.outcome == Outcome::Inconclusive)
+            .count();
+        if inconclusive > 0 {
+            human.note(format!(
+                "{inconclusive} inconclusive, which is not a pass, though raeva doctor exits 0 \
+                 when no check fails"
+            ))?;
+        }
+        Ok(())
     }
 }
 
@@ -242,23 +252,23 @@ async fn probe_all(config: &Config, client: &RepoClient, rows: &mut Vec<Row>) {
                 .map(|path| (normalize_repo_url(&target.repository.url), path))
         })
         .collect();
+    let secrets = config.secret_named_inputs();
     let refused = |repo: &Repository| {
         let path = declared_in
             .get(&normalize_repo_url(&repo.url))
             .map_or("pom.xml", String::as_str);
         let label = repo.id.as_deref().unwrap_or("repository");
+        let label = rv_config::without_secret_values(label, &secrets);
         (format!("{label} ({path})"), path.to_string())
     };
     for repo in &admission.secret_urls {
-        let part = rv_config::secret_url_part(&repo.url).unwrap_or("userinfo");
+        let Some(refusal) = rv_repo::secret_url_refusal(&repo.url, &secrets) else {
+            continue;
+        };
         let (label, path) = refused(repo);
         refused_rows.push(Row::new(
             label,
-            format!(
-                "a <repository> URL declared in {path} has {part}, which raeva.lock would \
-                 record; remove it, and put credentials in an [[auth]] entry in \
-                 config.toml or a <server> in settings.xml with the repository's id"
-            ),
+            format!("a <repository> URL declared in {path} {refusal}"),
             Outcome::Config,
         ));
     }
@@ -434,7 +444,7 @@ async fn probe(
         },
         Err(err) => {
             let settings = crate::error::HintEnv::for_config(config).settings_location();
-            classify_probe_error(err, &route.endpoint, &path, &settings)
+            classify_probe_error(err, &route.endpoint, &path, &settings, credential.as_ref())
         }
     };
     Row::new(label, details, outcome)
@@ -533,12 +543,15 @@ fn probe_metadata_path(coord: &Coord) -> String {
 }
 
 /// The details and outcome of a failed probe. For a 401 or 403, the hint
-/// tells "nothing was sent" from "credentials were sent and rejected".
+/// tells "nothing was sent" from "credentials were sent and rejected"; a
+/// 404 says whether `credential` was sent, as some repositories answer a
+/// wrong one with 404.
 fn classify_probe_error(
     err: RepoError,
     resolved: &Repository,
     path: &str,
     settings: &str,
+    credential: Option<&CredentialSource>,
 ) -> (String, Outcome) {
     let sent = match &err {
         RepoError::Unauthorized { sent, .. } => sent.as_deref(),
@@ -570,13 +583,25 @@ fn classify_probe_error(
             "407 (proxy authentication required; check proxy credentials)".to_string(),
             Outcome::Auth,
         ),
-        Some(404) => (
-            format!(
-                "404 for {path}; the repository is reachable but does not host this file, so \
-                 raeva could not check that it serves Maven content"
-            ),
-            Outcome::Inconclusive,
-        ),
+        Some(404) => {
+            let (sent, unchecked) = match credential {
+                Some(credential) => (
+                    format!("{} were sent", credential.label()),
+                    "neither the repository's content nor the credentials are checked",
+                ),
+                None => (
+                    "no credentials were sent".to_string(),
+                    "the repository's content is not checked",
+                ),
+            };
+            (
+                format!(
+                    "404 for the org.apache:maven metadata at {path} ({sent}), so {unchecked}; \
+                     run raeva sync with a dependency that lives there"
+                ),
+                Outcome::Inconclusive,
+            )
+        }
         Some(code) if (500..600).contains(&code) => (
             format!("{code} (repository server error, try again later)"),
             Outcome::Network,
@@ -770,6 +795,53 @@ mod tests {
                 sent,
                 "{file}: {details}"
             );
+        }
+    }
+
+    /// A 404 for the probe file checks nothing, since some repositories
+    /// answer a wrong credential with 404 too: the row says whether
+    /// credentials were sent and how to check the repository instead.
+    #[tokio::test]
+    async fn a_404_says_what_it_leaves_unchecked() {
+        let server = StubServer::start(|_| Response::new(404, ""));
+        let root = tempfile::tempdir().expect("tempdir");
+        let rows = probe_project(
+            root.path(),
+            "config.toml",
+            &format!(
+                "[[repositories]]\nid = \"corp\"\nurl = \"http://{0}/corp/\"\n\
+                 [[repositories]]\nid = \"open\"\nurl = \"http://{0}/open/\"\n{1}\n\
+                 [[auth]]\nid = \"corp\"\ntoken = \"t\"\n",
+                server.addr(),
+                local_central(&server),
+            ),
+        )
+        .await;
+        server.stop();
+        let path = "org/apache/maven/maven-metadata.xml";
+        for (id, expected) in [
+            (
+                "corp",
+                format!(
+                    "404 for the org.apache:maven metadata at {path} (credentials for id \
+                     'corp' were sent), so neither the repository's content nor the \
+                     credentials are checked; run raeva sync with a dependency that lives there"
+                ),
+            ),
+            (
+                "open",
+                format!(
+                    "404 for the org.apache:maven metadata at {path} (no credentials were \
+                     sent), so the repository's content is not checked; run raeva sync with a \
+                     dependency that lives there"
+                ),
+            ),
+        ] {
+            let row = (rows.iter())
+                .find(|row| row.check.starts_with(id))
+                .unwrap_or_else(|| panic!("no {id} row"));
+            assert_eq!(row.outcome, Outcome::Inconclusive, "{}", row.details);
+            assert_eq!(row.details, expected);
         }
     }
 

@@ -562,17 +562,19 @@ pub fn settings_file(
     ))
 }
 
-/// The settings options `.mvn/maven.config` names, `-s` and `-gs`, which
-/// raeva does not read from it.
+/// The options `.mvn/maven.config` names that raeva does not read from it:
+/// the settings options `-s` and `-gs`, and the reactor selection `-pl`,
+/// `-am` and `-amd`, since raeva locks the whole reactor.
 ///
 /// # Errors
 ///
 /// When Maven refuses the file's syntax, before any value is expanded.
-pub fn ignored_settings_options(content: &str) -> Result<Vec<&'static str>, MavenConfigError> {
+pub fn ignored_options(content: &str) -> Result<Vec<&'static str>, MavenConfigError> {
     let written = written_values(content)?;
     Ok([("-s", written.settings), ("-gs", written.global_settings)]
         .into_iter()
         .filter_map(|(option, named)| named.then_some(option))
+        .chain(written.selection)
         .collect())
 }
 
@@ -598,6 +600,8 @@ struct Written {
     profiles: Vec<String>,
     settings: bool,
     global_settings: bool,
+    /// The reactor selection options, `-pl`, `-am` and `-amd`, each once.
+    selection: Vec<&'static str>,
 }
 
 fn written_values(content: &str) -> Result<Written, MavenConfigError> {
@@ -626,6 +630,13 @@ fn written_values(content: &str) -> Result<Written, MavenConfigError> {
         }
         if option.name == "f" {
             return Err(MavenConfigError::ProjectFile);
+        }
+        if let Some(selection) = ["-pl", "-am", "-amd"]
+            .into_iter()
+            .find(|selection| selection[1..] == *option.name)
+            && !written.selection.contains(&selection)
+        {
+            written.selection.push(selection);
         }
         if !option.takes_value {
             continue;
@@ -957,9 +968,13 @@ mod tests {
             Ok(Some(std::env::current_dir().expect("cwd").join("here.xml")))
         );
         assert_eq!(file("-Dx=1\n", &CommandLine::default()), Ok(None));
-        assert_eq!(ignored_settings_options(content), Ok(vec!["-s", "-gs"]));
-        assert_eq!(ignored_settings_options("-s\nx.xml\n"), Ok(vec!["-s"]));
-        assert_eq!(ignored_settings_options("-Dx=1\n"), Ok(vec![]));
+        assert_eq!(ignored_options(content), Ok(vec!["-s", "-gs"]));
+        assert_eq!(ignored_options("-s\nx.xml\n"), Ok(vec!["-s"]));
+        assert_eq!(ignored_options("-Dx=1\n"), Ok(vec![]));
+        assert_eq!(
+            ignored_options("--projects=app\n-amd\n--also-make\n-pl\nlib\n-s\nx.xml\n"),
+            Ok(vec!["-s", "-pl", "-amd", "-am"])
+        );
         assert_eq!(
             parse("-s\n").err(),
             Some(MavenConfigError::MissingArgument("s".into()))

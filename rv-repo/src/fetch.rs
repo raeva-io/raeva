@@ -17,7 +17,9 @@ use crate::error::{IntegritySource, RepoError, Result};
 use rv_config::{redact_url, redacted_url};
 use rv_http::body::{BodyError, read_limited};
 use rv_http::retry::{Cooldowns, Outcome, RetryPolicy};
-use rv_http::transient::{TunnelRefusal, status_is_transient, transport_is_retryable};
+use rv_http::transient::{
+    TunnelRefusal, status_is_transient, transport_is_lookup_failure, transport_is_retryable,
+};
 use rv_maven_types::{ArtifactCoord, Digest, HashAlgorithm};
 use rv_store::{Expect, Expectation, PutError, Staged, Store, Verified};
 
@@ -51,6 +53,8 @@ fn request_error(error: reqwest::Error, url: &Url) -> RetryError {
     let error = error.without_url().with_url(redacted_url(url));
     if transport_is_retryable(&error) {
         RetryError::transient(RepoError::Http(error))
+    } else if transport_is_lookup_failure(&error) {
+        RetryError::Unresolved(RepoError::Http(error))
     } else {
         RetryError::permanent(RepoError::Http(error))
     }
@@ -1384,6 +1388,65 @@ mod tests {
             assert!(matches!(result, Err(RepoError::NotFound(_))), "{result:?}");
         }
         assert_eq!(server.connections(), 1);
+    }
+
+    /// Fails the first `fails` lookups, as a resolver that cannot answer
+    /// does, then resolves every name to `addr`.
+    struct FlakyResolver {
+        addr: std::net::SocketAddr,
+        fails: AtomicUsize,
+        lookups: AtomicUsize,
+    }
+
+    impl reqwest::dns::Resolve for FlakyResolver {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let fail = (self.fails)
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            let addr = self.addr;
+            Box::pin(async move {
+                if fail {
+                    return Err(
+                        std::io::Error::other("temporary failure in name resolution").into(),
+                    );
+                }
+                Ok(Box::new(std::iter::once(addr)) as reqwest::dns::Addrs)
+            })
+        }
+    }
+
+    /// A host name that fails to resolve once is looked up again; one that
+    /// fails twice fails the request as an unreachable host, which the
+    /// search moves on from.
+    #[tokio::test]
+    async fn a_failed_lookup_is_tried_once_more() {
+        let server = StubServer::start(|_| Response::new(200, "abc"));
+        let cfg = config(3, Duration::from_secs(5));
+        for fails in [1, 2] {
+            let resolver = Arc::new(FlakyResolver {
+                addr: server.addr(),
+                fails: AtomicUsize::new(fails),
+                lookups: AtomicUsize::new(0),
+            });
+            let client = rv_http::client_builder()
+                .no_proxy()
+                .dns_resolver(Arc::clone(&resolver))
+                .build()
+                .unwrap();
+            let url = format!("http://repo.example:{}/a.sha1", server.addr().port());
+            let result = fetch_text(&client, &Url::parse(&url).unwrap(), None, None, &cfg).await;
+            assert_eq!(resolver.lookups.load(Ordering::SeqCst), 2);
+            if fails == 1 {
+                assert_eq!(result.unwrap(), "abc");
+                continue;
+            }
+            let err = result.unwrap_err();
+            assert!(matches!(err, RepoError::Http(_)), "{err:?}");
+            assert!(err.is_unreachable() && !err.is_transient(), "{err:?}");
+            assert!(err.moves_to_next_repository(), "{err:?}");
+        }
+        assert_eq!(server.answered(), 1);
     }
 
     type Heads = Arc<std::sync::Mutex<Vec<String>>>;

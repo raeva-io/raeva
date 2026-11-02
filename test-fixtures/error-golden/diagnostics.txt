@@ -39,6 +39,13 @@ Another raeva process holds the store lock. Wait for it to finish or terminate t
 Lock holder info: pid 7
 ----
 STORE Failure
+artifact store error: /raeva/index.sqlite was written by a newer raeva (schema generation 2, this raeva knows up to 1), so this one leaves it alone
+
+  Suggestions:
+    - Run the newer raeva, or give this one its own RAEVA_HOME
+
+----
+STORE Failure
 artifact store error: no database connection available (busy); try again in a moment
 ----
 STORE Failure
@@ -58,6 +65,13 @@ repository metadata cache error: disk full; check available space on the volume 
 ----
 STORE Failure
 repository metadata cache error: database error; run the command again; if the problem persists, delete /home/u/.raeva/metadata.db
+----
+STORE Failure
+repository metadata cache error: /raeva/metadata.db was written by a newer raeva (schema generation 2, this raeva knows up to 1), so this one leaves it alone
+
+  Suggestions:
+    - Run the newer raeva, or delete /raeva/metadata.db and its -wal and -shm files while no raeva runs: it is a cache, and this raeva starts a new one
+
 ----
 STORE Failure
 repository metadata cache error: could not grow the shared-memory file of /home/u/.raeva/metadata.db, most often because its volume is full; check available space there

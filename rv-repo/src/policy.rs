@@ -54,8 +54,8 @@ pub struct Admission {
     /// transitive URL the `[security]` policy does not allow.
     pub dropped: Vec<Repository>,
     /// The repositories refused whatever the policy allows, because their
-    /// URL has userinfo, a query or a fragment
-    /// ([`rv_config::secret_url_part`]), which raeva.lock would record.
+    /// URL may hold a secret ([`secret_url_refusal`]), which raeva.lock
+    /// would record.
     pub secret_urls: Vec<Repository>,
     /// External HTTP repositories refused by the built-in blocker.
     pub blocked_http: Vec<Repository>,
@@ -83,6 +83,8 @@ pub struct RepositoryPolicy {
     /// Where a local declaration's origin is recorded, so that an id-scoped
     /// credential may follow a fetched POM's repository there.
     named_origins: Option<NamedOrigins>,
+    /// [`Config::secret_named_inputs`], which a URL path may not hold.
+    secrets: Arc<[(String, String)]>,
 }
 
 impl RepositoryPolicy {
@@ -95,6 +97,7 @@ impl RepositoryPolicy {
             config: Arc::new(config.clone()),
             grants,
             named_origins,
+            secrets: config.secret_named_inputs().into(),
         }
     }
 
@@ -105,7 +108,7 @@ impl RepositoryPolicy {
         repos: impl IntoIterator<Item = Repository>,
         from: Declaration,
     ) -> Admission {
-        let admission = Self::screen(&self.config, repos, from);
+        let admission = Self::screen_with(&self.config, &self.secrets, repos, from);
         for repo in &admission.admitted {
             self.grant(repo);
         }
@@ -119,6 +122,15 @@ impl RepositoryPolicy {
         repos: impl IntoIterator<Item = Repository>,
         from: Declaration,
     ) -> Admission {
+        Self::screen_with(config, &config.secret_named_inputs(), repos, from)
+    }
+
+    fn screen_with(
+        config: &Config,
+        secrets: &[(String, String)],
+        repos: impl IntoIterator<Item = Repository>,
+        from: Declaration,
+    ) -> Admission {
         let mut admission = Admission::default();
         for mut repo in repos {
             let provenance = match from {
@@ -126,7 +138,7 @@ impl RepositoryPolicy {
                 Declaration::RemoteParent | Declaration::Transitive => Provenance::FetchedPom,
             };
             repo.set_provenance(provenance);
-            if rv_config::secret_url_part(&repo.url).is_some() {
+            if secret_url_refusal(&repo.url, secrets).is_some() {
                 admission.secret_urls.push(repo);
                 continue;
             }
@@ -163,6 +175,30 @@ impl RepositoryPolicy {
             }
         }
     }
+}
+
+/// Why `url` may not be used, as a clause after "its URL", or `None` when
+/// it may: it has a part [`rv_config::secret_url_part`] names, or the value
+/// of one of `secrets` ([`Config::secret_named_inputs`]) makes up whole
+/// segments of its path. The clause names the input, never its value, and
+/// says what to do instead.
+pub fn secret_url_refusal(url: &str, secrets: &[(String, String)]) -> Option<String> {
+    if let Some(part) = rv_config::secret_url_part(url) {
+        return Some(format!(
+            "has {part}, which raeva.lock would record; put credentials in an [[auth]] entry \
+             in config.toml or a <server> in settings.xml with the repository's id, not in the \
+             URL"
+        ));
+    }
+    rv_config::secret_input_in_path(url, secrets).map(|input| {
+        format!(
+            "has the value of {input} as one or more whole path segments, which raeva.lock \
+             would record, and that name looks like a secret's; if the value is a token, give \
+             the URL with it to a settings.xml <mirror> of the repository, whose URL \
+             raeva.lock does not record, or put the credential in a <server> with the \
+             repository's id; if it is not a secret, rename {input}"
+        )
+    })
 }
 
 static HTTP_REPO_WARNED: LazyLock<Mutex<HashSet<(String, bool)>>> = LazyLock::new(Mutex::default);

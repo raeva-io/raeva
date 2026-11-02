@@ -2,10 +2,7 @@ schema_version = 8
 config_hash = "c0ec4de46cce1cc336386a86ba9b89d893e4aab61fd7cf166d3875ccd0ea97e1"
 
 [resolution]
-ambient_inputs = [
-    "user-property:os.detection.classifierWithLikes",
-    "user-property:util.version",
-]
+ambient_inputs = ["user-property:util.version"]
 
 [[platforms]]
 targets = [
@@ -94,20 +91,18 @@ sha256 = "ffe04faf64ab862e146285d6a1cf70a02ff1087dc3d51ad93380eb36add33804"
 [[inputs]]
 target = "linux-x86_64"
 profiles = []
-ambient_inputs = [
-    "user-property:os.detection.classifierWithLikes",
-    "user-property:util.version",
-]
 
 [[inputs.poms]]
 path = "api/pom.xml"
 sha256 = "b92b8853e7618cd7e1d79e624ddca263338eb1a58e1de06c742209fc726b0d6d"
-graph = "0d7a6eb9b01a774096325ac12a63073a504b968214f76bd7a4143fdbe7129855"
+graph = "7f42ce1a7ae29146d48d3af98f9c106d10a7ab849ddfb53efe4c903ec9db615e"
+ambient_inputs = ["user-property:util.version"]
 
 [[inputs.poms]]
 path = "app/pom.xml"
 sha256 = "8a479789200c6126fa423ff24c0eb9c38a062ae34fa84a64e5208387dea77ebd"
-graph = "b915f0fa9b7e91f21b63de0b1e06ba3b3df711ef8ae4d958f69b50338c355272"
+graph = "d3bec3e52ec9c16bef4786636be71e2c589d9949b1a517adb558255b991ebc26"
+ambient_inputs = ["user-property:util.version"]
 
 [[inputs.poms]]
 path = "build-parent/pom.xml"
@@ -116,7 +111,8 @@ sha256 = "aa28f93633ffda2b4e6df88000df8a2b6e520cb34500ac337f275527f65b3d2b"
 [[inputs.poms]]
 path = "pom.xml"
 sha256 = "7c2a2059f91fc4e5447634f4526981a85b6e274aea9a52342bf7eede632f1768"
-graph = "ab1f505847bf7bbe4223c76f380aae7f802163d1c8ff6f3c17151235ee3f45cc"
+graph = "026c6105973fb79dece19a384a20d1ea5fdddc88f39a9e033a324f2e2f7ab50f"
+ambient_inputs = ["user-property:util.version"]
 
 [[inputs]]
 target = "windows-x86_64"

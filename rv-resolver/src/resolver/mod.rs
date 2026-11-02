@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use foldhash::{HashMap, HashMapExt};
 use futures::FutureExt;
+use futures::future::{Either, select};
 use futures::stream::{self, StreamExt};
 use petgraph::graph::NodeIndex;
 use rv_config::Config;
@@ -94,12 +95,13 @@ impl Resolver {
     /// selects the configuration's per-platform settings and the profiles
     /// that activate.
     ///
-    /// Modules build their graphs in parallel and populate their artifacts in
-    /// discovery order as the graphs come in; the support POMs and the
-    /// store's rows are written at the end. A watchdog fails the resolution with
-    /// [`ResolveError::WorkspaceStalled`] when nothing at all happens for
-    /// the stall timeout, so a scheduling bug fails a build with the stuck
-    /// modules named instead of hanging it.
+    /// Modules build their graphs in parallel and populate their artifacts
+    /// in discovery order as the graphs come in, downloading none before
+    /// every module's own dependencies pass the checks a graph starts with;
+    /// the support POMs and the store's rows are written at the end. A
+    /// watchdog fails the resolution with [`ResolveError::WorkspaceStalled`]
+    /// when nothing at all happens for the stall timeout, so a scheduling
+    /// bug fails a build with the stuck modules named instead of hanging it.
     pub async fn resolve_workspace(
         &self,
         workspace: &Workspace,
@@ -425,6 +427,16 @@ struct PendingModuleResolution {
     root_parent_ranges: Vec<rv_lock::ParentRange>,
 }
 
+/// The classifier likes of a platform pass, and what finding them read.
+/// Those reads, and the reactor when the first sorted project sets the
+/// likes, count only once a build reads the likes, so a pass that never
+/// reads `${os.detected.classifier}` records nothing of them.
+struct ReactorLikes {
+    likes: rv_maven_model::ClassifierLikes,
+    reads: Arc<std::collections::BTreeSet<rv_maven_model::HostInput>>,
+    from_project: bool,
+}
+
 struct WorkspaceModuleWork {
     index: usize,
     pom_path: String,
@@ -545,8 +557,7 @@ impl PlatformResolver {
         let support_poms = &store_state.support_poms;
         let workspace =
             (reactor.with_effective_gavs(workspace, &store_state.progress, support_poms)).await?;
-        let likes: Option<Arc<str>> =
-            (reactor.classifier_likes(&workspace, support_poms).await).map(Arc::from);
+        let likes = reactor.classifier_likes(&workspace, support_poms).await;
         let module_concurrency = max_module_concurrency().min(workspace.len().max(1));
 
         let module_specs: Vec<(usize, String, PathBuf)> = workspace
@@ -566,6 +577,58 @@ impl PlatformResolver {
         // building, which is most of a warm resolution, runs on as many
         // threads as there are modules in flight instead of on one.
         let runtime = tokio::runtime::Handle::try_current().ok();
+        let module_ctx = || {
+            self.ctx
+                .for_module(self.ctx.config.clone())
+                .with_classifier_likes(likes.as_ref().map(|likes| likes.likes.clone()))
+                .recording_into(rv_maven_model::HostReads::default())
+        };
+        // A module fails on its own dependencies before it reads any, but
+        // it may start only after the modules ahead of it have downloaded
+        // their artifacts. So no artifact is downloaded until every module's
+        // own dependencies pass their checks, beside the graphs, which start
+        // once one would be, or until every graph is in; after a failed
+        // graph, none is. A failed check is not one: a POM it could not
+        // fetch, the graph may.
+        // Without a prefetcher nothing is downloaded, and a lone module
+        // checks its own dependencies before it reads any.
+        let prefetcher = (self.ctx.prefetcher.as_ref()).filter(|_| workspace.len() > 1);
+        if let Some(prefetcher) = prefetcher {
+            prefetcher.hold_artifacts();
+        }
+        let imports = Arc::<KeptImports>::default();
+        let checked = stream::iter(module_specs.clone())
+            .map(|(_, _, absolute_pom)| {
+                let workspace = Arc::clone(&workspace);
+                let store_state = Arc::clone(&store_state);
+                let imports = Arc::clone(&imports);
+                let resolver = PlatformResolver::new(module_ctx());
+                let check = async move {
+                    let support_poms = &store_state.support_poms;
+                    let check = resolver.check_own_dependencies(
+                        &absolute_pom,
+                        workspace,
+                        support_poms,
+                        &imports,
+                    );
+                    // The module's graph logs what this would.
+                    Ok(store_state.holds.hold(check).await.0)
+                };
+                on_task(runtime.as_ref(), check).map(|checked| checked.flatten().is_ok())
+            })
+            .buffer_unordered(module_concurrency)
+            .all(std::future::ready);
+        let checking = async {
+            let Some(prefetcher) = prefetcher else {
+                return;
+            };
+            if prefetcher.downloads_wanted().await {
+                let released = std::pin::pin!(prefetcher.downloads_released());
+                if let Either::Left((true, _)) = select(std::pin::pin!(checked), released).await {
+                    prefetcher.release_artifacts(true);
+                }
+            }
+        };
         // Once a graph fails the pass fails, so no other module starts or
         // downloads its artifacts.
         let graph_failed = Arc::new(AtomicBool::new(false));
@@ -575,12 +638,7 @@ impl PlatformResolver {
                 let graph_failed = Arc::clone(&graph_failed);
                 let workspace = Arc::clone(&workspace);
                 let store_state = Arc::clone(&store_state);
-                let ctx = self
-                    .ctx
-                    .for_module(self.ctx.config.clone())
-                    .with_classifier_likes(likes.clone())
-                    .recording_into(rv_maven_model::HostReads::default());
-                let resolver = PlatformResolver::new(ctx);
+                let resolver = PlatformResolver::new(module_ctx());
                 let module = async move {
                     tracing::debug!(
                         target: "rv_resolver::workspace",
@@ -618,6 +676,7 @@ impl PlatformResolver {
             })
             .buffer_unordered(module_concurrency);
         let (done, mut resolved) = futures::channel::mpsc::unbounded();
+        let failed = Arc::clone(&graph_failed);
         let resolving = async move {
             graphs
                 .for_each(|result| {
@@ -626,6 +685,9 @@ impl PlatformResolver {
                     std::future::ready(())
                 })
                 .await;
+            if let Some(prefetcher) = prefetcher {
+                prefetcher.release_artifacts(!failed.load(Ordering::Relaxed));
+            }
         };
         // Each module's artifacts are populated, in reactor order, as soon as
         // its graph and those of the modules before it are in, while later
@@ -643,8 +705,12 @@ impl PlatformResolver {
             // Graphs that were in before the failed one but not populated.
             let mut unpopulated = Vec::new();
             let (mut graph_failure, mut failure) = (None, None);
-            while let Some((index, work)) = resolved.next().await {
-                ready.insert(index, work);
+            loop {
+                let result = resolved.next().await;
+                let all_in = result.is_none();
+                if let Some((index, work)) = result {
+                    ready.insert(index, work);
+                }
                 while let Some((work, graph)) = ready.remove(&next) {
                     next += 1;
                     let module: WorkspaceModuleWork = match work {
@@ -703,6 +769,9 @@ impl PlatformResolver {
                         }
                     }
                 }
+                if all_in {
+                    break;
+                }
             }
             // A module before the first failure to populate may still fail
             // to complete; the first failure in reactor order is reported.
@@ -721,7 +790,7 @@ impl PlatformResolver {
                         });
                     }
                     Err(error) => {
-                        failure = Some((error, Default::default()));
+                        failure = Some((error.in_module(&pom_path), Default::default()));
                         break;
                     }
                 }
@@ -732,8 +801,8 @@ impl PlatformResolver {
             });
             (modules, held, unpopulated, retired, graph_failure, failure)
         };
-        let ((), (modules, held, unpopulated, retired, graph_failure, failure)) =
-            futures::join!(resolving, finishing);
+        let ((), (), (modules, held, unpopulated, retired, graph_failure, failure)) =
+            futures::join!(checking, resolving, finishing);
         store_state.models.clear();
         crate::util::drop_in_background(retired);
         // Modules resolve in any order; a failed graph is reported first, the
@@ -777,6 +846,14 @@ impl PlatformResolver {
         if let Some(error) = failure {
             return Err(error);
         }
+        if let Some(likes) = likes.filter(|likes| likes.likes.read()) {
+            reactor.ctx.record_reads(&likes.reads);
+            if likes.from_project {
+                // Every module's classifier reads them, and edits anywhere in
+                // the reactor can change which project Maven sorts first.
+                self.ctx.note_reactor_through_dependencies();
+            }
+        }
 
         Ok(WorkspaceResolution {
             platform: self.ctx.platform.clone(),
@@ -795,23 +872,31 @@ impl PlatformResolver {
         &self,
         workspace: &Arc<Workspace>,
         support_poms: &WorkspaceSupportPomBuffer,
-    ) -> Option<String> {
+    ) -> Option<ReactorLikes> {
         const LIKES: &str = "os.detection.classifierWithLikes";
-        let environment = self.ctx.environment();
-        if !environment.reads_classifier_likes() {
+        if !self.ctx.environment().reads_classifier_likes() {
             return None;
         }
-        let first = self.first_sorted_project(workspace, support_poms).await;
-        let likes = first.and_then(|project| project.classifier_with_likes);
-        if likes.is_some() {
-            // Every module's classifier reads it, and edits anywhere in the
-            // reactor can change which project Maven sorts first.
-            self.ctx.note_reactor_through_dependencies();
+        let reads = rv_maven_model::HostReads::default();
+        let search = Self::new(self.ctx.recording_only_into(reads.clone()));
+        let first = search.first_sorted_project(workspace, support_poms).await;
+        let own = first.and_then(|project| project.classifier_with_likes);
+        let from_project = own.is_some();
+        if (search.ctx.config.defined_settings_properties()).contains(LIKES) {
+            // An active settings.xml profile's likes are the project's, over
+            // any other, so a profile that sets them counts, active or not.
+            search.ctx.environment().record_settings_property(LIKES);
         }
-        likes.or_else(|| {
+        let likes = own.or_else(|| {
+            let environment = search.ctx.environment();
             environment.record_user_property(LIKES);
             let activation = rv_maven_model::ActivationContext::new(environment);
             workspace.root_user_properties(&activation).0.remove(LIKES)
+        });
+        Some(ReactorLikes {
+            likes: rv_maven_model::ClassifierLikes::new(likes.as_deref()),
+            reads: Arc::new(reads.take()),
+            from_project,
         })
     }
 
@@ -920,6 +1005,7 @@ impl PlatformResolver {
             }
             let path = workspace.root().join(&module.pom_path);
             progress.enter(index, &module.pom_path, WorkPhase::Graph);
+            let in_module = |err: ResolveError| err.in_module(&module.pom_path);
             let (pom, activation, backend, local_parents) = self
                 .root_model_inputs(
                     &path,
@@ -928,7 +1014,8 @@ impl PlatformResolver {
                     Some(support_poms),
                     None,
                 )
-                .await?;
+                .await
+                .map_err(in_module)?;
             let backend = backend.with_workspace_progress(Arc::clone(progress));
             let descriptor = rv_maven_model::EffectiveDescriptor::build(
                 pom,
@@ -937,7 +1024,7 @@ impl PlatformResolver {
                 &activation,
             )
             .await
-            .map_err(|err| project_model_error(err, &path))?;
+            .map_err(|err| in_module(project_model_error(err, &path)))?;
             progress.leave(index);
             gavs.push((index, descriptor.gav));
         }
@@ -1151,6 +1238,35 @@ impl PlatformResolver {
             None => LocalParents::none(),
         };
         Ok((pom, activation, backend, local_parents))
+    }
+
+    /// Fail where the solver fails on the own dependencies of the module at
+    /// `path` before it reads any of them.
+    async fn check_own_dependencies(
+        &self,
+        path: &Path,
+        workspace: Arc<Workspace>,
+        support_poms: &WorkspaceSupportPomBuffer,
+        imports: &Arc<KeptImports>,
+    ) -> Result<()> {
+        let (coord, project, ..) = self
+            .load_root_project(
+                path,
+                &self.ctx.repos,
+                Arc::clone(&workspace),
+                Some(support_poms),
+                Some(imports),
+            )
+            .await?;
+        let backend = ModelService::new(&self.ctx, Vec::new()).with_workspace(workspace);
+        let management = Management::new(project.dependency_management.dependencies);
+        Solver::new(&backend)
+            .with_management(management)
+            .check_root(SolverRoot {
+                coord,
+                dependencies: project.dependencies,
+                scope: Scope::Compile,
+            })
     }
 
     async fn load_root_project(
@@ -1562,6 +1678,14 @@ impl PlatformResolver {
 
         if to_fetch.is_empty() {
             return Ok(());
+        }
+        // Refused only once a graph fails, whose error is reported.
+        if let Some(prefetcher) = self.ctx.prefetcher.as_deref()
+            && !prefetcher.may_download().await
+        {
+            return Err(ResolveError::InternalError(
+                "a reactor module failed before its graph did".to_string(),
+            ));
         }
 
         let client = self

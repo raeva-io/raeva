@@ -69,7 +69,7 @@ pub use effective::{EffectiveDescriptor, Gav};
 #[cfg(any(test, feature = "testing"))]
 pub use environment::OS_RELEASE_TEST_ENV;
 pub use environment::{
-    HostInput, HostReads, HostSnapshot, ModelEnvironment, ModelEnvironmentBuilder,
+    ClassifierLikes, HostInput, HostReads, HostSnapshot, ModelEnvironment, ModelEnvironmentBuilder,
 };
 pub use error::{ParentCoordMismatch, PomError};
 pub use inheritance::{

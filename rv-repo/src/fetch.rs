@@ -1025,9 +1025,18 @@ pub(crate) async fn publish_artifact(
             actual,
         }) => {
             let (subject, check) = match (against, checks.index) {
-                (Expectation::Pin, Some(key)) => (key.to_string(), IntegritySource::LockPin),
-                (Expectation::Pin, None) => (url.path().to_string(), IntegritySource::LockPin),
-                (Expectation::Sidecar, _) => (url.path().to_string(), IntegritySource::Sidecar),
+                (Expectation::Pin, Some(key)) => (
+                    format!("{key} from {}", rv_config::redact_url(url.as_str())),
+                    IntegritySource::LockPin,
+                ),
+                (Expectation::Pin, None) => (
+                    redacted_url(url).path().to_string(),
+                    IntegritySource::LockPin,
+                ),
+                (Expectation::Sidecar, _) => (
+                    redacted_url(url).path().to_string(),
+                    IntegritySource::Sidecar,
+                ),
             };
             Err(RepoError::ChecksumMismatch {
                 subject: subject.into(),
@@ -1272,7 +1281,13 @@ mod tests {
         else {
             panic!("expected a lock pin mismatch, got {result:?}");
         };
-        assert_eq!(&*subject, "com.example:a:1.0.0:jar");
+        assert_eq!(
+            &*subject,
+            format!(
+                "com.example:a:1.0.0:jar from {}",
+                rv_config::redact_url(url.as_str())
+            )
+        );
         assert_eq!(artifact.as_deref(), Some(&key));
         assert_eq!((expected, actual), (wrong, Digest::Sha256(served.clone())));
         assert_eq!(server.answered(), 1);

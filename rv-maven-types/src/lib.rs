@@ -24,8 +24,8 @@ mod text;
 mod version;
 
 pub use component::{
-    CoordinateField, InvalidCoordinateComponent, is_maven_id_text, is_terminal_safe,
-    validate_coordinate_component, validate_reactor_version,
+    CoordinateField, InvalidCoordinateComponent, MAX_COMPONENT_BYTES, is_maven_id_text,
+    is_terminal_safe, validate_coordinate_component, validate_reactor_version,
 };
 pub use coord::{ArtifactCoord, Coord, Gav, PartialCoord};
 pub use digest::{BlobId, Digest, DigestError, HashAlgorithm, Md5, Sha1, Sha256};

@@ -1,6 +1,7 @@
 use super::*;
 use crate::artifact::ArtifactRequest;
 use crate::auth::AuthStore;
+use crate::error::IntegritySource;
 use crate::fetch::FetchConfig;
 use crate::mirror::MirrorSelector;
 use crate::routing::{Router, cache_scope_key};
@@ -127,6 +128,56 @@ fn offline_miss<T: std::fmt::Debug>(result: Result<T>) -> bool {
 
 fn coord(raw: &str) -> Coord {
     raw.parse().unwrap()
+}
+
+/// A cached POM without a checksum file that matches a SHA-1 lock pin is
+/// verified by it, offline too, as one that matches a SHA-256 pin is.
+#[tokio::test]
+async fn a_cached_pom_matching_a_sha1_pin_needs_no_checksum_file() {
+    let server = model_stub(Arc::new(AtomicBool::new(false)));
+    let (mut client, _tmp) = test_client();
+    let repo = http_repo(&server);
+    let req = ArtifactRequest::new("test", "demo", "1.0");
+    let bytes = (client.clone().with_allow_missing_checksums(true))
+        .fetch_pom(&repo, &req)
+        .await
+        .unwrap();
+    let pin = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, &bytes);
+    client.lock_pins = unserved_pins([(req.pom().to_path(), pin)]);
+    let offline = client.with_offline(true);
+    assert_eq!(offline.fetch_pom(&repo, &req).await.unwrap(), bytes);
+}
+
+/// A SHA-1 lock pin decides a fetched POM before its checksum file does: it
+/// needs none, and other bytes are refused as differing from the pin even
+/// when the repository's checksum file matches them.
+#[tokio::test]
+async fn a_sha1_pin_decides_a_fetched_pom_before_its_checksum_file() {
+    for checksums in [false, true] {
+        let server = model_stub(Arc::new(AtomicBool::new(checksums)));
+        let repo = http_repo(&server);
+        let req = ArtifactRequest::new("test", "demo", "1.0");
+        let (lenient, _lenient_home) = test_client();
+        let bytes = (lenient.with_allow_missing_checksums(true))
+            .fetch_pom(&repo, &req)
+            .await
+            .unwrap();
+        let pin = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, &bytes);
+        let (mut client, _home) = test_client();
+        client.lock_pins = unserved_pins([(req.pom().to_path(), pin)]);
+        assert_eq!(client.fetch_pom(&repo, &req).await.unwrap(), bytes);
+
+        let other = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, b"other");
+        let (mut client, _home) = test_client();
+        client.lock_pins = unserved_pins([(req.pom().to_path(), other)]);
+        assert!(matches!(
+            client.fetch_pom(&repo, &req).await,
+            Err(RepoError::ChecksumMismatch {
+                check: IntegritySource::LockPin,
+                ..
+            })
+        ));
+    }
 }
 
 /// A POM or `maven-metadata.xml` cached under `--allow-missing-checksums`
@@ -1400,7 +1451,7 @@ async fn rows_dated_in_the_future_are_fetched_again() {
     read_all(client).await;
     for update in [true, false] {
         let conn = rusqlite::Connection::open(&db).expect("metadata.db");
-        for table in ["pom_cache_v3", "version_list_cache_v3"] {
+        for table in ["pom_cache_v4", "version_list_cache_v3"] {
             let sql = format!("UPDATE {table} SET fetched_at = unixepoch() + 3600");
             conn.execute(&sql, []).expect("date rows ahead");
         }
@@ -1627,25 +1678,32 @@ async fn a_timestamped_snapshot_spelled_without_a_hyphen_is_read_from_its_build(
 }
 
 /// A cached POM other than the one raeva.lock pins is a miss: it is fetched
-/// again rather than served or reported as a mismatch from the cache.
+/// again rather than served from the cache, and the fetched bytes are then
+/// held to the pin whichever repository serves them.
 #[tokio::test]
 async fn a_cached_pom_that_differs_from_the_pin_is_fetched_again() {
-    let server = model_stub(Arc::new(AtomicBool::new(true)));
-    let (mut client, _tmp) = test_client();
-    let repo = http_repo(&server);
-    let req = ArtifactRequest::new("test", "demo", "1.0");
-    client.fetch_pom(&repo, &req).await.unwrap();
-    let answered = server.answered();
-    client.lock_pins = unserved_pins([(
-        req.pom().to_path(),
+    for pin in [
         rv_maven_types::Digest::Sha256(rv_maven_types::Sha256::from_bytes(b"other")),
-    )]);
-    client.pom_memo = Arc::default();
-    client.fetch_pom(&repo, &req).await.unwrap();
-    assert!(
-        server.answered() > answered,
-        "the differing row is not served"
-    );
+        rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, b"other"),
+    ] {
+        let server = model_stub(Arc::new(AtomicBool::new(true)));
+        let (mut client, _tmp) = test_client();
+        let repo = http_repo(&server);
+        let req = ArtifactRequest::new("test", "demo", "1.0");
+        client.fetch_pom(&repo, &req).await.unwrap();
+        let answered = server.answered();
+        client.lock_pins = unserved_pins([(req.pom().to_path(), pin.clone())]);
+        client.pom_memo = Arc::default();
+        let err = client.fetch_pom(&repo, &req).await.unwrap_err();
+        assert!(
+            matches!(err, RepoError::ChecksumMismatch { .. }),
+            "{pin}: {err:?}"
+        );
+        assert!(
+            server.answered() > answered,
+            "{pin}: the differing row is not served"
+        );
+    }
 }
 
 /// A repeat fetch with a SHA-1 pin reuses the stored file that matches it.
@@ -1740,9 +1798,27 @@ async fn pins_skip_sidecars_and_stored_files_are_not_downloaded_again() {
         pinned.stored_artifact(&store, &repo, &key).await.unwrap(),
         Some(rv_maven_types::BlobId::from_bytes(JAR))
     );
-    // Bytes that differ from a stale lock pin are checked against the
-    // sidecar instead.
-    let verified = client.fetch_artifact(&repo, &b, &store, FetchArtifact::default());
+    // Bytes that differ from a release file's lock pin are refused before
+    // the store keeps them; an update checks them against the sidecar.
+    let refused = client.fetch_artifact(&repo, &b, &store, FetchArtifact::default());
+    let refused = refused.await;
+    assert!(
+        matches!(
+            refused,
+            Err(RepoError::ChecksumMismatch {
+                check: IntegritySource::LockPin,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        !store
+            .get_path(&rv_maven_types::BlobId::from_bytes(OTHER))
+            .exists()
+    );
+    let updating = client.clone().with_update(true);
+    let verified = updating.fetch_artifact(&repo, &b, &store, FetchArtifact::default());
     assert!(verified.await.unwrap().checksum_verified);
     let lenient = client.clone().with_allow_missing_checksums(true);
     assert!(
@@ -1754,9 +1830,10 @@ async fn pins_skip_sidecars_and_stored_files_are_not_downloaded_again() {
 
     let requests = server.requests();
     let count = |path: &str| requests.iter().filter(|r| r.path == path).count();
-    for path in ["/g/a/1/a-1.pom", "/g/b/1/b-1.jar", "/g/b/1/b-1.jar.sha256"] {
+    for path in ["/g/a/1/a-1.pom", "/g/b/1/b-1.jar.sha256"] {
         assert_eq!(count(path), 1, "{path}");
     }
+    assert_eq!(count("/g/b/1/b-1.jar"), 2);
     // The pinned fetch and its repeat download once; the strict fetch
     // without the pin downloads again and finds no checksum.
     assert_eq!(count("/g/a/1/a-1.jar"), 2);
@@ -2044,6 +2121,7 @@ async fn a_refusal_counts_from_when_its_route_picked_the_credential() {
             &route,
             "g/a/1/a-1.pom",
             "1",
+            None,
             &mut super::requests::DeferredWarnings::default(),
         )
         .await;
@@ -2143,4 +2221,228 @@ fn unserved_pins<const N: usize>(
             .map(|(path, pin)| (path, (pin, Default::default())))
             .collect(),
     )
+}
+
+#[test]
+fn release_file_pins_include_timestamped_snapshots() {
+    let (mut client, _tmp) = test_client();
+    let pin = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha256, b"pinned");
+    for (version, fixed) in [
+        ("1", true),
+        ("1-20260101.010101-1", true),
+        ("1-SNAPSHOT", false),
+        ("1SNAPSHOT", false),
+        ("SNAPSHOT", false),
+    ] {
+        for classifier in [None, Some("sources")] {
+            let key = ArtifactCoord::new("g", "a", version, "jar", classifier);
+            let path = file_path(&key);
+            client.lock_pins = unserved_pins([(path.clone(), pin.clone())]);
+            assert_eq!(
+                client.release_file_pin(&path),
+                fixed.then_some(&pin),
+                "{path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stored_fixed_files_must_match_lock_pins_under_update_too() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = store_in(&store_dir);
+    let blob = store.put_bytes(b"stored").await.unwrap();
+    let repo = Repository::new(None, "https://repo.example/", true, true);
+    for (version, fixed) in [
+        ("1", true),
+        ("1-20260101.010101-1", true),
+        ("1-SNAPSHOT", false),
+    ] {
+        let key = ArtifactCoord::new("g", "a", version, "jar", None);
+        let origin = rv_store::Origin {
+            repo_url: repo.url.clone(),
+            endpoint_url: repo.url.clone(),
+            checksum_verified: true,
+            served: true,
+        };
+        store
+            .record_origins(vec![(key.clone(), blob.clone(), origin)])
+            .await
+            .unwrap();
+        for update in [false, true] {
+            for bytes in [b"stored".as_slice(), b"other"] {
+                for algorithm in [HashAlgorithm::Sha256, HashAlgorithm::Sha1] {
+                    let (mut client, _tmp) = test_client();
+                    let pin = rv_maven_types::Digest::of_bytes(algorithm, bytes);
+                    client.lock_pins = unserved_pins([(file_path(&key), pin)]);
+                    let client = client.with_update(update);
+                    let accepted = !fixed || bytes == b"stored";
+                    assert_eq!(
+                        client.stored_artifact(&store, &repo, &key).await.unwrap(),
+                        accepted.then(|| blob.clone()),
+                        "{version}, update={update}, {algorithm:?}"
+                    );
+                    assert_eq!(
+                        client.served_artifact(&store, &repo, &key).await.unwrap(),
+                        accepted.then(|| (blob.clone(), true)),
+                        "{version}, update={update}, {algorithm:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_pom_pins_filter_cached_bytes() {
+    const POM: &[u8] = b"<project/>";
+    for version in ["1", "1-20260101.010101-1"] {
+        for algorithm in [HashAlgorithm::Sha256, HashAlgorithm::Sha1] {
+            let (client, _tmp) = test_client();
+            let repo = Repository::new(None, "https://repo.example/", true, true);
+            let request = ArtifactRequest::new("g", "a", version);
+            let path = request
+                .pom()
+                .to_path_with_versions(&super::models::resolved_directory(version), version);
+            let scope = client.router.route(&repo).scope;
+            client
+                .cache
+                .insert_with_ttl(CacheTable::Pom, &scope, &path, POM, i64::MAX, true)
+                .unwrap();
+            let client = client.with_offline(true);
+            assert_eq!(
+                client.fetch_pom(&repo, &request).await.unwrap().as_ref(),
+                POM
+            );
+            let wrong = rv_maven_types::Digest::of_bytes(algorithm, b"other pom");
+            let result = client
+                .fetch_pinned_pom_with_path(&repo, &request, &wrong)
+                .await;
+            assert!(
+                matches!(result, Err(RepoError::OfflineNotCached(_))),
+                "{result:?}"
+            );
+            let correct = rv_maven_types::Digest::of_bytes(algorithm, POM);
+            assert_eq!(
+                client
+                    .fetch_pinned_pom_with_path(&repo, &request, &correct)
+                    .await
+                    .unwrap()
+                    .0
+                    .as_ref(),
+                POM,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mismatching_explicit_pom_pins_are_not_cached() {
+    const POM: &[u8] = b"<project/>";
+    const OTHER: &[u8] = b"<project><!-- changed --></project>";
+    for version in ["1", "1-20260101.010101-1"] {
+        for algorithm in [HashAlgorithm::Sha256, HashAlgorithm::Sha1] {
+            let tampered = Arc::new(AtomicBool::new(true));
+            let serving = Arc::clone(&tampered);
+            let server = StubServer::start(move |request| {
+                let body = if serving.load(Ordering::SeqCst) {
+                    OTHER
+                } else {
+                    POM
+                };
+                if request.path.ends_with(".sha256") {
+                    Response::new(200, sha256_hex(body))
+                } else {
+                    Response::new(200, body)
+                }
+            });
+            let repo = http_repo(&server);
+            let (client, _tmp) = test_client();
+            assert!(client.lock_pins.is_empty());
+            let request = ArtifactRequest::new("g", "a", version);
+            let pin = rv_maven_types::Digest::of_bytes(algorithm, POM);
+            let result = client
+                .fetch_pinned_pom_with_path(&repo, &request, &pin)
+                .await;
+            assert!(matches!(result, Err(RepoError::ChecksumMismatch {
+                check: IntegritySource::LockPin, expected, actual, ..
+            }) if expected == pin && actual == rv_maven_types::Digest::of_bytes(algorithm, OTHER)));
+            let path = request
+                .pom()
+                .to_path_with_versions(&super::models::resolved_directory(version), version);
+            let scope = client.router.route(&repo).scope;
+            assert!(
+                client
+                    .cache
+                    .get(CacheTable::Pom, &scope, &path)
+                    .unwrap()
+                    .is_none()
+            );
+            tampered.store(false, Ordering::SeqCst);
+            assert_eq!(
+                client
+                    .fetch_pinned_pom_with_path(&repo, &request, &pin)
+                    .await
+                    .unwrap()
+                    .0
+                    .as_ref(),
+                POM,
+            );
+            assert_eq!(
+                server
+                    .requests()
+                    .iter()
+                    .filter(|r| r.path == format!("/{path}"))
+                    .count(),
+                2
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_pom_pins_check_local_bytes() {
+    const POM: &[u8] = b"<project/>";
+    const OTHER: &[u8] = b"<project><!-- changed --></project>";
+    for version in ["1", "1-20260101.010101-1"] {
+        for algorithm in [HashAlgorithm::Sha256, HashAlgorithm::Sha1] {
+            let repository = tempfile::tempdir().unwrap();
+            let repo = file_repo(repository.path());
+            let (client, _tmp) = test_client();
+            let request = ArtifactRequest::new("g", "a", version);
+            let path = request
+                .pom()
+                .to_path_with_versions(&super::models::resolved_directory(version), version);
+            let file = repository.path().join(&path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, OTHER).unwrap();
+            std::fs::write(
+                repository.path().join(format!("{path}.sha256")),
+                sha256_hex(OTHER),
+            )
+            .unwrap();
+            let pin = rv_maven_types::Digest::of_bytes(algorithm, POM);
+            let result = client
+                .fetch_pinned_pom_with_path(&repo, &request, &pin)
+                .await;
+            assert!(matches!(result, Err(RepoError::ChecksumMismatch {
+                check: IntegritySource::LockPin, expected, actual, ..
+            }) if expected == pin && actual == rv_maven_types::Digest::of_bytes(algorithm, OTHER)));
+            std::fs::write(&file, POM).unwrap();
+            std::fs::write(
+                repository.path().join(format!("{path}.sha256")),
+                sha256_hex(POM),
+            )
+            .unwrap();
+            assert_eq!(
+                client
+                    .fetch_pinned_pom_with_path(&repo, &request, &pin)
+                    .await
+                    .unwrap()
+                    .0
+                    .as_ref(),
+                POM,
+            );
+        }
+    }
 }

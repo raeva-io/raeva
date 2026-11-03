@@ -768,6 +768,39 @@ fn a_database_damaged_past_its_schema_page_is_recreated_mid_run() {
     }
 }
 
+/// A store index or metadata cache that an older raeva wrote is upgraded
+/// with one `DATABASE_UPGRADED` warning naming it, and the next run is quiet.
+#[test]
+fn a_database_an_older_raeva_wrote_is_upgraded_with_one_warning() {
+    let (_server, project) = stub_libraries(1);
+    for (database, legacy) in [
+        ("store/index.sqlite", "artifact_origins_v2"),
+        ("metadata.db", "pom_cache_v3"),
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let run = || crate::common::run_raeva(project.path(), home.path(), &["sync"]);
+        assert_success(&run(), "cold sync");
+        let path = home.path().join(database);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE {legacy} (x); PRAGMA user_version = 1;"
+        ))
+        .unwrap();
+        drop(conn);
+        let first = run();
+        assert_success(&first, database);
+        let warned = text(&first);
+        assert!(
+            warned.matches("DATABASE_UPGRADED").count() == 1
+                && warned.contains(path.file_name().unwrap().to_str().unwrap()),
+            "{database}: {warned}"
+        );
+        let second = run();
+        assert_success(&second, database);
+        assert!(!text(&second).contains("DATABASE_UPGRADED"), "{database}");
+    }
+}
+
 /// A store index or metadata cache that a newer raeva stamped with a later
 /// generation fails the run with an error that names the file, and the
 /// file keeps its bytes. The hint says to run the newer raeva, and to
@@ -831,7 +864,7 @@ fn a_database_recreated_mid_restore_keeps_what_the_restore_wrote_before() {
     let parent = "org/example/parent/1/parent-1.pom";
     for (database, table) in [
         ("store/index.sqlite", "served_files"),
-        ("metadata.db", "pom_cache_v3"),
+        ("metadata.db", "pom_cache_v4"),
     ] {
         let home = tempfile::TempDir::new().unwrap();
         let sync = |args: &[&str]| crate::common::run_raeva(project.path(), home.path(), args);
@@ -866,7 +899,7 @@ fn a_database_recreated_mid_restore_keeps_what_the_restore_wrote_before() {
         let cached: bool = rusqlite::Connection::open(home.path().join("metadata.db"))
             .unwrap()
             .query_row(
-                "SELECT EXISTS (SELECT 1 FROM pom_cache_v3 WHERE path = ?1)",
+                "SELECT EXISTS (SELECT 1 FROM pom_cache_v4 WHERE path = ?1)",
                 [parent],
                 |row| row.get(0),
             )
@@ -937,7 +970,7 @@ fn a_cached_pom_that_no_longer_matches_its_digest_is_fetched_again() {
     let edited = rusqlite::Connection::open(home.path().join("metadata.db"))
         .unwrap()
         .execute(
-            "UPDATE pom_cache_v3 SET content = ?1 WHERE path = 'org/example/parent/1/parent-1.pom'",
+            "UPDATE pom_cache_v4 SET content = ?1 WHERE path = 'org/example/parent/1/parent-1.pom'",
             [
                 "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>\
               <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\

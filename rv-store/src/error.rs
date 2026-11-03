@@ -88,6 +88,8 @@ pub enum DbFailure {
     SharedMemory,
     /// The database file could not be opened.
     CannotOpen,
+    /// The database, its directory, or its `-wal` file cannot be written.
+    ReadOnly,
     /// The file is damaged or is not an SQLite database.
     Corrupt,
     /// Any other result code.
@@ -136,6 +138,7 @@ impl DbFailure {
                 DbFailure::SharedMemory
             }
             ErrorCode::CannotOpen => DbFailure::CannotOpen,
+            ErrorCode::ReadOnly | ErrorCode::PermissionDenied => DbFailure::ReadOnly,
             ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => DbFailure::Corrupt,
             _ => DbFailure::Other,
         }
@@ -192,6 +195,9 @@ mod tests {
         for (code, failure) in [
             (ffi::SQLITE_FULL, DbFailure::DiskFull),
             (ffi::SQLITE_CANTOPEN, DbFailure::CannotOpen),
+            (ffi::SQLITE_READONLY, DbFailure::ReadOnly),
+            (ffi::SQLITE_READONLY_DIRECTORY, DbFailure::ReadOnly),
+            (ffi::SQLITE_PERM, DbFailure::ReadOnly),
             (ffi::SQLITE_CORRUPT, DbFailure::Corrupt),
             (ffi::SQLITE_NOTADB, DbFailure::Corrupt),
             (ffi::SQLITE_BUSY, DbFailure::Other),

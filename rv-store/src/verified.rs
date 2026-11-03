@@ -199,9 +199,11 @@ impl Store {
             sha1,
             size,
         } = staged;
+        // The pin decides first, so bytes that differ from raeva.lock are
+        // reported as that, whatever their checksum file says.
         let checks = [
-            (Expectation::Sidecar, expect.sidecar),
             (Expectation::Pin, expect.pin),
+            (Expectation::Sidecar, expect.sidecar),
         ];
         for (against, expected) in checks {
             let Some(expected) = expected else { continue };

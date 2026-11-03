@@ -1,6 +1,53 @@
+use std::sync::{PoisonError, RwLock};
 use url::Url;
 
 const REDACTED: &str = "***";
+
+/// Mirror URLs that settings.xml expanded with a secret-named variable, as
+/// parsed, each with the masked form shown in their place.
+static MASKED_URLS: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// Show `masked` in place of `expanded` wherever [`redact_url`] or
+/// [`redacted_url`] shows that URL or one under it: the same text up to a
+/// `/`, `?` or `#`, with or without a trailing slash. `expanded` is a
+/// mirror URL as settings.xml expanded it, and `masked` the same URL with
+/// `***` for each secret-named variable: a mirror URL may take a token, as
+/// services such as Cloudsmith expect.
+pub fn register_masked_url(expanded: &str, masked: &str) {
+    let shown = |url: &Url| {
+        let shown = redact_parsed(url, false).to_string();
+        shown.trim_end_matches('/').to_string()
+    };
+    let Ok(expanded) = Url::parse(expanded).map(|url| shown(&url)) else {
+        return;
+    };
+    // A masked host may not parse; such a URL is not shown at all.
+    let masked = Url::parse(masked).map_or_else(
+        |_| UNPARSABLE_URL_PLACEHOLDER.trim_end_matches('/').to_string(),
+        |url| shown(&url),
+    );
+    let mut urls = MASKED_URLS.write().unwrap_or_else(PoisonError::into_inner);
+    if expanded != masked && !urls.iter().any(|(known, _)| *known == expanded) {
+        urls.push((expanded, masked));
+        // The longest first, so a mirror under another's path matches whole.
+        urls.sort_by_key(|(expanded, _)| std::cmp::Reverse(expanded.len()));
+    }
+}
+
+fn mask(url: Url) -> Url {
+    let urls = MASKED_URLS.read().unwrap_or_else(PoisonError::into_inner);
+    let shown = url.as_str();
+    let Some((expanded, masked)) = urls.iter().find(|(expanded, _)| {
+        shown
+            .strip_prefix(expanded.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '?', '#']))
+    }) else {
+        return url;
+    };
+    let masked = format!("{masked}{}", &shown[expanded.len()..]);
+    Url::parse(&masked)
+        .unwrap_or_else(|_| Url::parse(UNPARSABLE_URL_PLACEHOLDER).expect("placeholder URL parses"))
+}
 
 /// What stands in for text that does not parse as a URL.
 pub const UNPARSABLE_URL: &str = "<unparsable URL>";
@@ -30,7 +77,7 @@ pub fn redact_url(url: impl AsRef<str>) -> String {
         Ok(parsed) if parsed.has_authority() => {
             // The parser drops an empty or default port, as in
             // `https://user:443/x@host/`, so look for it in the text.
-            redact_parsed(&parsed, raw_authority_has_port(raw)).to_string()
+            mask(redact_parsed(&parsed, raw_authority_has_port(raw))).to_string()
         }
         _ => UNPARSABLE_URL.to_string(),
     }
@@ -42,7 +89,7 @@ pub fn redact_url(url: impl AsRef<str>) -> String {
 /// dropped, so `https://user:443/x@host/` keeps `user` as the host and `/x@`
 /// in the path; the text form passed to [`redact_url`] does not.
 pub fn redacted_url(url: &Url) -> Url {
-    redact_parsed(url, false)
+    mask(redact_parsed(url, false))
 }
 
 /// The part of `url` that [`redact_url`] would remove because it may carry
@@ -66,7 +113,8 @@ pub fn secret_url_part(url: &str) -> Option<&'static str> {
         return Some("a fragment");
     }
     // A port read from a password, as in `https://user:1234/x@host/`.
-    (redact_url(url) != parsed.as_str()).then_some("userinfo")
+    let redacted = redact_parsed(&parsed, raw_authority_has_port(url)).to_string();
+    (redacted != parsed.as_str()).then_some("userinfo")
 }
 
 /// Whether a property or environment variable name looks like it holds a
@@ -92,10 +140,7 @@ pub fn secret_named(name: &str) -> bool {
 /// when it has no `://`, as the scheme or host may still be unexpanded.
 /// `None` for a `file:` URL, whose path names a local directory.
 pub(crate) fn repository_url_path(url: &str) -> Option<&str> {
-    if url
-        .split_once(':')
-        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
-    {
+    if Url::parse(url).is_ok_and(|url| url.scheme() == "file") {
         return None;
     }
     Some(match url.split_once("://") {
@@ -317,6 +362,49 @@ mod tests {
     use super::redact_url;
 
     #[test]
+    fn a_registered_mirror_url_is_shown_masked() {
+        use super::{redact_url, register_masked_url};
+        register_masked_url(
+            "https://m.example/tok3n-zq/m2/",
+            "https://m.example/***/m2/",
+        );
+        register_masked_url("https://q9.example/m2/", "https://***.example/m2/");
+        for (raw, shown) in [
+            (
+                "https://m.example/tok3n-zq/m2/a/1/a-1.jar",
+                "https://m.example/***/m2/a/1/a-1.jar",
+            ),
+            (
+                "https://M.example:443/tok3n-zq/m2/",
+                "https://m.example/***/m2/",
+            ),
+            (
+                "https://m.example/other/tok3n-zq/m2/",
+                "https://m.example/other/tok3n-zq/m2/",
+            ),
+            (
+                "https://q9.example/m2/a.pom",
+                "https://***.example/m2/a.pom",
+            ),
+            (
+                "https://repo1.maven.org/maven2/m2/",
+                "https://repo1.maven.org/maven2/m2/",
+            ),
+            ("https://m.example/tok3n-zq/m2", "https://m.example/***/m2"),
+            (
+                "https://m.example/tok3n-zq/m2-public/a.pom",
+                "https://m.example/tok3n-zq/m2-public/a.pom",
+            ),
+            (
+                "https://m.example/tok3n-zq/m2?x=1",
+                "https://m.example/***/m2?***",
+            ),
+        ] {
+            assert_eq!(redact_url(raw), shown, "{raw}");
+        }
+    }
+
+    #[test]
     fn secret_url_parts_are_named() {
         use super::secret_url_part;
         for (raw, part) in [
@@ -354,6 +442,12 @@ mod tests {
         for name in ["nexus.url", "CI_PROJECT_ID", "repo.path", "revision"] {
             assert!(!secret_named(name), "{name}");
         }
+    }
+
+    #[test]
+    fn repository_path_locality_uses_the_parsed_scheme() {
+        assert!(super::repository_url_path("f\tile:///srv/repo/").is_none());
+        assert!(super::repository_url_path("file://[invalid]/repo/").is_some());
     }
 
     /// A value counts when it makes up whole segments of the path, never

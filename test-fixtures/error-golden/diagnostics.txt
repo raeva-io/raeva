@@ -23,7 +23,7 @@ STORE Failure
 artifact store error: the store index in /home/u/.raeva/store is damaged; run 'raeva sync' again once no other raeva process uses the store, and raeva starts a new index
 ----
 STORE Failure
-artifact store error: open; try running 'raeva sync' again; if the problem persists, delete /home/u/.raeva/store
+artifact store error: open; try running 'raeva sync' again
 ----
 STORE Failure
 artifact store error: could not grow the shared-memory file of the store index in /home/u/.raeva/store, most often because its volume is full; check available space there
@@ -530,10 +530,10 @@ LOCAL_REPOSITORY Config
 export error: path traversal attempt detected: x
 ----
 LOCAL_REPOSITORY Config
-export error: A and a differ only in letter case, and the file system holding "x" does not distinguish case, so both would be written to the same file
+export error: A and a differ only in letter case or Unicode normalization, and the file system holding "x" treats such names as one, so both would be written to the same file
 
   Suggestions:
-    - Export to a case-sensitive volume with --m2-path
+    - Export with --m2-path to a volume that keeps the names apart: a case-sensitive one, though APFS treats names that differ only in Unicode normalization as one either way
 
 ----
 EXPORT Failure

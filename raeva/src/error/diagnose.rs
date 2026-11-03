@@ -637,11 +637,32 @@ fn diagnose_export(err: &ExportError, env: &HintEnv) -> Diagnostic {
         ExportError::PathTraversal(_) | ExportError::Destination { .. } => {
             (S::Config, "LOCAL_REPOSITORY", None)
         }
-        ExportError::CaseCollision { .. } => (
+        ExportError::DestinationCollision { .. } => (
             S::Config,
             "LOCAL_REPOSITORY",
-            Some("Export to a case-sensitive volume with --m2-path".to_string()),
+            Some(
+                "--overwrite does not help, as both need that path; when one is a sources or \
+                 javadoc file, export without --with-sources or --with-javadocs"
+                    .to_string(),
+            ),
         ),
+        ExportError::CaseCollision { path, .. } => {
+            let metadata = path.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("maven-metadata-")
+                    && (name.ends_with(".xml") || name.contains(".xml."))
+            });
+            let hint = if metadata {
+                "Rename the repositories so that their ids differ in more than letter case or \
+                 Unicode normalization, or export with --m2-path to a volume that keeps the \
+                 names apart"
+            } else {
+                "Export with --m2-path to a volume that keeps the names apart: a case-sensitive \
+                 one, though APFS treats names that differ only in Unicode normalization as one \
+                 either way"
+            };
+            (S::Config, "LOCAL_REPOSITORY", Some(hint.to_string()))
+        }
         ExportError::DestinationMismatch { .. } => (
             S::Failure,
             "EXPORT",

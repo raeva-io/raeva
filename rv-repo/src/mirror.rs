@@ -210,43 +210,20 @@ pub(crate) fn origins_differ(original: &str, resolved: &str) -> bool {
     }
 }
 
-/// The protocol and host Resolver's `RemoteRepository` reads from `url`,
-/// as written: the text before the first `:`, and after `//`, any userinfo,
-/// up to the next `/` or `:`. Both are empty when the URL has no protocol.
-fn protocol_and_host(url: &str) -> (&str, &str) {
-    let Some((protocol, rest)) = url.split_once(':') else {
-        return ("", "");
-    };
-    if protocol.is_empty() || protocol.contains('/') {
-        return ("", "");
-    }
-    let host = rest.strip_prefix("//").map_or("", |authority| {
-        let authority = match authority.find(['@', '/']) {
-            Some(at) if authority.as_bytes()[at] == b'@' => &authority[at + 1..],
-            _ => authority,
-        };
-        &authority[..authority.find(['/', ':']).unwrap_or(authority.len())]
-    });
-    (protocol, host)
+fn is_local_host(url: &Url) -> bool {
+    matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
 }
 
-fn is_local_host(host: &str) -> bool {
-    matches!(host, "localhost" | "127.0.0.1")
-}
-
-/// As Maven's mirror selector decides `external:*`: a `file:` URL and the
-/// hosts `localhost` and `127.0.0.1`, spelled so, are local; other loopback
-/// addresses are not.
+/// For `external:*`, a `file:` URL and the parsed hosts `localhost` and
+/// `127.0.0.1` are local. Unparseable URLs are external.
 pub(crate) fn is_external_repo(url: &str) -> bool {
-    let (protocol, host) = protocol_and_host(url);
-    !(is_local_host(host) || protocol.eq_ignore_ascii_case("file"))
+    Url::parse(url).map_or(true, |url| !(is_local_host(&url) || url.scheme() == "file"))
 }
 
-/// As Maven's mirror selector decides `external:http:*`, for the `http`
-/// protocol, the only plain one raeva reads.
-fn is_external_http_repo(url: &str) -> bool {
-    let (protocol, host) = protocol_and_host(url);
-    protocol.eq_ignore_ascii_case("http") && !is_local_host(host)
+/// For `external:http:*` and the HTTP blocker, use the request parser's
+/// scheme and host. Unparseable URLs are treated as external HTTP.
+pub(crate) fn is_external_http_repo(url: &str) -> bool {
+    Url::parse(url).map_or(true, |url| url.scheme() == "http" && !is_local_host(&url))
 }
 
 #[cfg(test)]
@@ -258,6 +235,30 @@ mod tests {
         let mut mirror = rv_config::MirrorConfig::new(id, url);
         mirror.mirror_of = mirror_of.iter().map(|value| value.to_string()).collect();
         mirror
+    }
+
+    #[test]
+    fn external_mirrors_match_the_parsed_host_and_fail_closed() {
+        for pattern in ["external:*", "external:http:*"] {
+            for url in [
+                r"http://repo.example\@localhost/maven2/",
+                "http://repo.example?@localhost/",
+                "http://repo.example#@localhost/",
+                "http://[invalid]/",
+                "http://localhost:invalid/",
+                "not a URL",
+            ] {
+                let repo = Repository::new(Some("corp".into()), url, true, true);
+                let selector = MirrorSelector::from_mirrors(vec![mirror_config(
+                    Some("mirror"),
+                    "https://mirror.example/",
+                    &[pattern],
+                )]);
+                let (resolved, mirror, _) = selector.select(&repo);
+                assert!(mirror.is_some(), "{pattern}: {url}");
+                assert_eq!(resolved.url, "https://mirror.example/", "{pattern}: {url}");
+            }
+        }
     }
 
     /// Maven Resolver 1.9's mirror selection: an exact id beats an earlier
@@ -335,7 +336,7 @@ mod tests {
     }
 
     /// Origins compare scheme, case-insensitive host and effective port.
-    /// `external:*` reads the host as written.
+    /// `external:*` reads the parsed host too.
     #[test]
     fn origins_and_loopback_are_decided_on_the_parsed_url() {
         for (a, b, differ) in [
@@ -352,8 +353,11 @@ mod tests {
             ("https://[::1]:8080/repo", true),
             ("http://127.0.0.2/repo", true),
             ("http://localhost/repo", false),
-            ("http://LOCALHOST/repo", true),
+            ("http://LOCALHOST/repo", false),
             ("http://user@localhost:8080/repo", false),
+            (r"http://localhost\@repo.example/repo", false),
+            ("http://127.1/repo", false),
+            ("http://2130706433/repo", false),
             ("file:///srv/repo/", false),
             ("FILE:///srv/repo/", false),
             ("https://127.0.0.1:8080/repo", false),

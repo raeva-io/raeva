@@ -209,7 +209,7 @@ static HTTP_REPO_WARNED: LazyLock<Mutex<HashSet<(String, bool)>>> = LazyLock::ne
 /// without `-v`.
 pub(crate) fn http_repository_blocked(config: &Config, repo: &Repository, project: bool) -> bool {
     if !url::Url::parse(&repo.url).is_ok_and(|url| url.scheme() == "http")
-        || !crate::mirror::is_external_repo(&repo.url)
+        || !crate::mirror::is_external_http_repo(&repo.url)
         || config.repositories().iter().any(|configured| {
             crate::repository::normalize_repo_url(&configured.url)
                 == crate::repository::normalize_repo_url(&repo.url)
@@ -415,6 +415,13 @@ mod tests {
         }
         assert!(!trusts(&transport, "https://nexus.corp:8443/"));
         assert!(!trusts(&transport, "http://nexus.corp/"));
+    }
+
+    #[test]
+    fn a_backslash_before_localhost_does_not_bypass_the_http_blocker() {
+        let config = config(SecurityConfig::default());
+        let repository = repo(r"http://repo.example\@localhost/maven2/");
+        assert!(super::http_repository_blocked(&config, &repository, true));
     }
 
     #[test]

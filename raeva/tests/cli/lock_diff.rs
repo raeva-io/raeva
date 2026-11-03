@@ -150,6 +150,261 @@ fn added_removed_and_added_platform_are_structured() {
     assert!(!removed["via"].as_array().unwrap().is_empty());
 }
 
+fn lock_with_versions(versions: &[&str]) -> rv_lock::Lockfile {
+    use rv_lock::{LockArtifact, LockEdge, LockPlatform, Lockfile, Scope};
+    use rv_maven_types::{ArtifactCoord, BlobId, Digest, Gav};
+
+    let coordinates =
+        [
+            ArtifactCoord::new("g", "parent", "1", "jar", None),
+            ArtifactCoord::new("z", "leaf", "1", "jar", None),
+        ]
+        .into_iter()
+        .chain(versions.iter().map(|version| {
+            ArtifactCoord::new("commons-codec", "commons-codec", version, "jar", None)
+        }));
+    let artifacts = coordinates
+        .map(|coordinate| {
+            let mut row = LockArtifact::new(coordinate, "https://repo.example/");
+            row.checksums = vec![Digest::Sha256(BlobId::from_bytes(b"jar"))];
+            row.pom_sha256 = Some(BlobId::from_bytes(b"pom"));
+            row
+        })
+        .collect();
+    let mut lock = Lockfile::new();
+    lock.platforms.push(LockPlatform::single_module(
+        "linux-x86_64".parse().unwrap(),
+        Gav::new("g", "root", "1"),
+        "pom",
+        artifacts,
+    ));
+    lock.repo_ids
+        .insert("https://repo.example/".into(), ["repo".into()].into());
+    let module = &mut lock.platforms[0].modules[0];
+    let parent = module
+        .packages
+        .iter()
+        .position(|package| package.coordinate.artifact_id() == "parent")
+        .unwrap();
+    for (index, package) in module.packages.iter_mut().enumerate() {
+        if index != parent {
+            package.direct_scope = None;
+            module
+                .edges
+                .push(LockEdge::new(parent, index, Some(Scope::Compile), false));
+        }
+    }
+    lock
+}
+
+#[test]
+fn multiple_versions_report_additions_and_removals_per_version() {
+    let (project, home) = temp_project();
+    for (before, after, expected) in [
+        (
+            vec!["1.22.1"],
+            vec!["1.17.0", "1.22.1"],
+            vec![("added", "1.17.0")],
+        ),
+        (
+            vec!["1.17.0", "1.22.1"],
+            vec!["1.22.1"],
+            vec![("removed", "1.17.0")],
+        ),
+        (
+            vec!["1.17.0", "1.22.1"],
+            vec!["1.22.1", "2.0"],
+            vec![("removed", "1.17.0"), ("added", "2.0")],
+        ),
+        (
+            vec!["1.17.0", "1.22.1"],
+            vec!["2.0"],
+            vec![
+                ("removed", "1.17.0"),
+                ("removed", "1.22.1"),
+                ("added", "2.0"),
+            ],
+        ),
+        (
+            vec!["2.0"],
+            vec!["1.17.0", "1.22.1"],
+            vec![("added", "1.17.0"), ("added", "1.22.1"), ("removed", "2.0")],
+        ),
+    ] {
+        for (name, versions) in [("old.lock", before), ("new.lock", after)] {
+            fs::write(
+                project.path().join(name),
+                lock_with_versions(&versions).to_toml().unwrap(),
+            )
+            .unwrap();
+        }
+        let data = data(&diff(
+            project.path(),
+            home.path(),
+            "old.lock",
+            Some("new.lock"),
+        ));
+        assert_eq!(data["changed"], true, "{data}");
+        let changes = data["changes"].as_array().unwrap();
+        assert_eq!(changes.len(), expected.len(), "{data}");
+        for (change, version) in &expected {
+            let (old, new) = if *change == "added" {
+                (None, Some(version))
+            } else {
+                (Some(version), None)
+            };
+            let row = changes
+                .iter()
+                .find(|row| {
+                    row["change"] == *change
+                        && row["old_version"] == json!(old)
+                        && row["new_version"] == json!(new)
+                })
+                .unwrap_or_else(|| panic!("{data}"));
+            assert_eq!(row["coordinate"], "commons-codec:commons-codec:jar");
+            assert_eq!(row["module"], "pom.xml");
+            assert_eq!(
+                row["via"],
+                json!([[
+                    "g:parent:1:jar",
+                    format!("commons-codec:commons-codec:{version}:jar")
+                ]])
+            );
+        }
+        assert_eq!(data["edge_changes"], json!([]), "{data}");
+        let output = raeva_command(project.path(), home.path())
+            .current_dir(project.path())
+            .args(["--offline", "lock", "diff", "old.lock", "new.lock"])
+            .output()
+            .unwrap();
+        assert_success(&output, "text lock diff");
+        let text = String::from_utf8(output.stdout).unwrap();
+        for (change, version) in expected {
+            assert!(text.contains(&format!("{version} ({change})")), "{text}");
+        }
+    }
+}
+
+#[test]
+fn inserted_package_keeps_edges_between_existing_coordinates() {
+    let (project, home) = temp_project();
+    for (name, versions) in [("old.lock", vec![]), ("new.lock", vec!["1.17.0"])] {
+        fs::write(
+            project.path().join(name),
+            lock_with_versions(&versions).to_toml().unwrap(),
+        )
+        .unwrap();
+    }
+    for (old, new) in [("old.lock", "new.lock"), ("new.lock", "old.lock")] {
+        let data = data(&diff(project.path(), home.path(), old, Some(new)));
+        assert_eq!(data["changes"].as_array().unwrap().len(), 1, "{data}");
+        assert_eq!(data["edge_changes"], json!([]), "{data}");
+    }
+}
+
+#[test]
+fn edges_between_existing_versions_are_compared_separately() {
+    use rv_lock::{LockEdge, Scope};
+
+    let (project, home) = temp_project();
+    for (versions_are_sources, removed_version) in [
+        (false, "1.17.0"),
+        (false, "1.22.1"),
+        (true, "1.17.0"),
+        (true, "1.22.1"),
+    ] {
+        let mut old = lock_with_versions(&["1.17.0", "1.22.1"]);
+        let module = &mut old.platforms[0].modules[0];
+        let endpoint = module
+            .packages
+            .iter()
+            .position(|package| {
+                package.coordinate.artifact_id()
+                    == if versions_are_sources {
+                        "leaf"
+                    } else {
+                        "parent"
+                    }
+            })
+            .unwrap();
+        module.edges = module
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, package)| package.coordinate.artifact_id() == "commons-codec")
+            .map(|(index, _)| {
+                let (from, to) = if versions_are_sources {
+                    (index, endpoint)
+                } else {
+                    (endpoint, index)
+                };
+                LockEdge::new(from, to, Some(Scope::Compile), false)
+            })
+            .collect();
+        let removed = module
+            .edges
+            .iter()
+            .position(|edge| {
+                let index = if versions_are_sources {
+                    edge.from
+                } else {
+                    edge.to
+                };
+                module.packages[index].coordinate.version() == removed_version
+            })
+            .unwrap();
+        let mut new = old.clone();
+        new.platforms[0].modules[0].edges.remove(removed);
+        for (name, lock) in [("old.lock", old), ("new.lock", new)] {
+            fs::write(project.path().join(name), lock.to_toml().unwrap()).unwrap();
+        }
+        let data = data(&diff(
+            project.path(),
+            home.path(),
+            "old.lock",
+            Some("new.lock"),
+        ));
+        assert_eq!(data["changed"], true, "{data}");
+        assert_eq!(data["changes"], json!([]), "{data}");
+        let (from, to) = if versions_are_sources {
+            ("commons-codec:commons-codec:jar", "z:leaf:jar")
+        } else {
+            ("g:parent:jar", "commons-codec:commons-codec:jar")
+        };
+        let mut expected = json!({
+                "platform": "linux-x86_64", "module": "pom.xml", "from": from,
+                "to": to, "change": "removed", "old": "scope compile, optional false", "new": null,
+        });
+        let (from_name, to_name) = if versions_are_sources {
+            expected["from_version"] = json!(removed_version);
+            (
+                format!("commons-codec:commons-codec:{removed_version}"),
+                "z:leaf".to_string(),
+            )
+        } else {
+            expected["to_version"] = json!(removed_version);
+            (
+                "g:parent".to_string(),
+                format!("commons-codec:commons-codec:{removed_version}"),
+            )
+        };
+        assert_eq!(data["edge_changes"], json!([expected]));
+        let output = raeva_command(project.path(), home.path())
+            .current_dir(project.path())
+            .args(["--offline", "lock", "diff", "old.lock", "new.lock"])
+            .output()
+            .unwrap();
+        assert_success(&output, "text lock diff");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(&format!(
+                "in pom.xml: {from_name} no longer depends on {to_name}"
+            )),
+            "{text}"
+        );
+    }
+}
+
 #[test]
 fn malformed_or_conflicted_second_lock_uses_the_strict_reader() {
     let (project, home) = temp_project();

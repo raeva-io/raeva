@@ -1,8 +1,8 @@
 //! The Maven repository path layout, shared by remote requests, the
 //! local-repository export and the trusted-checksums file.
 //!
-//! These functions only format. They do not check the parts, so callers that
-//! take them from untrusted input validate first (see
+//! The formatting functions do not check the parts, so callers that take
+//! them from untrusted input validate first (see
 //! [`crate::validate_coordinate_component`]).
 
 use crate::ArtifactCoord;
@@ -48,6 +48,22 @@ pub fn metadata_path(group: &str, artifact: &str, version: Option<&str>) -> Stri
     }
 }
 
+/// Whether an artifact path names a mutable snapshot file rather than a
+/// timestamped build. A classifier does not change the file's version.
+pub fn is_mutable_snapshot_path(path: &str) -> bool {
+    let mut parts = path.rsplit('/');
+    let [Some(file), Some(version), Some(artifact)] = [parts.next(), parts.next(), parts.next()]
+    else {
+        return false;
+    };
+    crate::resolves_through_snapshot_metadata(version)
+        && file
+            .strip_prefix(artifact)
+            .and_then(|file| file.strip_prefix('-'))
+            .and_then(|file| file.strip_prefix(version))
+            .is_some_and(|suffix| suffix.starts_with(['.', '-']))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +90,23 @@ mod tests {
             artifact_path(&coord, "1.0-SNAPSHOT", coord.version()),
             "com/example/demo/1.0-SNAPSHOT/demo-1.0-20240101.010101-1-tests.jar"
         );
+    }
+
+    #[test]
+    fn only_non_unique_snapshot_paths_are_mutable() {
+        for (version, directory, mutable) in [
+            ("1.0", "1.0", false),
+            ("1.0-20260101.010101-1", "1.0-SNAPSHOT", false),
+            ("1.0-SNAPSHOT", "1.0-SNAPSHOT", true),
+            ("1.0SNAPSHOT", "1.0SNAPSHOT", true),
+            ("SNAPSHOT", "SNAPSHOT", true),
+        ] {
+            for classifier in [None, Some("sources"), Some("SNAPSHOT")] {
+                let coord = ArtifactCoord::new("g", "a-b", version, "jar", classifier);
+                let path = artifact_path(&coord, directory, version);
+                assert_eq!(is_mutable_snapshot_path(&path), mutable, "{path}");
+            }
+        }
     }
 
     #[test]

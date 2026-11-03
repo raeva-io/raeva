@@ -38,10 +38,7 @@ const LOCK_REPO_IDS_KEY: &str = "repo_ids";
 /// compare equal. That reads only the text, never the filesystem.
 pub fn normalize_repo_url(url: &str) -> String {
     let trimmed = url.trim();
-    // Every lock row's origin passes through here, so an http(s) URL, which
-    // cannot parse as `file:`, skips the parse.
-    if !is_http_origin(trimmed)
-        && let Ok(mut file) = Url::parse(trimmed)
+    if let Ok(mut file) = Url::parse(trimmed)
         && file.scheme() == "file"
     {
         if !file.path().ends_with('/') {
@@ -82,14 +79,10 @@ pub fn file_url_path(url: &Url) -> Option<PathBuf> {
     url.to_file_path().ok()
 }
 
-/// True when `url`, trimmed, starts with `http://` or `https://` in any case.
-/// Such an origin matches only http(s) declarations, which compare as text.
+/// True when `url` parses as HTTP or HTTPS, using the fetch layer's parser.
+/// Such origins match only HTTP(S) declarations, which compare as text.
 pub fn is_http_origin(url: &str) -> bool {
-    let url = url.trim();
-    ["http://", "https://"].iter().any(|scheme| {
-        url.get(..scheme.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
-    })
+    Url::parse(url.trim()).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 /// True when `value` is spelled as a project-relative origin. Whether it is a
@@ -493,6 +486,28 @@ pub(crate) fn record_repo_ids(origins: &LockOrigins, ids: RepoIds) -> Result<Rep
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_origins_use_the_parsed_scheme() {
+        for url in [
+            "http://repo.example/maven2/",
+            r"http://repo.example\@localhost/maven2/",
+            " HTTPS://repo.example/ ",
+            "http:repo.example/maven2/",
+            r"https:\repo.example\maven2\",
+            "h\tttp://repo.example/",
+        ] {
+            assert!(is_http_origin(url), "{url}");
+        }
+        for url in [
+            "http://[invalid]/",
+            "http://localhost:invalid/",
+            "file:///repo/",
+            "not a URL",
+        ] {
+            assert!(!is_http_origin(url), "{url}");
+        }
+    }
 
     fn origins(root: &Path) -> LockOrigins {
         LockOrigins::for_root(root)

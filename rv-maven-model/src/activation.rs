@@ -96,7 +96,10 @@ impl ActivationContext {
         self.property_source = source;
         match source {
             PropertySource::User | PropertySource::Import => self.properties = properties,
-            PropertySource::System => self.system_properties = properties,
+            PropertySource::System => {
+                self.system_properties = self.environment.system_properties().clone();
+                self.system_properties.extend(properties);
+            }
         }
     }
 
@@ -104,6 +107,7 @@ impl ActivationContext {
     /// directory.
     pub fn new(environment: ModelEnvironment) -> Self {
         Self {
+            system_properties: environment.system_properties().clone(),
             environment,
             ..Self::default()
         }

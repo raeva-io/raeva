@@ -1229,8 +1229,8 @@ fn a_losing_path_without_the_pom_keeps_its_origin() {
 /// A release POM from one repository and its jar from another, as camel
 /// reads jakarta.jms-api's POM from a stub repository and its jar from
 /// Central: the lock records the POM's origin and a cold frozen check
-/// fetches it there, and a module that read other bytes for that POM fails
-/// naming the repository that served each.
+/// fetches it there. Other bytes fail the pin check; without a lock, modules
+/// that read different bytes fail naming the repository that served each.
 #[test]
 fn a_release_pom_from_another_repository_is_named_as_its_origin() {
     let base = TempDir::new().expect("base");
@@ -1278,6 +1278,14 @@ fn a_release_pom_from_another_repository_is_named_as_its_origin() {
         )
         .expect("write module pom");
     }
+    let output = run_raeva(&project, home.path(), &["sync"]);
+    assert_eq!(output.status.code(), Some(7), "pinned POM bytes");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("checksum mismatch") && stderr.contains(&file_url(&a)),
+        "{stderr}"
+    );
+    fs::remove_file(project.join("raeva.lock")).expect("remove lock");
     let output = run_raeva(&project, home.path(), &["sync"]);
     assert_eq!(output.status.code(), Some(5), "conflicting POM bytes");
     let stderr = String::from_utf8_lossy(&output.stderr);

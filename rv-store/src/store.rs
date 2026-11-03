@@ -33,7 +33,7 @@ pub(crate) const INDEX: sqlite::Spec = sqlite::Spec {
               PRAGMA foreign_keys=ON;
               PRAGMA temp_store=MEMORY;",
     max_size: POOL_SIZE,
-    generation: 1,
+    generation: 2,
     init: index::init_db,
     lock: |path| Ok(Box::new(StoreLock::acquire(path.parent().unwrap_or(path))?)),
 };
@@ -1246,7 +1246,8 @@ mod tests {
             )
             .unwrap();
         let peer = rusqlite::Connection::open(dir.path().join("index.sqlite")).unwrap();
-        peer.pragma_update(None, "user_version", 2).unwrap();
+        peer.pragma_update(None, "user_version", super::INDEX.generation + 1)
+            .unwrap();
         let version = || -> i64 {
             peer.pragma_query_value(None, "data_version", |row| row.get(0))
                 .unwrap()
@@ -1286,7 +1287,7 @@ mod tests {
         ];
         for err in errors {
             assert!(
-                matches!(err, StoreError::NewerDatabase { found: 2, .. }),
+                matches!(err, StoreError::NewerDatabase { found, .. } if found == super::INDEX.generation + 1),
                 "{err}"
             );
         }

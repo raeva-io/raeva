@@ -50,8 +50,8 @@ mod settings;
 mod test_warnings;
 
 pub use config::{
-    AuthConfigLayers, Config, LockConfig, MAX_ARTIFACT_SIZE_ENV, NetworkConfig, SecurityConfig,
-    is_valid_jdk, jdk_matches_target,
+    AuthConfigLayers, Config, LockConfig, MAX_ARTIFACT_SIZE_ENV, NetworkConfig, PropertyInput,
+    PropertyInputs, SecurityConfig, is_valid_jdk, jdk_matches_target,
 };
 pub use error::{ConfigError, ConfigOrigin};
 pub use limited_read::{
@@ -64,8 +64,8 @@ pub use paths::MAVEN_USER_HOME_TEST_ENV;
 pub use paths::ResolvedPaths;
 pub use proxy_env::{EnvironmentProxy, NoProxy, environment_proxies};
 pub use redact::{
-    UNPARSABLE_URL, redact_url, redacted_url, secret_input_in_path, secret_named, secret_url_part,
-    url_path_holds, without_secret_values,
+    UNPARSABLE_URL, redact_url, redacted_url, register_masked_url, secret_input_in_path,
+    secret_named, secret_url_part, url_path_holds, without_secret_values,
 };
 pub use settings::{
     AuthConfig, ChecksumPolicy, MirrorConfig, ProxyAuthType, ProxyConfig, RepoConfig, UpdatePolicy,

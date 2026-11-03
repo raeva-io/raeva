@@ -439,18 +439,8 @@ pub(crate) async fn apply_inheritance_tracked<S: ModelSource>(
     ))
 }
 
-/// Model fields the input POM or its directory decides, which a parent cannot
-/// change: the `<parent>` element is the project's own and must match the
-/// parent it names.
-const LOCAL_FIELDS: &[&str] = &[
-    "artifactId",
-    "packaging",
-    "basedir",
-    "baseUri",
-    "parent.groupId",
-    "parent.artifactId",
-    "parent.version",
-];
+/// Model fields the input POM's directory decides, without interpolation.
+const LOCAL_FIELDS: &[&str] = &["basedir", "baseUri"];
 
 /// Which values of an effective model a POM fetched from a repository chose:
 /// properties it defined that no POM of the project redefined, and the
@@ -461,6 +451,7 @@ struct FetchedValues {
     keys: HashMap<String, String>,
     group_id: Option<(bool, String)>,
     version: Option<(bool, String)>,
+    local: HashMap<&'static str, String>,
     build: HashMap<&'static str, (bool, String)>,
 }
 
@@ -487,6 +478,25 @@ impl FetchedValues {
         if let Some(version) = &pom.version {
             self.version = Some((fetched, version.clone()));
         }
+        // These fields are not inherited, but their expressions can read
+        // inherited properties.
+        self.local.clear();
+        if let Some(artifact_id) = &pom.artifact_id {
+            self.local.insert("artifactId", artifact_id.clone());
+        }
+        self.local.insert(
+            "packaging",
+            pom.packaging.clone().unwrap_or_else(|| "jar".into()),
+        );
+        if let Some(parent) = &pom.parent {
+            for (name, value) in [
+                ("parent.groupId", &parent.group_id),
+                ("parent.artifactId", &parent.artifact_id),
+                ("parent.version", &parent.version),
+            ] {
+                self.local.insert(name, value.clone());
+            }
+        }
         for (name, value) in Build::NAMES.into_iter().zip(pom.build.fields()) {
             if let Some(value) = value {
                 self.build.insert(name, (fetched, value.clone()));
@@ -503,11 +513,9 @@ impl FetchedValues {
         }
     }
 
-    /// Whether interpolating `text` takes a value a fetched POM chose. A
-    /// model field other than the group, the version, the `<build>` fields
-    /// and the [`LOCAL_FIELDS`]
-    /// counts as chosen once any fetched POM is in the lineage, as does a
-    /// reference too deep or too wide to follow.
+    /// Whether interpolating `text` takes a value a fetched POM chose. An
+    /// untracked model field counts as chosen once any fetched POM is in
+    /// the lineage, as does a reference too deep or too wide to follow.
     fn chose(&self, text: &str, properties: &PropertyMap, ctx: Option<&ActivationContext>) -> bool {
         let mut budget = 10_000usize;
         self.any && self.chose_within(text, properties, ctx, 0, &mut budget)
@@ -542,16 +550,22 @@ impl FetchedValues {
                     .strip_prefix("build.")
                     .filter(|field| Build::NAMES.contains(field))
             }
-            // The same order as the interpolator: a `project.` name is the
-            // model's, before any property, and an unprefixed one is a user
-            // or settings property, then a property, before it is a model
-            // field.
+            // The same order as the interpolator: property aliases read
+            // user or settings properties, then properties, then model
+            // fields. Other `project.` and `pom.` names read the model first.
+            let alias = name
+                .strip_prefix("project.properties.")
+                .or_else(|| name.strip_prefix("pom.properties."));
             let field = name
                 .strip_prefix("project.")
-                .or_else(|| name.strip_prefix("pom."));
+                .or_else(|| name.strip_prefix("pom."))
+                .filter(|_| alias.is_none());
             let model = match field {
                 Some("groupId") => coordinate(&self.group_id),
                 Some("version") => coordinate(&self.version),
+                Some(field) if self.local.contains_key(field) => {
+                    self.local.get(field).map(|raw| (false, raw.as_str()))
+                }
                 Some(field) if LOCAL_FIELDS.contains(&field) => continue,
                 Some(field) => match build(field) {
                     Some(field) => self.build_field(field),
@@ -559,6 +573,7 @@ impl FetchedValues {
                 },
                 None => None,
             };
+            let name = alias.unwrap_or(name);
             // A model field without a value falls through to the
             // properties, under its full name.
             let inherited = if model.is_some() {
@@ -582,7 +597,10 @@ impl FetchedValues {
                 match name {
                     "groupId" => coordinate(&self.group_id),
                     "version" => coordinate(&self.version),
-                    name => match build(name) {
+                    name if self.local.contains_key(name) => {
+                        self.local.get(name).map(|raw| (false, raw.as_str()))
+                    }
+                    name => match build(name).filter(|_| alias.is_none()) {
                         Some(field) => self.build_field(field),
                         None => continue,
                     },
@@ -1227,7 +1245,7 @@ mod tests {
             assert_eq!(local_parent_in_range(version, range), expected);
         }
         let deep = format!("{}1", "1-".repeat(100_000));
-        assert!(local_parent_in_range(&deep, "[1,2)"));
+        assert!(!local_parent_in_range(&deep, "[1,2)"));
     }
 
     fn pom(xml: &str) -> Pom {
@@ -1555,6 +1573,221 @@ mod tests {
             "goal",
         ];
         assert_eq!(build(Some(&ctx), remote()), user);
+    }
+
+    #[test]
+    fn local_model_fields_trace_fetched_properties_in_repository_urls() {
+        for field in ["artifactId", "packaging"] {
+            for prefix in ["project.", "pom.", ""] {
+                for (raw, own, user, trusted) in [
+                    ("${wrapped}", "", false, false),
+                    ("literal", "", false, true),
+                    ("${wrapped}", "<chosen>local</chosen>", false, true),
+                    ("${wrapped}", "", true, true),
+                    ("${project.properties.chosen}", "", false, false),
+                    (
+                        "${project.properties.chosen}",
+                        "<chosen>local</chosen>",
+                        false,
+                        true,
+                    ),
+                    ("${project.properties.chosen}", "", true, true),
+                    ("${pom.properties.chosen}", "", false, false),
+                    (
+                        "${pom.properties.chosen}",
+                        "<chosen>local</chosen>",
+                        false,
+                        true,
+                    ),
+                    ("${pom.properties.chosen}", "", true, true),
+                ] {
+                    let mut parent = pom(
+                        "<project><groupId>g</groupId><artifactId>parent</artifactId>\
+                         <version>1</version><packaging>pom</packaging>\
+                         <properties><chosen>remote</chosen></properties></project>",
+                    );
+                    parent.set_provenance(crate::Provenance::RemoteParentOfRoot);
+                    let source = MemorySource::new().with_parent("g", "parent", "1", parent);
+                    let fields = if field == "artifactId" {
+                        format!("<artifactId>{raw}</artifactId>")
+                    } else {
+                        format!("<artifactId>app</artifactId><packaging>{raw}</packaging>")
+                    };
+                    let mut project = pom(&format!(
+                        "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+                         <version>1</version></parent><groupId>g</groupId><version>1</version>\
+                         {fields}<properties>\
+                         <wrapped>${{chosen}}</wrapped>{own}</properties>{}</project>",
+                        repositories(&[
+                            (
+                                "direct",
+                                &format!("https://repo.example/${{{prefix}{field}}}/")
+                            ),
+                            ("build", "https://repo.example/${project.build.finalName}/"),
+                            ("default", "https://repo.example/${project.packaging}/"),
+                        ])
+                    ));
+                    project.mark_root_repositories();
+                    let mut ctx = ActivationContext::default();
+                    if user {
+                        ctx.properties.insert("chosen".into(), "user".into());
+                    }
+                    let effective = crate::ready(apply_inheritance_tracked(
+                        project,
+                        &source,
+                        ModelPolicy::DEPENDENCY,
+                        ParentLookup::Project,
+                        Some(&ctx),
+                    ))
+                    .unwrap()
+                    .0;
+                    for repo in effective.repositories {
+                        let expected = match repo.id.as_deref().unwrap() {
+                            "direct" => trusted,
+                            "build" => field != "artifactId" || trusted,
+                            "default" => field != "packaging" || trusted,
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            repo.root_declared, expected,
+                            "{field} {prefix} {raw} own={own} user={user}: {:?}",
+                            repo.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn property_aliases_follow_interpolation_precedence_in_repository_urls() {
+        for prefix in ["project.properties.", "pom.properties."] {
+            for (key, own, user, settings, value, trusted) in [
+                ("chosen", "", "", "", "remote", false),
+                ("chosen", "<chosen>local</chosen>", "", "", "local", true),
+                ("chosen", "", "user", "", "user", true),
+                (
+                    "chosen",
+                    "<chosen>local</chosen>",
+                    "${fetched}",
+                    "",
+                    "remote",
+                    false,
+                ),
+                ("chosen", "", "", "settings", "settings", true),
+                ("chosen", "", "user", "${fetched}", "user", true),
+                ("groupId", "", "", "", "g", true),
+                ("version", "", "", "", "1", false),
+                (
+                    "project.properties.chosen",
+                    "<project.properties.chosen>local</project.properties.chosen>",
+                    "",
+                    "",
+                    "local",
+                    true,
+                ),
+                (
+                    "build.finalName",
+                    "",
+                    "",
+                    "",
+                    "${project.properties.build.finalName}",
+                    true,
+                ),
+            ] {
+                let mut parent = pom(
+                    "<project><groupId>g</groupId><artifactId>parent</artifactId>\
+                     <version>1</version><packaging>pom</packaging>\
+                     <properties><chosen>remote</chosen><fetched>remote</fetched></properties>\
+                     <build><finalName>remote</finalName></build></project>",
+                );
+                parent.set_provenance(crate::Provenance::RemoteParentOfRoot);
+                let source = MemorySource::new().with_parent("g", "parent", "1", parent);
+                let mut project = pom(&format!(
+                    "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+                     <version>1</version></parent><groupId>g</groupId><artifactId>app</artifactId>\
+                     <properties>{own}</properties>{}</project>",
+                    repositories(&[("own", &format!("https://repo.example/${{{prefix}{key}}}/"))])
+                ));
+                project.mark_root_repositories();
+                let mut ctx = ActivationContext::default();
+                ctx.properties
+                    .insert(format!("{prefix}{key}"), "shadow".into());
+                if !user.is_empty() {
+                    ctx.properties.insert(key.into(), user.into());
+                }
+                if !settings.is_empty() {
+                    ctx.settings_properties.insert(key, settings);
+                }
+                let effective = crate::ready(crate::Project::build(
+                    project,
+                    &source,
+                    ModelPolicy::PROJECT,
+                    &ctx,
+                ))
+                .unwrap();
+                let repo = &effective.repositories[0];
+                let value = value.replace("project.properties.", prefix);
+                let case = format!("{prefix}{key} own={own} user={user} settings={settings}");
+                assert_eq!(repo.url, format!("https://repo.example/{value}/"), "{case}");
+                assert_eq!(repo.root_declared, trusted, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_parent_fields_trace_fetched_properties_in_repository_urls() {
+        for field in ["groupId", "artifactId", "version"] {
+            let coordinates = format!(
+                "<groupId>{}</groupId><artifactId>{}</artifactId><version>{}</version>",
+                if field == "groupId" { "${chosen}" } else { "g" },
+                if field == "artifactId" {
+                    "${chosen}"
+                } else {
+                    "parent"
+                },
+                if field == "version" { "${chosen}" } else { "1" },
+            );
+            let mut parent = pom(&format!(
+                "<project><parent><groupId>g</groupId><artifactId>top</artifactId>\
+                 <version>1</version></parent>{coordinates}</project>"
+            ));
+            parent.set_provenance(crate::Provenance::LocalParent {
+                path: "../pom.xml".into(),
+            });
+            let mut top = pom(
+                "<project><groupId>g</groupId><artifactId>top</artifactId><version>1</version>\
+                 <properties><chosen>remote</chosen></properties></project>",
+            );
+            top.set_provenance(crate::Provenance::RemoteParentOfRoot);
+            let source = MemorySource::new()
+                .with_parent(
+                    parent.group_id.as_deref().unwrap(),
+                    parent.artifact_id.as_deref().unwrap(),
+                    parent.version.as_deref().unwrap(),
+                    parent.clone(),
+                )
+                .with_parent("g", "top", "1", top);
+            let mut project = pom(&format!(
+                "<project><parent>{coordinates}</parent><groupId>g</groupId>\
+                 <artifactId>app</artifactId><version>1</version>{}</project>",
+                repositories(&[(
+                    "own",
+                    &format!("https://repo.example/${{project.parent.{field}}}/")
+                )])
+            ));
+            project.mark_root_repositories();
+            let effective = crate::ready(apply_inheritance_tracked(
+                project,
+                &source,
+                ModelPolicy::DEPENDENCY,
+                ParentLookup::Project,
+                None,
+            ))
+            .unwrap()
+            .0;
+            assert!(!effective.repositories[0].root_declared, "{field}");
+        }
     }
 
     /// A strict build fails on a missing parent; a lenient one stands its

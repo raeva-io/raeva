@@ -18,7 +18,7 @@ use super::requests::DeferredWarnings;
 use super::{RepoClient, SnapshotResolution, validate_coord_components};
 use crate::artifact::ArtifactRequest;
 use crate::auth::{Auth, SentCredential};
-use crate::error::{RepoError, Result};
+use crate::error::{IntegritySource, RepoError, Result};
 use crate::fetch::verify_checksum;
 use crate::metadata::Metadata;
 use crate::repository::Repository;
@@ -530,7 +530,7 @@ impl RepoClient {
         {
             return Ok(None);
         }
-        let read = self.read_pom(repo, req, PomRead::Prefetch);
+        let read = self.read_pom(repo, req, PomRead::Prefetch, None);
         let (bytes, _) = self.prefetching(read).await?;
         Ok(Some(bytes))
     }
@@ -547,7 +547,17 @@ impl RepoClient {
         req: &ArtifactRequest,
     ) -> Result<(Bytes, String)> {
         req.validate().map_err(RepoError::InvalidCoord)?;
-        self.read_pom(repo, req, PomRead::Use).await
+        self.read_pom(repo, req, PomRead::Use, None).await
+    }
+
+    pub(crate) async fn fetch_pinned_pom_with_path(
+        &self,
+        repo: &Repository,
+        req: &ArtifactRequest,
+        pin: &Digest,
+    ) -> Result<(Bytes, String)> {
+        req.validate().map_err(RepoError::InvalidCoord)?;
+        self.read_pom(repo, req, PomRead::Use, Some(pin)).await
     }
 
     /// The time before which a row of `path` in `table` is fetched again,
@@ -656,6 +666,7 @@ impl RepoClient {
         repo: &Repository,
         req: &ArtifactRequest,
         read: PomRead,
+        pin: Option<&Digest>,
     ) -> Result<(Bytes, String)> {
         let route = self.router.route(repo);
         self.ensure_repo_allows_version(&route.endpoint, &req.version)?;
@@ -677,9 +688,10 @@ impl RepoClient {
         // strict client must not take bytes a lenient one, or one with
         // another pin, accepted without a checksum file.
         let flight_key = format!(
-            "{cache_scope}\n{path}\n{}\n{}",
+            "{cache_scope}\n{path}\n{}\n{}\n{}",
             self.require_checksums,
-            self.lock_pin(&path)
+            pin.is_some(),
+            pin.or_else(|| self.lock_pin(&path))
                 .map(ToString::to_string)
                 .unwrap_or_default()
         );
@@ -690,7 +702,7 @@ impl RepoClient {
             return Ok((bytes, path));
         }
         if let Some((bytes, expires_at)) = self
-            .cache_get_entry(CacheTable::Pom, cache_scope, &path)
+            .cache_get_entry(CacheTable::Pom, cache_scope, &path, pin)
             .await?
         {
             if fixed_content && expires_at == i64::MAX {
@@ -719,8 +731,8 @@ impl RepoClient {
             .get_or_try_init(|| async {
                 // Another initializer may fill the cache, or hold a prefetched
                 // copy, before this caller acquires the cell.
-                if let Some(bytes) = self
-                    .cache_get_bytes(CacheTable::Pom, cache_scope, &path)
+                if let Some((bytes, _)) = self
+                    .cache_get_entry(CacheTable::Pom, cache_scope, &path, pin)
                     .await?
                 {
                     return Ok(bytes);
@@ -731,7 +743,7 @@ impl RepoClient {
                 }
                 let mut warnings = DeferredWarnings::default();
                 let fetched = self
-                    .fetch_model_bytes(&route, &path, &pom_req.version, &mut warnings)
+                    .fetch_model_bytes(&route, &path, &pom_req.version, pin, &mut warnings)
                     .await;
                 // A read that uses the POM logs its warnings now; a
                 // prefetch holds them with the bytes.
@@ -801,6 +813,11 @@ impl RepoClient {
         ttl: i64,
         checked: Checked,
     ) {
+        // Other bytes than the ones a fixed file is pinned to are not kept,
+        // so another project cannot take them for verified.
+        if self.release_lock_pin(path).is_some() && checked != Checked::Pinned {
+            return;
+        }
         let cached = (self.cache_insert_bytes_with_ttl(
             CacheTable::Pom,
             cache_scope,
@@ -844,7 +861,7 @@ impl RepoClient {
         path: &str,
     ) -> Result<Option<Bytes>> {
         Ok(self
-            .cache_get_entry(table, repo_url, path)
+            .cache_get_entry(table, repo_url, path, None)
             .await?
             .map(|(bytes, _)| bytes))
     }
@@ -855,6 +872,7 @@ impl RepoClient {
         table: CacheTable,
         repo_url: &str,
         path: &str,
+        pin: Option<&Digest>,
     ) -> Result<Option<(Bytes, i64)>> {
         // Local `file://` repositories are mutable by the user and cheap to
         // read; caching them would only serve stale content.
@@ -865,7 +883,8 @@ impl RepoClient {
         let offline = self.offline;
         let require_checksum = self.require_checksums;
         // A miss row holds the answer, not the file a pin names.
-        let pin = (self.lock_pin(path).and_then(Digest::as_sha256))
+        let pin = pin
+            .or_else(|| self.lock_pin(path))
             .filter(|_| !matches!(table, CacheTable::Miss))
             .cloned();
         let refresh_before = self.renew_before(table, path);
@@ -875,8 +894,14 @@ impl RepoClient {
         tokio::task::spawn_blocking(move || {
             // A copy that differs from the pin is a miss, so a repository
             // that once served other bytes does not wedge every later run.
-            let differs = |entry: &CacheEntry| pin.as_ref().is_some_and(|pin| *pin != entry.sha256);
-            // A row that matches the pin needs no checksum file.
+            let differs = |entry: &CacheEntry| {
+                pin.as_ref().is_some_and(|pin| match pin {
+                    Digest::Sha256(expected) => *expected != entry.sha256,
+                    _ => Digest::of_bytes(pin.algorithm(), &entry.content) != *pin,
+                })
+            };
+            // A row that matches a pin, of either algorithm, needs no
+            // checksum file, as a download the pin verifies needs none.
             let unchecked =
                 |entry: &CacheEntry| require_checksum && !entry.checksum_checked && pin.is_none();
             let entry = cache.get(table, &repo_url, &path).map_err(|err| {
@@ -1053,6 +1078,7 @@ impl RepoClient {
         route: &Route<'_>,
         path: &str,
         version: &str,
+        pin: Option<&Digest>,
         warnings: &mut DeferredWarnings,
     ) -> Result<(Bytes, Checked)> {
         let repo = &route.endpoint;
@@ -1096,7 +1122,7 @@ impl RepoClient {
             return Err(miss);
         }
         let result = self
-            .fetch_with_checksums(route, path, version, warnings)
+            .fetch_with_checksums(route, path, version, pin, warnings)
             .await;
         if let (Some(key), Err(err)) = (key, &result) {
             self.record_miss(route, key, err, generation);
@@ -1220,7 +1246,7 @@ impl RepoClient {
             Some(cached) => cached,
             None => {
                 let cached = match self
-                    .cache_get_entry(CacheTable::VersionList, &scope, &path)
+                    .cache_get_entry(CacheTable::VersionList, &scope, &path, None)
                     .await?
                 {
                     Some((bytes, expires_at)) => Some((Metadata::from_bytes(&bytes)?, expires_at)),
@@ -1268,7 +1294,7 @@ impl RepoClient {
 
         let mut warnings = DeferredWarnings::default();
         let fetched = self
-            .fetch_model_bytes(route, &path, version, &mut warnings)
+            .fetch_model_bytes(route, &path, version, None, &mut warnings)
             .await;
         // A prefetch holds its warnings with the file, for the read that
         // uses it; a miss stands for both, as it does for a POM.
@@ -1356,6 +1382,7 @@ impl RepoClient {
         route: &Route<'_>,
         path: &str,
         version: &str,
+        pin: Option<&Digest>,
         warnings: &mut DeferredWarnings,
     ) -> Result<(Bytes, Checked)> {
         let repo = &route.endpoint;
@@ -1370,18 +1397,31 @@ impl RepoClient {
         }
         // raeva.lock's pin checks the file without its sidecar, which is
         // read only when the bytes do not match.
-        let pin = self.lock_pin(path).and_then(Digest::as_sha256);
+        let required_pin = pin.or_else(|| self.release_lock_pin(path));
+        let sha256 = pin
+            .or_else(|| self.lock_pin(path))
+            .and_then(Digest::as_sha256);
         for attempt in 0..=1 {
             // A publisher may update metadata and its sidecar separately, so refetch both.
             // A failed file request ends both and is the result, whichever
             // request failed first; the probe's warnings are logged only once
             // the file has arrived.
             let mut probed = DeferredWarnings::default();
-            let (bytes, checksum) = match pin {
+            let (bytes, checksum) = match sha256 {
                 Some(pin) => {
                     let bytes = self.fetch_path(route, path).await?;
-                    if Sha256::from_bytes(&bytes) == *pin {
+                    let actual = Sha256::from_bytes(&bytes);
+                    if actual == *pin {
                         return Ok((bytes, Checked::Pinned));
+                    }
+                    if required_pin.is_some() {
+                        return Err(RepoError::ChecksumMismatch {
+                            subject: path.to_string().into(),
+                            artifact: None,
+                            expected: Digest::Sha256(pin.clone()),
+                            actual: Digest::Sha256(actual),
+                            check: IntegritySource::LockPin,
+                        });
                     }
                     (bytes, self.probe_checksum(route, path, &mut probed).await)
                 }
@@ -1400,6 +1440,21 @@ impl RepoClient {
                     })?
                 }
             };
+            // A pin of another algorithm than SHA-256 decides the bytes as a
+            // SHA-256 pin does, whatever their checksum file says.
+            if let Some(pin) = required_pin.filter(|pin| pin.as_sha256().is_none()) {
+                let actual = Digest::of_bytes(pin.algorithm(), &bytes);
+                if actual != *pin {
+                    return Err(RepoError::ChecksumMismatch {
+                        subject: path.to_string().into(),
+                        artifact: None,
+                        expected: pin.clone(),
+                        actual,
+                        check: IntegritySource::LockPin,
+                    });
+                }
+                return Ok((bytes, Checked::Pinned));
+            }
             warnings.append(probed);
             let checksum = checksum?;
             let checked = match checksum {

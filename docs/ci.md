@@ -69,7 +69,30 @@ lock. When the lock conflicts, run `raeva sync` on the merged POMs and add
 the lock. If your `.gitattributes` has the `raeva.lock -merge` line that
 older raeva docs suggested, remove it.
 
-To collapse the lock in GitHub diffs, mark it as generated:
+## Review lock changes in pull requests
+
+A `REPOSITORY_FALLBACK` or `AUTH_FALLBACK` warning does not fail
+`--frozen`; read it before merging a lock that a resolving sync wrote.
+A lock written before raeva 0.5.2 can fail `--frozen` when `.mvn/jvm.config`
+sets a `-D` option the build reads; run `raeva sync` and commit the lock.
+
+When the POMs, settings or other inputs changed since the lock was written,
+`raeva sync --frozen` resolves again and fails if the result differs from
+the lock; an edit that resolves to the same dependencies, such as a bump of
+the reactor's own version, passes. Every file it downloads must match its
+pin. When those inputs are unchanged it does not resolve again: it takes
+the dependencies the lock lists as written. A pull request that edits only
+`raeva.lock` can drop a dependency from it, and Maven then fetches that
+dependency without a pin. Compare the lock with the base branch's, and
+read a lock change that comes without a POM change:
+
+```sh
+git show origin/main:raeva.lock > base.lock
+raeva lock diff base.lock raeva.lock
+```
+
+To collapse the lock in GitHub diffs, mark it as generated. GitHub then hides
+its changes until you expand them:
 
 ```sh
 printf 'raeva.lock linguist-generated=true\n' >> .gitattributes

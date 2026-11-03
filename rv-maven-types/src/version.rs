@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::VersionError;
+use crate::{MAX_COMPONENT_BYTES, VersionError};
 
 /// A parsed Maven version ordered like maven-resolver's `GenericVersion`, the
 /// ordering Maven 3.9 uses for range matching, version listing and conflict
@@ -40,11 +40,12 @@ impl Version {
     ///
     /// # Errors
     ///
-    /// [`VersionError::InvalidVersion`] when it is empty or whitespace only,
-    /// and [`VersionError::UnresolvedProperty`] when it holds a `${`.
+    /// [`VersionError::InvalidVersion`] when it is empty, whitespace only or
+    /// longer than [`MAX_COMPONENT_BYTES`] after trimming, and
+    /// [`VersionError::UnresolvedProperty`] when it holds a `${`.
     pub fn parse(s: &str) -> Result<Self, VersionError> {
         let trimmed = s.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.len() > MAX_COMPONENT_BYTES {
             return Err(VersionError::InvalidVersion(s.to_string()));
         }
         // `${revision}` would parse, and then match no artifact.
@@ -59,12 +60,17 @@ impl Version {
 
     /// `s` as Maven's collector reads a version that still holds a `${...}`,
     /// which [`Self::parse`] refuses: compared as written. It names no
-    /// artifact.
+    /// artifact. One longer than [`MAX_COMPONENT_BYTES`] is not split into
+    /// items, so a crafted POM cannot make it allocate one per separator.
     pub fn unresolved(s: &str) -> Self {
         let trimmed = s.trim();
         Self {
             original: trimmed.to_string(),
-            items: parse_items(trimmed),
+            items: if trimmed.len() > MAX_COMPONENT_BYTES {
+                Vec::new()
+            } else {
+                parse_items(trimmed)
+            },
         }
     }
 
@@ -350,6 +356,35 @@ mod tests {
             ));
         }
         assert!(Version::parse("  ").is_err());
+    }
+
+    #[test]
+    fn parsing_refuses_versions_over_the_component_limit() {
+        let longest = format!("{}1", "1.".repeat(127));
+        assert_eq!(v(&format!(" {longest} ")).as_str(), longest);
+        for text in [
+            "1".repeat(256),
+            "1.".repeat(128),
+            "1-".repeat(128),
+            "1_".repeat(128),
+            "1a".repeat(128),
+            "é".repeat(128),
+            "1.".repeat(100_000),
+        ] {
+            assert!(matches!(
+                Version::parse(&text),
+                Err(crate::VersionError::InvalidVersion(value)) if value == text
+            ));
+        }
+    }
+
+    #[test]
+    fn an_unresolved_version_over_the_limit_is_not_split() {
+        let text = format!("${{x}}{}", ".".repeat(1_000_000));
+        let version = Version::unresolved(&text);
+        assert_eq!(version.as_str(), text);
+        assert!(version.items.is_empty());
+        assert!(!Version::unresolved("${x}.1").items.is_empty());
     }
 
     /// Each row is what `GenericVersionScheme` from maven-resolver 1.9.25,

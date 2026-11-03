@@ -1517,7 +1517,9 @@ fn a_download_refuses_bytes_that_differ_from_the_lock_pins() {
     let replaced = sha256_hex(b"replaced");
     for expected in [
         "1 downloaded file(s) do not match their checksums in raeva.lock",
-        &format!("org.test:shared:1:jar: expected sha256 {locked}, got {replaced}"),
+        "org.test:shared:1:jar from ",
+        "shared-1.jar: expected sha256 ",
+        &format!("{locked}, got {replaced}"),
         "and 1 other download failure(s):\norg.test:app-only:1",
     ] {
         assert!(stderr.contains(expected), "{expected}: {stderr}");

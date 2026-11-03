@@ -571,7 +571,10 @@ async fn cache_route_pom(
     if served_by.iter().any(|row| served(row).0 == route.0) {
         return Ok(());
     }
-    if let Ok((bytes, _)) = client.fetch_pom_with_path(repo, request).await
+    // The pin is checked before the client caches the bytes, so another
+    // repository's copy of a plain -SNAPSHOT POM is not kept either.
+    let pin = Digest::Sha256(blob.clone());
+    if let Ok((bytes, _)) = client.fetch_pinned_pom_with_path(repo, request, &pin).await
         && BlobId::from_bytes(&bytes) == *blob
     {
         let served = (
@@ -682,11 +685,33 @@ async fn fetch_from(
             .await?;
         Ok(fetched.path)
     };
-    let Some(expected) = pin.as_sha256().filter(|_| is_pom(key)) else {
+    if !is_pom(key) {
         return fetch_pinned_artifact().await;
+    }
+    let served_from = || {
+        let endpoint = input.client.effective_repository(repo);
+        format!("{key} from {}", rv_config::redact_url(&endpoint.url))
     };
-    let (bytes, path) = match input.client.fetch_pom_with_path(repo, request).await {
+    let (bytes, path) = match input
+        .client
+        .fetch_pinned_pom_with_path(repo, request, pin)
+        .await
+    {
         Ok(fetched) => fetched,
+        Err(RepoError::ChecksumMismatch {
+            expected,
+            actual,
+            check: IntegritySource::LockPin,
+            ..
+        }) => {
+            return Err(RepoError::ChecksumMismatch {
+                subject: served_from().into(),
+                artifact: Some(Box::new(key.clone())),
+                expected,
+                actual,
+                check: IntegritySource::LockPin,
+            });
+        }
         // Bytes other than the pinned ones lose the pin's exemption from
         // the checksum file, whose failure would hide them; the pin check
         // reports what is wrong. A repository that fails the second request
@@ -700,15 +725,16 @@ async fn fetch_from(
         }
         Err(err) => return Err(err),
     };
-    // Fetched bytes are checked against the pin before anything is stored,
-    // so a repository that serves other bytes indexes nothing.
+    // The client checked the pin before caching; checking again here keeps
+    // a store mismatch from being reachable whatever path served the bytes.
     let actual = BlobId::from_bytes(&bytes);
-    if actual != *expected {
+    let digest = Digest::of_bytes(pin.algorithm(), &bytes);
+    if digest != *pin {
         return Err(RepoError::ChecksumMismatch {
-            subject: key.to_string().into(),
+            subject: served_from().into(),
             artifact: Some(Box::new(key.clone())),
             expected: pin.clone(),
-            actual: Digest::Sha256(actual),
+            actual: digest,
             check: IntegritySource::LockPin,
         });
     }
@@ -745,13 +771,13 @@ struct PinnedSearch {
     recorded: Option<RepoError>,
     failure: Option<RepoError>,
     refusal: Option<RepoError>,
-    fallback: crate::AuthFallback,
+    fallback: crate::RepositoryFallback,
 }
 
 impl PinnedSearch {
     fn failed(&mut self, client: &RepoClient, repo: &Repository, recorded: bool, err: RepoError) {
         self.fallback
-            .refused(&client.effective_repository(repo), &err);
+            .failed(&client.effective_repository(repo), &err);
         self.keep(recorded, err);
     }
 
@@ -2307,7 +2333,7 @@ mod tests {
     async fn a_pom_cached_with_other_bytes_is_seeded_with_the_pinned_ones() {
         let other = rv_maven_types::Sha256::from_bytes(b"<project/>");
         let spoil = format!(
-            "UPDATE pom_cache_v3 SET content = CAST('<project/>' AS BLOB), sha256 = '{other}'"
+            "UPDATE pom_cache_v4 SET content = CAST('<project/>' AS BLOB), sha256 = '{other}'"
         );
         restore_seeds_over(&spoil).await;
     }
@@ -2316,7 +2342,7 @@ mod tests {
     /// so an online resolution reads it from the cache.
     #[tokio::test]
     async fn an_expired_cached_pom_is_seeded_again() {
-        restore_seeds_over("UPDATE pom_cache_v3 SET expires_at = 0").await;
+        restore_seeds_over("UPDATE pom_cache_v4 SET expires_at = 0").await;
     }
 
     /// Restore twice, running `spoil` on the metadata cache in between, and
@@ -2374,7 +2400,7 @@ mod tests {
         let request = ArtifactRequest::new("com.example", "demo", "1.0");
         assert_eq!(&offline.fetch_pom(&repo, &request).await.unwrap()[..], POM);
         let expired: i64 = (cache.query_row(
-            "SELECT count(*) FROM pom_cache_v3 WHERE expires_at <= unixepoch()",
+            "SELECT count(*) FROM pom_cache_v4 WHERE expires_at <= unixepoch()",
             [],
             |row| row.get(0),
         ))
@@ -2657,7 +2683,10 @@ mod tests {
 
     /// A row whose file fails after another platform's row for the same
     /// coordinate stored its bytes never asked for its POM, so the checks
-    /// after the restores do.
+    /// after the restores do. When the other row stores the bytes before
+    /// this row's search starts, the row is served from the store and asks
+    /// for its POM all the same. The other platform's repository has no POM,
+    /// so only this row's request can store it.
     #[tokio::test]
     async fn a_row_failing_after_its_bytes_were_stored_asks_for_its_pom() {
         use rv_test_support::http::{Response, StubServer};
@@ -2677,7 +2706,6 @@ mod tests {
             }),
             StubServer::start(|req| match req.path.as_str() {
                 "/m2/com/example/slow/1.0/slow-1.0.jar" => Response::new(200, JAR),
-                "/m2/com/example/slow/1.0/slow-1.0.pom" => Response::new(200, POM),
                 _ => Response::new(404, ""),
             }),
         ];
@@ -2698,7 +2726,6 @@ mod tests {
         sha1_only.checksums = vec![Digest::Sha1(rv_maven_types::Sha1::from_bytes(SHA1_ONLY))];
         let mut fast = row("slow", &urls[1]);
         fast.checksums = vec![Digest::Sha256(BlobId::from_bytes(JAR))];
-        fast.pom_sha256 = Some(BlobId::from_bytes(POM));
         let mut lock = support_only_lock(&urls[0], &BlobId::from_bytes(b"unused"));
         lock.platforms[0].support_poms.clear();
         let template = lock.platforms[0].clone();
@@ -2742,7 +2769,7 @@ mod tests {
         );
         let asked =
             |file: &str| (servers[0].requests().iter()).any(|request| request.path.ends_with(file));
-        assert!(asked("slow-1.0.jar") && asked("slow-1.0.pom"));
+        assert!(asked("slow-1.0.pom"), "{:?}", servers[0].requests());
     }
 
     /// A POM one row fetches late has the bytes of another row's file, which
@@ -3630,7 +3657,7 @@ mod tests {
         .await;
         let err = results[0].result.as_ref().expect_err("pin mismatch");
         assert!(
-            matches!(err, RepoError::ChecksumMismatch { subject, .. } if &**subject == "org.test:bom:1:pom"),
+            matches!(err, RepoError::ChecksumMismatch { subject, .. } if subject.starts_with("org.test:bom:1:pom from ")),
             "{err:?}"
         );
         assert_eq!(
@@ -3738,9 +3765,10 @@ mod tests {
     }
 
     /// A repository that serves other POM bytes under a stale checksum file
-    /// and then no POM at all still ends the search.
+    /// ends the search at the pin check, before another repository's copy
+    /// or a second request could pass it on.
     #[tokio::test]
-    async fn a_pom_gone_on_the_second_request_still_ends_the_search() {
+    async fn other_pom_bytes_end_the_search_at_the_pin() {
         use rv_test_support::http::{Response, StubServer};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3783,10 +3811,7 @@ mod tests {
         server.stop();
         let err = result.expect_err("`first` served other bytes");
         assert!(matches!(err, RepoError::ChecksumMismatch { .. }), "{err:?}");
-        assert!(
-            poms.load(Ordering::SeqCst) >= 2,
-            "the POM was requested again"
-        );
+        assert_eq!(poms.load(Ordering::SeqCst), 1, "refused at the pin");
         let row = store.lookup_artifact(&demo("1.0", "pom")).await.unwrap();
         assert_eq!(row, None);
     }

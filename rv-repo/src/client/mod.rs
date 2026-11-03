@@ -5,6 +5,13 @@
 mod artifacts;
 mod models;
 mod requests;
+/// The path below a repository root of the file `key` names, by its file
+/// version.
+pub(super) fn file_path(key: &rv_maven_types::ArtifactCoord) -> String {
+    let file = key.version();
+    rv_maven_types::layout::artifact_path(key, &models::resolved_directory(file), file)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -268,18 +275,16 @@ impl RepoClient {
     }
 
     /// Accept a file without a checksum sidecar when it matches the SHA-256
-    /// `lock` pins for it: the pin verifies it. A file that does not match
-    /// is treated as if `lock` did not pin it. Offline, a `-SNAPSHOT` in a
-    /// remote repository resolves to a build `lock` pins whose POM the cache
-    /// holds for that repository.
+    /// `lock` pins for it: the pin verifies it. Other bytes for a release
+    /// file or timestamped snapshot build are refused before anything stores
+    /// them, unless the run updates the lock; a non-unique `-SNAPSHOT` file
+    /// that does not match is treated as if `lock` did not pin it. Offline,
+    /// a `-SNAPSHOT` in a remote repository resolves to a build `lock` pins
+    /// whose POM the cache holds for that repository.
     pub fn with_lock_pins(mut self, lock: &Lockfile) -> Self {
         self.lock_snapshots = Arc::new(lock.pinned_snapshots());
         self.lock_missing_poms = Arc::new(lock.missing_pom_paths());
-        let pins = lock.pinned_paths().into_iter();
-        self.lock_pins = Arc::new(
-            pins.map(|(path, (pin, origins))| (path, (Digest::Sha256(pin), origins)))
-                .collect(),
-        );
+        self.lock_pins = Arc::new(lock.pinned_paths());
         self
     }
 
@@ -293,9 +298,25 @@ impl RepoClient {
         self
     }
 
-    /// The SHA-256 raeva.lock pins for the file at `path`.
+    /// The digest raeva.lock pins for the file at `path`.
     fn lock_pin(&self, path: &str) -> Option<&Digest> {
         self.lock_pins.get(path).map(|(pin, _)| pin)
+    }
+
+    /// [`Self::lock_pin`] for a release file or timestamped snapshot build.
+    /// Only non-unique snapshot filenames can be redeployed and are left
+    /// out, as [`rv_lock::Lockfile::repinned_releases`] leaves them out.
+    fn release_file_pin(&self, path: &str) -> Option<&Digest> {
+        let snapshot = rv_maven_types::layout::is_mutable_snapshot_path(path);
+        self.lock_pin(path).filter(|_| !snapshot)
+    }
+
+    /// [`Self::release_file_pin`], which other bytes must not replace unless
+    /// [`Self::with_update`] asked to lock new bytes, online or from a local
+    /// repository.
+    fn release_lock_pin(&self, path: &str) -> Option<&Digest> {
+        self.release_file_pin(path)
+            .filter(|_| self.refresh_before.is_none())
     }
 
     /// The SHA-256 raeva.lock pins for the file `key` names, by its file
@@ -304,10 +325,7 @@ impl RepoClient {
         &self,
         key: &rv_maven_types::ArtifactCoord,
     ) -> Option<&rv_maven_types::Sha256> {
-        let file = key.version();
-        let path =
-            rv_maven_types::layout::artifact_path(key, &models::resolved_directory(file), file);
-        self.lock_pin(&path).and_then(Digest::as_sha256)
+        self.lock_pin(&file_path(key)).and_then(Digest::as_sha256)
     }
 
     /// Where requests for `repo` go: the mirror that serves it, if any, and

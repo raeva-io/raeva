@@ -174,6 +174,15 @@ pub(crate) fn render_repo_error(
              --offline once to download it",
         );
     }
+    if class == ErrorClass::Integrity(rv_repo::IntegritySource::LockPin) {
+        out.hint(format!(
+            "Ask the publisher, or the operator of the mirror, why the bytes changed: a \
+             republished release, a mirror that rewrites files, and tampering look the same \
+             here. If the new bytes are intended, run '{}' and review the changes to \
+             raeva.lock before committing it",
+            crate::output::command_line("sync --update")
+        ));
+    }
     if class == ErrorClass::Integrity(rv_repo::IntegritySource::Sidecar) {
         out.message.push_str(
             "\n  The repository served bytes that do not match the checksum it publishes \
@@ -201,6 +210,16 @@ fn render_metadata_cache_error(err: &CacheError, env: &HintEnv) -> Rendered {
         return Rendered::plain(format!(
             "repository metadata cache error: {}",
             shared_memory_failure(&env.metadata_cache_location())
+        ));
+    }
+    if matches!(
+        err.db_failure(),
+        Some(DbFailure::ReadOnly | DbFailure::CannotOpen)
+    ) {
+        return Rendered::plain(format!(
+            "repository metadata cache error: cannot write {}; check the permissions of it and \
+             its directory",
+            env.metadata_cache_location()
         ));
     }
     if let CacheError::Setup(inner) = err
@@ -1017,16 +1036,18 @@ pub(crate) fn render_store_error(err: &StoreError, env: &HintEnv) -> Rendered {
             Some(DbFailure::CannotOpen) => {
                 "cannot open the artifact database; check directory permissions".to_string()
             }
+            Some(DbFailure::ReadOnly) => format!(
+                "cannot write the store index in {store}; check the permissions of {store} and \
+                 the files in it"
+            ),
             // A run replaces a damaged index while no other process has it
             // open; the blobs stay.
             Some(DbFailure::Corrupt) => format!(
                 "the store index in {store} is damaged; run '{sync}' again once no other raeva \
                  process uses the store, and raeva starts a new index"
             ),
-            _ => format!(
-                "{}; try running '{sync}' again; if the problem persists, delete {store}",
-                ctx.as_str()
-            ),
+            // The store index is not a cache, so never advise deleting it.
+            _ => format!("{}; try running '{sync}' again", ctx.as_str()),
         },
         StoreError::PoolError(detail) => {
             format!("no database connection available ({detail}); try again in a moment")
@@ -1053,6 +1074,35 @@ mod tests {
     }
 
     use rv_resolver::{RepoSearchStatus, RepoStatus, ResolveError};
+
+    /// The store index is not a cache: no store error may advise deleting
+    /// it, and one it cannot write names the permissions to check.
+    #[test]
+    fn store_database_errors_never_advise_deleting_the_store() {
+        use rusqlite::ffi;
+        let human = |code| {
+            let err = rv_store::StoreError::DbContext {
+                ctx: "failed to initialize artifacts table".to_string(),
+                source: rusqlite::Error::SqliteFailure(ffi::Error::new(code), None),
+            };
+            super::render_store_error(&err, &env()).human()
+        };
+        let read_only = human(ffi::SQLITE_READONLY);
+        assert!(
+            read_only.contains("cannot write the store index"),
+            "{read_only}"
+        );
+        assert!(read_only.contains("check the permissions"), "{read_only}");
+        for code in [
+            ffi::SQLITE_READONLY,
+            ffi::SQLITE_PERM,
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_IOERR_WRITE,
+        ] {
+            let rendered = human(code);
+            assert!(!rendered.contains("delete"), "{rendered}");
+        }
+    }
 
     #[tokio::test]
     async fn vulnerability_http_error_redacts_base_url_credentials() {

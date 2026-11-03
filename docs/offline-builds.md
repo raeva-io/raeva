@@ -165,8 +165,17 @@ above.
   character, more than 255 UTF-16 units, or an 8.3 short name such as
   `LONGER~1`. Checked on every platform, before writing. Exit 3
   (`LOCKFILE_INVALID`).
+- Planned artifacts, checksums, metadata, or repository markers that share a
+  file path, or a file path that another artifact needs as a directory.
+  This includes optional sources and javadoc jars. Checked before writing,
+  including with `--overwrite` and `--dry-run`. Exit 3 (`LOCAL_REPOSITORY`).
 - Names that differ only by letter case on a case-insensitive volume, such
   as APFS or NTFS. Exit 3 (`LOCAL_REPOSITORY`).
+- On macOS or a case-insensitive volume, names equivalent under Unicode
+  normalization, such as repository ids `é` and `e` followed by a
+  combining acute accent. A case-insensitive volume is judged by the
+  rules of both APFS and NTFS, so a pair one of them keeps apart may be
+  refused. Exit 3 (`LOCAL_REPOSITORY`).
 - An existing file with different bytes. Exit 1 (`EXPORT`). `--overwrite`
   replaces it. A plain `-SNAPSHOT` copy is replaced without it, as Maven
   replaces it on every update.
@@ -365,7 +374,8 @@ to the shared resolution may still conflict.
 
 `[resolution] ambient_inputs` records each consulted `user-property:NAME`
 lookup, including names without a `-D` override. `config_hash` covers their
-effective values from the command line and `.mvn/maven.config`; the
+effective values from the command line, `.mvn/maven.config` and the system
+properties in `.mvn/jvm.config`; the
 recorded names stand for the absence of the rest. An unrelated `-Dci.note`
 does not invalidate the lock, and neither does consulting another name
 without an override. Adding, changing, or removing a consulted override
@@ -441,7 +451,9 @@ the locked versions to the lists already there (see
 
 A `SNAPSHOT` is exported as Maven 3.9.11 leaves one: labeled timestamped
 files, unlabeled `-SNAPSHOT` copies, and `maven-metadata-<id>.xml`. It
-resolves offline with or without the mirror. Outside the shared local
+resolves offline with or without the mirror. A version without a hyphen
+before `SNAPSHOT`, such as `1.0SNAPSHOT`, is locked as a release and does
+not resolve offline; see [Verified against real projects](verification.md). Outside the shared local
 repository, every other repository id's `maven-metadata-<id>.xml` in its
 directory, and `maven-metadata-local.xml`, lists nothing, since `mvn -o`
 reads the latest build any of them names, in the export or in a tail. A

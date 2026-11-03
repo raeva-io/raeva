@@ -43,10 +43,13 @@ Known differences:
   several reactor versions of one module that a version range links to, so
   it can take another project's list in such a reactor.
 - Raeva reads a local `<relativePath>` parent only inside the project
-  directory, or one directory above it when the project is a single module,
-  so a cloned project cannot make it read other files. Maven reads the parent
-  wherever the path points. Run raeva from a directory that contains the
-  parent, or publish the parent to a repository.
+  directory or, when the project is a single module, inside the directory
+  that holds it, such as `../parent/pom.xml`, after resolving symlinks, and
+  only when its coordinates match the declared parent. Such a parent's
+  properties and repositories count as the project's own, so keep an
+  untrusted single-module checkout in a directory of its own. Maven reads
+  the parent wherever the path points. Run raeva from a directory that
+  contains the parent, or publish the parent to a repository.
 - During resolution, Maven moves on to the next repository after any failed
   download of an artifact or POM, and so does raeva, except when the file
   fails its checksum, when the repository publishes no checksum for it, when
@@ -60,7 +63,12 @@ Known differences:
   that matches the lock's SHA-256 pin. A repository that serves other bytes
   stops the restoration, whatever its checksum files say, so an edited pin
   cannot pick its bytes from another repository while the recorded one
-  serves the file.
+  serves the file. When a later repository serves a file after an earlier
+  one was unreachable or returned a non-retried 5xx response,
+  `REPOSITORY_FALLBACK` names the skipped repository, the reason, an example
+  coordinate and the serving repository, once per repository pair. Check
+  the connection (VPN) or repository before committing `raeva.lock`.
+  HTTP 401 and 403 fallbacks use `AUTH_FALLBACK` instead.
 - In a POM's values, raeva resolves the model fields `${project.groupId}`,
   `artifactId`, `version`, `packaging`, `parent.*`, `basedir` and
   `baseUri`, and the single `<build>` values such as
@@ -80,3 +88,9 @@ Known differences:
   unless a mirror whose `<mirrorOfLayouts>` includes `legacy` serves it.
 - Locking build plugins is a deferred feature: they are neither locked nor
   exported; see [Scope](offline-builds.md#scope).
+- A SNAPSHOT version without a hyphen before `SNAPSHOT`, such as
+  `1.0SNAPSHOT`, resolves to a build such as `1.020240101.010101-1`, as in
+  Maven. The lock records that build as a release version, so
+  `raeva export-m2` writes no `1.0SNAPSHOT` metadata for it, and `mvn -o`
+  on the exported repository cannot resolve the declaration. Use a
+  hyphenated version, such as `1.0-SNAPSHOT`, for offline builds.

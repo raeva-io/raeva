@@ -80,7 +80,8 @@ CI runs on another OS, lock both once, as in
 Your Maven build stays as it is. In CI, add a step that runs
 `raeva sync --frozen`: it downloads the locked artifacts and fails when a
 plain `raeva sync` would change the lock, after an edit to a POM,
-`.mvn/maven.config` or the settings, or on another JDK or environment. An
+`.mvn/maven.config`, `.mvn/jvm.config` or the settings, or on another JDK
+or environment. An
 edit that resolves the same, such as a new comment, passes, and so does a
 newer build of a locked SNAPSHOT. On
 GitHub Actions, [setup-raeva](https://github.com/raeva-io/setup-raeva) installs
@@ -108,7 +109,8 @@ tail for what the export lacks. The export writes a version list under
 every repository id it knows the build reads, empty where the lock takes
 nothing from it, so a version range, SNAPSHOT, `RELEASE` or `LATEST`
 resolves to what `raeva.lock` pins, not to a newer version in the tail.
-See [Offline builds](docs/offline-builds.md#scope) for the limits.
+See [Offline builds](docs/offline-builds.md#scope) and
+[Verified against real projects](docs/verification.md) for the limits.
 
 ## Files
 

@@ -19,7 +19,6 @@
 
 mod artifact;
 mod auth;
-mod auth_fallback;
 mod client;
 mod error;
 mod fetch;
@@ -28,13 +27,13 @@ mod mirror;
 mod policy;
 mod proxy;
 mod repository;
+mod repository_fallback;
 mod restore;
 mod routing;
 mod transport;
 
 pub use artifact::ArtifactRequest;
 pub use auth::{CredentialFile, SentCredential};
-pub use auth_fallback::AuthFallback;
 pub use client::{
     FetchArtifact, Fetched, PomArrival, RepoClient, SnapshotResolution, announcing_poms,
 };
@@ -44,6 +43,7 @@ pub use metadata::{Metadata, Snapshot, SnapshotCandidate, SnapshotVersion};
 pub use policy::{Admission, Declaration, Provenance, RepositoryPolicy, secret_url_refusal};
 pub use proxy::configured_proxies;
 pub use repository::{Repository, fresh_secs, normalize_repo_url};
+pub use repository_fallback::RepositoryFallback;
 pub use restore::{
     DownloadResult, LockRepositorySelector, RestoreContext, count_missing, ensure_artifacts,
     ensure_support_pom, index_restored, repository_for_package, restore_complete,

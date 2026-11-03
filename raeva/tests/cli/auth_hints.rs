@@ -1,6 +1,5 @@
 //! What a first sync against a private repository declared in `pom.xml`
-//! reports when no credentials are configured, or when the repository
-//! refuses the ones sent.
+//! reports when the repository refuses credentials or is unavailable.
 
 use crate::common::{
     assert_status, assert_success, raeva_command, run_raeva, with_sha256, write_repo_toml,
@@ -249,6 +248,105 @@ fn fallback_repository(project: &TempDir, first: &StubServer, second: &StubServe
     )
     .expect("write fallback repository");
     url
+}
+
+fn check_repository_fallback(first: &str, reason: &str) {
+    let second = tempfile::tempdir().expect("repository");
+    for (name, bytes) in LIBRARY {
+        let name = name.trim_start_matches('/');
+        let path = second.path().join(name);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("repository directory");
+        std::fs::write(&path, bytes).expect("repository file");
+        std::fs::write(
+            second.path().join(format!("{name}.sha256")),
+            crate::common::sha256_hex(bytes),
+        )
+        .expect("checksum");
+    }
+    let project = project(first);
+    let url = url::Url::from_directory_path(second.path())
+        .expect("repository URL")
+        .to_string();
+    std::fs::write(
+        project.path().join("raeva.toml"),
+        format!(
+            "[[repositories]]\nid = \"corp\"\nurl = \"{first}/maven/canary/\"\n\n\
+             [[repositories]]\nid = \"central\"\nurl = \"{url}\"\n"
+        ),
+    )
+    .expect("write fallback repository");
+    let pom_path = project.path().join("pom.xml");
+    let pom = std::fs::read_to_string(&pom_path).expect("pom");
+    std::fs::write(pom_path, pom.replace("<id>raeva</id>", "<id>corp</id>"))
+        .expect("write repository id");
+
+    for json in [false, true] {
+        let home = tempfile::tempdir().expect("home");
+        let args: &[&str] = if json { &["--json", "sync"] } else { &["sync"] };
+        let output = run_raeva(project.path(), home.path(), args);
+        assert_success(&output, "repository fallback");
+        let messages = if json {
+            let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+            envelope["data"]["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .filter(|warning| warning["code"] == "REPOSITORY_FALLBACK")
+                .map(|warning| warning["message"].as_str().expect("message").to_string())
+                .collect::<Vec<_>>()
+        } else {
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .filter(|line| line.contains("REPOSITORY_FALLBACK"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        for expected in [
+            "Repository `corp`",
+            reason,
+            "io.raeva:lib:1.0",
+            "using the copy from `central`",
+            "VPN",
+            "before committing raeva.lock",
+        ] {
+            assert!(messages[0].contains(expected), "{messages:?}");
+        }
+        let lock = rv_lock::Lockfile::read(&project.path().join("raeva.lock")).expect("lock");
+        let artifacts: Vec<_> = lock
+            .platforms
+            .iter()
+            .flat_map(|platform| &platform.artifacts)
+            .collect();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].repo_url, url);
+        std::fs::remove_file(project.path().join("raeva.lock")).expect("remove lock");
+    }
+}
+
+#[test]
+fn sync_warns_on_repository_fallback_after_dns_failure() {
+    check_repository_fallback("https://corp.raeva.invalid", "host name did not resolve");
+}
+
+#[test]
+fn sync_warns_on_repository_fallback_after_connection_refused() {
+    let refusing = rv_test_support::net::RefusingPort::bind();
+    check_repository_fallback(&format!("http://{}", refusing.addr()), "connection refused");
+}
+
+#[test]
+fn sync_warns_on_repository_fallback_after_http_500() {
+    for pom_in_first in [false, true] {
+        let first = StubServer::start(move |request| {
+            if pom_in_first && request.path.contains(".pom") {
+                library_response(&request.path)
+            } else {
+                Response::new(500, "")
+            }
+        });
+        check_repository_fallback(&format!("http://{}", first.addr()), "HTTP 500");
+    }
 }
 
 /// The refusing repository precedes the one that serves the files. Exercise

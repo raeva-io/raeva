@@ -112,11 +112,35 @@ impl Lockfile {
         Self::default()
     }
 
-    /// The SHA-256 this lockfile pins for each file, by the file's path
-    /// below a Maven repository root: every artifact row, its companion POM
-    /// and every support POM. With it, the origins the lockfile records as
-    /// serving the file, spelled as `repo_url` is.
-    pub fn pinned_paths(&self) -> HashMap<String, (Sha256, BTreeSet<String>)> {
+    /// The digest this lockfile pins for each file, by the file's path below
+    /// a Maven repository root: every artifact row, its companion POM and
+    /// every support POM. With it, the origins the lockfile records as
+    /// serving the file, spelled as `repo_url` is. A file a row pins only by
+    /// SHA-1 is held to that, unless another row pins it by SHA-256.
+    pub fn pinned_paths(&self) -> HashMap<String, (Digest, BTreeSet<String>)> {
+        let mut files: HashMap<String, (Digest, BTreeSet<String>)> = (self.sha256_pins())
+            .into_iter()
+            .map(|(path, (pin, origins))| (path, (Digest::Sha256(pin), origins)))
+            .collect();
+        let mut sha1: HashMap<String, (Digest, BTreeSet<String>)> = HashMap::new();
+        for artifact in self
+            .platforms
+            .iter()
+            .flat_map(|platform| &platform.artifacts)
+        {
+            if let Some(pin @ Digest::Sha1(_)) = artifact.pin() {
+                let file = (sha1.entry(artifact.repository_path()))
+                    .or_insert_with(|| (pin.clone(), BTreeSet::new()));
+                file.1.extend(artifact.file_origins().map(str::to_string));
+            }
+        }
+        for (path, pin) in sha1 {
+            files.entry(path).or_insert(pin);
+        }
+        files
+    }
+
+    fn sha256_pins(&self) -> HashMap<String, (Sha256, BTreeSet<String>)> {
         let mut files: HashMap<String, (Sha256, BTreeSet<String>)> = HashMap::new();
         for (path, pin, served) in self.pinned_files() {
             let file = files
@@ -128,17 +152,15 @@ impl Lockfile {
         files
     }
 
-    /// Each release file `fresh` pins to other bytes than this lockfile, by
-    /// path, with this lockfile's pin and then `fresh`'s. A release file
-    /// does not change, so other bytes under its path are a replaced file.
-    /// A `-SNAPSHOT` directory can be redeployed and is left out.
+    /// Each release file or timestamped snapshot build `fresh` pins to other
+    /// bytes than this lockfile, by path, with this lockfile's pin and then
+    /// `fresh`'s. Other bytes under the same path are a replaced file.
+    /// Only non-unique snapshot filenames can be redeployed and are left out.
     pub fn repinned_releases(&self, fresh: &Lockfile) -> Vec<(String, Sha256, Sha256)> {
-        let pinned = self.pinned_paths();
+        let pinned = self.sha256_pins();
         let mut repinned: Vec<_> = fresh
             .pinned_files()
-            .filter(|(path, ..)| {
-                !(path.rsplit('/').nth(1)).is_some_and(rv_maven_types::is_snapshot_version)
-            })
+            .filter(|(path, ..)| !rv_maven_types::layout::is_mutable_snapshot_path(path))
             .filter_map(|(path, pin, _)| {
                 let (locked, _) = pinned.get(&path)?;
                 (locked != pin).then(|| (path, locked.clone(), pin.clone()))
@@ -2218,6 +2240,36 @@ mod tests {
             ]
         );
         lock.warn_on_env_values(&values);
+    }
+
+    /// One map holds every pin: SHA-256 where any row has one, else the
+    /// SHA-1 a row pins.
+    #[test]
+    fn pinned_paths_hold_sha1_pins_under_sha256_ones() {
+        let sha1 = |digest: char| {
+            rv_maven_types::Digest::parse("sha1", &digest.to_string().repeat(40)).expect("sha1")
+        };
+        let mut shared = package("shared", "1.0", 'a');
+        shared.checksums.push(sha1('d'));
+        let mut only = package("only", "1.0", 'a');
+        only.checksums = vec![sha1('e')];
+        let mut weak = package("shared", "1.0", 'a');
+        weak.checksums = vec![sha1('f')];
+        let lock = lock(vec![
+            locked_platform("linux-x86_64", vec![shared, only], 'b'),
+            locked_platform("macos-aarch64", vec![weak], 'b'),
+        ]);
+        let pins = lock.pinned_paths();
+        let pin = |path: &str| pins.get(path).map(|(pin, _)| pin.clone());
+        let sha256 = |digest: char| {
+            rv_maven_types::Digest::parse("sha256", &digest.to_string().repeat(64)).expect("sha256")
+        };
+        assert_eq!(
+            pin("com/example/shared/1.0/shared-1.0.jar"),
+            Some(sha256('a'))
+        );
+        assert_eq!(pin("com/example/only/1.0/only-1.0.jar"), Some(sha1('e')));
+        assert_eq!(pin("com/example/only/1.0/only-1.0.pom"), Some(sha256('b')));
     }
 
     #[test]

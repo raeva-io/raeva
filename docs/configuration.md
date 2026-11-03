@@ -33,6 +33,15 @@ A raeva older than the one that last changed the schema of `metadata.db`,
 or of the store index, refuses to open that file rather than replace it.
 Run the newer raeva. For `metadata.db` alone, deleting it as above also
 works; the store index is not a cache, so do not delete it.
+
+Upgrading to 0.5.2 discards older artifact-origin trust and cached POMs,
+which could contain bytes saved before a rejected lock pin. An unpinned
+resolution fetches those files again. Blobs and served-file evidence stay
+available for restores that verify the lock pins. The first 0.5.2 run on such a home reports `DATABASE_UPGRADED`. Version
+0.5.1 refuses the upgraded databases, so give it its own `RAEVA_HOME`;
+0.5.0 can still write its old tables, but their origin
+trust and cached POMs are ignored and removed on the next 0.5.2 open.
+
 `metadata.db` also records the POMs and `maven-metadata.xml` files a repository
 answered 404, 401 or 403 for, with an HMAC-SHA256 digest of the credential
 sent, and a later sync does not ask
@@ -110,7 +119,9 @@ fills fields it left unset. A mirror whose `mirror_of` is exactly the
 repository id wins, then the first entry whose patterns match. Patterns
 match as Maven 3.9 matches `<mirrorOf>`: the `mirror_of` entries join with
 `,`, the first `id` or `!id` naming the repository decides, otherwise `*`,
-`external:*` or `external:http:*` matches, and entries are not trimmed. A
+`external:*` or `external:http:*` matches, and entries are not trimmed.
+Repository schemes and hosts are classified with the same URL parser used
+for requests; an unparseable URL is treated as external. A
 settings.xml mirror serves only the `<mirrorOfLayouts>` it lists
 (`default,legacy` when unset), and Raeva reads the `default` layout. A mirror
 with `blocked` set to true (settings.xml `<blocked>true</blocked>`) gets no
@@ -165,6 +176,19 @@ which `mvn` builds another POM, fails the load (exit 3). Everything this
 page says about `-D` and `-P` in
 `.mvn/maven.config` holds for the command-line options too.
 
+raeva also reads `-Dname=value` options from `.mvn/jvm.config` as JVM system
+properties, below the user properties from `.mvn/maven.config` and the
+command line. Tokens are separated by whitespace across all lines; other
+JVM options are ignored. `-Dname` sets an empty value, as the JVM does.
+A name the JVM sets itself, such as `java.version`, `java.vendor`,
+`java.vm.version` or `java.class.path`, keeps the JVM's value, as on JDK
+17 and newer.
+These properties can activate profiles and fill `${name}` expressions.
+For model interpolation, settings.xml profile properties and a POM's own
+properties take precedence over JVM system properties. Changes to
+consulted properties make `sync --frozen` fail with exit 7, even where a
+POM property hides the value.
+
 `raeva` searches Maven Central (`central`) last, as Maven's super POM does.
 Repositories in `raeva.toml`, `config.toml`, `settings.xml` or the project
 POMs add to it. A file an earlier repository serves is not requested from
@@ -208,8 +232,12 @@ A `[[repositories]]` entry has `url` and optionally `id`, `releases`,
   in it standing for any text. The error names the input, not its value.
   A fetched POM's repository with such a path is ignored
   (`REPO_URL_SECRET_REFUSED`). Give such a URL to a `<mirror>`, whose URL
-  the lock does not record. When the value is not a secret, rename the
-  input. Keep any other secret out of repository URLs too.
+  the lock does not record; where messages and logs show that URL, they
+  show `***` in place of the value of a secret-named `${env.NAME}` in it.
+  A token written into the URL as literal text is shown as written, and so
+  is one in a host name or a `file:` mirror's directory where a message
+  names the host or the directory on its own. When the
+  value is not a secret, rename the input. Keep any other secret out of repository URLs too.
 - External HTTP repositories declared by any POM are ignored, as with
   Maven's default HTTP blocker. One the project or its parents declare is
   reported (`HTTP_REPO_BLOCKED`); a dependency POM's only under `-v`, or in
@@ -235,7 +263,9 @@ A `[[repositories]]` entry has `url` and optionally `id`, `releases`,
   BOM the project imports get that trust and serve only that BOM's parents
   and imports.
 - A project repository URL taken from a fetched parent has that parent's
-  trust (`PROJECT_REPO_URL_FROM_FETCHED_POM`).
+  trust (`PROJECT_REPO_URL_FROM_FETCHED_POM`), including through a local model
+  field such as `${project.artifactId}` or `${project.packaging}` that reads
+  an inherited property.
 - Private addresses (loopback, private, link-local, and similar) are allowed
   for a repository your configuration, the project POM, or an in-project
   parent POM names, and only for that origin. Through a proxy, only an IP
@@ -507,7 +537,17 @@ not asked for that file again in the run; if the next one serves the file,
 `AUTH_FALLBACK` warns once per refusing and serving repository pair with an
 example coordinate and the number of further files affected. A version
 range, `RELEASE` or `LATEST` lists the versions of every repository that
-answers; one that failed otherwise is named by `LISTING_REPO_SKIPPED`.
+answers. `REPOSITORY_FALLBACK` reports the same when a host name did not
+resolve, the connection or TLS handshake failed, or a repository answered a
+5xx error that raeva does not retry. It names the reason and asks you to
+check the connection, such as a VPN, or the repository before committing
+`raeva.lock`. Both warnings apply to artifacts, POMs, version listings and
+restoration, and neither fails `sync --frozen`. Restoring a file that
+`raeva.lock` pins stops at a 5xx answer instead, so a cold `--frozen` run
+fails there when a resolving `raeva sync` would warn and continue. A
+version listing that left out another failure reports
+`LISTING_REPO_SKIPPED`. Version strings are limited to 255 bytes. Longer
+entries in a repository's version listing are ignored.
 
 A download below `low_speed_limit` for `low_speed_time` seconds is retried
 on a new connection, up to `retries` times.
@@ -527,4 +567,10 @@ in Maven (exit 3).
 
 An artifact or POM checksum mismatch always fails. `raeva.lock` pins those
 hashes, and a sync that resolves again fails (exit 7) when it finds other
-bytes for a release file the lock pins. `raeva sync --update` locks them.
+bytes for a release file or timestamped SNAPSHOT build the lock pins,
+whichever repository serves it. This check precedes POM parsing and storage,
+including parents, imported BOMs and relocation POMs. `raeva sync --update`
+can lock new bytes for a republished file or select a newer SNAPSHOT build.
+Restoration also checks pinned POMs before caching or storing them. Rejected
+downloads are not cached for another project using the same home. Non-unique
+`-SNAPSHOT` filenames remain mutable.

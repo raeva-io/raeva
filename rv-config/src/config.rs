@@ -1232,6 +1232,57 @@ fn resolve_active_profiles(
     active
 }
 
+/// A property value the lock hash covers. A POM property ranks below a `-D`
+/// and above `.mvn/jvm.config`, so the same text from each can resolve
+/// differently and hashes differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyInput {
+    /// Set by anything but `.mvn/jvm.config`: a `-D` on the command line or
+    /// in `.mvn/maven.config`, settings.xml, the environment or the platform.
+    Value(String),
+    /// Set only by `.mvn/jvm.config`.
+    JvmConfig(String),
+}
+
+impl serde::Serialize for PropertyInput {
+    // A value encodes as a plain string, as before jvm.config was read, so
+    // the hashes of locks without one are unchanged.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        match self {
+            Self::Value(value) => serializer.serialize_str(value),
+            Self::JvmConfig(value) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(".mvn/jvm.config", value)?;
+                map.end()
+            }
+        }
+    }
+}
+
+/// One user property's [`PropertyInput`] on each target a lock covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyInputs(Vec<Option<PropertyInput>>);
+
+impl PropertyInputs {
+    /// Whether some target sets it.
+    pub fn is_set(&self) -> bool {
+        self.0.iter().any(Option::is_some)
+    }
+
+    /// Whether a `-D` on the command line or in `.mvn/maven.config` sets it
+    /// on some target.
+    pub fn defined(&self) -> bool {
+        (self.0.iter()).any(|input| matches!(input, Some(PropertyInput::Value(_))))
+    }
+
+    /// What the lock hash covers, `None` when no target sets it.
+    pub fn hash_value(&self) -> Option<String> {
+        self.is_set()
+            .then(|| serde_json::to_string(&self.0).expect("property inputs serialize"))
+    }
+}
+
 fn encode_target_values(values: Vec<Option<String>>) -> Option<String> {
     values
         .iter()
@@ -1353,7 +1404,12 @@ impl Config {
                 origins.1,
             );
         }
-        let host = HostSnapshot::capture(&security.allow_env_substitution);
+        let jvm_config = crate::read_optional_project_input_string(
+            &project_root.join(".mvn").join("jvm.config"),
+        )?;
+        let host = HostSnapshot::capture(&security.allow_env_substitution).with_system_properties(
+            crate::maven_config::jvm_properties(jvm_config.as_deref().unwrap_or_default()),
+        );
         // settings.xml profiles follow its -P and -D, so a file Maven would
         // refuse fails here, before any repository is used.
         let maven_config_path = project_root.join(".mvn").join("maven.config");
@@ -1769,7 +1825,7 @@ impl Config {
     /// The inputs a POM can take into a repository URL that are private to
     /// this host and named like a secret ([`crate::secret_named`]), on any
     /// target platform: `-D` options on the command line or in
-    /// `.mvn/maven.config`, the properties of active settings.xml profiles,
+    /// `.mvn/maven.config` or `.mvn/jvm.config`, active settings.xml profiles,
     /// and the allowlisted environment variables. Each comes as how a
     /// message names it, then its value, expanded as far as these inputs
     /// go, which no message may show.
@@ -1804,6 +1860,12 @@ impl Config {
             // values without the settings.xml properties, read them.
             let mut project = with_env.clone();
             let mut dependency = with_env.clone();
+            for (name, value) in environment.system_properties() {
+                if !model_owned(name) {
+                    project.insert(name.as_str(), value.as_str());
+                    dependency.insert(name.as_str(), value.as_str());
+                }
+            }
             for (name, value) in settings.iter().chain(&defines) {
                 if !model_owned(name) {
                     project.insert(name.as_str(), value.as_str());
@@ -1817,8 +1879,13 @@ impl Config {
             let defines = (defines.iter()).map(|(name, value)| (format!("-D{name}"), name, value));
             let settings = (settings.iter())
                 .map(|(name, value)| (format!("settings.xml property {name}"), name, value));
+            let system = environment
+                .system_properties()
+                .iter()
+                .map(|(name, value)| (format!(".mvn/jvm.config -D{name}"), name, value));
             for (input, _, value) in defines
                 .chain(settings)
+                .chain(system)
                 .filter(|(_, name, _)| crate::secret_named(name))
             {
                 for properties in [&project, &dependency] {
@@ -1834,24 +1901,28 @@ impl Config {
         inputs
     }
 
-    /// Effective user-property values across supported targets, including absent overrides.
-    pub fn user_property_values(
+    /// The values of the user properties `names` on each target: a `-D` on
+    /// the command line or in `.mvn/maven.config`, else `.mvn/jvm.config`.
+    pub fn user_property_inputs(
         &self,
         names: &BTreeSet<String>,
-    ) -> BTreeMap<String, Option<String>> {
+    ) -> BTreeMap<String, PropertyInputs> {
         if names.is_empty() {
             return BTreeMap::new();
         }
         let options = self.target_maven_options();
+        let environment = self.host.host_environment();
         names
             .iter()
             .map(|name| {
-                let values: Vec<_> = options
-                    .iter()
-                    .map(|options| options.properties.get(name).cloned())
+                let inputs = (options.iter())
+                    .map(|options| match options.properties.get(name) {
+                        Some(value) => Some(PropertyInput::Value(value.clone())),
+                        None => (environment.system_properties().get(name))
+                            .map(|value| PropertyInput::JvmConfig(value.clone())),
+                    })
                     .collect();
-                let value = encode_target_values(values);
-                (name.clone(), value)
+                (name.clone(), PropertyInputs(inputs))
             })
             .collect()
     }
@@ -1867,10 +1938,8 @@ impl Config {
             .map(|environment| {
                 let environment = environment.detached();
                 let mut ctx = ActivationContext::new(environment.clone());
-                ctx.set_external_properties(
-                    self.inputs.maven_options(&environment).properties,
-                    lookup.source,
-                );
+                let defines = self.inputs.maven_options(&environment).properties;
+                ctx.set_external_properties(defines.clone(), lookup.source);
                 if lookup.source == PropertySource::User {
                     ctx.settings_properties = self.settings_profile_properties_for(&environment);
                 }
@@ -1923,17 +1992,34 @@ impl Config {
                         if properties.get(&name).is_some() && !properties.is_external(&name) {
                             return None;
                         }
+                        // A dependency model reads a `-D` as a system property.
+                        let jvm_config = environment.system_properties().contains_key(&name)
+                            && !defines.contains_key(&name);
                         let value = properties
                             .get(&name)
                             .cloned()
-                            .or_else(|| system.get(&name).cloned())
-                            .or_else(|| match name.as_str() {
-                                "java.version" => ctx.property("java.version").map(str::to_string),
-                                name => name
-                                    .strip_prefix("env.")
-                                    .or_else(|| (lookup.mode == LookupMode::Model).then_some(name))
-                                    .and_then(|key| self.host.env_values().get(key))
-                                    .cloned(),
+                            .map(PropertyInput::Value)
+                            .or_else(|| {
+                                let value = system.get(&name)?.clone();
+                                Some(match jvm_config {
+                                    true => PropertyInput::JvmConfig(value),
+                                    false => PropertyInput::Value(value),
+                                })
+                            })
+                            .or_else(|| {
+                                match name.as_str() {
+                                    "java.version" => {
+                                        ctx.property("java.version").map(str::to_string)
+                                    }
+                                    name => name
+                                        .strip_prefix("env.")
+                                        .or_else(|| {
+                                            (lookup.mode == LookupMode::Model).then_some(name)
+                                        })
+                                        .and_then(|key| self.host.env_values().get(key))
+                                        .cloned(),
+                                }
+                                .map(PropertyInput::Value)
                             });
                         Some((name, value))
                     })
@@ -3561,6 +3647,11 @@ mod tests {
                 "-Drepo.password=s3\n-Drepo.path=open\n",
             )
             .unwrap();
+            fs::write(
+                project.join(".mvn/jvm.config"),
+                "-Djvm.password=${repo.value}\n",
+            )
+            .unwrap();
             let command_line = CommandLine {
                 defines: vec![
                     "gpg.passphrase=s4".to_string(),
@@ -3590,6 +3681,8 @@ mod tests {
                 // As a dependency's model and the project's read it.
                 ("-Dstaged.key", "${repo.value}/s12"),
                 ("-Dstaged.key", "s8/s12"),
+                (".mvn/jvm.config -Djvm.password", "${repo.value}"),
+                (".mvn/jvm.config -Djvm.password", "s8"),
                 ("settings.xml property alias.token", "${repo.value}"),
                 ("settings.xml property alias.token", "s8"),
                 // A POM can set `os.arch`.
@@ -3794,6 +3887,24 @@ mod tests {
         });
     }
 
+    /// A value encodes as the JSON array of plain strings it hashed as
+    /// before `.mvn/jvm.config` was read; a jvm.config value encodes apart.
+    #[test]
+    fn property_inputs_keep_the_old_encoding_without_jvm_config() {
+        use super::{PropertyInput, PropertyInputs};
+        let value = |text: &str| Some(PropertyInput::Value(text.to_string()));
+        let inputs = PropertyInputs(vec![value("2.0"), None]);
+        assert_eq!(inputs.hash_value().as_deref(), Some(r#"["2.0",null]"#));
+        assert!(inputs.defined());
+        let jvm = PropertyInputs(vec![Some(PropertyInput::JvmConfig("2.0".to_string()))]);
+        assert_eq!(
+            jvm.hash_value().as_deref(),
+            Some(r#"[{".mvn/jvm.config":"2.0"}]"#)
+        );
+        assert!(jvm.is_set() && !jvm.defined());
+        assert_eq!(PropertyInputs(vec![None, None]).hash_value(), None);
+    }
+
     #[test]
     fn target_property_encodings_do_not_alias_literal_vector_or_joined_text() {
         with_homes(|home, project| {
@@ -3803,14 +3914,16 @@ mod tests {
             fs::write(&path, "-Dflag=${java.version}\n").unwrap();
             let names = std::collections::BTreeSet::from(["flag".to_string()]);
             let config = Config::load(project).unwrap();
-            let varying = config.user_property_values(&names)["flag"].clone().unwrap();
+            let varying = config.user_property_inputs(&names)["flag"]
+                .hash_value()
+                .unwrap();
             let values: Vec<Option<String>> = (0..6)
                 .flat_map(|_| [Some("17".to_string()), Some("21".to_string())])
                 .collect();
             let literal = serde_json::to_string(&values).unwrap();
             fs::write(&path, format!("-Dflag={literal}\n")).unwrap();
             let uniform =
-                Config::load(project).unwrap().user_property_values(&names)["flag"].clone();
+                Config::load(project).unwrap().user_property_inputs(&names)["flag"].hash_value();
             assert_ne!(Some(varying), uniform);
 
             write_settings(

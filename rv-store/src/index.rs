@@ -7,8 +7,14 @@ const KEY_MATCHES: &str = "group_id = ?1 AND artifact_id = ?2 AND version = ?3
      AND packaging = ?4 AND classifier = ?5";
 
 pub(crate) fn init_db(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS artifacts (
+    let path = std::path::Path::new(conn.path().unwrap_or_default());
+    let tx = crate::sqlite::write_transaction(conn, path, crate::store::INDEX.generation)?;
+    let upgraded = crate::sqlite::has_table(&tx, "artifact_origins_v2")?;
+    // Legacy origins could precede a rejected lock pin. Keep served evidence
+    // for pinned restores, but retire the trust used by unpinned resolution.
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS artifact_origins_v2;
+        CREATE TABLE IF NOT EXISTS artifacts (
             group_id   TEXT NOT NULL,
             artifact_id TEXT NOT NULL,
             version    TEXT NOT NULL,
@@ -17,7 +23,7 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             blob_id    TEXT NOT NULL,
             PRIMARY KEY (group_id, artifact_id, version, packaging, classifier)
         );
-        CREATE TABLE IF NOT EXISTS artifact_origins_v2 (
+        CREATE TABLE IF NOT EXISTS artifact_origins_v3 (
             group_id    TEXT NOT NULL,
             artifact_id TEXT NOT NULL,
             version     TEXT NOT NULL,
@@ -45,7 +51,20 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
             stamp   TEXT NOT NULL
         ) WITHOUT ROWID;",
     )
-    .db_context(|| "failed to initialize artifacts table")
+    .db_context(|| "failed to initialize artifacts table")?;
+    let generation: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .db_context(|| "failed to read the database generation")?;
+    if generation < crate::store::INDEX.generation {
+        tx.pragma_update(None, "user_version", crate::store::INDEX.generation)
+            .db_context(|| "failed to write the database generation")?;
+    }
+    tx.commit()
+        .db_context(|| "failed to initialize artifacts table")?;
+    if upgraded {
+        crate::sqlite::warn_upgraded(path, "its record of which repository served each file");
+    }
+    Ok(())
 }
 
 pub(crate) fn add_artifact(conn: &Connection, key: &ArtifactCoord, id: &BlobId) -> Result<()> {
@@ -133,7 +152,7 @@ pub(crate) fn add_origin(
         origin.checksum_verified
     ];
     conn.prepare_cached(
-        "INSERT INTO artifact_origins_v2 (group_id, artifact_id, version, packaging, classifier,
+        "INSERT INTO artifact_origins_v3 (group_id, artifact_id, version, packaging, classifier,
              repo_url, endpoint_url, blob_id, checksum_verified)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(group_id, artifact_id, version, packaging, classifier, repo_url, endpoint_url)
@@ -215,7 +234,7 @@ pub(crate) fn lookup_origin(
 ) -> Result<Option<BlobId>> {
     let value: Option<String> = conn
         .prepare_cached(&format!(
-            "SELECT blob_id FROM artifact_origins_v2 AS o WHERE {KEY_MATCHES} AND repo_url = ?6
+            "SELECT blob_id FROM artifact_origins_v3 AS o WHERE {KEY_MATCHES} AND repo_url = ?6
              AND endpoint_url = ?7 AND (checksum_verified OR ?8)
              AND (?9 OR EXISTS (SELECT 1 FROM served_files AS s
                  WHERE s.group_id = o.group_id AND s.artifact_id = o.artifact_id

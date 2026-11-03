@@ -146,11 +146,23 @@ pub enum ExportError {
         /// The SHA-256 that record names.
         second: String,
     },
-    /// Two files, or artifact or version directories, differ only in letter
-    /// case and the destination's file system folds case, so one would
-    /// overwrite the other.
+    /// Two planned files, or a file and a directory, occupy one path.
     #[error(
-        "{first} and {second} differ only in letter case, and the file system holding {path:?} does not distinguish case, so both would be written to the same file"
+        "{first} and {second} would both use {path:?}; Maven has one local-repository path per file, so no export can write both"
+    )]
+    DestinationCollision {
+        /// The first file or directory's owner.
+        first: String,
+        /// The conflicting file or directory's owner.
+        second: String,
+        /// The colliding destination path.
+        path: PathBuf,
+    },
+    /// Two files, or artifact or version directories, differ only in letter
+    /// case or Unicode normalization and the destination's file system
+    /// treats them as one name, so one would overwrite the other.
+    #[error(
+        "{first} and {second} differ only in letter case or Unicode normalization, and the file system holding {path:?} treats such names as one, so both would be written to the same file"
     )]
     CaseCollision {
         /// The coordinate queued first.

@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-03
+
+### Changed
+
+- The store and metadata databases move to a new generation. A home that
+  0.5.0 or 0.5.1 used drops the repository evidence and POM cache those
+  versions recorded, since they could have kept a tampered file, and
+  fetches unpinned files again; stored files are kept and still serve
+  pinned restores. `DATABASE_UPGRADED` reports it once. 0.5.1 cannot open
+  an upgraded home.
+- `-D` options in `.mvn/jvm.config` are read as system properties, as Maven
+  passes them to the JVM, so the profiles and `${...}` values they set
+  reach the lock. Names the JVM or `mvn` sets itself, such as
+  `java.version` or `maven.home`, keep that value. A lock written before can fail `sync --frozen` until
+  `raeva sync` relocks it.
+- `REPOSITORY_FALLBACK` warns when a repository whose host did not resolve,
+  that refused the connection or the TLS handshake, or that answered a
+  server error was skipped and a later one served the file, as
+  `AUTH_FALLBACK` does for 401 and 403. A sync off a VPN no longer locks a
+  public copy of an internal artifact without a word.
+
+### Fixed
+
+- When a repository serves other bytes, with checksum files that match
+  them, for a release file or timestamped snapshot build that `raeva.lock`
+  pins, raeva refuses them before the resolver reads them or the store
+  keeps them, whichever repository serves them, for jars, POMs, parents
+  and imported BOMs alike. It does not reuse a stored copy that differs
+  from the pin, under `--update` either. 0.5.1 refused the sync but kept
+  the bytes, so a later `sync --update`, or another project on the same
+  machine, could lock them. A lock row that pins only a SHA-1 digest is
+  held to it the same way.
+- A token that a settings.xml `<mirror>` URL takes from a secret-named
+  `${env.NAME}`, as docs/configuration.md suggests for such services, is
+  shown as `***` where errors, warnings and logs show the URL. 0.5.1 printed
+  it, for example in the repositories a failed sync searched.
+- Repository host and scheme checks use the same URL parser as requests,
+  so a URL such as `http://repo.example\@localhost/` no longer passes the
+  plain-HTTP blocker or an `external:*` mirror as localhost.
+- A project repository URL built from `${project.artifactId}` or another
+  model field whose value a fetched parent chose gets the parent's trust,
+  so that parent cannot pick the host that receives the id's credentials.
+- `raeva export-m2` refuses coordinates whose files, checksum files,
+  metadata or directories would overwrite each other, sources and javadoc
+  jars included. Names that differ only in case count as one on a volume
+  that folds case, and names that differ only in Unicode normalization
+  count as one there and on macOS.
+- A version longer than 255 bytes is no longer split into items, so a
+  crafted metadata listing or POM can no longer use hundreds of MiB.
+- A `<file>` condition whose path leaves the project and comes back, such
+  as `${project.basedir}/../project/marker.txt`, no longer fails the sync,
+  and one that a symlink leads out of the project is not recorded in
+  `raeva.lock`, as a path outside it is not.
+- An error on a store index that raeva cannot write says to check its
+  permissions, and no store error advises deleting the store, which is not
+  a cache.
+- `raeva lock diff` shows every version of a dependency a module locks,
+  not only the last one, and names the version an edge change affects.
+- Within one module, a version range after a `RELEASE` lookup no longer
+  reuses a release listing whose update policy differs, so it sees the
+  versions Maven sees.
+- `docs/ci.md` says what `--frozen` trusts in a pull request's lock and how
+  to review lock changes. `docs/verification.md` describes the local
+  parent boundary as implemented, and what `export-m2` writes for a
+  SNAPSHOT version without a hyphen, such as `1.0SNAPSHOT`.
+
 ## [0.5.1] - 2026-11-02
 
 ### Changed
@@ -451,7 +517,8 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
-[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/raeva-io/raeva/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/raeva-io/raeva/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/raeva-io/raeva/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/raeva-io/raeva/compare/v0.4.0...v0.4.1

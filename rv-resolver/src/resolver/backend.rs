@@ -519,7 +519,7 @@ fn is_newer(new: Option<&str>, kept: Option<&str>) -> bool {
 /// serves it.
 #[derive(Default)]
 struct Search {
-    fallback: rv_repo::AuthFallback,
+    fallback: rv_repo::RepositoryFallback,
     searched: Vec<RepoSearchStatus>,
     last_error: Option<RepoError>,
 }
@@ -556,7 +556,7 @@ impl Search {
         err: RepoError,
     ) -> Result<()> {
         self.fallback
-            .refused(&source.effective_repository(repo), &err);
+            .failed(&source.effective_repository(repo), &err);
         self.searched
             .push(RepoSearchStatus::from_fetch_error(repo, &err, |repo| {
                 source.effective_repository(repo)
@@ -1620,7 +1620,8 @@ impl ModelService {
                 let url = Arc::from(repos[idx].url.as_str());
                 let key = MetadataKey::new(url, Arc::from(group_id), Arc::from(artifact_id))
                     .with_repo_id(repos[idx].id.as_deref())
-                    .with_checksum_policy(listing.releases_checksum_policy);
+                    .with_checksum_policy(listing.releases_checksum_policy)
+                    .with_update_policy(listing.releases_update_policy);
                 let dummy = &dummy;
                 async move {
                     if let Some(metadata) = self.ctx.cached_metadata(&key) {
@@ -1642,7 +1643,7 @@ impl ModelService {
         let mut hits = Vec::new();
         let mut searched = Vec::new();
         let mut first_error = None;
-        let mut fallback = rv_repo::AuthFallback::default();
+        let mut fallback = rv_repo::RepositoryFallback::default();
         let mut skipped = Vec::new();
         for (idx, result) in results {
             let repo = &repos[idx];
@@ -1654,10 +1655,9 @@ impl ModelService {
                 Err(err) => err,
             };
             let effective = source.effective_repository(repo);
-            fallback.refused(&effective, &err);
+            let warned = fallback.failed(&effective, &err);
             if !matches!(err, RepoError::NotFound(_)) {
-                let refused = matches!(err.status_code(), Some(401 | 403));
-                skipped.push((effective, err.to_string(), refused));
+                skipped.push((effective, err.to_string(), warned));
             }
             searched.push(RepoSearchStatus::from_fetch_error(repo, &err, |repo| {
                 source.effective_repository(repo)
@@ -1691,10 +1691,10 @@ impl ModelService {
             );
         }
         if !hits.is_empty() || found {
-            for (repo, error, refused) in skipped {
-                // AUTH_FALLBACK already names a refusal another repository
-                // answered past.
-                if refused && !hits.is_empty() {
+            for (repo, error, warned) in skipped {
+                // A fallback warning already names this failure when
+                // another repository answered.
+                if warned && !hits.is_empty() {
                     continue;
                 }
                 let repository = rv_maven_types::bounded(

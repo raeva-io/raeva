@@ -595,3 +595,73 @@ fn a_dependency_pom_url_path_taking_a_secret_named_input_is_ignored() {
         assert!(!lock.contains(SECRET), "{lock}");
     }
 }
+
+/// A settings.xml mirror may take a secret-named `${env.NAME}` into its URL
+/// path, as a token service expects. Messages and logs show `***` there,
+/// also in the list of searched repositories a failed sync prints.
+#[test]
+fn a_secret_in_a_mirror_url_path_is_hidden_in_output() {
+    // A missing file, and a jar whose checksum file does not match it.
+    for broken_jar in [false, true] {
+        mirror_secret_case(broken_jar);
+    }
+}
+
+fn mirror_secret_case(broken_jar: bool) {
+    let server = StubServer::start(move |request| {
+        let base = format!("/{SECRET}/m2/t/a/1/a-1");
+        if !broken_jar {
+            return rv_test_support::http::Response::new(404, "");
+        }
+        if request.path == format!("{base}.jar.sha1") {
+            return rv_test_support::http::Response::new(200, "0".repeat(40));
+        }
+        with_sha1(
+            &request.path,
+            [
+                (format!("{base}.pom"), pom("a", "")),
+                (format!("{base}.jar"), "a jar".to_string()),
+            ],
+        )
+    });
+    let project = tempfile::tempdir().expect("project");
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(project.path().join("pom.xml"), pom("app", DEPENDENCY)).expect("pom.xml");
+    std::fs::create_dir_all(home.path().join(".m2")).expect(".m2");
+    std::fs::write(
+        home.path().join(".m2").join("settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf>\
+             <url>http://{}/${{env.RAEVA_MIRROR_TOKEN}}/m2/</url></mirror></mirrors></settings>",
+            server.addr()
+        ),
+    )
+    .expect("settings.xml");
+    for json in [true, false] {
+        let mut args = vec!["sync"];
+        if json {
+            args.insert(0, "--json");
+        }
+        let output = raeva_command(project.path(), home.path())
+            .env("RAEVA_MIRROR_TOKEN", SECRET)
+            .env("RAEVA_RETRIES", "0")
+            .env("RUST_LOG", "debug")
+            .args(&args)
+            .output()
+            .expect("run raeva sync");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{text}");
+        assert!(
+            !text.contains(SECRET),
+            "json={json} jar={broken_jar}: {text}"
+        );
+        assert!(
+            text.contains("/***/m2/"),
+            "json={json} jar={broken_jar}: {text}"
+        );
+    }
+}

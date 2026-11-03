@@ -7,7 +7,7 @@ use std::process::Output;
 
 use tempfile::TempDir;
 
-use crate::common::{assert_success, raeva_command, sha256_hex};
+use crate::common::{assert_success, raeva_command, run_raeva, sha1_hex, sha256_hex};
 
 pub(crate) fn publish_lib(repository: &Path) {
     let dir = repository.join("org/test/lib/1.0");
@@ -354,6 +354,220 @@ fn a_republished_release_file_is_locked_again_only_by_update() {
         let updated = fs::read_to_string(root.join("raeva.lock")).unwrap();
         assert!(updated.contains(&sha256_hex(replaced)), "{updated}");
     }
+}
+
+/// Other bytes a repository serves for a release file the lock pins are
+/// refused before the store keeps them, so once the repository serves the
+/// pinned bytes again, neither an update nor another project takes the
+/// refused ones from the cache.
+#[test]
+fn a_refused_release_file_is_not_kept_for_a_later_sync() {
+    for (file, replaced) in [
+        ("lib-1.0.jar", b"other jar bytes".as_slice()),
+        (
+            "lib-1.0.pom",
+            b"<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+<artifactId>lib</artifactId><version>1.0</version><!-- replaced --></project>",
+        ),
+    ] {
+        let project = Project::synced();
+        let root = project.root();
+        let path = root.join("repository/org/test/lib/1.0").join(file);
+        let sidecar = path.with_file_name(format!("{file}.sha256"));
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, replaced).unwrap();
+        fs::write(&sidecar, sha256_hex(replaced)).unwrap();
+        let pom = fs::read_to_string(root.join("pom.xml")).unwrap();
+        let edited = pom.replace("<version>1</version>", "<version>1</version><name>e</name>");
+        fs::write(root.join("pom.xml"), &edited).unwrap();
+        fs::remove_dir_all(project.home.path()).unwrap();
+        for args in [
+            &["sync", "--offline", "--frozen"][..],
+            &["sync", "--offline"],
+        ] {
+            let output = project.raeva(args);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(7), "{file} {args:?}: {stderr}");
+        }
+        fs::write(&path, &original).unwrap();
+        fs::write(&sidecar, sha256_hex(&original)).unwrap();
+
+        let other = project.base.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let repository = format!("file://{}/repository/", root.display());
+        let other_pom = edited
+            .replace(
+                "<artifactId>root</artifactId>",
+                "<artifactId>other</artifactId>",
+            )
+            .replace("file://${project.basedir}/repository/", &repository);
+        fs::write(other.join("pom.xml"), other_pom).unwrap();
+        let output = run_raeva(&other, project.home.path(), &["sync", "--offline"]);
+        assert_success(&output, "other project");
+        let other_lock = fs::read_to_string(other.join("raeva.lock")).unwrap();
+        assert!(
+            other_lock.contains(&sha256_hex(&original)),
+            "{file}: {other_lock}"
+        );
+        assert!(
+            !other_lock.contains(&sha256_hex(replaced)),
+            "{file}: {other_lock}"
+        );
+
+        assert_success(&project.raeva(&["sync", "--offline", "--update"]), "update");
+        let updated = fs::read_to_string(root.join("raeva.lock")).unwrap();
+        assert!(
+            updated.contains(&sha256_hex(&original)),
+            "{file}: {updated}"
+        );
+        assert!(
+            !updated.contains(&sha256_hex(replaced)),
+            "{file}: {updated}"
+        );
+    }
+}
+
+/// A repository the lock does not record for a file, searched first, is held
+/// to the pin as the recorded one is.
+#[test]
+fn another_repository_is_held_to_the_pin() {
+    let project = Project::synced_with(&[
+        ("first/.keep", ""),
+        (
+            "pom.xml",
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.test</groupId><artifactId>root</artifactId><version>1</version>
+  <repositories>
+    <repository><id>first</id><url>file://${project.basedir}/first/</url></repository>
+    <repository><id>project-local</id><url>file://${project.basedir}/repository/</url></repository>
+  </repositories>
+  <dependencies><dependency>
+    <groupId>org.test</groupId><artifactId>lib</artifactId><version>1.0</version>
+  </dependency></dependencies>
+</project>
+"#,
+        ),
+    ]);
+    let root = project.root();
+    let lock = fs::read_to_string(root.join("raeva.lock")).unwrap();
+    assert!(lock.contains("/repository/"), "{lock}");
+    publish_lib(&root.join("first"));
+    let jar = root.join("first/org/test/lib/1.0/lib-1.0.jar");
+    let original = fs::read(&jar).unwrap();
+    let replaced = b"other jar bytes";
+    fs::write(&jar, replaced).unwrap();
+    fs::write(jar.with_extension("jar.sha256"), sha256_hex(replaced)).unwrap();
+    let pom = fs::read_to_string(root.join("pom.xml")).unwrap();
+    let edited = pom.replace("<version>1</version>", "<version>1</version><name>e</name>");
+    fs::write(root.join("pom.xml"), edited).unwrap();
+    fs::remove_dir_all(project.home.path()).unwrap();
+    let output = project.raeva(&["sync", "--offline"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+
+    fs::write(&jar, &original).unwrap();
+    fs::write(jar.with_extension("jar.sha256"), sha256_hex(&original)).unwrap();
+    assert_success(&project.raeva(&["sync", "--offline", "--update"]), "update");
+    let updated = fs::read_to_string(root.join("raeva.lock")).unwrap();
+    assert!(updated.contains(&sha256_hex(&original)), "{updated}");
+    assert!(!updated.contains(&sha256_hex(replaced)), "{updated}");
+}
+
+/// `export-m2 --with-sources` exports the pinned copy of a sources jar the
+/// lock pins, which a restore stored without its checksum file, rather than
+/// other bytes the repository now serves.
+#[test]
+fn a_pinned_sources_jar_is_exported_only_as_pinned() {
+    let project = Project::synced_with(&[
+        (
+            "repository/org/test/lib/1.0/lib-1.0-sources.jar",
+            "lib sources",
+        ),
+        (
+            "repository/org/test/lib/1.0/lib-1.0-sources.jar.sha256",
+            &sha256_hex(b"lib sources"),
+        ),
+        (
+            "pom.xml",
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.test</groupId><artifactId>root</artifactId><version>1</version>
+  <repositories>
+    <repository><id>project-local</id><url>file://${project.basedir}/repository/</url></repository>
+  </repositories>
+  <dependencies>
+    <dependency><groupId>org.test</groupId><artifactId>lib</artifactId><version>1.0</version></dependency>
+    <dependency><groupId>org.test</groupId><artifactId>lib</artifactId><version>1.0</version><classifier>sources</classifier></dependency>
+  </dependencies>
+</project>
+"#,
+        ),
+    ]);
+    let root = project.root();
+    let sources = root.join("repository/org/test/lib/1.0/lib-1.0-sources.jar");
+    let sidecar = sources.with_extension("jar.sha256");
+    fs::remove_file(&sidecar).unwrap();
+    fs::remove_dir_all(project.home.path()).unwrap();
+    assert_success(&project.raeva(&["sync", "--frozen"]), "restore");
+    let replaced = b"other sources";
+    fs::write(&sources, replaced).unwrap();
+    fs::write(&sidecar, sha256_hex(replaced)).unwrap();
+    let m2 = project.m2();
+    let m2_path = m2.to_str().unwrap();
+    let args = [
+        "export-m2",
+        "--offline",
+        "--with-sources",
+        "--m2-path",
+        m2_path,
+    ];
+    assert_success(&project.raeva(&args), "export");
+    let exported = m2.join("org/test/lib/1.0/lib-1.0-sources.jar");
+    assert_eq!(fs::read(exported).unwrap(), b"lib sources");
+    let other = sha256_hex(replaced);
+    let blobs = project.home.path().join("store/blobs");
+    assert!(
+        !blobs
+            .join(&other[..2])
+            .join(&other[2..4])
+            .join(&other)
+            .exists()
+    );
+}
+
+/// A row that pins only a SHA-1 digest binds the file as a SHA-256 pin does.
+#[test]
+fn a_sha1_pin_refuses_other_bytes() {
+    let project = Project::synced();
+    let root = project.root();
+    let path = root.join("repository/org/test/lib/1.0/lib-1.0.jar");
+    let original = fs::read(&path).unwrap();
+    let lock = fs::read_to_string(root.join("raeva.lock")).unwrap();
+    let sha256_row = format!(
+        "algorithm = \"sha256\"\ndigest = \"{}\"",
+        sha256_hex(&original)
+    );
+    let sha1_row = format!("algorithm = \"sha1\"\ndigest = \"{}\"", sha1_hex(&original));
+    assert!(lock.contains(&sha256_row), "{lock}");
+    fs::write(
+        root.join("raeva.lock"),
+        lock.replace(&sha256_row, &sha1_row),
+    )
+    .unwrap();
+    let lock = fs::read(root.join("raeva.lock")).unwrap();
+    let replaced = b"other jar bytes";
+    fs::write(&path, replaced).unwrap();
+    fs::write(path.with_extension("jar.sha256"), sha256_hex(replaced)).unwrap();
+    let pom = fs::read_to_string(root.join("pom.xml")).unwrap();
+    let edited = pom.replace("<version>1</version>", "<version>1</version><name>e</name>");
+    fs::write(root.join("pom.xml"), edited).unwrap();
+    fs::remove_dir_all(project.home.path()).unwrap();
+    let output = project.raeva(&["sync", "--offline"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(7), "{stderr}");
+    assert!(stderr.contains("raeva sync --update"), "{stderr}");
+    assert_eq!(fs::read(root.join("raeva.lock")).unwrap(), lock);
 }
 
 #[test]

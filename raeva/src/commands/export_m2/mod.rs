@@ -235,11 +235,33 @@ pub(crate) async fn run(args: &ExportM2Args, session: &Session) -> Result<Report
         repos.extend(resolved.iter().cloned());
     }
     let plan = ExportPlan::from_lock(&config, &lock, &searched)?;
-    let exporter = Exporter::new(options, &store, plan).with_support_pom_limit(
-        std::env::var(rv_export::MAX_SUPPORT_POM_NODES_ENV)
-            .ok()
-            .as_deref(),
-    );
+    let classifiers = [
+        ("sources", args.with_sources),
+        ("javadoc", args.with_javadocs),
+    ];
+    let candidates = if args.with_sources || args.with_javadocs {
+        let (candidates, warnings) = plan.authorize_classifiers(&config, &declared);
+        report_warnings(output, &warnings);
+        candidates
+    } else {
+        Vec::new()
+    };
+    let optional: Vec<_> = candidates
+        .iter()
+        .flat_map(|authorized| {
+            classifiers
+                .into_iter()
+                .filter(|(_, wanted)| *wanted)
+                .map(|(classifier, _)| authorized.candidate.artifact(classifier))
+        })
+        .collect();
+    let exporter = Exporter::new(options, &store, plan)
+        .with_optional_classifiers(&optional)
+        .with_support_pom_limit(
+            std::env::var(rv_export::MAX_SUPPORT_POM_NODES_ENV)
+                .ok()
+                .as_deref(),
+        );
     output.step("Exporting artifacts...");
     let reactor = reactor(&projects, session.project_root());
     let stats = exporter
@@ -255,20 +277,16 @@ pub(crate) async fn run(args: &ExportM2Args, session: &Session) -> Result<Report
         Some(
             client
                 .with_offline(session.offline())
-                .with_progress(output.progress()),
+                .with_progress(output.progress())
+                .with_lock_pins(&lock),
         )
     };
     let mut classifier_counts = [0usize; 2];
     let mut unchanged = stats.skipped_count;
-    for (count, (classifier, wanted)) in classifier_counts.iter_mut().zip([
-        ("sources", args.with_sources),
-        ("javadoc", args.with_javadocs),
-    ]) {
+    for (count, (classifier, wanted)) in classifier_counts.iter_mut().zip(classifiers) {
         if !wanted {
             continue;
         }
-        let (candidates, warnings) = exporter.plan().authorize_classifiers(&config, &declared);
-        report_warnings(output, &warnings);
         *count = match &client {
             // `--dry-run` must not touch the network, so it counts the
             // classifier jars the store already holds.
@@ -279,7 +297,7 @@ pub(crate) async fn run(args: &ExportM2Args, session: &Session) -> Result<Report
                     config.network.fetch_concurrency(),
                     client,
                     &declared,
-                    candidates,
+                    candidates.clone(),
                     classifier,
                 )
                 .await?;

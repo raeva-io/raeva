@@ -192,6 +192,277 @@ fn frozen_names_a_profile_maven_config_activates() {
     );
 }
 
+#[test]
+fn jvm_config_activates_a_property_profile_and_invalidates_frozen() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>use.v2</name>\
+             <value>true</value></property></activation>",
+        ),
+    );
+    project.sync(&[]);
+    project.write(".mvn/jvm.config", "-Xmx256m -Duse.v2=true\n-ea\n");
+    let output = project.frozen(&[]);
+    assert_status(&output, 7, "jvm.config activates a profile");
+    assert!(
+        stderr(&output).contains("jvm.config"),
+        "{}",
+        stderr(&output)
+    );
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    assert_success(&project.frozen(&[]), "unchanged jvm.config");
+    project.write(".mvn/jvm.config", "-Duse.v2=false\n");
+    assert_status(&project.frozen(&[]), 7, "changed jvm.config property");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    project.write(".mvn/maven.config", "-Duse.v2=true\n");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    project.sync(&["-Duse.v2=false"]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+}
+
+#[test]
+fn jvm_config_system_properties_interpolate_below_pom_and_user_properties() {
+    let project = Project::new();
+    project.write(".mvn/jvm.config", "-Dlib.version=2.0\n");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<properties><lib.version>1.0</lib.version></properties>",
+            "",
+        ),
+    );
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+    project.write(".mvn/jvm.config", "-Dlib.version=1.0\n");
+    let output = project.frozen(&[]);
+    assert_status(&output, 7, "jvm.config interpolation changed");
+    assert!(
+        stderr(&output).contains("jvm.config"),
+        "{}",
+        stderr(&output)
+    );
+
+    project.write(".mvn/maven.config", "-Dlib.version=2.0\n");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+    project.sync(&["-Dlib.version=1.0"]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+}
+
+/// The JVM keeps its own value for `java.version` and the other names it
+/// fixes, so a `-D` for one in jvm.config changes nothing.
+#[test]
+fn jvm_config_cannot_set_the_java_version() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><jdk>1.4</jdk></activation>",
+        ),
+    );
+    project.write(
+        ".mvn/jvm.config",
+        "-Djava.version=1.4.2 -Djava.vm.version=1.4.2\n",
+    );
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+}
+
+/// A settings.xml profile property ranks above jvm.config and below `-D`,
+/// so `--frozen` checks it when only jvm.config set the name.
+#[test]
+fn frozen_checks_a_settings_property_that_shadows_jvm_config() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<properties><lib.version>1.0</lib.version></properties>",
+            "",
+        ),
+    );
+    project.write(".mvn/jvm.config", "-Dlib.version=1.0\n");
+    let empty = project.write(
+        "settings.xml",
+        "<settings><profiles><profile><id>pin</id></profile></profiles>\
+         <activeProfiles><activeProfile>pin</activeProfile></activeProfiles></settings>",
+    );
+    let empty = empty.to_str().expect("path").to_string();
+    project.sync(&["-s", &empty]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    let pinned = project.write("pinned.xml", &settings("2.0"));
+    let pinned = pinned.to_str().expect("path").to_string();
+    assert_status(
+        &project.frozen(&["-s", &pinned]),
+        7,
+        "settings property over jvm.config",
+    );
+    project.sync(&["-s", &pinned]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+}
+
+/// `config_hash` covers a jvm.config value of a name the build reads even
+/// when a POM property hides it: adding one needs a sync, which locks the
+/// same dependencies.
+#[test]
+fn a_jvm_config_value_a_pom_property_hides_relocks_to_the_same_dependencies() {
+    let project = Project::new();
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    project.write(".mvn/jvm.config", "-Dlib.version=2.0\n");
+    assert_status(&project.frozen(&[]), 7, "new jvm.config value");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    assert_success(&project.frozen(&[]), "relocked");
+}
+
+/// A project `app` whose `lib` version is `version`, with `lib.version` and
+/// `app.version` 1.0 in a parent raeva fetches, so the lock cannot list
+/// those POM properties.
+fn with_fetched_parent(project: &Project, version: &str) {
+    let parent = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+                  <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\
+                  <properties><lib.version>1.0</lib.version><app.version>1.0</app.version>\
+                  </properties></project>";
+    let path = "repository/org/test/parent/1/parent-1.pom";
+    project.write(path, parent);
+    project.write(&format!("{path}.sha256"), &sha256_hex(parent.as_bytes()));
+    project.write(
+        "pom.xml",
+        &format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.test</groupId>\
+             <artifactId>parent</artifactId><version>1</version><relativePath/></parent>\
+             <artifactId>app</artifactId><dependencies><dependency>\
+             <groupId>org.test</groupId><artifactId>lib</artifactId>\
+             <version>{version}</version></dependency></dependencies></project>"
+        ),
+    );
+    let url = url::Url::from_directory_path(project.path().join("repository")).expect("url");
+    project.write(
+        "raeva.toml",
+        &format!("[[repositories]]\nid = \"local\"\nurl = \"{url}\"\n"),
+    );
+}
+
+/// A POM property ranks below a `-D` and above `.mvn/jvm.config`, so the
+/// same value moved from one to the other changes the dependencies.
+#[test]
+fn frozen_checks_a_jvm_config_value_moved_to_the_command_line() {
+    let project = Project::new();
+    with_fetched_parent(&project, "${lib.version}");
+    project.write(".mvn/jvm.config", "-Dlib.version=2.0\n");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    assert_status(&project.frozen(&["-Dlib.version=2.0"]), 7, "moved to -D");
+    project.sync(&["-Dlib.version=2.0"]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+    assert_status(&project.frozen(&[]), 7, "moved back to jvm.config");
+}
+
+/// As [`frozen_checks_a_jvm_config_value_moved_to_the_command_line`], for a
+/// property whose name an expression computes.
+#[test]
+fn frozen_checks_a_computed_name_moved_to_jvm_config() {
+    let project = Project::new();
+    with_fetched_parent(&project, "${${project.artifactId}.version}");
+    project.sync(&["-Dapp.version=2.0"]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+    project.write(".mvn/jvm.config", "-Dapp.version=2.0\n");
+    assert_status(&project.frozen(&[]), 7, "moved to jvm.config");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+}
+
+#[test]
+fn jvm_config_properties_expand_maven_config_values() {
+    let project = Project::new();
+    project.write(".mvn/jvm.config", "-Dselected=1.0\t-Dselected=2.0\n");
+    project.write(".mvn/maven.config", "-Dlib.version=${selected}\n");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+    assert_success(&project.frozen(&[]), "expanded jvm.config property");
+    project.write(".mvn/jvm.config", "-Dselected=1.0\n");
+    assert_status(&project.frozen(&[]), 7, "expanded jvm.config changed");
+}
+
+#[test]
+fn jvm_config_activates_settings_profiles() {
+    let project = Project::new();
+    let file = project.write(
+        "settings.xml",
+        &settings("2.0")
+            .replace(
+                "<id>pin</id>",
+                "<id>pin</id><activation><property><name>use.v2</name>\
+             </property></activation>",
+            )
+            .replace(
+                "<activeProfiles><activeProfile>pin</activeProfile></activeProfiles>",
+                "",
+            ),
+    );
+    project.write(".mvn/jvm.config", "-Duse.v2 -Dlib.version=1.0\n");
+    project.sync(&["-s", file.to_str().expect("path")]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    project.write(".mvn/jvm.config", "-Duse.v2=true -Dlib.version=1.0\n");
+    project.sync(&["-s", file.to_str().expect("path")]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+}
+
+#[test]
+fn jvm_config_reaches_dependency_models_as_system_properties() {
+    let project = Project::new();
+    let pom = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+               <artifactId>lib</artifactId><version>1.0</version>\
+               <properties><extra.version>1.0</extra.version></properties>\
+               <profiles><profile><id>extra</id><activation><property><name>use.v2</name>\
+               </property></activation><dependencies><dependency><groupId>org.test</groupId>\
+               <artifactId>extra</artifactId><version>${extra.version}</version>\
+               </dependency></dependencies></profile></profiles></project>";
+    let path = "repository/org/test/lib/1.0/lib-1.0.pom";
+    project.write(path, pom);
+    project.write(&format!("{path}.sha256"), &sha256_hex(pom.as_bytes()));
+    project.write(".mvn/jvm.config", "-Duse.v2=true -Dextra.version=2.0\n");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    assert_success(&project.frozen(&[]), "dependency reads jvm.config");
+}
+
+/// A dependency model reads a `-D` as a system property, over the same name
+/// in `.mvn/jvm.config`, so adding one there changes nothing.
+#[test]
+fn a_jvm_config_value_a_define_overrides_keeps_a_dependency_lookup() {
+    let project = Project::new();
+    let pom = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+               <artifactId>lib</artifactId><version>1.0</version><dependencies><dependency>\
+               <groupId>org.test</groupId><artifactId>extra</artifactId>\
+               <version>${${project.artifactId}.version}</version></dependency>\
+               </dependencies></project>";
+    let path = "repository/org/test/lib/1.0/lib-1.0.pom";
+    project.write(path, pom);
+    project.write(&format!("{path}.sha256"), &sha256_hex(pom.as_bytes()));
+    project.sync(&["-Dlib.version=1.0"]);
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    project.write(".mvn/jvm.config", "-Dlib.version=2.0\n");
+    assert_success(
+        &project.frozen(&["-Dlib.version=1.0"]),
+        "overridden jvm.config",
+    );
+}
+
 /// As Maven 3.9 does, a requested profile that neither a POM nor
 /// settings.xml has gets a warning, and a deselected one does not.
 #[test]
@@ -647,4 +918,23 @@ fn only_a_selected_invalid_pom_is_reported() {
     };
     assert_eq!(problems("[1.0,3.0)"), Vec::<String>::new());
     assert_eq!(problems("[1.0]"), ["\"org.test:lib:1.0\""]);
+}
+
+#[test]
+fn a_range_skips_an_overlong_listed_version() {
+    let project = Project::new();
+    let version = format!("{}1", "2.".repeat(128));
+    let metadata = format!(
+        "<metadata><versioning><versions><version>1.0</version>\
+         <version>{version}</version><version>2.0</version>\
+         </versions></versioning></metadata>"
+    );
+    project.write("repository/org/test/lib/maven-metadata.xml", &metadata);
+    project.write(
+        "repository/org/test/lib/maven-metadata.xml.sha256",
+        &sha256_hex(metadata.as_bytes()),
+    );
+
+    project.sync(&["-Dlib.version=[1.0,3.0)"]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
 }

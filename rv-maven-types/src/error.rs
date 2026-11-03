@@ -7,7 +7,8 @@ use crate::text::bounded;
 #[derive(Error, Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum VersionError {
-    /// The string is not a version: it is empty or whitespace only.
+    /// The string is not a version: it is empty, whitespace only or longer
+    /// than 255 bytes.
     #[error("invalid version string: {}", bounded(.0))]
     InvalidVersion(String),
     /// The string is not a range that

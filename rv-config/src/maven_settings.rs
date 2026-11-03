@@ -188,7 +188,20 @@ fn interpolate_xml(settings: &mut SettingsXml) -> Result<(), ConfigError> {
     if let Some(mirrors) = &mut settings.mirrors {
         for mirror in &mut mirrors.mirror {
             expand_opt(&mut mirror.id);
+            // A mirror URL may take a token; messages show `***` for it.
+            let masked = replace_env_refs(&mirror.url, |name| {
+                if crate::redact::secret_named(name)
+                    && std::env::var(name).is_ok_and(|value| !value.is_empty())
+                {
+                    Some("***".to_string())
+                } else {
+                    std::env::var(name).ok()
+                }
+            });
             expand(&mut mirror.url);
+            if masked != mirror.url {
+                crate::redact::register_masked_url(&mirror.url, &masked);
+            }
             expand(&mut mirror.mirror_of);
             expand_opt(&mut mirror.mirror_of_layouts);
         }

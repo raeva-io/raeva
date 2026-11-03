@@ -106,7 +106,7 @@ const CACHE: crate::sqlite::Spec = crate::sqlite::Spec {
     pragmas: "PRAGMA synchronous=NORMAL;
               PRAGMA busy_timeout=5000;",
     max_size: CACHE_POOL_SIZE,
-    generation: 1,
+    generation: 2,
     init: init_schema,
     lock: |path| Ok(Box::new(bootstrap_lock(path)?)),
 };
@@ -179,7 +179,7 @@ pub enum CacheTable {
 impl CacheTable {
     fn name(self) -> &'static str {
         match self {
-            CacheTable::Pom => "pom_cache_v3",
+            CacheTable::Pom => "pom_cache_v4",
             CacheTable::VersionList => "version_list_cache_v3",
             CacheTable::Miss => "miss_cache_v3",
         }
@@ -490,6 +490,11 @@ impl MetadataCache {
 
 fn init_schema(conn: &Connection) -> crate::error::Result<()> {
     drop_unkeyed_misses(conn)?;
+    let path = Path::new(conn.path().unwrap_or_default());
+    let tx = crate::sqlite::write_transaction(conn, path, CACHE.generation)?;
+    let upgraded = crate::sqlite::has_table(&tx, "pom_cache_v3")?;
+    tx.execute_batch("DROP TABLE IF EXISTS pom_cache_v3")
+        .db_context(|| "failed to retire legacy cached POMs")?;
     for table in [CacheTable::Pom, CacheTable::VersionList, CacheTable::Miss] {
         // The content comes last: a read of a column after it walks its
         // overflow pages.
@@ -506,8 +511,20 @@ fn init_schema(conn: &Connection) -> crate::error::Result<()> {
              )",
             table.name()
         );
-        conn.execute_batch(&sql)
+        tx.execute_batch(&sql)
             .db_context(|| "failed to initialize metadata cache database")?;
+    }
+    let generation: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .db_context(|| "failed to read the database generation")?;
+    if generation < CACHE.generation {
+        tx.pragma_update(None, "user_version", CACHE.generation)
+            .db_context(|| "failed to write the database generation")?;
+    }
+    tx.commit()
+        .db_context(|| "failed to initialize metadata cache database")?;
+    if upgraded {
+        crate::sqlite::warn_upgraded(path, "the POMs it cached");
     }
     Ok(())
 }
@@ -574,6 +591,76 @@ mod tests {
         let mut digest = cache.keyed_digest().unwrap();
         digest.update(secret);
         digest.finalize_hex()
+    }
+
+    #[test]
+    fn legacy_poms_are_retired_without_clearing_current_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metadata.db");
+        let scope = "https://repo.example/";
+        let pom = "g/a/1/a-1.pom";
+        let legacy = || {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pom_cache_v3 (
+                    repo_url TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL,
+                    fetched_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                    checksum_checked INTEGER NOT NULL, content BLOB NOT NULL,
+                    PRIMARY KEY (repo_url, path)
+                );",
+            )
+            .unwrap();
+            let content = b"<tampered/>";
+            conn.execute(
+                "INSERT INTO pom_cache_v3 VALUES (?1, ?2, ?3, 0, ?4, 1, ?5)",
+                rusqlite::params![
+                    scope,
+                    pom,
+                    rv_maven_types::Sha256::from_bytes(content).as_str(),
+                    i64::MAX,
+                    content
+                ],
+            )
+            .unwrap();
+        };
+        legacy();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        drop(conn);
+        let cache = MetadataCache::new(&path).unwrap();
+        assert!(cache.get(CacheTable::Pom, scope, pom).unwrap().is_none());
+        cache
+            .insert_with_ttl(CacheTable::Pom, scope, pom, b"<repaired/>", i64::MAX, true)
+            .unwrap();
+        cache
+            .insert_with_ttl(
+                CacheTable::VersionList,
+                scope,
+                "metadata.xml",
+                b"versions",
+                3600,
+                true,
+            )
+            .unwrap();
+        drop(cache);
+
+        // A release that ignores the generation can recreate its own table.
+        legacy();
+        let cache = MetadataCache::new(&path).unwrap();
+        assert_eq!(
+            cache
+                .get(CacheTable::Pom, scope, pom)
+                .unwrap()
+                .unwrap()
+                .content,
+            b"<repaired/>"
+        );
+        assert!(
+            cache
+                .get(CacheTable::VersionList, scope, "metadata.xml")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -719,7 +806,8 @@ mod tests {
             .unwrap();
         drop(cache);
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.pragma_update(None, "user_version", super::CACHE.generation + 1)
+            .unwrap();
         drop(conn);
         let err = MetadataCache::new(&path).err().unwrap();
         assert!(
@@ -728,7 +816,7 @@ mod tests {
         );
         let conn = rusqlite::Connection::open(&path).unwrap();
         let rows: i64 = conn
-            .query_row("SELECT count(*) FROM pom_cache_v3", [], |row| row.get(0))
+            .query_row("SELECT count(*) FROM pom_cache_v4", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1);
     }
@@ -746,9 +834,10 @@ mod tests {
             .insert_with_ttl(CacheTable::Pom, scope, pom, b"<pom/>", 3600, true)
             .unwrap();
         let peer = rusqlite::Connection::open(&path).unwrap();
-        peer.execute("UPDATE pom_cache_v3 SET content = x'00'", [])
+        peer.execute("UPDATE pom_cache_v4 SET content = x'00'", [])
             .unwrap();
-        peer.pragma_update(None, "user_version", 2).unwrap();
+        peer.pragma_update(None, "user_version", super::CACHE.generation + 1)
+            .unwrap();
         let version = || -> i64 {
             peer.pragma_query_value(None, "data_version", |row| row.get(0))
                 .unwrap()
@@ -824,7 +913,7 @@ mod tests {
         };
         assert!(holds(None) && holds(Some(now)));
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute("UPDATE pom_cache_v3 SET fetched_at = ?1 + 600", [now])
+        conn.execute("UPDATE pom_cache_v4 SET fetched_at = ?1 + 600", [now])
             .unwrap();
         assert!(!holds(None) && !holds(Some(now)));
         let entry = cache.get(CacheTable::Pom, scope, pom).unwrap().unwrap();

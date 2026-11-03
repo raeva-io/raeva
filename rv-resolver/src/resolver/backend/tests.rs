@@ -922,9 +922,9 @@ async fn refusals_do_not_hide_later_poms_or_metadata() {
 }
 
 /// A version listing names a repository it left out while another
-/// answered: through `AUTH_FALLBACK` for a 401 or 403, otherwise through
-/// `LISTING_REPO_SKIPPED`. A repository that failed a retried request,
-/// such as a 502, fails the listing instead.
+/// answered: through a fallback warning for an auth or server failure,
+/// otherwise through `LISTING_REPO_SKIPPED`. A repository that failed a
+/// retried request, such as a 502, fails the listing instead.
 #[test]
 fn listings_report_the_repositories_they_left_out() {
     use crate::resolver::pom_source::MemoryPomSource;
@@ -938,9 +938,11 @@ fn listings_report_the_repositories_they_left_out() {
             .to_vec(),
     )]);
     for (code, expected) in [
-        (403, "a later repository served a file"),
+        (403, "AUTH_FALLBACK"),
+        (500, "REPOSITORY_FALLBACK"),
+        (501, "REPOSITORY_FALLBACK"),
         (
-            500,
+            418,
             "the versions of g:a were listed without repository 'first'",
         ),
         (502, ""),
@@ -2093,6 +2095,75 @@ async fn runtime_repo_trust_reaches_the_http_client() {
     ] {
         assert_eq!(client.trusts_origin(origin), trusted, "{origin}");
     }
+}
+
+#[tokio::test]
+async fn release_and_range_listings_use_their_own_update_policies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    let dir = root.join("com/example/lib");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("maven-metadata.xml");
+    let metadata = |versions: &str| {
+        format!(
+            "<metadata><groupId>com.example</groupId><artifactId>lib</artifactId>\
+             <versioning><release>1.0</release><versions>{versions}</versions>\
+             </versioning></metadata>"
+        )
+    };
+    std::fs::write(&path, metadata("<version>1.0</version>")).unwrap();
+    let mut repo = Repository::new(
+        Some("local".into()),
+        reqwest::Url::from_directory_path(&root)
+            .unwrap()
+            .to_string(),
+        true,
+        true,
+    );
+    repo.releases_update_policy = rv_config::UpdatePolicy::Never;
+    repo.snapshots_update_policy = rv_config::UpdatePolicy::Always;
+    let config = Config::for_testing_with_repos(
+        tmp.path().to_owned(),
+        ResolvedPaths::from_raeva_home(tmp.path().join("home")),
+        Vec::new(),
+    );
+    let client = rv_repo::RepoClient::new(&config).await.unwrap();
+    let ctx = ResolveContext::new(
+        config,
+        vec![repo.clone()],
+        Arc::new(Store::open(&tmp.path().join("store")).unwrap()),
+        rv_lock::Platform::new("linux", "x86_64").unwrap(),
+        Some(client),
+    );
+    let backend = ModelService::new(&ctx, vec![repo]);
+    let repos = RepoContext::default();
+    let release = backend
+        .resolve_dynamic_version_internal(
+            "com.example",
+            "lib",
+            DynamicVersionToken::Release,
+            &repos,
+        )
+        .await
+        .unwrap();
+    assert_eq!(release.version.as_str(), "1.0");
+
+    std::fs::write(
+        &path,
+        metadata("<version>1.0</version><version>1.1</version>"),
+    )
+    .unwrap();
+    let versions = backend
+        .resolve_versions_internal(
+            "com.example",
+            "lib",
+            &VersionReq::parse("[1.1,2.0)").unwrap(),
+            &repos,
+        )
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version.as_str(), "1.1");
 }
 
 /// `RELEASE` considers each repository's versions only when that

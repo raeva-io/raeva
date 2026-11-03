@@ -347,6 +347,7 @@ pub struct Exporter<'a> {
     /// The lock's pins and repository ids. Unknown repository URLs fall back
     /// to `central` in the `_remote.repositories` markers.
     plan: ExportPlan,
+    optional_destinations: Vec<(ArtifactCoord, Vec<String>)>,
     /// Ceiling on unique support-POM nodes for one export. Resolved once at
     /// construction so every pass of a run shares one stable budget.
     max_support_pom_nodes: usize,
@@ -362,6 +363,7 @@ impl<'a> Exporter<'a> {
             options,
             store,
             plan,
+            optional_destinations: Vec::new(),
             max_support_pom_nodes: MAX_SUPPORT_POM_NODES,
             startup_warnings: Mutex::new(Vec::new()),
         }
@@ -384,6 +386,24 @@ impl<'a> Exporter<'a> {
     /// The plan this exporter was given.
     pub fn plan(&self) -> &ExportPlan {
         &self.plan
+    }
+
+    /// Reserve the destinations of optional classifiers before the primary
+    /// export writes. Their companion POMs and metadata are already covered
+    /// by the plan's artifacts.
+    pub fn with_optional_classifiers(mut self, items: &[LockArtifact]) -> Self {
+        for item in items {
+            self.optional_destinations
+                .push((item.coord(), self.repo_ids_for(item)));
+            if item.snapshot.is_some()
+                && rv_maven_types::is_snapshot_version(item.coordinate.version())
+                && TimestampedSnapshot::parse(item.coordinate.version()).is_none()
+            {
+                self.optional_destinations
+                    .push((item.coordinate.clone(), Vec::new()));
+            }
+        }
+        self
     }
 
     /// The Maven repository ids of the repositories that served a package,
@@ -747,7 +767,12 @@ impl<'a> Exporter<'a> {
         }
 
         queue_plain_snapshot_copies(items, queue)?;
-        reject_case_folded_collisions(&self.options, &queue.units)?;
+        reject_destination_collisions(
+            &self.options,
+            &queue.units,
+            &self.optional_destinations,
+            &meta,
+        )?;
         stats.warnings.append(&mut queue.warnings);
 
         // Exports to one local repository take turns: each judges the files
@@ -1626,7 +1651,14 @@ fn write_artifact_metadata_blocking(
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with("maven-metadata-") && name.ends_with(".xml") && !keep.contains(name) {
+        if name.starts_with("maven-metadata-")
+            && name.ends_with(".xml")
+            && !keep.contains(name)
+            && !keep.iter().any(|other| {
+                other.to_lowercase() == name.to_lowercase()
+                    && same_file(&dir.join(name), &dir.join(other))
+            })
+        {
             remove_metadata_file(&dir.join(name))?;
         }
     }
@@ -1700,7 +1732,16 @@ fn remove_version_metadata(
         let id = name
             .to_str()
             .and_then(|name| name.strip_prefix("maven-metadata-")?.strip_suffix(".xml"));
-        if id.is_some_and(|id| !keep.contains(id)) {
+        if id.is_some_and(|id| {
+            !keep.contains(id)
+                && !keep.iter().any(|other| {
+                    other.to_lowercase() == id.to_lowercase()
+                        && same_file(
+                            &dir.join(&name),
+                            &dir.join(format!("maven-metadata-{other}.xml")),
+                        )
+                })
+        }) {
             remove_metadata_file(&dir.join(name))?;
         }
     }
@@ -1849,64 +1890,347 @@ fn reject_windows_hostile_names(key: &ArtifactCoord, relative: &Path) -> Result<
     Ok(())
 }
 
-/// Refuse two units whose files, or artifact and version directories, differ
-/// only in letter case when the local repository's file system folds case,
-/// as APFS and NTFS do by default: both would be written to one file,
-/// leaving one coordinate holding the other's bytes while the export reports
-/// success. Directories count because Maven metadata is written per artifact
-/// directory; group directories hold no files of their own, so `org.Acme:a`
-/// and `org.acme:b` can share one. Every path segment is printable ASCII by
-/// the coordinate rule, so ASCII case is the whole comparison.
-fn reject_case_folded_collisions(options: &ExportOptions, units: &[ExportUnit]) -> Result<()> {
-    let Some((first, second, relative)) = case_folded_collision(units)? else {
-        return Ok(());
-    };
-    let root = options
-        .m2_path
-        .ancestors()
-        .find(|ancestor| ancestor.is_dir())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let folds = if options.dry_run {
-        folds_case_without_writing(&root)
-    } else {
-        folds_case(&root)?
-    };
-    if !folds {
-        return Ok(());
-    }
-    Err(ExportError::CaseCollision {
-        first,
-        second,
-        path: options.m2_path.join(relative),
-    })
+struct DestinationClaim {
+    path: PathBuf,
+    owner: String,
+    directory: bool,
+    // Group directories can share different spellings on a folding volume.
+    group: bool,
 }
 
-/// The first two units, by coordinate, whose files or artifact or version
-/// directories differ only in letter case, and the colliding relative path.
-fn case_folded_collision(units: &[ExportUnit]) -> Result<Option<(String, String, PathBuf)>> {
-    let mut seen: HashMap<String, (PathBuf, &ExportUnit)> = HashMap::new();
-    for unit in units {
-        let relative = artifact_relative_path(&unit.key)?;
-        let group_depth = unit.key.group_id().split('.').count();
-        let mut prefix = PathBuf::new();
-        for (depth, component) in relative.components().enumerate() {
-            prefix.push(component);
-            if depth < group_depth {
-                continue;
-            }
-            let caseless = prefix.to_string_lossy().to_ascii_lowercase();
-            match seen.get(&caseless) {
-                None => {
-                    seen.insert(caseless, (prefix.clone(), unit));
-                }
-                Some((existing, first)) if *existing != prefix => {
-                    return Ok(Some((first.key.to_string(), unit.key.to_string(), prefix)));
-                }
-                Some(_) => {}
+struct DestinationPaths {
+    claims: Vec<DestinationClaim>,
+    index: HashMap<String, usize>,
+    metadata: HashSet<String>,
+    cleanup: HashSet<String>,
+    folds_case: bool,
+}
+
+impl DestinationPaths {
+    /// The names `path` may take on the destination volume. On a volume that
+    /// folds case each is one rule such volumes use: lowercase, uppercase as
+    /// NTFS compares, so `σ` and `ς` are one, and Unicode case folding as
+    /// APFS does, so `ẞ` and `ss` are one, each applied to the name as given
+    /// and to its NFD form, as APFS decomposes before it folds. Two paths
+    /// sharing any of them collide: refusing a rare pair of names one volume
+    /// keeps apart is safe, and overwriting one is not. APFS also treats
+    /// names equal under Unicode normalization as one, with or without case
+    /// folding; ext4 keeps them apart.
+    fn names(&self, path: &Path) -> Vec<String> {
+        // A group path joins with `/` and the rest with the platform's
+        // separator, so compare components.
+        let name = (path.components())
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let mut names = if self.folds_case {
+            let decomposed = icu_normalizer::DecomposingNormalizer::new_nfd().normalize(&name);
+            [&*name, &*decomposed]
+                .into_iter()
+                .flat_map(|name| {
+                    [
+                        name.to_lowercase(),
+                        name.to_uppercase().to_lowercase(),
+                        icu_casemap::CaseMapper::new()
+                            .fold_string(name)
+                            .into_owned(),
+                    ]
+                })
+                .collect()
+        } else {
+            vec![name]
+        };
+        if self.folds_case || cfg!(target_os = "macos") {
+            let nfc = icu_normalizer::ComposingNormalizer::new_nfc();
+            for name in &mut names {
+                *name = nfc.normalize(name).into_owned();
             }
         }
+        names.sort();
+        names.dedup();
+        names
     }
-    Ok(None)
+
+    fn claim(&mut self, path: &Path, owner: &str, directory: bool, group: bool) -> Result<()> {
+        let names = self.names(path);
+        let mut matched: Vec<usize> = names
+            .iter()
+            .filter_map(|name| self.index.get(name).copied())
+            .collect();
+        matched.sort_unstable();
+        matched.dedup();
+        for &index in &matched {
+            let first = &mut self.claims[index];
+            if first.directory && directory {
+                if first.path == path || first.group || group {
+                    if !group {
+                        first.path = path.to_path_buf();
+                        first.owner = owner.to_string();
+                        first.group = false;
+                    }
+                    continue;
+                }
+            } else if !first.directory && !directory && first.owner == owner {
+                continue;
+            }
+            // Two spellings that share a name differ only in what the
+            // volume folds.
+            return Err(if first.path != path {
+                ExportError::CaseCollision {
+                    first: first.owner.clone(),
+                    second: owner.to_string(),
+                    path: path.to_path_buf(),
+                }
+            } else {
+                ExportError::DestinationCollision {
+                    first: first.owner.clone(),
+                    second: owner.to_string(),
+                    path: path.to_path_buf(),
+                }
+            });
+        }
+        let index = match matched.first() {
+            Some(&index) => index,
+            None => {
+                self.claims.push(DestinationClaim {
+                    path: path.to_path_buf(),
+                    owner: owner.to_string(),
+                    directory,
+                    group,
+                });
+                self.claims.len() - 1
+            }
+        };
+        for name in names {
+            self.index.entry(name).or_insert(index);
+        }
+        Ok(())
+    }
+
+    fn file(&mut self, path: &Path, owner: &str, group_depth: usize) -> Result<()> {
+        let mut prefix = PathBuf::new();
+        let depth = path.components().count();
+        for (index, component) in path.components().enumerate() {
+            prefix.push(component);
+            self.claim(&prefix, owner, index + 1 < depth, index < group_depth)?;
+        }
+        Ok(())
+    }
+
+    fn metadata(&mut self, dir: &Path, group: &str, owner: &str, id: &str) -> Result<()> {
+        let path = dir.join(format!("maven-metadata-{id}.xml"));
+        let depth = group.split('.').count();
+        self.file(&path, owner, depth)?;
+        self.metadata.extend(self.names(&path));
+        // Replacing metadata removes every checksum Maven may have saved.
+        for extension in ["md5", "sha1", "sha256", "sha512"] {
+            self.file(
+                &PathBuf::from(format!("{}.{}", path.display(), extension)),
+                &format!("{owner} .{extension} checksum"),
+                depth,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn metadata_lists(
+        &mut self,
+        dir: &Path,
+        group: &str,
+        coordinate: &str,
+        listed: impl Iterator<Item = String>,
+        empty: &BTreeSet<String>,
+    ) -> Result<()> {
+        let mut written = HashSet::new();
+        for id in listed.filter(|id| is_metadata_repo_id(id)) {
+            let owner = format!("metadata for {coordinate} from repository {id:?}");
+            self.metadata(dir, group, &owner, &id)?;
+            written.insert(if self.folds_case {
+                id.to_lowercase()
+            } else {
+                id
+            });
+        }
+        // A populated list wins over an empty list whose id folds to the same name.
+        for id in empty {
+            let name = if self.folds_case {
+                id.to_lowercase()
+            } else {
+                id.clone()
+            };
+            if written.insert(name) {
+                let owner = format!("empty metadata for {coordinate} from repository {id:?}");
+                self.metadata(dir, group, &owner, id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn planned_destinations(
+    units: &[ExportUnit],
+    optional: &[(ArtifactCoord, Vec<String>)],
+    meta: &MetadataAccumulator,
+    folds_case: bool,
+) -> Result<DestinationPaths> {
+    let mut paths = DestinationPaths {
+        claims: Vec::new(),
+        index: HashMap::new(),
+        metadata: HashSet::new(),
+        cleanup: HashSet::new(),
+        folds_case,
+    };
+    for (key, repo_ids) in units
+        .iter()
+        .map(|unit| (&unit.key, &unit.repo_ids))
+        .chain(optional.iter().map(|(key, ids)| (key, ids)))
+    {
+        let relative = artifact_relative_path(key)?;
+        let owner = key.to_string();
+        let depth = key.group_id().split('.').count();
+        paths.file(&relative, &owner, depth)?;
+        for extension in ["sha1", "sha256"] {
+            paths.file(
+                &PathBuf::from(format!("{}.{}", relative.display(), extension)),
+                &format!("{owner} .{extension} checksum"),
+                depth,
+            )?;
+        }
+        if repo_ids.iter().any(|id| !id.is_empty()) {
+            let dir = relative.parent().expect("artifact directory");
+            paths.file(
+                &dir.join("_remote.repositories"),
+                &format!("repository markers for {}", dir.display()),
+                depth,
+            )?;
+        }
+    }
+    for (key, by_repo) in &meta.artifacts {
+        let dir = PathBuf::from(validate_group_path(&key.group_id)?).join(&key.artifact_id);
+        if !meta.shared {
+            paths.cleanup.extend(paths.names(&dir));
+        }
+        // An artifact id can spell a version directory, so owners name
+        // the coordinate rather than the directory.
+        paths.metadata_lists(
+            &dir,
+            &key.group_id,
+            &format!("{}:{}", key.group_id, key.artifact_id),
+            by_repo
+                .iter()
+                .filter(|(_, state)| !state.is_empty())
+                .map(|(id, _)| id.clone()),
+            &meta.empty_list_ids,
+        )?;
+    }
+    let mut versions: BTreeMap<(&str, &str, &str), BTreeSet<String>> = BTreeMap::new();
+    for (key, state) in &meta.snapshots {
+        if state.timestamp.is_some() && is_metadata_repo_id(&key.repo_id) {
+            versions
+                .entry((&key.group_id, &key.artifact_id, &key.base_version))
+                .or_default()
+                .insert(key.repo_id.clone());
+        }
+    }
+    if !meta.shared {
+        for (group, artifact, version) in &meta.plain_snapshots {
+            versions.entry((group, artifact, version)).or_default();
+        }
+    }
+    let empty = BTreeSet::new();
+    for ((group, artifact, version), ids) in versions {
+        let dir = PathBuf::from(validate_group_path(group)?)
+            .join(artifact)
+            .join(version);
+        if !meta.shared && (meta.replaces_listings || ids.is_empty()) {
+            paths.cleanup.extend(paths.names(&dir));
+        }
+        paths.metadata_lists(
+            &dir,
+            group,
+            &format!("{group}:{artifact}:{version}"),
+            ids.into_iter(),
+            if meta.replaces_listings && !meta.shared {
+                &meta.empty_list_ids
+            } else {
+                &empty
+            },
+        )?;
+    }
+    for claim in &paths.claims {
+        let Some(dir) = claim.path.parent() else {
+            continue;
+        };
+        if !(paths.names(dir).iter()).any(|name| paths.cleanup.contains(name)) {
+            continue;
+        }
+        let name = claim
+            .path
+            .file_name()
+            .expect("destination name")
+            .to_string_lossy();
+        let base = [".md5", ".sha1", ".sha256", ".sha512"]
+            .into_iter()
+            .find_map(|suffix| name.strip_suffix(suffix))
+            .unwrap_or(&name);
+        if base.starts_with("maven-metadata-")
+            && base.ends_with(".xml")
+            && !(paths.names(&dir.join(base)).iter()).any(|name| paths.metadata.contains(name))
+        {
+            return Err(ExportError::DestinationCollision {
+                first: claim.owner.clone(),
+                second: format!("metadata cleanup for {}", dir.display()),
+                path: claim.path.clone(),
+            });
+        }
+    }
+    Ok(paths)
+}
+
+fn reject_destination_collisions(
+    options: &ExportOptions,
+    units: &[ExportUnit],
+    optional: &[(ArtifactCoord, Vec<String>)],
+    meta: &MetadataAccumulator,
+) -> Result<()> {
+    let check = || {
+        planned_destinations(units, optional, meta, false)?;
+        let Err(collision) = planned_destinations(units, optional, meta, true) else {
+            return Ok(());
+        };
+        let root = options
+            .m2_path
+            .ancestors()
+            .find(|ancestor| ancestor.is_dir())
+            .unwrap_or_else(|| Path::new("."));
+        let folds = if options.dry_run {
+            folds_case_without_writing(root)
+        } else {
+            folds_case(root)?
+        };
+        if folds { Err(collision) } else { Ok(()) }
+    };
+    check().map_err(|error| match error {
+        ExportError::CaseCollision {
+            first,
+            second,
+            path,
+        } => ExportError::CaseCollision {
+            first,
+            second,
+            path: options.m2_path.join(path),
+        },
+        ExportError::DestinationCollision {
+            first,
+            second,
+            path,
+        } => ExportError::DestinationCollision {
+            first,
+            second,
+            path: options.m2_path.join(path),
+        },
+        error => error,
+    })
 }
 
 /// Whether `dir` resolves a name that differs from an existing entry only in

@@ -134,6 +134,9 @@ fn digit(ch: char) -> Option<u8> {
 const MAX_NESTING: usize = 256;
 
 fn parse(version: &str) -> Option<Item> {
+    if version.len() > rv_maven_types::MAX_COMPONENT_BYTES {
+        return None;
+    }
     let version = version.to_lowercase();
     let mut stack = Vec::new();
     let mut list = Vec::new();
@@ -168,6 +171,9 @@ fn parse(version: &str) -> Option<Item> {
             }
             numeric = false;
         }
+        if stack.len() > MAX_NESTING {
+            return None;
+        }
     }
     if start < version.len() {
         if !numeric && !list.is_empty() {
@@ -201,8 +207,8 @@ fn trim(text: &str) -> &str {
     text.trim_matches(|ch| ch <= '\u{20}')
 }
 
-/// None means createFromVersionSpec rejects the range, or a version nests
-/// too deeply, allowing the caller to preserve its existing handling.
+/// None means createFromVersionSpec rejects the range, or a version is too
+/// long or nests too deeply, allowing the caller to preserve its existing handling.
 pub(crate) fn contains(version: &str, mut spec: &str) -> Option<bool> {
     let version = parse(version)?;
     let mut matched = false;
@@ -266,6 +272,21 @@ pub(crate) fn contains(version: &str, mut spec: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsing_refuses_versions_over_the_component_limit() {
+        assert!(parse(&format!("{}1", "1.".repeat(127))).is_some());
+        for version in [
+            "1".repeat(256),
+            "1.".repeat(128),
+            "1-".repeat(128),
+            "1a".repeat(128),
+            "é".repeat(128),
+            "1-".repeat(100_000),
+        ] {
+            assert!(parse(&version).is_none());
+        }
+    }
 
     // Recorded with DefaultArtifactVersion and VersionRange from the
     // maven-artifact 3.9.12 jar, including the resolver table's differing rows.
@@ -374,7 +395,7 @@ mod tests {
         assert_eq!(contains(&deep, "[1,2)"), None);
         assert_eq!(contains("1", &format!("[{deep},)")), None);
         assert_eq!(
-            contains(&format!("{}1", "1-".repeat(255)), "[1,2)"),
+            contains(&format!("{}1", "1-".repeat(127)), "[1,2)"),
             Some(true)
         );
     }

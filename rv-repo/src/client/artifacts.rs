@@ -8,8 +8,8 @@ use tracing::warn;
 use rv_maven_types::{ArtifactCoord, BlobId, Digest};
 use rv_store::{Origin, PinCheck, Staged, Store};
 
-use super::RepoClient;
 use super::requests::DeferredWarnings;
+use super::{RepoClient, file_path};
 use crate::artifact::ArtifactRequest;
 use crate::error::{RepoError, Result};
 use crate::fetch::{ArtifactChecks, Transfer, fetch_artifact_staged, publish_artifact};
@@ -187,11 +187,13 @@ impl RepoClient {
 
     /// Download an artifact from `repo`, or the mirror that serves it, into
     /// `store`. The bytes must match the repository's checksum sidecar and
-    /// `options.pin`. A file without a sidecar is accepted when `options.pin`
-    /// is given or the bytes match the pin [`Self::with_lock_pins`] recorded,
-    /// and otherwise only when missing sidecars are allowed. The bytes are
-    /// hashed while they stream and enter the store only after the checks
-    /// pass, so a mismatch leaves no blob and no index row.
+    /// `options.pin`, or without it the pin [`Self::with_lock_pins`]
+    /// recorded for a release file or timestamped snapshot build, unless
+    /// this run updates the lock. A file without a sidecar is accepted when
+    /// one of those pins verifies it, and otherwise only when missing
+    /// sidecars are allowed. The bytes are hashed while they
+    /// stream and enter the store only after the checks pass, so a mismatch
+    /// leaves no blob and no index row.
     pub async fn fetch_artifact(
         &self,
         repo: &crate::Repository,
@@ -244,15 +246,20 @@ impl RepoClient {
         let lookup = |unverified, recorded| {
             store.lookup_artifact_from(key, &repo.url, &endpoint.url, unverified, recorded)
         };
-        if let Some(blob) = lookup(!self.require_checksums, false).await? {
+        if let Some(blob) = lookup(!self.require_checksums, false).await?
+            && self.holds_release_pin(store, key, &blob).await?
+        {
             return Ok(Some(blob));
         }
         // `--update` fetches bytes a restore took without a checksum file
         // again.
-        let Some(pin) = self.lock_pin_for(key).filter(|_| !self.updates()) else {
+        let Some(pin) = self.lock_pin(&file_path(key)).filter(|_| !self.updates()) else {
             return Ok(None);
         };
-        Ok(lookup(true, true).await?.filter(|blob| blob == pin))
+        match lookup(true, true).await? {
+            Some(blob) if holds_pin(store, &blob, pin).await? => Ok(Some(blob)),
+            _ => Ok(None),
+        }
     }
 
     /// The blob `store` holds for `key` as `repo` serves it now, and whether
@@ -279,11 +286,29 @@ impl RepoClient {
             let found = store
                 .lookup_artifact_from(key, &repo.url, &endpoint.url, !verified, false)
                 .await?;
-            if let Some(blob) = found {
+            if let Some(blob) = found
+                && self.holds_release_pin(store, key, &blob).await?
+            {
                 return Ok(Some((blob, verified)));
             }
         }
         Ok(None)
+    }
+
+    /// Whether stored `blob` may stand for `key`: it matches the pin
+    /// raeva.lock gives the release file or timestamped snapshot build, if
+    /// any. Under `--update` too, other bytes are not the repository's answer,
+    /// so the file is fetched again.
+    async fn holds_release_pin(
+        &self,
+        store: &Store,
+        key: &ArtifactCoord,
+        blob: &BlobId,
+    ) -> std::result::Result<bool, rv_store::StoreError> {
+        match self.release_file_pin(&file_path(key)) {
+            Some(pin) => holds_pin(store, blob, pin).await,
+            None => Ok(true),
+        }
     }
 
     /// The endpoint that serves `repo`, or `None` behind a blocked mirror,
@@ -370,6 +395,14 @@ impl RepoClient {
         }
     }
 
+    /// The pin the bytes at `path` must match: the caller's, or the one
+    /// [`Self::release_lock_pin`] names, whichever repository serves them.
+    /// Other bytes would otherwise sit in the store as that repository's
+    /// copy of a coordinate the lock pins.
+    fn required_pin<'a>(&'a self, path: &str, options: FetchArtifact<'a>) -> Option<&'a Digest> {
+        (options.pin).or_else(|| self.release_lock_pin(path))
+    }
+
     async fn fetch_artifact_once(
         &self,
         route: &Route<'_>,
@@ -395,12 +428,15 @@ impl RepoClient {
         if downloaded.into_inner() {
             return Ok((blob, verified));
         }
-        let accepted = match options.pin {
+        let accepted = match self.required_pin(path, options) {
             Some(pin) => holds_pin(store, &blob, pin).await?,
             None => {
                 verified
                     || !self.require_checksums
-                    || self.lock_pin(path).and_then(Digest::as_sha256) == Some(&blob)
+                    || match self.lock_pin(path) {
+                        Some(pin) => holds_pin(store, &blob, pin).await?,
+                        None => false,
+                    }
             }
         };
         if !accepted || !store.exists_async(&blob).await {
@@ -499,9 +535,10 @@ impl RepoClient {
         // of its sidecar: a missing file has no checksum file either.
         let (staged, transfer) = staged?;
         let checksum = checksum.transpose()?;
-        // A pin verifies the bytes without a sidecar: the caller's, or the
-        // one raeva.lock records when the bytes match it.
-        let pinned = options.pin.is_some()
+        // A pin verifies or refuses the bytes without a sidecar: the
+        // required one, or the one raeva.lock records when the bytes match it.
+        let required = self.required_pin(path, options);
+        let pinned = required.is_some()
             || self
                 .lock_pin(path)
                 .and_then(Digest::as_sha256)
@@ -518,7 +555,7 @@ impl RepoClient {
 
         let checks = ArtifactChecks {
             sidecar: checksum.as_ref(),
-            pin: options.pin,
+            pin: required,
             index: options.index,
         };
         let verified = publish_artifact(&url, transfer, store, staged, checks).await?;
@@ -537,7 +574,11 @@ impl RepoClient {
 
 /// Whether `blob` holds the bytes `pin` names: a SHA-256 pin is the blob id,
 /// another algorithm's is checked against the stored file.
-async fn holds_pin(store: &Store, blob: &BlobId, pin: &Digest) -> Result<bool> {
+async fn holds_pin(
+    store: &Store,
+    blob: &BlobId,
+    pin: &Digest,
+) -> std::result::Result<bool, rv_store::StoreError> {
     Ok(match pin.as_sha256() {
         Some(pinned) => pinned == blob,
         None => matches!(store.check_pin_async(blob, pin).await?, PinCheck::Match),

@@ -1,7 +1,7 @@
 //! What a model build reads from outside the POMs: the target platform, the
 //! JDK and the environment variables the user allowed POMs to read.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -275,6 +275,7 @@ impl HostSnapshot {
             java_version,
             target_jdk: false,
             java_home,
+            system_properties: HashMap::new(),
             env,
             host_env: HostEnv(Arc::new(host_env)),
             allowed,
@@ -284,6 +285,13 @@ impl HostSnapshot {
             consulted: Consulted::default(),
             defaulted_java: Warned::default(),
         })
+    }
+
+    /// This snapshot with the JVM properties supplied by the project's launcher options.
+    #[must_use]
+    pub fn with_system_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.0.system_properties = properties;
+        self
     }
 
     /// A snapshot for tests: the allowlisted variables as
@@ -548,6 +556,7 @@ struct EnvironmentInner {
     java_version: Option<String>,
     target_jdk: bool,
     java_home: Option<String>,
+    system_properties: HashMap<String, String>,
     env: BTreeMap<String, String>,
     host_env: HostEnv,
     allowed: BTreeSet<String>,
@@ -838,6 +847,11 @@ impl ModelEnvironment {
     /// A builder that starts from no platform, no JDK and no variable.
     pub fn builder() -> ModelEnvironmentBuilder {
         ModelEnvironmentBuilder::default()
+    }
+
+    /// The JVM properties supplied by the project's launcher options.
+    pub fn system_properties(&self) -> &HashMap<String, String> {
+        &self.inner.system_properties
     }
 
     /// This environment for another target platform.

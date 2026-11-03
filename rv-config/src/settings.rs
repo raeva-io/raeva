@@ -19,7 +19,7 @@ pub enum ProxyAuthType {
 
 /// How long a cached snapshot or metadata answer stays fresh, as Maven's
 /// `<updatePolicy>` names it. The default is `interval:60`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UpdatePolicy {
     /// Check again on every use.
     Always,

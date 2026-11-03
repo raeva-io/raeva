@@ -553,6 +553,29 @@ pub(crate) fn write_transaction<'a>(
     Ok(tx)
 }
 
+/// Whether the database `conn` opens has a table named `name`.
+pub(crate) fn has_table(conn: &rusqlite::Connection, name: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
+    .db_context(|| "failed to read the database schema")
+}
+
+/// Reports that this raeva upgraded the database at `path` from an older
+/// raeva's and dropped `dropped`.
+pub(crate) fn warn_upgraded(path: &Path, dropped: &str) {
+    tracing::warn!(
+        sec_code = "DATABASE_UPGRADED",
+        path = %path.display(),
+        "upgraded {} from an older raeva and dropped {dropped}; the next resolution fetches \
+         what it needs again. raeva 0.5.1 refuses the file now, so give an older raeva its own \
+         RAEVA_HOME",
+        path.display()
+    );
+}
+
 /// Runs `spec.init` on `conn` to the database at `path`, then stamps it
 /// with the spec's generation, unless a newer raeva's generation is there.
 fn set_up(conn: &rusqlite::Connection, path: &Path, spec: Spec) -> Result<()> {

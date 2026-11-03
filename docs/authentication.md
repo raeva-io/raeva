@@ -78,7 +78,9 @@ host and port.
 An entry with an id goes to any repository with that id that your
 configuration or the project's own POMs declare, as in Maven, wherever it
 points. Review the repositories of a project you cloned before you sync it
-with credentials. A repository that a fetched POM (a remote parent, a
+with credentials. A pull request can change the project's POMs, so give a
+job that syncs one no credentials, or a mirror with `<mirrorOf>*</mirrorOf>`
+so that every repository goes through it. A repository that a fetched POM (a remote parent, a
 dependency or an imported BOM) declares with the id gets the entry only
 when its origin (scheme, host and port) is one that a configured
 repository, mirror or `transitive_repository_allowlist` entry, or a

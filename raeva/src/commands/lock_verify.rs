@@ -505,7 +505,8 @@ impl LockVerifyReport {
         }
         if !self.pin_mismatch.is_empty() {
             hints.push(
-                "a repository served other bytes than raeva.lock pins; the store is unchanged"
+                "a repository served other bytes than raeva.lock pins; the store is unchanged. \
+                 Ask the publisher or the mirror's operator why before running 'raeva sync --update'"
                     .to_string(),
             );
         }

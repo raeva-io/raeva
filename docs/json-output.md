@@ -38,7 +38,8 @@ redacted URL, or `null`). Distinct warnings are kept once and sorted.
 whose `context.count` counts the files. Text mode prints one `warning: CODE: ...` line per code
 on stderr at the end: the first warning, and `and N more` when that code
 fired for several things (`'raeva --json <command>' lists them`).
-`AUTH_FALLBACK` prints each refusing/serving repository pair. The text
+`AUTH_FALLBACK` and `REPOSITORY_FALLBACK` print each skipped/serving
+repository pair, naming an example coordinate and counting further files. The text
 summary omits `WEAK_HASH_FALLBACK` and `TRANSITIVE_REPO_DROPPED`. Without
 `-v`, `HTTP_REPO_BLOCKED` for a repository that a dependency's POM declares
 is left out of both.
@@ -162,11 +163,20 @@ removed package); `via_truncated` is true when more exist or a search limit
 was reached. Only the first 500 changes get paths, and `via_limited` is true
 when there were more.
 
+Versions are paired as a `version` change only when each lock records exactly
+one version of the package key in that module. If either side records multiple
+versions, each full coordinate is compared separately, with additions and
+removals for versions present on only one side.
+
 Each `edge_changes` item names `platform`, `module`, `from` and `to` (package
 coordinates as in `changes`), `change` (`added`, `removed`, `scope`, or `optional`),
 and `old` and `new` (scope or boolean strings, or scope and optional details for
 an added or removed edge; `null` when absent). Edges with an added or removed
 endpoint package are covered by that package's row.
+If an endpoint's package key has multiple versions in that module in either
+lock, `from_version` or `to_version` identifies the affected version. These
+fields are absent for endpoints with a single version on both sides. Text
+appends the version to the affected endpoint's name.
 
 Each `pom_changes` item is one POM pin change on a platform both locks
 record: `platform`, `coordinate`, `change` (`pom` for an artifact's POM,
@@ -323,7 +333,7 @@ usual status. `raeva vuln` exits 2 instead of 1, since its 1 means findings.
 | `NOT_FOUND` | 5 or 1 | 5: a repository answered 404. 1: `raeva why` found no path to the coordinate. |
 | `OFFLINE_NOT_CACHED` | 5 | `--offline`, and a needed file is not cached. The hint says to run `raeva sync` online once. |
 | `REPOSITORY` | 5 | Another repository failure, such as invalid metadata, a refused redirect, an address that is not public, or a 500 answer. |
-| `LOCKFILE_MISMATCH` | 7 | `raeva.lock` is valid but out of date for the project, its configuration, a fresh resolution, or the stored files. `hints` gives the update command, usually `raeva sync`. |
+| `LOCKFILE_MISMATCH` | 7 | `raeva.lock` is valid but out of date for the project, its configuration, a fresh resolution, or the stored files. `hints` gives the update command, usually `raeva sync`; when a repository served other bytes than a pin, it says to check with the publisher before `raeva sync --update`. |
 | `DOCTOR_CHECKS_FAILED` | 8, 3, 4, or 1 | `raeva doctor` checks failed: 8 when others passed, 3 when every failure is an authentication, TLS or configuration failure, 4 when every failure is a network failure, and 1 otherwise. |
 | `INTEGRITY` | 9 | A file does not match the checksum the repository publishes next to it. |
 | `STORE` | 1 | The artifact store or the metadata cache failed. |
@@ -353,6 +363,7 @@ A warning does not change the exit status. Codes are stable. Messages may change
 | `CREDENTIAL_DROPPED` | A `settings.xml` password could not be decrypted and was dropped. `context.reason` says why. |
 | `CROSS_HOST_MIRROR` | A mirror on another host serves a repository, so an `[[auth]]` entry without an `id` was not sent. |
 | `DATABASE_RECREATED` | The store index or the metadata cache was damaged or was not an SQLite database, as a partial CI cache restore can leave it, so `raeva` deleted it and started a new one. `context.path` names it. Stored files are still checked against `raeva.lock`; what the lost entries held is hashed or downloaded again. |
+| `DATABASE_UPGRADED` | This `raeva` upgraded the store index or the metadata cache that an older one wrote, and dropped the cached POMs or the record of which repository served each file, which older versions could have kept from before a rejected lock pin. `context.path` names it. The next resolution fetches what it needs again. raeva 0.5.1 refuses the upgraded file; 0.5.0 opens it, and the next 0.5.2 run drops what 0.5.0 cached. |
 | `DEFAULT_CREDENTIAL_WITHHELD` | An `[[auth]]` entry without an `id` was not sent to an origin your own files do not name ([Authentication](authentication.md#precedence)). |
 | `ENV_VALUE_IN_LOCKFILE` | A `raeva.lock` field holds the value of an allowlisted environment variable. |
 | `ENV_VAR_HIDDEN` | A POM reads an environment variable other than `JAVA_HOME` and `PWD` that is set, as `${env.NAME}`, `${NAME}` in the model, or an `env.NAME` activation, and that `allow_env_substitution` does not list, so `raeva` treats it as unset where Maven reads its value. `context.variable` names it; the value is never shown. Allow it in `[security] allow_env_substitution` in `config.toml` if the value may be public. |
@@ -365,7 +376,7 @@ A warning does not change the exit status. Codes are stable. Messages may change
 | `ID_CREDENTIAL_WITHHELD` | An id credential was not sent to a repository a fetched POM declares, on an origin neither your configuration nor the project's POMs name ([Authentication](authentication.md#precedence)). |
 | `JAVA_VERSION_DEFAULTED` | A POM, a `settings.xml` profile or a `.mvn/maven.config` value reads `java.version` where it can change resolution, and neither `JAVA_HOME` nor `JAVA_VERSION` names a JDK, so `raeva` used 17. `context.pom` names the POM when a POM profile condition read it. Set `JAVA_HOME`, or list the JDKs in `[lock] jdks`. |
 | `JDK_NOT_LOCKED` | `raeva sync` ran on a host JDK that matches no entry in `[lock] jdks`. It resolved the listed JDKs. |
-| `LISTING_REPO_SKIPPED` | A version range, `RELEASE` or `LATEST` was resolved without a repository that failed, other than with a 404 or a 401 or 403 (which `AUTH_FALLBACK` reports), while another repository answered. |
+| `LISTING_REPO_SKIPPED` | A version range, `RELEASE` or `LATEST` was resolved without a repository that failed, other than with a 404 or a failure reported by `AUTH_FALLBACK` or `REPOSITORY_FALLBACK`, while another repository answered. |
 | `LOCKFILE_REGENERATED` | `raeva sync` replaced a `raeva.lock` it cannot read, such as an older schema or one with merge conflict markers, keeping the platforms it names. The message says whether the change list compares with the `raeva.lock` at git `HEAD`. |
 | `LOW_DISK_SPACE` | Less than 100 MiB free on the store volume. |
 | `METADATA_CHECKSUM_MISMATCH` | `maven-metadata.xml` still mismatched its checksum after a second download, and the repository's checksum policy accepted it. |
@@ -376,6 +387,7 @@ A warning does not change the exit status. Codes are stable. Messages may change
 | `PROJECT_LOCAL_REPOSITORY_IGNORED` | `raeva export-m2` ignored `local_repository` in the project `raeva.toml`, or `-Dmaven.repo.local` in `.mvn/maven.config`. |
 | `PROJECT_REPO_URL_FROM_FETCHED_POM` | A project POM repository URL comes from a fetched parent, so the repository has that parent's trust. |
 | `PROJECT_SECURITY_WIDENING_IGNORED` | Project `raeva.toml` set `[security]` wider than the user `config.toml`. That part was ignored. |
+| `REPOSITORY_FALLBACK` | A later repository served files after an earlier repository was unreachable or returned a non-retried 5xx response. One warning per repository pair names an example coordinate, the reason and the serving repository, and counts further files. Check the connection (VPN) or repository before committing `raeva.lock`. `context` holds `skipped`, `skipped_endpoint`, `serving`, `serving_endpoint`, `reason`, `coordinate` and an example `file`. |
 | `REPO_URL_SECRET_REFUSED` | A fetched POM's repository URL has userinfo, a query, or a fragment, or the value of an input named like a secret in its path (see [Configuration](configuration.md#repositories-and-mirrors)), which may hold a credential. Ignored, and the URL is not shown. `context` holds `repository` (the id) and `declared_by` (the declaring POM, when known). |
 | `SETTING_IGNORED` | An unusable setting was ignored: an environment variable such as `RAEVA_MAX_ARTIFACT_SIZE`, `RAEVA_HOME`, `SSL_CERT_FILE`, or `SSL_CERT_DIR` with a value `raeva` cannot use; `settings-security.xml` that is not valid XML; a `settings.xml` proxy protocol other than `http`, `https`, or `all`; a `<mirrorOf>` pattern Maven does not know; `-s` or `-gs` in `.mvn/maven.config`, since a project cannot choose the settings file; `-pl`, `-am` or `-amd` there, since `raeva` locks the whole reactor; or an `rv.toml` or `rv.lock`, the names older releases used, where no `raeva.toml` or `raeva.lock` exists. `context.env` names the variable. |
 | `STORE_FILE_REFETCHED` | A stored locked file did not match its `raeva.lock` checksum and was downloaded again. Every mode reports it, including `--frozen`. |

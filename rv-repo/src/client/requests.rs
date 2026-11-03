@@ -1,7 +1,6 @@
 //! Single requests on a route: one file, or the checksum sidecar of one.
 
 use bytes::Bytes;
-use rv_config::redact_url;
 use rv_maven_types::{Digest, HashAlgorithm};
 use tracing::warn;
 
@@ -47,7 +46,8 @@ impl RepoClient {
         // has answered 404 for a `.sha256`, since another 404 is then likely
         // and costs a round trip before the fallback. The answers are still
         // taken in preference order.
-        let origin = redact_url(&repo.url).to_string();
+        // A key, not shown: redaction could make two mirrors look alike.
+        let origin = repo.url.clone();
         let request = |algorithm: HashAlgorithm| async move {
             let checksum_url = repo.url_for_path(&format!("{path}.{}", algorithm.as_str()))?;
             fetch_text(

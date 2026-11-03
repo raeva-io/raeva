@@ -55,7 +55,7 @@ pub(super) async fn fetch_artifact_from_repos(
     key: &ArtifactCoord,
     repos: &[Repository],
 ) -> std::result::Result<(BlobId, rv_store::Origin), FetchError> {
-    let mut fallback = rv_repo::AuthFallback::default();
+    let mut fallback = rv_repo::RepositoryFallback::default();
     let mut last_error: Option<RepoError> = None;
     let mut searched: Vec<RepoSearchStatus> = Vec::with_capacity(repos.len());
 
@@ -97,7 +97,7 @@ pub(super) async fn fetch_artifact_from_repos(
                 return Ok((fetched.blob, origin));
             }
             Err(err) => {
-                fallback.refused(&client.effective_repository(repo), &err);
+                fallback.failed(&client.effective_repository(repo), &err);
                 searched.push(RepoSearchStatus::from_fetch_error(repo, &err, |repo| {
                     client.effective_repository(repo)
                 }));

@@ -27,8 +27,10 @@ use serde_json::Value;
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum WarningCode {
     AuthFallback,
+    RepositoryFallback,
     /// A version listing left out a repository that failed, other than with
-    /// a 404 or a 401 or 403 refusal, while another repository answered.
+    /// a 404 or a failure covered by a fallback warning, while another
+    /// repository answered.
     ListingRepoSkipped,
     /// raeva accepted remote metadata under the repository policy although its
     /// checksum still did not match after a retry.
@@ -39,6 +41,9 @@ pub(crate) enum WarningCode {
     /// The store index or the metadata cache was damaged or not SQLite, so
     /// raeva deleted it and started a new one.
     DatabaseRecreated,
+    /// This raeva upgraded the store index or the metadata cache from an
+    /// older raeva's and dropped what it can no longer trust.
+    DatabaseUpgraded,
     /// A credential configured for a repository id was not sent to a
     /// repository a fetched POM declared, on an origin neither the
     /// configuration nor the project's POMs name.
@@ -214,19 +219,45 @@ impl WarningCollector {
                 weak.push(warning.clone());
                 return false;
             }
-            if warning.code != WarningCode::AuthFallback {
+            if !matches!(
+                warning.code,
+                WarningCode::AuthFallback | WarningCode::RepositoryFallback
+            ) {
                 return true;
             }
             let context = &warning.context;
-            let (Some(refusing), Some(serving), Some(file)) = (
-                context["refusing_endpoint"].as_str(),
+            let skipped_endpoint = if warning.code == WarningCode::AuthFallback {
+                "refusing_endpoint"
+            } else {
+                "skipped_endpoint"
+            };
+            let (Some(skipped), Some(serving), Some(file)) = (
+                context[skipped_endpoint].as_str(),
                 context["serving_endpoint"].as_str(),
                 context["file"].as_str(),
             ) else {
                 return true;
             };
+            // Two mirrors can show one masked endpoint; their ids tell them apart.
+            let skipped_name = if warning.code == WarningCode::AuthFallback {
+                "refusing"
+            } else {
+                "skipped"
+            };
+            let names = (
+                context[skipped_name]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                context["serving"].as_str().unwrap_or_default().to_string(),
+            );
             fallbacks
-                .entry((refusing.to_string(), serving.to_string()))
+                .entry((
+                    warning.code,
+                    skipped.to_string(),
+                    serving.to_string(),
+                    names,
+                ))
                 .or_insert_with(|| (warning.clone(), BTreeSet::new()))
                 .1
                 .insert(file.to_string());
@@ -234,7 +265,6 @@ impl WarningCollector {
         });
         for (mut warning, files) in fallbacks.into_values() {
             let context = &warning.context;
-            let refusing = context["refusing"].as_str().unwrap_or("unknown");
             let serving = context["serving"].as_str().unwrap_or("unknown");
             let coordinate = context["coordinate"].as_str().unwrap_or("unknown");
             let more = match files.len() {
@@ -242,17 +272,28 @@ impl WarningCollector {
                 2 => " (and 1 more file)".to_string(),
                 count => format!(" (and {} more files)", count - 1),
             };
-            let unset: Vec<String> = context["unset_variables"]
-                .as_str()
-                .map(|names| names.split(',').map(str::to_string).collect())
-                .unwrap_or_default();
-            let unset = crate::error::report::unset_variables_note(&unset)
-                .map(|note| format!(" {note}."))
-                .unwrap_or_default();
-            warning.message = format!(
-                "Repository `{refusing}` refused {coordinate} (HTTP {}){more}; using the copy from `{serving}`.{unset} Check the credentials for `{refusing}` if the file should come from there.",
-                context["status"]
-            );
+            warning.message = if warning.code == WarningCode::RepositoryFallback {
+                let skipped = context["skipped"].as_str().unwrap_or("unknown");
+                let reason = context["reason"]
+                    .as_str()
+                    .unwrap_or("repository unreachable");
+                format!(
+                    "Repository `{skipped}` failed for {coordinate} ({reason}){more}; using the copy from `{serving}`. The versions and repositories a resolution picks can depend on that, so check the connection (VPN) or repository `{skipped}` before committing raeva.lock."
+                )
+            } else {
+                let refusing = context["refusing"].as_str().unwrap_or("unknown");
+                let unset: Vec<String> = context["unset_variables"]
+                    .as_str()
+                    .map(|names| names.split(',').map(str::to_string).collect())
+                    .unwrap_or_default();
+                let unset = crate::error::report::unset_variables_note(&unset)
+                    .map(|note| format!(" {note}."))
+                    .unwrap_or_default();
+                format!(
+                    "Repository `{refusing}` refused {coordinate} (HTTP {}){more}; using the copy from `{serving}`.{unset} Check the credentials for `{refusing}` if the file should come from there.",
+                    context["status"]
+                )
+            };
             entries.insert(
                 (
                     warning.code,
@@ -326,8 +367,9 @@ impl WarningCollector {
     }
 }
 
-/// One line per warning code, except `AUTH_FALLBACK` prints each repository
-/// pair, each starting with `warning: `, in code order, from the distinct
+/// One line per warning code, except `AUTH_FALLBACK` and
+/// `REPOSITORY_FALLBACK` print each repository pair, each starting with
+/// `warning: `, in code order, from the distinct
 /// warnings [`WarningCollector::take`] returns. A
 /// code raised once prints its message and context; a code raised for
 /// several things prints one line with a count, and `--json` lists each.
@@ -352,7 +394,10 @@ pub(crate) fn summarize(warnings: &[Warning], list_all: &str) -> Vec<String> {
     groups
         .into_iter()
         .flat_map(|(code, group)| {
-            if code == WarningCode::AuthFallback {
+            if matches!(
+                code,
+                WarningCode::AuthFallback | WarningCode::RepositoryFallback
+            ) {
                 return group
                     .into_iter()
                     .map(|warning| format!("warning: {code}: {}", warning.message))
@@ -542,6 +587,124 @@ mod tests {
     use super::WarningCode;
 
     #[test]
+    fn repository_fallback_counts_files_per_pair_and_preserves_auth_fallback() {
+        use super::{WarningCollector, WarningCollectorLayer, summarize};
+        use tracing_subscriber::layer::SubscriberExt;
+        let collector = std::sync::Arc::new(WarningCollector::default());
+        let sink = collector.clone();
+        let subscriber =
+            tracing_subscriber::registry().with(WarningCollectorLayer::new(move |warning| {
+                sink.push(warning)
+            }));
+        rv_test_support::with_default(subscriber, || {
+            for (skipped, serving, status, file) in [
+                ("corp", "central", 500, "lib.pom"),
+                ("corp", "central", 500, "lib.pom"),
+                ("corp", "central", 501, "lib.jar"),
+                ("other", "central", 500, "lib.jar"),
+                ("corp", "backup", 500, "lib.jar"),
+                ("corp", "central", 401, "lib.pom"),
+            ] {
+                let mut fallback = rv_repo::RepositoryFallback::default();
+                fallback.failed(
+                    &rv_repo::Repository::new(
+                        Some(skipped.to_string()),
+                        format!("https://{skipped}.example/"),
+                        true,
+                        false,
+                    ),
+                    &rv_repo::RepoError::HttpStatus {
+                        status: reqwest::StatusCode::from_u16(status).unwrap(),
+                        url: "https://corp.example/lib".to_string(),
+                        retry_after: None,
+                    },
+                );
+                fallback.served(
+                    &rv_repo::Repository::new(
+                        Some(serving.to_string()),
+                        format!("https://{serving}.example/"),
+                        true,
+                        false,
+                    ),
+                    &rv_repo::ArtifactRequest::new("g", "lib", "1"),
+                    file.to_string(),
+                );
+            }
+        });
+        let warnings = collector.take();
+        assert_eq!(warnings.len(), 4);
+        assert_eq!(warnings[0].code, WarningCode::AuthFallback);
+        let fallbacks = &warnings[1..];
+        assert!(fallbacks.iter().all(|warning| {
+            warning.to_json()["code"] == "REPOSITORY_FALLBACK"
+                && warning.message.contains("HTTP 50")
+                && warning.message.contains("g:lib:1")
+                && warning.message.contains("VPN")
+                && warning.message.contains("before committing raeva.lock")
+        }));
+        let corp = fallbacks
+            .iter()
+            .find(|warning| {
+                warning.context["skipped"] == "corp" && warning.context["serving"] == "central"
+            })
+            .unwrap();
+        assert!(corp.message.contains("and 1 more file"), "{}", corp.message);
+        assert_eq!(summarize(fallbacks, "list them").len(), 3);
+    }
+
+    #[test]
+    fn mirrors_that_mask_alike_keep_their_own_fallback_warnings() {
+        use super::{WarningCollector, WarningCollectorLayer};
+        use tracing_subscriber::layer::SubscriberExt;
+        for token in ["tokC-81", "tokD-82"] {
+            rv_config::register_masked_url(
+                &format!("https://mask.example/{token}/m2/"),
+                "https://mask.example/***/m2/",
+            );
+        }
+        let collector = std::sync::Arc::new(WarningCollector::default());
+        let sink = collector.clone();
+        let subscriber =
+            tracing_subscriber::registry().with(WarningCollectorLayer::new(move |warning| {
+                sink.push(warning)
+            }));
+        rv_test_support::with_default(subscriber, || {
+            for (id, token) in [("c", "tokC-81"), ("d", "tokD-82")] {
+                let mut fallback = rv_repo::RepositoryFallback::default();
+                fallback.failed(
+                    &rv_repo::Repository::new(
+                        Some(id.to_string()),
+                        format!("https://mask.example/{token}/m2/"),
+                        true,
+                        false,
+                    ),
+                    &rv_repo::RepoError::HttpStatus {
+                        status: reqwest::StatusCode::from_u16(500).unwrap(),
+                        url: "https://mask.example/lib".to_string(),
+                        retry_after: None,
+                    },
+                );
+                fallback.served(
+                    &rv_repo::Repository::new(
+                        Some("central".to_string()),
+                        "https://central.example/".to_string(),
+                        true,
+                        false,
+                    ),
+                    &rv_repo::ArtifactRequest::new("g", "lib", "1"),
+                    "lib.jar".to_string(),
+                );
+            }
+        });
+        let warnings = collector.take();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().all(|warning| {
+            let json = warning.to_json().to_string();
+            !json.contains("tokC-81") && !json.contains("tokD-82")
+        }));
+    }
+
+    #[test]
     fn auth_fallback_counts_distinct_files_and_keeps_each_repository_pair() {
         use super::{WarningCollector, WarningCollectorLayer, summarize};
         use tracing_subscriber::layer::SubscriberExt;
@@ -559,8 +722,8 @@ mod tests {
                 ("corp", 401, "lib.jar"),
                 ("other", 403, "lib.jar"),
             ] {
-                let mut fallback = rv_repo::AuthFallback::default();
-                fallback.refused(
+                let mut fallback = rv_repo::RepositoryFallback::default();
+                fallback.failed(
                     &rv_repo::Repository::new(
                         Some(refusing.to_string()),
                         format!("https://{refusing}.example/"),

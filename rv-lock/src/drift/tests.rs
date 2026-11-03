@@ -406,7 +406,7 @@ fn system_file_drift_accepts_a_relative_lock_root() {
 }
 
 #[test]
-fn only_a_release_file_with_other_bytes_is_repinned() {
+fn only_a_fixed_file_with_other_bytes_is_repinned() {
     let repinned = |old: &str, new: &str| {
         let fresh = linux_lock(new, '2');
         let paths = linux_lock(old, '1').repinned_releases(&fresh);
@@ -414,6 +414,12 @@ fn only_a_release_file_with_other_bytes_is_repinned() {
     };
     assert_eq!(repinned("1", "1"), ["com/example/a/1/a-1.jar"]);
     assert!(repinned("1", "2").is_empty());
+    let timestamped = "1-20260101.010101-1";
+    assert_eq!(
+        repinned(timestamped, timestamped),
+        ["com/example/a/1-SNAPSHOT/a-1-20260101.010101-1.jar"]
+    );
+    assert!(repinned(timestamped, "1-20260101.010101-2").is_empty());
     for snapshot in ["1-SNAPSHOT", "1SNAPSHOT", "SNAPSHOT"] {
         assert!(repinned(snapshot, snapshot).is_empty(), "{snapshot}");
     }

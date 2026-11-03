@@ -128,6 +128,58 @@ impl CommandLine {
 /// The user property that sets `mvn`'s local repository.
 pub const LOCAL_REPOSITORY_PROPERTY: &str = "maven.repo.local";
 
+/// The `-D` tokens passed to the JVM from whitespace-separated launcher
+/// options, without the names the JVM sets itself.
+pub(crate) fn jvm_properties(content: &str) -> HashMap<String, String> {
+    content
+        .split_whitespace()
+        .filter_map(|token| token.strip_prefix("-D"))
+        .filter(|property| !property.is_empty())
+        .map(|property| property.split_once('=').unwrap_or((property, "")))
+        .filter(|(name, _)| !jvm_fixed(name))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+/// A system property that JDK 17 and newer keep at their own value whatever
+/// `-D` says, or that the `mvn` launcher sets after `.mvn/jvm.config`.
+fn jvm_fixed(name: &str) -> bool {
+    matches!(
+        name,
+        "java.version"
+            | "java.version.date"
+            | "java.vendor"
+            | "java.vendor.url"
+            | "java.vendor.url.bug"
+            | "java.class.version"
+            | "java.class.path"
+            | "java.vm.version"
+            | "java.vm.name"
+            | "java.vm.vendor"
+            | "java.vm.info"
+            | "java.vm.compressedOopsMode"
+            | "java.vm.specification.version"
+            | "java.vm.specification.name"
+            | "java.vm.specification.vendor"
+            | "java.specification.version"
+            | "java.specification.name"
+            | "java.specification.vendor"
+            | "java.runtime.version"
+            | "java.runtime.name"
+            | "jdk.debug"
+            | "native.encoding"
+            | "sun.jnu.encoding"
+            | "sun.java.launcher"
+            | "sun.java.command"
+            | "sun.boot.library.path"
+            | "sun.management.compiler"
+            | "classworlds.conf"
+            | "maven.home"
+            | "library.jansi.path"
+            | "maven.multiModuleProjectDirectory"
+    )
+}
+
 /// The name of a `-D` value, as `MavenCli` splits it.
 fn define_name(define: &str) -> &str {
     match define.find('=') {
@@ -447,7 +499,7 @@ pub fn parse_for(
     let profiles = command_line.profiles.iter().chain(&written.profiles);
     let mut options = MavenConfigOptions::default();
     let system_properties =
-        ActivationContext::new(environment.clone()).platform_system_properties();
+        ActivationContext::new(environment.clone()).activation_system_properties();
     let mut raw = PropertyMap::new();
     for (name, value) in &system_properties {
         raw.insert(name, value);
@@ -543,7 +595,7 @@ pub fn settings_file(
     let options = parse_for(None, command_line, &environment.detached(), project_root)?;
     let mut session = PropertyMap::new();
     let system_properties =
-        ActivationContext::new(environment.clone()).platform_system_properties();
+        ActivationContext::new(environment.clone()).activation_system_properties();
     for (name, value) in &system_properties {
         session.insert(name, value);
     }
@@ -668,6 +720,32 @@ fn written_values(content: &str) -> Result<Written, MavenConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jvm_options_are_whitespace_separated_system_properties() {
+        assert_eq!(
+            jvm_properties("-Xmx256m\n-Dflag -Dempty=\t-Dvalue=one=two\r\n-Dvalue=last -ea"),
+            HashMap::from([
+                ("flag".to_string(), String::new()),
+                ("empty".to_string(), String::new()),
+                ("value".to_string(), "last".to_string()),
+            ])
+        );
+        assert_eq!(jvm_properties("-Dvalue=one=two")["value"], "one=two");
+        assert_eq!(
+            jvm_properties(
+                "-Djava.version=1.4 -Djava.vm.version=1 -Djdk.debug=fastdebug -Dos.name=Other \
+                 -Duser.dir=/chosen -Djava.vm.custom=2 -Dline.separator=X \
+                 -Dmaven.multiModuleProjectDirectory=/other"
+            ),
+            HashMap::from([
+                ("os.name".to_string(), "Other".to_string()),
+                ("line.separator".to_string(), "X".to_string()),
+                ("user.dir".to_string(), "/chosen".to_string()),
+                ("java.vm.custom".to_string(), "2".to_string()),
+            ])
+        );
+    }
 
     /// A lookup record encodes as it did before a model field joined it
     /// unset, so the names a lock lists keep their spelling.

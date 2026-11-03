@@ -331,7 +331,7 @@ mod workspace_resolution {
             assert_eq!(
                 pins.get(&format!("p/nat/1.0-SNAPSHOT/nat-{build1}.pom"))
                     .map(|(pin, _)| pin),
-                Some(&BlobId::from_bytes(&pom))
+                Some(&rv_maven_types::Digest::Sha256(BlobId::from_bytes(&pom)))
             );
             assert!(!pins.contains_key(&format!("p/nat/1.0-SNAPSHOT/nat-{build2}.pom")));
             let empty = Store::open(&dir.path().join("restored")).unwrap();

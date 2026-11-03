@@ -10,7 +10,7 @@ use std::fmt;
 /// Longest component accepted, in bytes. Most file systems cap one path
 /// component at 255 bytes, and a component becomes a directory or a file
 /// name in the Maven repository layout.
-const MAX_COMPONENT_BYTES: usize = 255;
+pub const MAX_COMPONENT_BYTES: usize = 255;
 
 /// Which part of a coordinate a value is, which decides the rules it gets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

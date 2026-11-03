@@ -110,6 +110,7 @@ pub(crate) struct MetadataKey {
     /// and credential.
     repo_id: Option<Arc<str>>,
     checksum_fail: bool,
+    update_policy: rv_config::UpdatePolicy,
 }
 
 impl MetadataKey {
@@ -120,6 +121,7 @@ impl MetadataKey {
             artifact_id,
             repo_id: None,
             checksum_fail: false,
+            update_policy: rv_config::UpdatePolicy::Daily,
         }
     }
 
@@ -130,6 +132,11 @@ impl MetadataKey {
 
     pub(crate) fn with_checksum_policy(mut self, policy: rv_config::ChecksumPolicy) -> Self {
         self.checksum_fail = policy == rv_config::ChecksumPolicy::Fail;
+        self
+    }
+
+    pub(crate) fn with_update_policy(mut self, policy: rv_config::UpdatePolicy) -> Self {
+        self.update_policy = policy;
         self
     }
 }

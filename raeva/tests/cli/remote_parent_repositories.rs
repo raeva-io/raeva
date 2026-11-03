@@ -237,6 +237,67 @@ fn a_project_repository_url_from_a_remote_parents_property_gets_the_parents_trus
     );
 }
 
+#[test]
+fn a_project_repository_url_through_a_local_model_field_gets_the_parents_trust() {
+    let repository = tempfile::tempdir().expect("parent repository");
+    let parent = repository.path().join("com/example/corp-parent/1.0");
+    std::fs::create_dir_all(&parent).expect("create parent directory");
+    std::fs::write(
+        parent.join("corp-parent-1.0.pom"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+         <artifactId>corp-parent</artifactId><version>1.0</version><packaging>pom</packaging>\
+         <properties><host>localhost</host></properties></project>",
+    )
+    .expect("write parent POM");
+    let configured = url::Url::from_directory_path(repository.path())
+        .expect("repository URL")
+        .to_string();
+    for field in ["artifactId", "packaging"] {
+        let project = project(
+            &configured,
+            Some(&format!("http://${{project.{field}}}:9/declared/")),
+        );
+        let pom = project.path().join("pom.xml");
+        let original = std::fs::read_to_string(&pom).expect("read pom.xml");
+        let fields = if field == "artifactId" {
+            "<artifactId>${host}</artifactId>"
+        } else {
+            "<artifactId>app</artifactId><packaging>${host}</packaging>"
+        };
+        std::fs::write(
+            &pom,
+            original.replace("<artifactId>app</artifactId>", fields),
+        )
+        .expect("write pom.xml");
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir(home.path().join(".m2")).expect("create .m2");
+        std::fs::write(
+            home.path().join(".m2/settings.xml"),
+            "<settings><servers><server><id>own</id><username>ci</username>\
+             <password>private-password</password></server></servers></settings>",
+        )
+        .expect("write settings.xml");
+
+        let output = sync(&project, &home);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_status(&output, 5, &format!("repository URL through {field}"));
+        for warning in [
+            "PROJECT_REPO_URL_FROM_FETCHED_POM",
+            "ID_CREDENTIAL_WITHHELD",
+        ] {
+            assert!(stderr.contains(warning), "{field}: {stderr}");
+        }
+        assert!(
+            stderr.contains("target address is not globally routable"),
+            "{field}: {stderr}"
+        );
+        assert!(
+            !project.path().join("raeva.lock").exists(),
+            "{field}: {stderr}"
+        );
+    }
+}
+
 /// A fresh clone's plain sync restores a lock whose artifact comes from a
 /// repository only the remote parent declares, and does not resolve it
 /// again: a newer version in range does not replace the locked one.

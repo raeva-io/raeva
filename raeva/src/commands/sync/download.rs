@@ -70,7 +70,8 @@ pub(super) async fn ensure_artifacts(
     Ok(())
 }
 
-/// Refuse a resolution that pins a release file of `lock` to other bytes.
+/// Refuse a resolution that pins a release file or timestamped snapshot
+/// build of `lock` to other bytes.
 /// Only `sync --update` accepts them, as it does for a download.
 pub(super) fn check_repinned(lock: &Lockfile, fresh: &Lockfile) -> Result<()> {
     let lines: Vec<_> = (lock.repinned_releases(fresh).into_iter())
@@ -90,7 +91,10 @@ fn replaced_files(details: String) -> CliError {
     CliError::lockfile_mismatch_with(
         details,
         format!(
-            "If the repository replaced these files on purpose, run '{}' to lock the new bytes",
+            "Ask the publisher, or the operator of the mirror, why the bytes changed: a \
+             republished release, a mirror that rewrites files, and tampering look the same \
+             here. If the new bytes are intended, run '{}' and review the changes to \
+             raeva.lock before committing it",
             command_line("sync --update")
         ),
     )

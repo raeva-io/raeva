@@ -356,9 +356,12 @@ mod tests {
             .await;
             let made = made.load(Ordering::SeqCst);
             assert!(attempts.contains(&made), "{made} attempts");
-            let elapsed = start.elapsed().as_millis();
+            // Each sleep ends on the next millisecond tick, so the waits a
+            // budget admits can add up to one more millisecond per retry.
+            let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap();
+            let rounding = u64::try_from(made - 1).unwrap();
             assert!(
-                waited.contains(&u64::try_from(elapsed).unwrap()),
+                *waited.start() <= elapsed && elapsed <= waited.end() + rounding,
                 "{elapsed} ms"
             );
             assert_eq!(result.is_ok(), failure(made - 1).is_none(), "{result:?}");

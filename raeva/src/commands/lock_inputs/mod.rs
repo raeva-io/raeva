@@ -45,7 +45,7 @@ pub(crate) fn resolution_inputs(
             _ => None,
         })
         .collect();
-    let user_properties = config.user_property_values(&names);
+    let user_properties = config.user_property_inputs(&names);
     Ok(ResolutionInputs {
         profile_selections: config.maven_profile_selections(),
         active_profiles: explicit.active_profiles().to_vec(),
@@ -86,17 +86,20 @@ pub(crate) fn resolution_inputs(
             .map(|(id, content)| SettingsProfileInput { id, content })
             .collect(),
         // An active settings.xml profile sets a listed property that no `-D`
-        // sets, whether or not the lock lists it as a settings property.
+        // sets, whether or not the lock lists it as a settings property. It
+        // ranks above `.mvn/jvm.config`, so a value from there alone still
+        // leaves it to check.
         ambient: (ambient.iter())
             .flat_map(|name| {
-                let value = match name {
-                    AmbientInput::UserProperty(name) => {
-                        user_properties.get(name).cloned().flatten()
-                    }
-                    _ => current_value(config, name),
+                let (value, overridden) = match name {
+                    AmbientInput::UserProperty(name) => match user_properties.get(name) {
+                        Some(inputs) => (inputs.hash_value(), inputs.defined()),
+                        None => (None, false),
+                    },
+                    _ => (current_value(config, name), false),
                 };
                 let settings = settings_companion(name)
-                    .filter(|settings| value.is_none() && !ambient.contains(settings))
+                    .filter(|settings| !overridden && !ambient.contains(settings))
                     .map(|settings| {
                         let value = current_value(config, &settings);
                         (settings, value)
@@ -258,8 +261,9 @@ pub(crate) fn consulted_ambient(
                 Some(None) => {
                     return Err(refuse(
                         "a <file> condition in its models names a project file raeva.lock \
-                         cannot record: a path over 256 characters, one ending in `/.`, or \
-                         one that is not valid UTF-8"
+                         cannot record: a path over 256 characters, one ending in `/.`, one \
+                         that is not valid UTF-8, or one that leaves the project and comes \
+                         back to another directory"
                             .to_string(),
                     ));
                 }
@@ -343,6 +347,18 @@ fn project_file(roots: &[Option<PathBuf>], text: &str) -> Option<Option<AmbientI
         .iter()
         .flatten()
         .find(|root| normalized.starts_with(root))?;
+    // A symlink in the project can lead the path out of it.
+    if let Ok(target) = rv_fs::canonicalize_existing_prefix(path)
+        && !roots.iter().flatten().any(|root| {
+            target.starts_with(root)
+                || rv_fs::canonicalize_existing_prefix(root)
+                    .is_ok_and(|root| target.starts_with(root))
+        })
+    {
+        return None;
+    }
+    // A path that does not start with the root is refused: the steps from
+    // the root to where it does start would have to be guessed.
     let names: Option<Vec<&str>> = path.strip_prefix(root).ok().and_then(|relative| {
         relative
             .components()
@@ -352,6 +368,41 @@ fn project_file(roots: &[Option<PathBuf>], text: &str) -> Option<Option<AmbientI
                 _ => None,
             })
             .collect()
+    });
+    // A path that leaves the root by name and comes back, such as
+    // `${project.basedir}/../project/marker.txt`, is recorded without the
+    // way out and back, when the filesystem resolves that, from where the
+    // path stands, back to where it stands. The rest stays as written, for the filesystem to
+    // resolve as it did here.
+    let names = names.and_then(|names| {
+        let canonical = rv_fs::canonicalize_existing_prefix;
+        let mut kept = Vec::new();
+        let mut detour = Vec::new();
+        let mut depth = 0usize;
+        for name in names {
+            if !detour.is_empty() {
+                detour.push(name);
+                let level: isize = detour
+                    .iter()
+                    .map(|name| if *name == ".." { -1 } else { 1 })
+                    .sum();
+                let base = root.join(kept.join("/"));
+                let resolved = base.join(detour.join("/"));
+                // Windows resolves `..` by name, so every step must exist for
+                // the path to mean the same on other systems.
+                let steps_exist =
+                    (1..=detour.len()).all(|steps| base.join(detour[..steps].join("/")).is_dir());
+                if level == 0 && steps_exist && canonical(&resolved).ok() == canonical(&base).ok() {
+                    detour.clear();
+                }
+            } else if name == ".." && depth == 0 {
+                detour.push(name);
+            } else {
+                depth = if name == ".." { depth - 1 } else { depth + 1 };
+                kept.push(name);
+            }
+        }
+        detour.is_empty().then_some(kept)
     });
     if names.as_ref().is_some_and(Vec::is_empty) {
         return None;
@@ -432,9 +483,9 @@ fn current_value(config: &Config, name: &AmbientInput) -> Option<String> {
         AmbientInput::SettingsProperty(name) => config.settings_property_value(name),
         AmbientInput::UserPropertyLookup(template) => config.user_property_lookup_value(template),
         AmbientInput::UserProperty(name) => config
-            .user_property_values(&BTreeSet::from([name.clone()]))
+            .user_property_inputs(&BTreeSet::from([name.clone()]))
             .remove(name)
-            .flatten(),
+            .and_then(|inputs| inputs.hash_value()),
         AmbientInput::Condition { condition, .. } => {
             condition_holds(config, condition).map(|holds| holds.to_string())
         }
@@ -475,10 +526,10 @@ pub(crate) fn command_line_names(
 
 fn option_names(config: &Config, names: &BTreeSet<String>) -> BTreeSet<String> {
     let command_line = config.command_line();
-    let properties = config.user_property_values(names);
+    let properties = config.user_property_inputs(names);
     let defines = properties
         .iter()
-        .filter(|(_, value)| value.is_some())
+        .filter(|(_, inputs)| inputs.is_set())
         .map(|(name, _)| format!("-D{name}"));
     let profiles = (command_line.profiles.iter())
         .flat_map(|list| list.split(','))
@@ -530,7 +581,9 @@ fn command_line_change(config: &Config, lock: &Lockfile) -> Option<String> {
     }
     (!clauses.is_empty()).then(|| {
         format!(
-            "{}; pass the same options, or run 'raeva sync' with these to relock",
+            "{}; set them as raeva.lock was written (on the command line or in \
+             .mvn/maven.config, and -D options also in .mvn/jvm.config), or run 'raeva sync' to \
+             relock",
             clauses.join(", and ")
         )
     })
@@ -575,7 +628,7 @@ pub(crate) fn config_changed(config: &Config, lock: &Lockfile, models: &[Reactor
         changed.push(conditions);
     }
     if let Some(options) = options {
-        changed.push(COMMAND_LINE.to_string());
+        changed.push(format!("{COMMAND_LINE} or .mvn/jvm.config"));
         return format!(
             "{CONFIG_CHANGED} in {}: {options}",
             crate::commands::util::join_and(changed)
@@ -587,10 +640,12 @@ pub(crate) fn config_changed(config: &Config, lock: &Lockfile, models: &[Reactor
         _ => None,
     };
     match (changed.is_empty(), profiles) {
-        (true, Some(profiles)) => format!("{CONFIG_CHANGED}: {profiles}"),
+        (true, Some(profiles)) => format!(
+            "{CONFIG_CHANGED}: {profiles}; check .mvn/jvm.config and the Maven profile options"
+        ),
         (true, None) => format!(
             "{CONFIG_CHANGED} since raeva.lock was written; raeva.lock covers the repositories, \
-             profiles, [lock] jdks, [security], .mvn/maven.config, {COMMAND_LINE} and \
+             profiles, [lock] jdks, [security], .mvn/maven.config, .mvn/jvm.config, {COMMAND_LINE} and \
              {HOST_VALUES}"
         ),
         (false, profiles) => format!(

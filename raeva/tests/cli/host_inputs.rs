@@ -294,6 +294,91 @@ fn a_file_path_raeva_lock_cannot_hold_fails() {
     }
 }
 
+/// A path that leaves the project by name and comes back is recorded
+/// without the detour, and one that a symlink leads out of the project is
+/// not recorded, as a path outside it is not.
+#[test]
+fn a_file_path_is_recorded_where_it_lands() {
+    let dependencies = format!("<dependencies>{LIB}</dependencies>");
+    let project = Project::synced();
+    let root = project.root();
+    fs::write(root.join("marker.txt"), "x").unwrap();
+    let name = root.file_name().unwrap().to_str().unwrap().to_string();
+    let write_profile = |path: &str| {
+        let profile = file_profile("marked", path, &dependencies);
+        fs::write(
+            root.join("pom.xml"),
+            pom(
+                "root",
+                "repository/",
+                &format!("<profiles>{profile}</profiles>"),
+            ),
+        )
+        .unwrap();
+    };
+    write_profile(&format!("${{project.basedir}}/../{name}/marker.txt"));
+    assert_success(&project.raeva(&["sync", "--offline"]), "re-entry path");
+    assert_eq!(ambient(&root), ["file:marker.txt is true"]);
+    // The `..` inside the project stays, as the filesystem resolves it.
+    write_profile(&format!(
+        "${{project.basedir}}/../{name}/gate/../marker.txt"
+    ));
+    assert_success(&project.raeva(&["sync", "--offline"]), "re-entry with ..");
+    let exists = root.join("gate/../marker.txt").exists();
+    assert_eq!(
+        ambient(&root),
+        [format!("file:gate/../marker.txt is {exists}")]
+    );
+    // A way out and back after a `..` inside the project keeps that `..`.
+    fs::create_dir(root.join("gate")).unwrap();
+    write_profile(&format!(
+        "${{project.basedir}}/gate/../../{name}/marker.txt"
+    ));
+    assert_success(&project.raeva(&["sync", "--offline"]), "out and back");
+    assert_eq!(ambient(&root), ["file:gate/../marker.txt is true"]);
+    // The way back can pass a sibling of the project.
+    fs::create_dir(root.with_file_name("sibling")).unwrap();
+    write_profile(&format!(
+        "${{project.basedir}}/../sibling/../{name}/marker.txt"
+    ));
+    assert_success(&project.raeva(&["sync", "--offline"]), "via a sibling");
+    assert_eq!(ambient(&root), ["file:marker.txt is true"]);
+    // A missing sibling is a way back only where `..` goes by name.
+    write_profile(&format!(
+        "${{project.basedir}}/../absent/../{name}/marker.txt"
+    ));
+    let output = project.raeva(&["sync", "--offline"]);
+    assert_status(&output, 3, "via a missing sibling");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot record"), "{stderr}");
+
+    #[cfg(unix)]
+    {
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::write(outside.path().join("marker.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        write_profile("${project.basedir}/link/marker.txt");
+        assert_success(&project.raeva(&["sync", "--offline"]), "symlink out");
+        assert!(ambient(&root).is_empty(), "{:?}", ambient(&root));
+
+        // A way out and back that the filesystem does not resolve to where
+        // the path stood, through a missing directory or a symlink, is not
+        // dropped.
+        fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::os::unix::fs::symlink(root.join("sub/deep"), root.join("hop")).unwrap();
+        for path in [
+            format!("${{project.basedir}}/missing/../../{name}/marker.txt"),
+            format!("${{project.basedir}}/hop/../../{name}/marker.txt"),
+        ] {
+            write_profile(&path);
+            let output = project.raeva(&["sync", "--offline"]);
+            assert_status(&output, 3, &path);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("cannot record"), "{stderr}");
+        }
+    }
+}
+
 #[test]
 fn a_condition_whose_profile_is_gone_is_not_drift() {
     let marked = file_profile(

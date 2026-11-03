@@ -13,7 +13,7 @@ use tempfile::{TempDir, tempdir};
 
 use super::{
     ExportOptions, ExportStats, ExportUnit, Exporter, UnitSource, artifact_relative_path,
-    case_folded_collision, folds_case, folds_case_without_writing, lexical_normalize,
+    folds_case, folds_case_without_writing, lexical_normalize, planned_destinations,
 };
 use crate::error::{ExportError, ExportFailure};
 use crate::link::LinkStrategy;
@@ -1979,10 +1979,15 @@ fn case_collisions_cover_files_and_shared_directories() {
         repo_id_recorded: false,
         replace: false,
     };
-    let collision = |units: &[ExportUnit]| {
-        case_folded_collision(units)
-            .expect("paths")
-            .map(|(_, _, relative)| relative)
+    let collision = |units: &[ExportUnit]| match planned_destinations(
+        units,
+        &[],
+        &crate::metadata::MetadataAccumulator::default(),
+        true,
+    ) {
+        Err(ExportError::CaseCollision { path, .. }) => Some(path),
+        Ok(_) => None,
+        Err(err) => panic!("{err}"),
     };
     assert_eq!(
         collision(&[
@@ -2002,6 +2007,12 @@ fn case_collisions_cover_files_and_shared_directories() {
         collision(&[unit("org.Acme", "a", "1"), unit("org.acme", "b", "1")]),
         None
     );
+    for units in [
+        [unit("org.Acme", "a", "1"), unit("org", "acme", "1")],
+        [unit("org", "acme", "1"), unit("org.Acme", "a", "1")],
+    ] {
+        assert_eq!(collision(&units), None);
+    }
     assert_eq!(
         collision(&[
             unit("com.example", "lib", "1"),
@@ -2028,6 +2039,141 @@ async fn a_case_only_collision_is_refused_where_the_file_system_folds_case() {
             .expect("a case-sensitive file system holds both");
         assert_eq!(f.read("com/example/Foo/1.0/Foo-1.0.jar"), "Foo");
         assert_eq!(f.read("com/example/foo/1.0/foo-1.0.jar"), "foo");
+    }
+}
+
+#[test]
+fn equivalent_repository_ids_collide_where_the_volume_merges_them() {
+    // Unicode normalization merges the first pair on macOS and on a volume
+    // that folds case; lowercase, uppercase or Unicode case folding, of the
+    // name or its NFD form, merges the others there.
+    for (pair, merged_on_macos) in [
+        (["\u{e9}", "e\u{301}"], true),
+        (["\u{3c3}", "\u{3c2}"], false),
+        (["\u{df}", "\u{1e9e}"], false),
+        (["ss", "\u{1e9e}"], false),
+        (["ss", "\u{df}"], false),
+        (
+            [
+                "\u{3b1}\u{345}\u{301}\u{3c2}",
+                "\u{3b1}\u{301}\u{345}\u{3c3}",
+            ],
+            false,
+        ),
+    ] {
+        for folds_case in [false, true] {
+            for populated in [0, 1, 2] {
+                let mut meta = crate::metadata::MetadataAccumulator::default();
+                let key = crate::metadata::ArtifactMetaKey {
+                    group_id: "org.test".to_string(),
+                    artifact_id: "lib".to_string(),
+                };
+                meta.artifacts.entry(key.clone()).or_default();
+                for (index, (id, version)) in pair.into_iter().zip(["1", "2"]).enumerate() {
+                    if index >= populated {
+                        meta.empty_list_ids.insert(id.to_string());
+                        continue;
+                    }
+                    meta.artifacts
+                        .entry(key.clone())
+                        .or_default()
+                        .entry(id.to_string())
+                        .or_default()
+                        .add_version(version);
+                }
+                let planned = planned_destinations(&[], &[], &meta, folds_case);
+                // An empty list gives way to a list its id lowercases alike.
+                let gives_way = populated < 2 && pair[0].to_lowercase() == pair[1].to_lowercase();
+                if !(folds_case || merged_on_macos && cfg!(target_os = "macos"))
+                    || folds_case && gives_way
+                {
+                    assert!(planned.is_ok(), "{pair:?} stay apart");
+                    continue;
+                }
+                let error = match planned {
+                    Err(error) => error,
+                    Ok(_) => panic!("{pair:?} must collide"),
+                };
+                assert!(
+                    matches!(
+                        error,
+                        ExportError::DestinationCollision { .. }
+                            | ExportError::CaseCollision { .. }
+                    ),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+/// `g.a:1-SNAPSHOT`'s version list and `g:a:1-SNAPSHOT`'s build metadata
+/// are both `g/a/1-SNAPSHOT/maven-metadata-repo.xml`.
+#[test]
+fn an_artifact_list_and_snapshot_metadata_in_one_directory_collide() {
+    let mut meta = crate::metadata::MetadataAccumulator::default();
+    let key = crate::metadata::ArtifactMetaKey {
+        group_id: "g.a".to_string(),
+        artifact_id: "1-SNAPSHOT".to_string(),
+    };
+    (meta.artifacts.entry(key).or_default())
+        .entry("repo".to_string())
+        .or_default()
+        .add_version("2");
+    let snapshot = crate::metadata::SnapshotMetaKey {
+        group_id: "g".to_string(),
+        artifact_id: "a".to_string(),
+        base_version: "1-SNAPSHOT".to_string(),
+        repo_id: "repo".to_string(),
+    };
+    meta.snapshots.entry(snapshot).or_default().timestamp = Some("20240101.010101".to_string());
+    for folds_case in [false, true] {
+        let error = planned_destinations(&[], &[], &meta, folds_case)
+            .err()
+            .expect("one file for two lists");
+        assert!(
+            matches!(error, ExportError::DestinationCollision { .. }),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn optional_snapshot_classifiers_claim_timestamped_and_plain_sidecars() {
+    for timestamped in [false, true] {
+        for dry_run in [false, true] {
+            let mut f = Fixture::new();
+            let mut row = jar("g", "a", "1-SNAPSHOT");
+            row.snapshot = SnapshotStamp::of_version("1-20240101.010101-1");
+            let mut sources = row.clone();
+            sources.coordinate = ArtifactCoord::new("g", "a", "1-SNAPSHOT", "jar", Some("sources"));
+            f.row(row, b"jar", b"pom").await;
+            let mut collision = sources.clone();
+            collision.coordinate =
+                ArtifactCoord::new("g", "a", "1-SNAPSHOT", "jar.sha256", Some("sources"));
+            if !timestamped {
+                collision.snapshot = None;
+            }
+            f.row(collision, b"locked bytes", b"pom").await;
+            let exporter = f
+                .exporter(ExportOptions {
+                    dry_run,
+                    ..f.options()
+                })
+                .with_optional_classifiers(&[sources]);
+            let failure = exporter.export(&Reactor::default()).await.unwrap_err();
+            let version = if timestamped {
+                "1-20240101.010101-1"
+            } else {
+                "1-SNAPSHOT"
+            };
+            assert!(
+                matches!(&failure.error, ExportError::DestinationCollision { path, .. }
+                    if *path == f.m2().join(format!("g/a/1-SNAPSHOT/a-{version}-sources.jar.sha256"))),
+                "{failure}"
+            );
+            assert!(!f.m2().exists(), "written before refusing: {failure}");
+        }
     }
 }
 
@@ -2184,4 +2330,41 @@ async fn a_held_export_lock_times_out() {
     super::lock_destination(m2.path(), wait)
         .await
         .expect("free after drop");
+}
+
+#[tokio::test]
+async fn a_dry_run_refuses_populated_repository_ids_that_fold_to_one_path() {
+    for snapshot in [false, true] {
+        let mut f = Fixture::new();
+        let mut row = jar("g", "a", if snapshot { "1-SNAPSHOT" } else { "1" });
+        if snapshot {
+            row.snapshot = SnapshotStamp::of_version("1-20240101.010101-1");
+        }
+        f.row(row, b"jar", b"pom").await;
+        f.lock
+            .repo_ids
+            .insert(REPO.to_string(), ["Repo".into(), "repo".into()].into());
+        let options = ExportOptions {
+            dry_run: true,
+            ..f.options()
+        };
+        let exporter = f.exporter(options);
+        let result = if snapshot {
+            exporter.export_items(&f.lock.platforms[0].artifacts).await
+        } else {
+            exporter.export(&Reactor::default()).await
+        };
+        let err =
+            result.expect_err("an empty destination is assumed to fold case during a dry run");
+        let relative = if snapshot {
+            "g/a/1-SNAPSHOT/maven-metadata-repo.xml"
+        } else {
+            "g/a/maven-metadata-repo.xml"
+        };
+        assert!(
+            matches!(&err.error, ExportError::CaseCollision { path, .. } if *path == f.m2().join(relative)),
+            "{err}"
+        );
+        assert!(!f.m2().exists());
+    }
 }

@@ -228,7 +228,13 @@ impl LockDiffReport {
                         .packages
                         .iter()
                         .enumerate()
-                        .filter(|(_, package)| PackageKey::of(package) == key.package)
+                        .filter(|(_, package)| {
+                            PackageKey::of(package) == key.package
+                                && key
+                                    .version
+                                    .as_deref()
+                                    .is_none_or(|version| package.coordinate.version() == version)
+                        })
                         .map(|(index, _)| index)
                         .collect();
                     let (paths, truncated) =
@@ -385,6 +391,7 @@ struct DepKey {
     /// The package, which the rendered line names without the platform and
     /// module unless they matter.
     package: PackageKey,
+    version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -511,6 +518,24 @@ impl LockChanges {
     fn between(old: &Lockfile, new: &Lockfile, allowed: Option<&HashSet<String>>) -> Self {
         let old_map = dep_map(old, allowed);
         let new_map = dep_map(new, allowed);
+        let mut versions = HashMap::<DepKey, [usize; 2]>::new();
+        for (side, map) in [&old_map, &new_map].into_iter().enumerate() {
+            for key in map.keys() {
+                let mut key = key.clone();
+                key.version = None;
+                versions.entry(key).or_default()[side] += 1;
+            }
+        }
+        // Pair versions only when each module has one on both sides.
+        let pair = |(mut key, entry): (DepKey, DepEntry)| {
+            let version = key.version.take();
+            if versions[&key] != [1, 1] {
+                key.version = version;
+            }
+            (key, entry)
+        };
+        let old_map: HashMap<_, _> = old_map.into_iter().map(pair).collect();
+        let new_map: HashMap<_, _> = new_map.into_iter().map(pair).collect();
         let old_platforms = platform_ids(old, allowed);
         let new_platforms = platform_ids(new, allowed);
         let keys: BTreeSet<&DepKey> = old_map.keys().chain(new_map.keys()).collect();
@@ -717,6 +742,7 @@ fn dep_map(lock: &Lockfile, allowed: Option<&HashSet<String>>) -> HashMap<DepKey
                     platform: platform_id.clone(),
                     module_path: module.path.clone(),
                     package: PackageKey::of(package),
+                    version: Some(package.coordinate.version().to_string()),
                 };
                 let entry = DepEntry {
                     artifact,
@@ -947,7 +973,7 @@ fn change_lines(diff: &LockChanges) -> Vec<(String, Option<usize>)> {
         let count = map
             .keys()
             .filter(|key| &key.platform == platform && key.package.kind == DepKind::External)
-            .map(|key| &key.package)
+            .map(|key| (&key.package, &key.version))
             .collect::<BTreeSet<_>>()
             .len();
         let count = plural(count, "dependency", "dependencies");
@@ -965,6 +991,10 @@ struct EdgeChange {
     module: String,
     from: String,
     to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to_version: Option<String>,
     change: &'static str,
     old: Option<String>,
     new: Option<String>,
@@ -1005,7 +1035,7 @@ impl EdgeChange {
 }
 
 type EdgeState = (Option<Scope>, bool);
-type EdgeMap = BTreeMap<(DepKey, PackageKey), BTreeSet<EdgeState>>;
+type EdgeMap = BTreeMap<(DepKey, DepKey), BTreeSet<EdgeState>>;
 
 /// The edges of `lock`'s modules, but for those `other` records the same:
 /// a module's edges only ever compare with its own.
@@ -1027,10 +1057,17 @@ fn edge_map(
                 continue;
             }
             let key = |index| {
-                module.packages.get(index).map(|package| DepKey {
-                    platform: platform_id.clone(),
-                    module_path: module.path.clone(),
-                    package: PackageKey::of(package),
+                module.packages.get(index).map(|package| {
+                    let mut key = DepKey {
+                        platform: platform_id.clone(),
+                        module_path: module.path.clone(),
+                        package: PackageKey::of(package),
+                        version: Some(package.coordinate.version().to_string()),
+                    };
+                    if !old_map.contains_key(&key) && !new_map.contains_key(&key) {
+                        key.version = None;
+                    }
+                    key
                 })
             };
             for edge in &module.edges {
@@ -1043,7 +1080,7 @@ fn edge_map(
                     .all(|key| old_map.contains_key(key) && new_map.contains_key(key))
                 {
                     edges
-                        .entry((from, to.package))
+                        .entry((from, to))
                         .or_default()
                         .insert((edge.scope, edge.optional));
                 }
@@ -1070,6 +1107,10 @@ fn edge_changes(
             scope.map_or("none", Scope::as_str)
         )
     };
+    let name = |key: &DepKey| match &key.version {
+        Some(version) => format!("{}:{version}", key.package.name()),
+        None => key.package.name(),
+    };
     for (from, to) in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
         let key = (from.clone(), to.clone());
         let old = before.get(&key).unwrap_or(&empty);
@@ -1086,12 +1127,14 @@ fn edge_changes(
                 platform: from.platform.clone(),
                 module: from.module_path.clone(),
                 from: from.package.coordinate(),
-                to: to.coordinate(),
+                to: to.package.coordinate(),
+                from_version: from.version.clone(),
+                to_version: to.version.clone(),
                 change,
                 old,
                 new,
-                from_name: from.package.name(),
-                to_name: to.name(),
+                from_name: name(from),
+                to_name: name(to),
                 others: others(change),
                 state: state.map_or_else(String::new, |(scope, optional)| {
                     let scope = scope.map_or("unscoped", Scope::as_str);

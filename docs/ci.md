@@ -9,21 +9,26 @@ on GitLab CI and Jenkins. This page lists what any other CI job needs.
 
 Pin the raeva version: a lock written by a newer raeva can use a schema
 that an older one refuses. Pin the archive's SHA-256 too, taken once from the
-release's `sha256.sum`, so a replaced release asset fails the job:
+release's `sha256.sum`, so a replaced release asset fails the job. Set both
+as CI variables; this Linux shell step stops at the first failure:
 
 ```sh
-RAEVA_VERSION=<the version your developers use>
-RAEVA_ARCHIVE=raeva-x86_64-unknown-linux-gnu.tar.gz
-RAEVA_SHA256=<the SHA-256 that sha256.sum gives for $RAEVA_ARCHIVE>
+set -eu
+: "${RAEVA_VERSION:?set RAEVA_VERSION to the pinned release, such as 0.5.3}"
+: "${RAEVA_SHA256:?set RAEVA_SHA256 to the archive's SHA-256 from sha256.sum}"
+RAEVA_ARCHIVE=raeva-x86_64-unknown-linux-musl.tar.gz
 curl --proto '=https' --tlsv1.2 -fsSL -o raeva.tar.gz \
   "https://github.com/raeva-io/raeva/releases/download/v$RAEVA_VERSION/$RAEVA_ARCHIVE"
 echo "$RAEVA_SHA256  raeva.tar.gz" | sha256sum -c -
 mkdir -p "$HOME/.local/bin"
 tar -xzf raeva.tar.gz -C "$HOME/.local/bin" --strip-components=1 --wildcards '*/raeva'
+export PATH="$HOME/.local/bin:$PATH"
+raeva --version
 ```
 
-On Alpine or another musl image, take the `x86_64-unknown-linux-musl` or
-`aarch64-unknown-linux-musl` archive ([Installation](installation.md)).
+The musl archive is linked statically, so it runs on x86_64 Linux with glibc
+or musl, of any version. On aarch64, take `aarch64-unknown-linux-musl`
+([Installation](installation.md)).
 
 ## Lock every platform CI runs on
 

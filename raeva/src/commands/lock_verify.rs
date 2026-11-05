@@ -21,6 +21,11 @@ use crate::output::{CommandOutput, Human, Output, Report, Table};
 use crate::session::Session;
 
 #[derive(Debug, Args)]
+#[command(after_long_help = crate::commands::util::help_examples(&[
+    ("lock verify", "Check the store against every pin"),
+    ("lock diff old.lock", "Compare old.lock with raeva.lock"),
+    ("lock info", "Show the schema, platforms and package counts"),
+]))]
 pub(crate) struct LockArgs {
     #[command(subcommand)]
     pub command: LockCommand,

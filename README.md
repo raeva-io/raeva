@@ -52,7 +52,7 @@ brew install raeva-io/tap/raeva
 Windows, in PowerShell:
 
 ```powershell
-irm https://raeva.io/install.ps1 | iex
+powershell -ExecutionPolicy ByPass -c "irm https://raeva.io/install.ps1 | iex"
 ```
 
 [GitHub Releases](https://github.com/raeva-io/raeva/releases) has archives
@@ -61,19 +61,19 @@ for Linux and macOS (x86_64 and aarch64) and Windows (x86_64), and a Windows
 static musl (`unknown-linux-musl`) builds for both architectures. On Alpine,
 use the musl archive. See [Installation](docs/installation.md).
 With Rust 1.89 or newer, `cargo binstall raeva` installs
-a prebuilt binary and `cargo install raeva` builds from source.
+a prebuilt binary and `cargo install --locked raeva` builds from source.
 
 ## Quick start
 
-Run this at the project root, or at the root of a multi-module reactor, and
-commit `raeva.lock`:
+Set `JAVA_HOME` to the JDK the build uses: without it or `JAVA_VERSION`,
+raeva assumes Java 17. Then run this at the project root, or at the root of
+a multi-module reactor, and commit `raeva.lock`:
 
 ```bash
 raeva sync        # resolve dependencies and write raeva.lock
 ```
 
-Set `JAVA_HOME` to the JDK the build uses: without it or `JAVA_VERSION`,
-raeva assumes Java 17. `raeva sync` locks the platform it runs on, so when
+`raeva sync` locks the platform it runs on, so when
 CI runs on another OS, lock both once, as in
 `raeva sync --platforms linux-x86_64,macos-aarch64`; later syncs keep them.
 
@@ -92,17 +92,19 @@ SNAPSHOT drift, and locked builds. For other CI systems, see
 ## Offline builds
 
 For an offline build, use separate repositories for locked dependencies and
-Maven's build plugins:
+Maven's build plugins, in a directory outside the checkout:
 
 ```bash
-raeva export-m2 --m2-path "$PWD/.offline/deps"
-mvn -Dmaven.repo.local="$PWD/.offline/plugins" -DskipTests package
-mvn -o -Dmaven.repo.local="$PWD/.offline/deps" -Dmaven.repo.local.tail="$PWD/.offline/plugins" -DskipTests package
+offline="$(mktemp -d "${TMPDIR:-/tmp}/raeva-offline.XXXXXX")"
+raeva export-m2 --m2-path "$offline/deps"
+mvn "-Dmaven.repo.local=$offline/plugins" -DskipTests package
+mvn -o "-Dmaven.repo.local=$offline/deps" "-Dmaven.repo.local.tail=$offline/plugins" -DskipTests package
 ```
 
-Run them at the project root and add `.offline/` to `.gitignore`; outside
-`target/`, `mvn clean` keeps it. Use the same phase in both Maven runs, and
-in both the profiles and settings `raeva sync` used. Plugins, plugin
+Run them at the project root. Keep both repositories out of the checkout:
+build checks such as Apache RAT and Spring's nohttp scan every file in it,
+and `mvn clean` deletes `target/`. Use the same phase in both Maven runs,
+and in both the profiles and settings `raeva sync` used. Plugins, plugin
 dependencies, and build extensions are not locked. The online run resolves the dependencies too
 and leaves them in the plugin repository, which the offline run reads as a
 tail for what the export lacks. The export writes a version list under

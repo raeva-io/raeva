@@ -25,40 +25,37 @@ use self::warnings::{report_failure, report_warnings};
 pub(crate) use rv_export::ExportError;
 
 #[derive(Debug, Args)]
-#[command(
-    about = "Export locked dependencies to the Maven local repository",
-    long_about = "Export the locked dependency artifacts (and their POM ancestry / imported \
-                  BOMs) into the Maven local repository so `mvn -o` resolves dependencies \
-                  offline.\n\n\
-                  The destination is --m2-path when given, otherwise -Dmaven.repo.local \
-                  given to raeva, otherwise local_repository from the user config.toml, \
-                  otherwise <localRepository> from ~/.m2/settings.xml, otherwise \
-                  ~/.m2/repository. local_repository in the project's raeva.toml and \
-                  -Dmaven.repo.local in .mvn/maven.config are ignored here, with a warning. \
-                  ${user.home} and ${env.NAME} in the configured path are expanded, and a \
-                  relative path is resolved against the current directory, as Maven does.\n\n\
-                  An export into a repository of its own lists only the locked versions in \
-                  each maven-metadata-<id>.xml, writes an empty list under local and every \
-                  other repository id raeva knows the build reads, and removes the other \
-                  metadata files, so `mvn -o` resolves what raeva.lock pins, also with a \
-                  -Dmaven.repo.local.tail, within the limits docs/offline-builds.md names. \
-                  In the Maven local repository other \
-                  builds share (settings.xml's <localRepository> or ~/.m2/repository) it adds \
-                  the locked versions and removes nothing, and warns that `mvn -o` there is \
-                  not a locked build.\n\n\
-                  For reactor locks, workspace modules are skipped and the external artifact / \
-                  support-POM union is exported. This supports `mvn -o package` at the reactor \
-                  root and `mvn -o -pl <module> -am package`. Running `cd <module> && mvn -o \
-                  package` is not guaranteed because the reactor root supplies the workspace \
-                  model.\n\n\
-                  Maven build plugins (compiler, surefire, ...) are NOT in scope and are not \
-                  exported; a `mvn -o` build still needs its plugins already present in the \
-                  local repository (e.g. from a prior online build).",
-    after_long_help = crate::commands::util::help_examples(&[
-        ("export-m2 --m2-path deps", "Export to ./deps, a repository of its own"),
+// The `Commands` variant's doc comment sets `about` and clears
+// `long_about`, so the details go in `after_long_help`.
+#[command(after_long_help = format!(
+    "{}{}",
+    "Copies the locked dependencies, their POMs, parents and imported BOMs from \
+     raeva's store into a Maven local repository, so `mvn -o` finds them.
+
+The destination is --m2-path, else -Dmaven.repo.local given to raeva, else \
+local_repository in the user config.toml, else <localRepository> in \
+~/.m2/settings.xml, else ~/.m2/repository. local_repository in raeva.toml and \
+-Dmaven.repo.local in .mvn/maven.config are ignored here, with a warning. \
+${user.home} and ${env.NAME} in a configured path are expanded, and a relative \
+path is resolved against the current directory, as Maven does.
+
+For a locked offline build, export to an empty directory of its own outside \
+the project, as `raeva --help` shows. Its version lists then name only the \
+locked versions, so `mvn -o` resolves what raeva.lock pins, also with a \
+-Dmaven.repo.local.tail. Into the local repository other builds share, it adds \
+the locked versions, removes nothing, and warns that `mvn -o` there is not a \
+locked build.
+
+Build plugins and extensions are not exported: fill another repository with \
+one online Maven run and pass it as the tail. Reactor modules are not \
+exported either: run `mvn -o` at the reactor root, or with -pl <module> -am.
+
+",
+    crate::commands::util::help_examples(&[
+        ("export-m2 --m2-path \"$(mktemp -d)/deps\"", "Export to a new repository of its own"),
         ("export-m2 --dry-run", "Show what would be exported"),
     ])
-)]
+))]
 pub(crate) struct ExportM2Args {
     #[arg(long, help = "Show what would be exported without writing")]
     pub dry_run: bool,
@@ -162,10 +159,6 @@ pub(crate) async fn run(args: &ExportM2Args, session: &Session) -> Result<Report
     let shared = maven_repository
         .as_deref()
         .is_some_and(|maven| same_directory(&m2_path, maven));
-    let isolated = shared.then(|| IsolatedExport {
-        path: rv_fs::plain_path(&session.project_root().join(".m2").join("repository")),
-        tail: rv_fs::plain_path(&m2_path),
-    });
     if shared {
         output.warn(
             Warning::new(
@@ -318,16 +311,9 @@ pub(crate) async fn run(args: &ExportM2Args, session: &Session) -> Result<Report
         sources: args.with_sources.then_some(sources_exported),
         javadocs: args.with_javadocs.then_some(javadocs_exported),
         m2_path: m2_display_path,
-        isolated,
+        shared,
         elapsed: start.elapsed(),
     }))
-}
-
-/// The export of its own that a locked `mvn -o` needs, with the shared
-/// repository as the tail Maven reads plugins from.
-struct IsolatedExport {
-    path: PathBuf,
-    tail: PathBuf,
 }
 
 struct ExportM2Report {
@@ -339,7 +325,7 @@ struct ExportM2Report {
     sources: Option<usize>,
     javadocs: Option<usize>,
     m2_path: String,
-    isolated: Option<IsolatedExport>,
+    shared: bool,
     elapsed: std::time::Duration,
 }
 
@@ -383,50 +369,14 @@ impl CommandOutput for ExportM2Report {
             ));
         }
         human.success(line)?;
-        if let Some(IsolatedExport { path, tail }) = &self.isolated {
-            let (path, tail) = (path.display().to_string(), tail.display().to_string());
-            human.note("For a locked offline build, export to a repository of its own:")?;
-            human.note(format!("  raeva export-m2 --m2-path {}", shell_word(&path)))?;
-            human.note(format!(
-                "  mvn -o {} {} package",
-                shell_word(&format!("-Dmaven.repo.local={path}")),
-                shell_word(&format!("-Dmaven.repo.local.tail={tail}"))
-            ))?;
+        if self.shared {
+            human.note(
+                "For a locked offline build, export to an empty directory outside the checkout \
+                 and fill another with Maven's plugins; 'raeva --help' shows the commands",
+            )?;
         }
         Ok(())
     }
-}
-
-/// `word` as one literal argument for a POSIX shell, or for PowerShell on
-/// Windows, quoted when it holds anything but path characters.
-fn shell_word(word: &str) -> String {
-    quote_word(word, cfg!(windows))
-}
-
-fn quote_word(word: &str, powershell: bool) -> String {
-    let safe = if powershell {
-        "\\/._-:=+@,"
-    } else {
-        "/._-:=+@,%"
-    };
-    if (word.chars()).all(|c| c.is_ascii_alphanumeric() || safe.contains(c)) {
-        return word.to_string();
-    }
-    let mut quoted = String::from("'");
-    for c in word.chars() {
-        match c {
-            '\'' if !powershell => quoted.push_str("'\\''"),
-            // PowerShell ends a single-quoted string at any of these, and
-            // reads one doubled as the character itself.
-            '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' if powershell => {
-                quoted.push(c);
-                quoted.push(c);
-            }
-            c => quoted.push(c),
-        }
-    }
-    quoted.push('\'');
-    quoted
 }
 
 /// The local repository to export into: `--m2-path`, then the command
@@ -788,7 +738,7 @@ fn parse_link_strategy(value: &str) -> std::result::Result<LinkStrategy, String>
 
 #[cfg(test)]
 mod tests {
-    use super::{ExportM2Args, export_destination, quote_word, same_directory};
+    use super::{ExportM2Args, export_destination, same_directory};
     use crate::error::CliError;
     use clap::Parser;
 
@@ -997,24 +947,6 @@ mod tests {
         );
         let err = export_destination(None, Some("${unset}/m2"), None, None).unwrap_err();
         assert!(matches!(err, CliError::LocalRepository { .. }), "{err}");
-    }
-
-    #[test]
-    fn shell_words_quote_what_the_shell_would_expand() {
-        for powershell in [false, true] {
-            assert_eq!(
-                quote_word("-Dmaven.repo.local=/a/b", powershell),
-                "-Dmaven.repo.local=/a/b"
-            );
-        }
-        assert_eq!(quote_word("/my repo/$(x)", false), "'/my repo/$(x)'");
-        assert_eq!(quote_word(r"/it's\", false), r"'/it'\''s\'");
-        assert_eq!(quote_word(r"C:\a\b", true), r"C:\a\b");
-        assert_eq!(quote_word(r"C:\it's $(x)", true), r"'C:\it''s $(x)'");
-        assert_eq!(
-            quote_word("C:\\\u{2019}$(x)\u{2018}", true),
-            "'C:\\\u{2019}\u{2019}$(x)\u{2018}\u{2018}'"
-        );
     }
 
     #[test]

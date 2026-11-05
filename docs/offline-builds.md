@@ -10,22 +10,45 @@ digest and not exported (see [`system` dependencies](#system-dependencies)).
 Build plugins, their dependencies, build extensions, and artifacts a plugin
 resolves from its own configuration (such as `annotationProcessorPaths`)
 are not locked or exported. For an offline build, fill a second local
-repository with one online Maven run and pass it as a read-only tail:
+repository with one online Maven run and pass it as a read-only tail. Run
+these at the project root:
 
 ```sh
-raeva export-m2 --m2-path "$PWD/.offline/deps"
-mvn -Dmaven.repo.local="$PWD/.offline/plugins" -DskipTests package
-mvn -o -Dmaven.repo.local="$PWD/.offline/deps" -Dmaven.repo.local.tail="$PWD/.offline/plugins" -DskipTests package
+offline="$(mktemp -d "${TMPDIR:-/tmp}/raeva-offline.XXXXXX")"
+raeva export-m2 --m2-path "$offline/deps"
+mvn "-Dmaven.repo.local=$offline/plugins" -DskipTests package
+mvn -o "-Dmaven.repo.local=$offline/deps" "-Dmaven.repo.local.tail=$offline/plugins" -DskipTests package
 ```
 
-Run them at the project root and add `.offline/` to `.gitignore`; outside
-`target/`, `mvn clean` keeps it.
+In PowerShell:
+
+```powershell
+$offline = Join-Path ([IO.Path]::GetTempPath()) ("raeva-offline-" + [guid]::NewGuid().ToString("N"))
+raeva export-m2 --m2-path "$offline/deps"
+mvn "-Dmaven.repo.local=$offline/plugins" -DskipTests package
+mvn -o "-Dmaven.repo.local=$offline/deps" "-Dmaven.repo.local.tail=$offline/plugins" -DskipTests package
+```
+
+Keep both repositories outside the checkout. Build checks such as Apache
+RAT and Spring's nohttp scan every file in it, `.gitignore` or not, and
+`mvn clean` deletes `target/`. `TMPDIR`, or `TEMP` on Windows, must not
+point into the checkout either. For repeated builds, `offline` can name a
+lasting directory outside the checkout instead, kept for that checkout
+alone: the export rewrites its version lists to the lock, so two projects
+or two concurrent builds must not share one. On GitHub Actions, use
+`offline="$(mktemp -d "$RUNNER_TEMP/raeva-offline.XXXXXX")"` and run the
+commands in one step.
 Use the same phase for both runs, and in both the profiles and
 `settings.xml` that `raeva sync` used; pass `raeva export-m2` the same `-s`
 and `-P` too, since it reads the mirrors and repositories from them. Maven
 resolves only the plugins that phase needs. Skip tests in both runs or in
 neither: Surefire resolves its test provider only when tests run, so a
 warm-up run with `-DskipTests` leaves an offline run with tests without it.
+A plugin that keeps a cache in the local repository finds none in the
+export: give the offline run pgpverify-maven-plugin's key cache from the
+warm-up, as `"-Dpgpverify.keycache=$offline/plugins/pgpkeys-cache"`. A
+plugin that downloads a tool during the build, such as a JDK for a
+toolchain that the machine does not have, fails offline.
 
 The online run resolves the dependencies too, from the repositories as they
 are that day, and leaves them and their version lists in the plugin
@@ -85,7 +108,9 @@ Exports cover every platform in `raeva.lock`. A plain or `--frozen`
 the named platforms. On a CI runner with an empty store, `raeva sync
 --frozen --platforms` with this machine's platform downloads less, but it
 leaves the other platforms' pins unchecked, since only their bytes can
-check a SHA-256 pin, and a later export downloads them anyway. `raeva export-m2` needs a section for this machine's
+check a SHA-256 pin, and `raeva export-m2` then stops (exit 7) at the first
+file it lacks: run `raeva sync --frozen` without `--platforms` before an
+export. `raeva export-m2` needs a section for this machine's
 platform and never uses another platform's instead: without one it exits 3
 (`PLATFORM_MISSING`) with the `raeva sync --platforms` command that adds it. A locked file missing from the store stops the export
 (exit 7). A remote parent in POM text with no support-POM pin stops it
@@ -141,13 +166,12 @@ tail's version lists, `mvn install` output included, do not reach a locked
 dependency, within the limits [Scope](#scope) describes:
 
 ```sh
-raeva export-m2 --m2-path "$PWD/.m2/repository"
-mvn -o -Dmaven.repo.local="$PWD/.m2/repository" \
-  -Dmaven.repo.local.tail="$HOME/.m2/repository" package
+deps="$(mktemp -d "${TMPDIR:-/tmp}/raeva-deps.XXXXXX")"
+raeva export-m2 --m2-path "$deps"
+mvn -o "-Dmaven.repo.local=$deps" "-Dmaven.repo.local.tail=$HOME/.m2/repository" package
 ```
 
-Add `.m2/` to `.gitignore`. Do not put the repository under `target/`:
-`mvn clean` deletes it.
+As above, keep it outside the checkout and use it for this checkout alone.
 
 The Maven local repository other builds share is `<localRepository>` from
 `settings.xml`, or `~/.m2/repository`, however the destination spells it
@@ -155,8 +179,8 @@ The Maven local repository other builds share is `<localRepository>` from
 files and versions and removes nothing, so `mvn install` output and other
 projects' version lists stay. `mvn -o` there can then resolve a range to a
 version the lock does not name, so it is not a locked build, and
-`export-m2` says so once (`EXPORT_SHARED_REPOSITORY`) with the two commands
-above.
+`export-m2` says so once (`EXPORT_SHARED_REPOSITORY`) and points to the
+recipe in [Scope](#scope).
 
 ## What export refuses
 

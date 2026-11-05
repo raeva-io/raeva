@@ -108,9 +108,10 @@ pub(crate) enum CliError {
         from_working_dir(path),
         match reactor {
             Some(root) => format!(
-                " (this directory is a module of the Maven project in {0}, whose raeva.lock \
-                 covers every module: add -C {0})",
-                root.display()
+                " (this directory is a module of the Maven project in {}, whose raeva.lock \
+                 covers every module: add -C {})",
+                root.display(),
+                crate::commands::util::shell_word(&root.display().to_string())
             ),
             None => String::new(),
         }

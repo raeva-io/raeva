@@ -439,6 +439,8 @@ fn help_matches_the_snapshots() {
     for (name, args) in [
         ("raeva", &["--help"][..]),
         ("sync", &["sync", "--help"]),
+        ("export-m2", &["export-m2", "--help"]),
+        ("lock", &["lock", "--help"]),
         ("lock-diff", &["lock", "diff", "--help"]),
         ("sbom", &["sbom", "--help"]),
         ("vuln", &["vuln", "--help"]),

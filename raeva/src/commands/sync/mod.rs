@@ -90,10 +90,11 @@ pub(crate) fn refuse_module_directory(root: &Path) -> Result<()> {
         return Ok(());
     };
     Err(CliError::Usage(format!(
-        "this directory is a module of the Maven project in {0}, whose raeva.lock covers \
-         every module: run 'raeva -C {0} sync', or 'raeva -C . sync' to lock this \
+        "this directory is a module of the Maven project in {}, whose raeva.lock covers \
+         every module: run 'raeva -C {} sync', or 'raeva -C . sync' to lock this \
          directory on its own",
-        reactor.display()
+        reactor.display(),
+        crate::commands::util::shell_word(&reactor.display().to_string())
     )))
 }
 

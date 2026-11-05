@@ -573,7 +573,10 @@ fn frozen_on_another_machine_names_the_options_added_and_removed() {
 /// module on its own.
 #[test]
 fn sync_in_a_module_directory_names_the_reactor() {
-    let root = tempfile::TempDir::new().expect("root");
+    let temp = tempfile::TempDir::new().expect("root");
+    // A space and an apostrophe, which the suggested -C path quotes.
+    let root = temp.path().join("it's a project");
+    fs::create_dir_all(&root).expect("mkdir root");
     let home = tempfile::TempDir::new().expect("home");
     let pom = |artifact: &str, rest: &str| {
         format!(
@@ -584,10 +587,10 @@ fn sync_in_a_module_directory_names_the_reactor() {
     };
     // `modules/` has no pom.xml: the root lists `modules/io` itself, with
     // the separator reactor discovery accepts on every host.
-    let module = root.path().join("modules/io");
+    let module = root.as_path().join("modules/io");
     fs::create_dir_all(&module).expect("mkdir");
     fs::write(
-        root.path().join("pom.xml"),
+        root.as_path().join("pom.xml"),
         pom("root", "<modules><module> modules\\io </module></modules>"),
     )
     .expect("root pom");
@@ -606,9 +609,17 @@ fn sync_in_a_module_directory_names_the_reactor() {
     let refused = sync(&[]);
     assert_status(&refused, 2, "sync in a module");
     let stderr = String::from_utf8_lossy(&refused.stderr);
-    let root_path = dunce::canonicalize(root.path()).expect("canonical root");
+    let root_path = dunce::canonicalize(&root).expect("canonical root");
+    let quoted = if cfg!(windows) {
+        format!("'{}'", root_path.display().to_string().replace('\'', "''"))
+    } else {
+        format!(
+            "'{}'",
+            root_path.display().to_string().replace('\'', "'\\''")
+        )
+    };
     assert!(
-        stderr.contains(&format!("raeva -C {} sync", root_path.display())),
+        stderr.contains(&format!("raeva -C {quoted} sync")),
         "{stderr}"
     );
     assert!(!module.join("raeva.lock").exists());
@@ -617,10 +628,7 @@ fn sync_in_a_module_directory_names_the_reactor() {
         let read = raeva(&[command]);
         let stderr = String::from_utf8_lossy(&read.stderr);
         assert!(
-            stderr.contains(&format!(
-                "covers every module: add -C {})",
-                root_path.display()
-            )),
+            stderr.contains(&format!("covers every module: add -C {quoted})")),
             "{command}: {stderr}"
         );
         assert!(!stderr.contains("Run 'raeva sync'"), "{command}: {stderr}");
@@ -640,12 +648,12 @@ fn sync_in_a_module_directory_names_the_reactor() {
         "<modules><module>${dir}/io</module></modules><properties><dir>modules</dir>\
          </properties>",
     ] {
-        fs::write(root.path().join("pom.xml"), pom("root", modules)).expect("root pom");
+        fs::write(root.as_path().join("pom.xml"), pom("root", modules)).expect("root pom");
         assert_success(&sync(&[]), modules);
         fs::remove_file(module.join("raeva.lock")).expect("remove lock");
     }
     let literal = pom("root", "<modules><module>modules/io</module></modules>");
-    fs::write(root.path().join("pom.xml"), literal).expect("root pom");
+    fs::write(root.as_path().join("pom.xml"), literal).expect("root pom");
     assert_status(&sync(&[]), 2, "literal entry again");
     fs::write(module.join("raeva.toml"), "").expect("raeva.toml");
     assert_success(&sync(&[]), "raeva.toml");

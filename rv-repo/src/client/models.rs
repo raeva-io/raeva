@@ -1486,9 +1486,11 @@ impl RepoClient {
                         Checked::Verified
                     }
                 }
-                None if !repo.is_local()
-                    && (self.require_checksums || (remote_metadata && fail)) =>
-                {
+                // No flag lifts a `fail` policy, so it is named before the flag.
+                None if !repo.is_local() && remote_metadata && fail => {
+                    return Err(RepoError::MissingMetadataChecksum(path.to_string()));
+                }
+                None if !repo.is_local() && self.require_checksums => {
                     return Err(RepoError::MissingChecksum(path.to_string()));
                 }
                 None => {

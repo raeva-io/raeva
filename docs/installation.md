@@ -17,7 +17,8 @@ Linux and macOS archives use `.tar.gz`, and the Windows archive `.zip`.
 Download the archive and its checksum file from the same release, verify the
 checksum, extract it, and put `raeva` in a directory on `PATH`. Run `raeva --version` to check it.
 
-The musl builds link the C runtime statically and also run on glibc Linux.
+The glibc builds need glibc 2.34 or newer. The musl builds link the C
+runtime statically and also run on glibc Linux, including older ones.
 TLS still reads the system certificate store. Install your distribution's
 `ca-certificates` package, including in Alpine containers.
 

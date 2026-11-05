@@ -180,6 +180,40 @@ async fn a_sha1_pin_decides_a_fetched_pom_before_its_checksum_file() {
     }
 }
 
+/// Metadata without a sidecar from a repository whose checksum policy is
+/// `fail` names that policy, with or without `--allow-missing-checksums`,
+/// since the flag cannot lift it; a POM there names the flag.
+#[tokio::test]
+async fn a_fail_policy_on_metadata_without_a_sidecar_names_the_policy() {
+    let server = model_stub(Arc::new(AtomicBool::new(false)));
+    let (client, _tmp) = test_client();
+    let mut repo = Repository::new(None, format!("http://{}/", server.addr()), true, false);
+    repo.releases_checksum_policy = ChecksumPolicy::Fail;
+    let release = coord("test:demo:1.0");
+    for run in [
+        client.clone(),
+        client.clone().with_allow_missing_checksums(true),
+    ] {
+        let err = run.fetch_metadata(&repo, &release).await.unwrap_err();
+        assert!(
+            matches!(err, RepoError::MissingMetadataChecksum(_)),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("warn or ignore and run 'raeva sync --allow-missing-checksums'"),
+            "{message}"
+        );
+    }
+    let req = ArtifactRequest::new("test", "demo", "1.0");
+    let err = client.fetch_pom(&repo, &req).await.unwrap_err();
+    assert!(matches!(err, RepoError::MissingChecksum(_)), "{err}");
+    assert!(
+        err.to_string()
+            .contains("raeva sync --allow-missing-checksums")
+    );
+}
+
 /// A POM or `maven-metadata.xml` cached under `--allow-missing-checksums`
 /// is not served to a run that requires checksums: it is fetched again,
 /// refused while no sidecar exists, and replaced once one does. Offline, the

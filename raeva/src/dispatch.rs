@@ -154,13 +154,16 @@ pub(crate) fn command() -> clap::Command {
          Quick start:\n  \
          raeva sync           Resolve dependencies and write raeva.lock\n  \
          raeva sync --frozen  Fail when raeva.lock is out of date, as in CI\n\n\
-         Offline build: export the locked dependencies to a repository of their own, and fill \
-         another with Maven's plugins (plugins are not locked):\n  \
-         raeva export-m2 --m2-path \"$PWD/.offline/deps\"\n  \
-         mvn -Dmaven.repo.local=\"$PWD/.offline/plugins\" -DskipTests package\n  \
-         mvn -o -Dmaven.repo.local=\"$PWD/.offline/deps\" \
-         -Dmaven.repo.local.tail=\"$PWD/.offline/plugins\" -DskipTests package\n\n\
-         Run them at the project root and add .offline/ to .gitignore.",
+         Offline build in a POSIX shell: export the locked dependencies to a repository of their \
+         own, and fill another with Maven's plugins (plugins are not locked):\n  \
+         offline=\"$(mktemp -d \"${TMPDIR:-/tmp}/raeva-offline.XXXXXX\")\"\n  \
+         raeva export-m2 --m2-path \"$offline/deps\"\n  \
+         mvn \"-Dmaven.repo.local=$offline/plugins\" -DskipTests package\n  \
+         mvn -o \"-Dmaven.repo.local=$offline/deps\" \
+         \"-Dmaven.repo.local.tail=$offline/plugins\" -DskipTests package\n\n\
+         Run them at the project root. Keep both repositories outside the checkout, which build \
+         checks may scan, and use them for this checkout alone. PowerShell and CI: \
+         https://github.com/raeva-io/raeva/blob/main/docs/offline-builds.md",
     )
 }
 

@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "raeva"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "chrono",
  "clap",
@@ -1980,7 +1980,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rv-config"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -2007,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "rv-export"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "dunce",
  "futures",
@@ -2038,7 +2038,7 @@ dependencies = [
 
 [[package]]
 name = "rv-fs"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "dunce",
  "tempfile",
@@ -2047,7 +2047,7 @@ dependencies = [
 
 [[package]]
 name = "rv-http"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "backon",
  "bytes",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "rv-lock"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "dunce",
  "foldhash 0.2.0",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "rv-maven-model"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "fancy-regex",
  "foldhash 0.2.0",
@@ -2103,7 +2103,7 @@ dependencies = [
 
 [[package]]
 name = "rv-maven-types"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "derive_more",
  "hex",
@@ -2118,7 +2118,7 @@ dependencies = [
 
 [[package]]
 name = "rv-repo"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "bytes",
  "chrono",
@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "rv-resolver"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "bytes",
  "foldhash 0.2.0",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "rv-sbom"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "rv-maven-types",
  "serde",
@@ -2193,7 +2193,7 @@ dependencies = [
 
 [[package]]
 name = "rv-store"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2218,7 +2218,7 @@ dependencies = [
 
 [[package]]
 name = "rv-test-support"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "tokio",
  "tracing",
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "rv-vuln"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "cvss",
  "futures",

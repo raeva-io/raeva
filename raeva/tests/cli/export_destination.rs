@@ -144,21 +144,9 @@ fn the_shared_repository_keeps_other_metadata() {
     let output = project.raeva(&["export-m2"]);
     assert_success(&output, "export-m2 to settings.xml's repository");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let isolated = project.path().join(".m2").join("repository");
     assert!(stderr.contains("EXPORT_SHARED_REPOSITORY"), "{stderr}");
-    // A command word is quoted when the shell could read a character of it,
-    // such as the `~` of a Windows short name.
-    for (before, word) in [
-        ("raeva export-m2 --m2-path ", isolated.display().to_string()),
-        ("", format!("-Dmaven.repo.local={}", isolated.display())),
-        ("", format!("-Dmaven.repo.local.tail={}", shared.display())),
-    ] {
-        assert!(
-            stderr.contains(&format!("{before}{word}"))
-                || stderr.contains(&format!("{before}'{word}'")),
-            "{word}: {stderr}"
-        );
-    }
+    assert!(stderr.contains("outside the checkout"), "{stderr}");
+    assert!(!stderr.contains(".m2/repository"), "{stderr}");
     assert_eq!(
         listed(&lib.join("maven-metadata-local.xml")),
         ["2.0-SNAPSHOT"]

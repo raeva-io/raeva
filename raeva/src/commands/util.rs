@@ -18,10 +18,42 @@ pub(crate) fn help_examples(examples: &[(&str, &str)]) -> String {
         if comment.is_empty() {
             out.push_str(&format!("  {command}\n"));
         } else {
-            out.push_str(&format!("  {command:<36}# {comment}\n"));
+            out.push_str(&format!("  {command:<35} # {comment}\n"));
         }
     }
     out
+}
+
+/// `word` as one literal argument for a POSIX shell, or for PowerShell on
+/// Windows, quoted when it holds anything but path characters.
+pub(crate) fn shell_word(word: &str) -> String {
+    quote_word(word, cfg!(windows))
+}
+
+pub(crate) fn quote_word(word: &str, powershell: bool) -> String {
+    let safe = if powershell {
+        "\\/._-:=+@,"
+    } else {
+        "/._-:=+@,%"
+    };
+    if (word.chars()).all(|c| c.is_ascii_alphanumeric() || safe.contains(c)) {
+        return word.to_string();
+    }
+    let mut quoted = String::from("'");
+    for c in word.chars() {
+        match c {
+            '\'' if !powershell => quoted.push_str("'\\''"),
+            // PowerShell ends a single-quoted string at any of these, and
+            // reads one doubled as the character itself.
+            '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' if powershell => {
+                quoted.push(c);
+                quoted.push(c);
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// Writes `contents` to `path` through a temporary file beside it, so a
@@ -568,6 +600,25 @@ mod tests {
 
 #[cfg(test)]
 mod parse_tests {
+    #[test]
+    fn shell_words_quote_what_the_shell_would_expand() {
+        use super::quote_word;
+        for powershell in [false, true] {
+            assert_eq!(
+                quote_word("-Dmaven.repo.local=/a/b", powershell),
+                "-Dmaven.repo.local=/a/b"
+            );
+        }
+        assert_eq!(quote_word("/my repo/$(x)", false), "'/my repo/$(x)'");
+        assert_eq!(quote_word(r"/it's\", false), r"'/it'\''s\'");
+        assert_eq!(quote_word(r"C:\a\b", true), r"C:\a\b");
+        assert_eq!(quote_word(r"C:\it's $(x)", true), r"'C:\it''s $(x)'");
+        assert_eq!(
+            quote_word("C:\\\u{2019}$(x)\u{2018}", true),
+            "'C:\\\u{2019}\u{2019}$(x)\u{2018}\u{2018}'"
+        );
+    }
+
     #[test]
     fn parse_scope_ignores_case_and_surrounding_space() {
         assert_eq!(

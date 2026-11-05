@@ -152,14 +152,24 @@ pub enum RepoError {
         check: IntegritySource,
     },
     /// The repository publishes no usable `.sha256`, `.sha1` or `.md5`
-    /// sidecar for a remote file and missing sidecars are not allowed
-    /// (metadata under a `fail` checksum policy is refused either way).
+    /// sidecar for a remote file and missing sidecars are not allowed.
     /// Holds the repository path.
     #[error(
         "missing checksum for {0}: the repository publishes no usable .sha256, .sha1 or .md5 sidecar for this file. \
-         Pass --allow-missing-checksums to fetch it anyway (SUPPLY-CHAIN RISK: bytes will not be verified against a server-published checksum)"
+         If you trust this repository without checksums, run 'raeva sync --allow-missing-checksums' and review \
+         raeva.lock (SUPPLY-CHAIN RISK: the bytes are not checked against a server-published checksum)"
     )]
     MissingChecksum(String),
+    /// Remote metadata without a usable sidecar, from a repository whose
+    /// checksum policy is `fail`, which no flag overrides. Holds the
+    /// repository path.
+    #[error(
+        "missing checksum for {0}: the repository publishes no usable .sha256, .sha1 or .md5 sidecar for this \
+         metadata, and its checksum policy is fail. The repository must publish one; to accept the metadata \
+         unverified, set that policy to warn or ignore and run 'raeva sync --allow-missing-checksums', then \
+         review raeva.lock"
+    )]
+    MissingMetadataChecksum(String),
     /// A lockfile row that [`ensure_artifacts`] would download records no
     /// checksum, so nothing could verify the bytes. Holds the coordinate.
     /// Nothing is fetched; a repository sidecar does not stand in for the
@@ -459,6 +469,7 @@ impl RepoError {
             | RepoError::TooLarge { .. }
             | RepoError::InvalidMetadata(_)
             | RepoError::MissingChecksum(_)
+            | RepoError::MissingMetadataChecksum(_)
             | RepoError::RedirectRejected { .. }
             | RepoError::NonGlobalAddress { .. }
             | RepoError::Internal(_) => ErrorClass::Other,
@@ -636,7 +647,8 @@ mod tests {
             (RepoError::UntrustedRepoUrl(url()), C::Config, false, false, ""),
             (RepoError::BlockedMirror("corp".to_string()), C::Config, false, true, "mirror 'corp' is blocked"),
             (RepoError::InvalidCoord("../x".to_string()), C::Other, false, false, ""),
-            (RepoError::MissingChecksum(path.to_string()), C::Other, false, false, "--allow-missing-checksums"),
+            (RepoError::MissingChecksum(path.to_string()), C::Other, false, false, "raeva sync --allow-missing-checksums"),
+            (RepoError::MissingMetadataChecksum(path.to_string()), C::Other, false, false, "checksum policy is fail"),
             (RepoError::NonGlobalAddress { url: url(), addr: std::net::IpAddr::from([10, 0, 0, 5]) }, C::Other, false, true, ""),
             (RepoError::RedirectRejected { kind: RedirectRejectionKind::NonGlobalTarget, details: "nexus.internal".to_string() },
                 C::Other, false, true, ""),
@@ -652,7 +664,9 @@ mod tests {
             assert!(rendered.contains(says), "{rendered}");
             if matches!(
                 err,
-                RepoError::OfflineNotCached(_) | RepoError::MissingChecksum(_)
+                RepoError::OfflineNotCached(_)
+                    | RepoError::MissingChecksum(_)
+                    | RepoError::MissingMetadataChecksum(_)
             ) {
                 assert!(rendered.contains(path), "{rendered}");
             }

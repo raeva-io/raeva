@@ -4,7 +4,7 @@ use clap::Args;
 use rv_lock::{LockPlatform, Lockfile, Platform};
 use serde::Serialize;
 
-use crate::commands::lock_adapter::adapt_sbom_modules;
+use crate::commands::lock_adapter::{adapt_sbom_modules_listing, listed_module_purls};
 use crate::commands::module_selector::ModuleSelector;
 use crate::error::{CliError, Result};
 
@@ -69,19 +69,9 @@ impl ReportSelector {
                 .map(|p| p.platform.to_string())
                 .collect::<Vec<_>>();
             available.sort();
-            let asked: Vec<String> = [
-                (
-                    "--platform",
-                    self.platform.as_ref().map(ToString::to_string),
-                ),
-                ("--jdk", self.jdk.clone()),
-            ]
-            .into_iter()
-            .filter_map(|(flag, value)| Some(format!("{flag} {}", value?)))
-            .collect();
             return Err(CliError::Usage(format!(
                 "no recorded target matches {}; available targets: {}",
-                asked.join(" and "),
+                self.asked(),
                 if available.is_empty() {
                     "none".to_string()
                 } else {
@@ -90,6 +80,75 @@ impl ReportSelector {
             )));
         }
         Ok(ReportSelection { platforms })
+    }
+
+    fn asked(&self) -> String {
+        [
+            (
+                "--platform",
+                self.platform.as_ref().map(ToString::to_string),
+            ),
+            ("--jdk", self.jdk.clone()),
+        ]
+        .into_iter()
+        .filter_map(|(flag, value)| Some(format!("{flag} {}", value?)))
+        .collect::<Vec<_>>()
+        .join(" and ")
+    }
+}
+
+/// The one target `tree` and `why` show.
+#[derive(Clone, Debug, Default, Args)]
+pub(crate) struct TargetSelector {
+    #[arg(
+        long,
+        value_name = "OS-ARCH",
+        help = "Show this recorded platform (default: this machine's)"
+    )]
+    platform: Option<Platform>,
+    #[arg(
+        long,
+        value_name = "VERSION",
+        help = "Show this exact recorded target JDK (default: this machine's)"
+    )]
+    jdk: Option<String>,
+}
+
+impl TargetSelector {
+    /// The host's target without selectors, as [`select_platform`] picks it.
+    /// Selectors must match exactly one recorded target and never fall back.
+    ///
+    /// [`select_platform`]: crate::commands::select_platform
+    pub(crate) fn select<'a>(
+        &self,
+        lock: &'a Lockfile,
+        host_jdk: Option<&str>,
+    ) -> Result<&'a LockPlatform> {
+        if self.platform.is_none() && self.jdk.is_none() {
+            return crate::commands::select_platform(lock, host_jdk);
+        }
+        let selector = ReportSelector {
+            platform: self.platform.clone(),
+            jdk: self.jdk.clone(),
+        };
+        match selector.select(lock)?.platforms.as_slice() {
+            [one] => Ok(one),
+            several => Err(CliError::Usage(format!(
+                "{} matches {} recorded targets: {}; pass {} to select one",
+                selector.asked(),
+                several.len(),
+                several
+                    .iter()
+                    .map(|entry| entry.platform.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if self.platform.is_none() {
+                    "--platform"
+                } else {
+                    "--jdk"
+                }
+            ))),
+        }
     }
 }
 
@@ -126,6 +185,8 @@ impl ReportSelection<'_> {
         }
         merged.modules = inventory.into_values().collect();
         let selected = selector.select(&merged)?;
+        // The document lists the modules every target selects.
+        let listed = listed_module_purls(&merged, selected.modules())?;
         let paths: std::collections::BTreeSet<_> =
             selected.modules().iter().map(|m| m.path.clone()).collect();
         let mut modules = BTreeMap::new();
@@ -174,8 +235,7 @@ impl ReportSelection<'_> {
             let coordinates: std::collections::BTreeSet<_> = selected
                 .iter()
                 .flat_map(|m| &m.packages)
-                .filter(|p| p.workspace_module.is_none())
-                .map(|p| &p.coordinate)
+                .filter_map(rv_lock::LockModulePackage::repository_file)
                 .collect();
             for artifact in platform
                 .artifacts
@@ -198,19 +258,16 @@ impl ReportSelection<'_> {
             if selected.is_empty() {
                 continue;
             }
-            let adapted = adapt_sbom_modules(platform, &selected).map_err(|err| {
-                CliError::LockfileDefect {
-                    details: err.to_string(),
-                }
-            })?;
+            let adapted = adapt_sbom_modules_listing(platform, &selected, &listed)?;
             for component in std::iter::once(adapted.root).chain(adapted.components) {
-                if let Some(old) = components.insert(component.purl.clone(), component.clone())
+                if let Some(old) =
+                    components.insert(component.reference().to_string(), component.clone())
                     && (old.hashes != component.hashes
                         || old.dependencies != component.dependencies)
                 {
                     return Err(ambiguous(format!(
                         "{} has different hashes or dependency edges",
-                        component.purl
+                        component.reference()
                     )));
                 }
             }
@@ -298,6 +355,35 @@ mod tests {
     }
 
     #[test]
+    fn a_shown_target_is_the_one_the_selectors_match() {
+        let lock = lock();
+        let jdk = |jdk: &str| TargetSelector {
+            jdk: Some(jdk.into()),
+            ..Default::default()
+        };
+        let shown = jdk("21").select(&lock, Some("17")).unwrap();
+        assert_eq!(shown.platform.jdk(), Some("21"));
+        let error = jdk("22").select(&lock, Some("22")).unwrap_err();
+        assert!(matches!(error, CliError::Usage(_)));
+        assert!(
+            error
+                .to_string()
+                .starts_with("no recorded target matches --jdk 22; available targets: "),
+            "{error}"
+        );
+        let platform = TargetSelector {
+            platform: Some("linux-x86_64".parse().unwrap()),
+            ..Default::default()
+        };
+        let error = platform.select(&lock, Some("21")).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "--platform linux-x86_64 matches 2 recorded targets: linux-x86_64 (JDK 17), \
+             linux-x86_64 (JDK 21); pass --jdk to select one"
+        );
+    }
+
+    #[test]
     fn sbom_merges_identical_and_disjoint_graphs_but_refuses_contradictions() {
         let mut lock = lock();
         assert_eq!(
@@ -366,7 +452,8 @@ mod tests {
             .sbom_platform(&selector)
             .unwrap();
         let selected = selector.select(&merged).unwrap();
-        let adapted = adapt_sbom_modules(&merged, selected.modules()).unwrap();
+        let adapted =
+            crate::commands::lock_adapter::adapt_sbom_modules(&merged, selected.modules()).unwrap();
         assert_eq!(adapted.root.dependencies, ["pkg:maven/com.example/lib@2"]);
         assert_eq!(adapted.components[0].version, "2");
     }
@@ -425,12 +512,7 @@ mod tests {
         }
         lock.platforms[0].modules[0]
             .edges
-            .push(rv_lock::LockEdge::new(
-                0,
-                1,
-                Some(rv_lock::Scope::Compile),
-                false,
-            ));
+            .push(rv_lock::LockEdge::new(0, 1, rv_lock::Scope::Compile, false));
         let error = ReportSelector::default()
             .select(&lock)
             .unwrap()

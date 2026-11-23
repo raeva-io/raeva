@@ -13,9 +13,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 
-use rv_maven_model::{ActivationContext, ModelEnvironment, PropertyMap};
+use rv_maven_model::{ModelEnvironment, PropertyMap};
 pub use rv_maven_model::{ModelLookup, PropertySource};
-use rv_maven_types::bounded;
+use rv_maven_types::{MavenMode, bounded};
 use thiserror::Error;
 
 /// An authored expression and the public context needed to replay its input reads.
@@ -128,63 +128,141 @@ impl CommandLine {
 /// The user property that sets `mvn`'s local repository.
 pub const LOCAL_REPOSITORY_PROPERTY: &str = "maven.repo.local";
 
-/// The `-D` tokens passed to the JVM from whitespace-separated launcher
-/// options, without the names the JVM sets itself.
-pub(crate) fn jvm_properties(content: &str) -> HashMap<String, String> {
-    content
-        .split_whitespace()
-        .filter_map(|token| token.strip_prefix("-D"))
-        .filter(|property| !property.is_empty())
-        .map(|property| property.split_once('=').unwrap_or((property, "")))
-        .filter(|(name, _)| !jvm_fixed(name))
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .collect()
+/// Test hook: when set, the shell raeva runs as `mvn`'s `/bin/sh`. Only
+/// builds with the `testing` feature read it.
+#[cfg(any(test, feature = "testing"))]
+pub const LAUNCHER_SHELL_TEST_ENV: &str = "RAEVA_TEST_SH";
+
+/// `.mvn/jvm.config`, `text`, as the launcher passes it to the JVM, for a
+/// project in `root`, the launcher's project directory, or why raeva cannot
+/// tell. `mvn` joins its lines with `tr` and passes them through `echo`,
+/// which some shells, as macOS's and dash, expand backslash escapes in;
+/// Maven 3.10's then replaces each `${MAVEN_PROJECTBASEDIR}`, then each
+/// `$MAVEN_PROJECTBASEDIR`, with `sed`, where `&` in `root` is the text
+/// replaced. `mvn.cmd` reads the file with delayed expansion, which drops
+/// each `!` and `^`, in the console's code page; Maven 3.10's replaces the
+/// placeholders ignoring case.
+pub(crate) fn launcher_jvm_config(
+    text: &str,
+    root: Option<&str>,
+    mode: MavenMode,
+) -> Result<String, String> {
+    if cfg!(windows) {
+        return windows_jvm_config(text, root, mode);
+    }
+    if text.contains('\\') && !sh_echo_keeps(&text.replace(['\r', '\n'], " ")) {
+        return Err(
+            "has a backslash, which the echo of mvn's /bin/sh expands, and raeva does \
+                    not; write the file without one"
+                .to_string(),
+        );
+    }
+    match root {
+        Some(root) if mode == MavenMode::Maven310 => sed_project_basedir(text, root),
+        _ => Ok(text.to_string()),
+    }
 }
 
-/// A system property that JDK 17 and newer keep at their own value whatever
-/// `-D` says, or that the `mvn` launcher sets after `.mvn/jvm.config`.
-fn jvm_fixed(name: &str) -> bool {
-    matches!(
-        name,
-        "java.version"
-            | "java.version.date"
-            | "java.vendor"
-            | "java.vendor.url"
-            | "java.vendor.url.bug"
-            | "java.class.version"
-            | "java.class.path"
-            | "java.vm.version"
-            | "java.vm.name"
-            | "java.vm.vendor"
-            | "java.vm.info"
-            | "java.vm.compressedOopsMode"
-            | "java.vm.specification.version"
-            | "java.vm.specification.name"
-            | "java.vm.specification.vendor"
-            | "java.specification.version"
-            | "java.specification.name"
-            | "java.specification.vendor"
-            | "java.runtime.version"
-            | "java.runtime.name"
-            | "jdk.debug"
-            | "native.encoding"
-            | "sun.jnu.encoding"
-            | "sun.java.launcher"
-            | "sun.java.command"
-            | "sun.boot.library.path"
-            | "sun.management.compiler"
-            | "classworlds.conf"
-            | "maven.home"
-            | "library.jansi.path"
-            | "maven.multiModuleProjectDirectory"
-    )
+const PROJECT_BASEDIR: [&str; 2] = ["${MAVEN_PROJECTBASEDIR}", "$MAVEN_PROJECTBASEDIR"];
+
+fn sed_project_basedir(text: &str, root: &str) -> Result<String, String> {
+    if !PROJECT_BASEDIR
+        .iter()
+        .any(|placeholder| text.contains(placeholder))
+    {
+        return Ok(text.to_string());
+    }
+    if root.contains(['\\', '|', '\n']) {
+        return Err(format!(
+            "takes $MAVEN_PROJECTBASEDIR, which Maven 3.10's mvn writes in with sed, and the \
+             project directory '{root}' has a \\, | or line break, which sed reads as its own \
+             syntax"
+        ));
+    }
+    Ok(PROJECT_BASEDIR
+        .iter()
+        .fold(text.to_string(), |text, placeholder| {
+            text.replace(placeholder, &root.replace('&', placeholder))
+        }))
 }
 
-/// The name of a `-D` value, as `MavenCli` splits it.
-fn define_name(define: &str) -> &str {
+fn windows_jvm_config(text: &str, root: Option<&str>, mode: MavenMode) -> Result<String, String> {
+    if root.is_some_and(|root| root.contains('!')) {
+        return Err(
+            "is in a project directory with a !, which mvn.cmd drops from its path, so it does \
+             not read the file"
+                .to_string(),
+        );
+    }
+    if text.contains(['!', '^']) {
+        return Err("has a ! or ^, which mvn.cmd drops as it reads the file".to_string());
+    }
+    if !text.is_ascii() {
+        return Err(
+            "has text that is not ASCII, which mvn.cmd reads in the console's code page and \
+             raeva reads as UTF-8"
+                .to_string(),
+        );
+    }
+    if text.contains('"') && text.contains("user.home") {
+        return Err(
+            "quotes text beside user.home, which java's own command line parsing reads and \
+             raeva does not"
+                .to_string(),
+        );
+    }
+    let Some(root) = root.filter(|_| mode == MavenMode::Maven310) else {
+        return Ok(text.to_string());
+    };
+    let mut text = text.to_string();
+    for placeholder in PROJECT_BASEDIR {
+        let folded = text.to_ascii_lowercase();
+        let placeholder = placeholder.to_ascii_lowercase();
+        if !folded.contains(&placeholder) {
+            continue;
+        }
+        if root.contains('^') {
+            return Err(format!(
+                "takes $MAVEN_PROJECTBASEDIR, which Maven 3.10's mvn.cmd writes in dropping the \
+                 ^ of the project directory '{root}'"
+            ));
+        }
+        let mut replaced = String::new();
+        let mut last = 0;
+        for (at, _) in folded.match_indices(&placeholder) {
+            replaced.push_str(&text[last..at]);
+            replaced.push_str(root);
+            last = at + placeholder.len();
+        }
+        replaced.push_str(&text[last..]);
+        text = replaced;
+    }
+    Ok(text)
+}
+
+/// Whether `/bin/sh`'s `echo` prints `text` as it is.
+fn sh_echo_keeps(text: &str) -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    let shell = std::env::var_os(LAUNCHER_SHELL_TEST_ENV);
+    #[cfg(not(any(test, feature = "testing")))]
+    let shell: Option<std::ffi::OsString> = None;
+    let shell = shell.unwrap_or_else(|| "/bin/sh".into());
+    std::process::Command::new(shell)
+        .args(["-c", "echo \"$1\"", "sh", text])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && output.stdout == format!("{text}\n").as_bytes()
+        })
+}
+
+/// The property a `-D` value sets, as `MavenCli` reads it: the name before
+/// the first `=`, trimmed, and the rest, or `true` without a value.
+pub fn define_property(define: &str) -> (&str, &str) {
     match define.find('=') {
-        Some(equals) if equals > 0 => define[..equals].trim(),
-        _ => define.trim(),
+        Some(equals) if equals > 0 => (define[..equals].trim(), &define[equals + 1..]),
+        _ => (define.trim(), "true"),
     }
 }
 
@@ -198,6 +276,13 @@ pub struct MavenConfigOptions {
     /// The user properties written with a `${...}`, whose value can hold
     /// one of the host's.
     pub expanded_properties: BTreeSet<String>,
+    /// The user properties whose value takes a system property that differs
+    /// by platform or JDK ([`rv_maven_model::PLATFORM_PROPERTIES`]), with
+    /// that property as written, for each locked platform to expand.
+    pub platform_values: HashMap<String, String>,
+    /// The secret-named ([`crate::secret_named`]) user properties and
+    /// `env.NAME` each user property took a value from, by property name.
+    pub secret_inputs: HashMap<String, Vec<String>>,
     /// The profile ids `-P` selects.
     pub active_profiles: Vec<String>,
     /// The profile ids `-P` deselects with `!` or `-`.
@@ -245,6 +330,22 @@ pub enum MavenConfigError {
          remove it"
     )]
     ProjectFile,
+    /// `-itr` (`--ignore-transitive-repositories`), with which Maven also
+    /// leaves out the repositories a dependency's POM declares for its
+    /// parent, which raeva searches.
+    #[error(
+        "-itr (--ignore-transitive-repositories) makes mvn ignore every repository a dependency's \
+         POM declares, also the one raeva searches for its parent; remove it, and leave \
+         [security] allow_transitive_repositories off"
+    )]
+    IgnoreTransitiveRepositories,
+    /// `-gs` (`--global-settings`), whose file Maven reads below the user
+    /// settings, and raeva does not.
+    #[error(
+        "-gs (--global-settings) makes mvn read a global settings file, which raeva does not \
+         read; remove it, and pass the file with -s if the build needs it"
+    )]
+    GlobalSettings,
     /// An argument that is a lone `"`, which Maven's quote joining cannot
     /// close.
     #[error("unterminated quote in argument")]
@@ -261,6 +362,14 @@ pub enum MavenConfigError {
     /// refuses with "key can't be empty". Holds the value.
     #[error("-D{} has no property name: write -Dname or -Dname=value", bounded(.0))]
     EmptyPropertyName(String),
+    /// A `-P` value that takes a JVM system property or a variable raeva
+    /// does not read from the host, so the profile it names is unknown.
+    /// Holds the name and how to fix it.
+    #[error(
+        "a -P value takes ${{{0}}}, which raeva does not read from the host, so it cannot \
+         tell which profile Maven selects; write the profile id, or {1}"
+    )]
+    UnreadHostProperty(String, String),
     /// A `${...}` in a `-D` or `-P` value could not be interpolated. Holds
     /// the interpolation error's message.
     #[error("invalid property value: {0}")]
@@ -344,6 +453,146 @@ fn option(token: &str) -> Option<CliOption> {
     })
 }
 
+/// The options of `MAVEN_ARGS` raeva cannot read as `mvn` does: those
+/// that choose the global settings, the toolchains, the POM or the
+/// repositories searched, and one Maven refuses.
+const MAVEN_ARGS_REFUSED: &[&str] = &["gs", "t", "gt", "f", "itr", "llr"];
+
+/// The reactor selection: options that pick which modules a build runs,
+/// not what they resolve. raeva locks the whole reactor, so it reads them
+/// and ignores them.
+pub const REACTOR_SELECTION: [&str; 5] = ["-pl", "-am", "-amd", "-rf", "-N"];
+
+/// The reactor selection option `option` is, if it is one.
+fn reactor_selection(option: CliOption) -> Option<&'static str> {
+    REACTOR_SELECTION
+        .into_iter()
+        .find(|selection| selection[1..] == *option.name)
+}
+
+/// What raeva takes from `MAVEN_ARGS`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MavenArgs {
+    /// Its `-D`, `-P` and `-s` values.
+    pub(crate) line: CommandLine,
+    /// Its reactor selection options, each once.
+    pub(crate) selection: Vec<&'static str>,
+}
+
+/// One argument of `mvn`'s command line as `CLIManager.parse` reads it.
+enum Word {
+    /// An option, as written, with its value, its quotes stripped.
+    Option {
+        token: String,
+        option: CliOption,
+        value: Option<String>,
+    },
+    /// A `-` argument that names no option.
+    Unknown(String),
+    /// An argument that is no option, such as a goal, or one after `--`.
+    Argument(String),
+}
+
+/// `args` as `CLIManager.parse` reads them: `CleanArgument.cleanArgs`, then
+/// `GnuParser`'s flattening, each option taking the next argument as its
+/// value unless that is an option, with the quotes around the value
+/// stripped as commons-cli strips them. Also whether a quote is still open
+/// at the end, which joins the arguments after `args`.
+fn read_args(args: &[&str]) -> Result<(Vec<Word>, bool), MavenConfigError> {
+    let (cleaned, open) = clean_args_open(args)?;
+    let mut words = Vec::new();
+    let mut tokens = flatten(cleaned).into_iter().peekable();
+    while let Some(token) = tokens.next() {
+        if token == "--" {
+            words.extend((tokens.by_ref().filter(|token| token != "--")).map(Word::Argument));
+            break;
+        }
+        if token == "-" || !token.starts_with('-') {
+            words.push(Word::Argument(token));
+            continue;
+        }
+        let Some(option) = option(&token) else {
+            words.push(Word::Unknown(token));
+            continue;
+        };
+        let value = match tokens.peek() {
+            Some(next)
+                if option.takes_value
+                    && !(next.starts_with('-') && self::option(next).is_some()) =>
+            {
+                tokens.next().map(|next| strip_quotes(&next).to_string())
+            }
+            _ => None,
+        };
+        words.push(Word::Option {
+            token,
+            option,
+            value,
+        });
+    }
+    Ok((words, open))
+}
+
+/// The `-D`, `-P` and `-s` values of `MAVEN_ARGS`, which `mvn` splits at
+/// white space, without removing quotes, and puts before the command
+/// line's arguments, read as [`read_args`] reads them, or why raeva cannot
+/// read it as `mvn` does: a file pattern, which `sh` expands against the
+/// working directory, or on Windows a character `mvn.cmd` or the java
+/// launcher reads, as a quote, a delayed expansion `!` or a `cmd`
+/// operator; a quote left open, which joins `mvn`'s own arguments; or an
+/// option that is not Maven's or that [`MAVEN_ARGS_REFUSED`] holds. Names
+/// the option, never a value. Also its [`REACTOR_SELECTION`] options.
+pub(crate) fn maven_args(args: &str) -> Result<MavenArgs, String> {
+    let (refused, reader) = match cfg!(windows) {
+        true => ("\"*?[!&|<>^%\r\n", "mvn.cmd"),
+        false => ("*?[", "the shell mvn runs in"),
+    };
+    if let Some(found) = args.chars().find(|c| refused.contains(*c)) {
+        return Err(format!("holds {found:?}, which {reader} expands"));
+    }
+    let words: Vec<&str> = (args.split([' ', '\t', '\n']))
+        .filter(|word| !word.is_empty())
+        .collect();
+    let (words, open) = read_args(&words).map_err(|_| "holds a lone '\"'".to_string())?;
+    if open {
+        return Err("holds a quote it does not close, which joins mvn's own arguments".into());
+    }
+    let mut read = MavenArgs::default();
+    for word in words {
+        let (token, found, value) = match word {
+            Word::Argument(_) => continue,
+            Word::Unknown(token) => {
+                let named = bounded(token.split('=').next().unwrap_or_default());
+                return Err(format!("holds {named}, which Maven 3.9 does not know"));
+            }
+            Word::Option {
+                token,
+                option,
+                value,
+            } => (token, option, value),
+        };
+        let named = bounded(token.split('=').next().unwrap_or_default());
+        if MAVEN_ARGS_REFUSED.contains(&found.name) {
+            return Err(format!("holds {named}"));
+        }
+        match (found.name, value) {
+            ("D", Some(value)) => read.line.defines.push(value),
+            ("P", Some(value)) => read.line.profiles.push(value),
+            ("s", Some(value)) => read.line.settings.push(value),
+            (_, None) if found.takes_value && !found.value_optional => {
+                return Err(format!("holds {named} without its value"));
+            }
+            _ => {}
+        }
+        if let Some(selection) = reactor_selection(found)
+            && !read.selection.contains(&selection)
+        {
+            read.selection.push(selection);
+        }
+    }
+    Ok(read)
+}
+
 /// Java's line terminators: `\n`, `\r\n` or a lone `\r`.
 fn java_lines(content: &str) -> impl Iterator<Item = &str> {
     let mut rest = Some(content);
@@ -371,6 +620,11 @@ fn java_lines(content: &str) -> impl Iterator<Item = &str> {
 /// that following arguments join, separated by a space, until an argument
 /// that both starts and ends with `"`, or another opening `"`, closes it.
 fn clean_args(args: &[&str]) -> Result<Vec<String>, MavenConfigError> {
+    clean_args_open(args).map(|(cleaned, _)| cleaned)
+}
+
+/// [`clean_args`], and whether the last buffer is still open.
+fn clean_args_open(args: &[&str]) -> Result<(Vec<String>, bool), MavenConfigError> {
     let mut cleaned = Vec::new();
     let mut current: Option<String> = None;
     for arg in args {
@@ -401,10 +655,11 @@ fn clean_args(args: &[&str]) -> Result<Vec<String>, MavenConfigError> {
             }
         }
     }
+    let open = current.is_some();
     if let Some(open) = current {
         cleaned.push(open);
     }
-    Ok(cleaned)
+    Ok((cleaned, open))
 }
 
 /// `GnuParser.flatten`: `--opt=value` and `-Xvalue` become an option token
@@ -464,16 +719,91 @@ pub(crate) fn parse(content: &str) -> Result<MavenConfigOptions, MavenConfigErro
 }
 
 /// The directory names `MavenCli` expands in option values ahead of the
-/// system properties and the `-D` values: all three are the directory
-/// `mvn` runs in, the project root.
-fn insert_root(map: &mut PropertyMap, project_root: &Path) {
-    let root = project_root.to_string_lossy();
-    for name in [
-        "session.rootDirectory",
-        "session.topDirectory",
-        "maven.multiModuleProjectDirectory",
-    ] {
-        map.insert(name, root.as_ref());
+/// system properties and the `-D` values. `session.topDirectory` is the
+/// canonical directory `mvn` runs in, the project's, and
+/// `session.rootDirectory` the nearest one from there up that holds `.mvn`,
+/// which `MavenCli` finds on the canonical path; without one it reads ahead
+/// of a `-D` of its name as undefined, [`ROOTLESS`].
+/// `maven.multiModuleProjectDirectory` is the launcher's, as `mvn` passes
+/// it, which may be above the project, below a `-D` of its name.
+fn insert_root(map: &mut PropertyMap, project_root: &Path, environment: &ModelEnvironment) {
+    let top = environment.reactor_root().unwrap_or(project_root);
+    map.insert("session.topDirectory", top.to_string_lossy().as_ref());
+    match environment.root_directory() {
+        Some(root) => map.insert("session.rootDirectory", root.to_string_lossy().as_ref()),
+        None => map.insert("session.rootDirectory", ROOTLESS),
+    }
+    if map.get("maven.multiModuleProjectDirectory").is_none() {
+        let root = project_root.to_string_lossy();
+        let launcher = environment.launcher_root().unwrap_or(&root);
+        map.insert("maven.multiModuleProjectDirectory", launcher);
+    }
+}
+
+/// The system properties `MavenCli` expands option values with on the
+/// platform being locked: those the JVM and `mvn` set that raeva answers
+/// ([`rv_maven_model::answered_host_properties`]), and the other
+/// `.mvn/jvm.config` values but those of JVM-owned names, which some JDKs
+/// keep their own of. One raeva does not read stays as written.
+fn host_system_properties(environment: &ModelEnvironment) -> Vec<(String, String)> {
+    // Interpolation asks the environment for `java.version`, which warns of
+    // a stand-in JDK once a value reads it.
+    let mut answered = rv_maven_model::answered_host_properties(environment);
+    answered.retain(|(name, _)| *name != "java.version");
+    let mut properties: Vec<(String, String)> = (environment.system_properties().iter())
+        .filter(|(name, _)| !answered.iter().any(|(known, _)| known == name))
+        .filter(|(name, _)| !rv_maven_model::jvm_owned(name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    properties.extend(
+        answered
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value)),
+    );
+    properties
+}
+
+/// Refuse the `-D` value `value` of `name`, as `MavenCli` expanded it, when
+/// it still takes a name a JVM option may set in a way raeva does not
+/// read: `MavenCli` expands it before a POM's properties could fill it.
+fn refuse_unread_option(
+    name: &str,
+    value: &str,
+    environment: &ModelEnvironment,
+) -> Result<(), MavenConfigError> {
+    let unread = (value.split("${").skip(1))
+        .filter_map(|rest| rest.split_once('}'))
+        .map(|(read, _)| read)
+        .find(|read| environment.unread_system_property(read));
+    let Some(read) = unread else {
+        return Ok(());
+    };
+    let why = crate::unread_jvm_option(read).unwrap_or_default();
+    Err(MavenConfigError::Interpolation(format!(
+        "-D{} takes ${{{}}}, which mvn's JVM may take from its options, where {why}, which \
+         raeva cannot read exactly; write that option plainly, or define {} on the command \
+         line of both raeva and mvn",
+        bounded(name),
+        bounded(read),
+        bounded(read)
+    )))
+}
+
+/// The value [`insert_root`] gives `session.rootDirectory` where no
+/// directory holds `.mvn`.
+const ROOTLESS: &str = "\0rootless\0";
+
+/// `MavenCli` fails the build on `${session.rootDirectory}` where no
+/// directory holds `.mvn`.
+fn refuse_rootless(value: &str) -> Result<(), MavenConfigError> {
+    match value.contains(ROOTLESS) {
+        true => Err(MavenConfigError::Interpolation(
+            "${session.rootDirectory} names the nearest directory from the project up that \
+             holds a .mvn directory, and there is none, which fails Maven's build too; create \
+             .mvn in the project's root directory"
+                .to_string(),
+        )),
+        false => Ok(()),
     }
 }
 
@@ -482,9 +812,10 @@ fn insert_root(map: &mut PropertyMap, project_root: &Path) {
 /// The command line's `-D` values come after the file's, so they win, and
 /// its `-P` values come first. `${...}` in `-D`, `-P` and `-s` values
 /// resolves against the platform's system properties as `MavenCli` resolves
-/// it against its own, and `${session.rootDirectory}`,
-/// `${session.topDirectory}` and `${maven.multiModuleProjectDirectory}`
-/// against `project_root`.
+/// it against its own (`host_system_properties`), a `-P` value that takes
+/// one raeva does not read failing, `${session.rootDirectory}` and
+/// `${session.topDirectory}` against `project_root`, and
+/// `${maven.multiModuleProjectDirectory}` against the launcher's directory.
 pub fn parse_for(
     content: Option<&str>,
     command_line: &CommandLine,
@@ -498,22 +829,17 @@ pub fn parse_for(
     let defines = written.defines.iter().chain(&command_line.defines);
     let profiles = command_line.profiles.iter().chain(&written.profiles);
     let mut options = MavenConfigOptions::default();
-    let system_properties =
-        ActivationContext::new(environment.clone()).activation_system_properties();
+    let system_properties = host_system_properties(environment);
     let mut raw = PropertyMap::new();
     for (name, value) in &system_properties {
         raw.insert(name, value);
     }
     let mut names = Vec::new();
     for define in defines {
-        let name = define_name(define);
+        let (name, value) = define_property(define);
         if name.is_empty() {
             return Err(MavenConfigError::EmptyPropertyName(define.clone()));
         }
-        let value = match define.find('=') {
-            Some(equals) if equals > 0 => &define[equals + 1..],
-            _ => "true",
-        };
         if !names.iter().any(|known| known == name) {
             names.push(name.to_string());
         }
@@ -522,7 +848,7 @@ pub fn parse_for(
     // `MavenCli.populateProperties` expands each value against the `-D`
     // values as written and the system properties.
     let mut lookup = raw.clone();
-    insert_root(&mut lookup, project_root);
+    insert_root(&mut lookup, project_root, environment);
     let mut session = PropertyMap::new();
     for (name, value) in &system_properties {
         session.insert(name, value);
@@ -530,18 +856,53 @@ pub fn parse_for(
     // Values matter only when a model reads their names. The configuration
     // hash covers those effective values without recording eager host reads.
     let property_environment = environment.detached();
+    let marker = |name: &str| format!("\u{1}{name}\u{1}");
+    let mut platform_free = lookup.clone();
+    for name in rv_maven_model::PLATFORM_PROPERTIES {
+        if !names.iter().any(|known| known == name) {
+            platform_free.insert(name, marker(name));
+        }
+    }
     for name in names {
         let value = raw.get(&name).cloned().unwrap_or_default();
         if value.contains("${") {
             options.expanded_properties.insert(name.clone());
+            let (_, read) = lookup.interpolate_str_exact_names(&value, &property_environment);
+            let reference = |read: &String| format!("${{{read}}}");
+            let secrets: Vec<String> = (read.into_iter())
+                .filter(|read| *read != name && crate::secret_named(read))
+                .filter(|read| {
+                    (lookup.interpolate_str_exact(&reference(read), &property_environment))
+                        .is_ok_and(|value| {
+                            crate::redact::register_named_secret(&value);
+                            value != reference(read)
+                        })
+                })
+                .collect();
+            if !secrets.is_empty() {
+                options.secret_inputs.insert(name.clone(), secrets);
+            }
         }
-        let value = lookup
+        let expanded = lookup
             .interpolate_str_exact(&value, &property_environment)
             .map_err(|error| MavenConfigError::Interpolation(error.to_string()))?;
+        if value.contains("${")
+            && let Ok(free) = platform_free.interpolate_str_exact(&value, &property_environment)
+            && free != expanded
+        {
+            let free = (rv_maven_model::PLATFORM_PROPERTIES.into_iter())
+                .fold(free, |free, read| {
+                    free.replace(&marker(read), &format!("${{{read}}}"))
+                });
+            options.platform_values.insert(name.clone(), free);
+        }
+        let value = expanded;
+        refuse_rootless(&value)?;
+        refuse_unread_option(&name, &value, environment)?;
         session.insert(name.as_str(), value.as_str());
         options.properties.insert(name, value);
     }
-    insert_root(&mut session, project_root);
+    insert_root(&mut session, project_root, environment);
 
     // `MavenCli.properties` then expands every other option value against
     // the system properties, which by then hold the `-D` values too.
@@ -549,13 +910,12 @@ pub fn parse_for(
         let value = session
             .interpolate_str_exact(value, environment)
             .map_err(|error| MavenConfigError::Interpolation(error.to_string()))?;
-        for action in value.split(',').filter(|action| !action.is_empty()) {
-            let action = action.trim();
-            let (inactive, profile) = match action.chars().next() {
-                Some('-' | '!') => (true, &action[1..]),
-                Some('+') => (false, &action[1..]),
-                _ => (false, action),
-            };
+        if let Some(name) = rv_maven_model::unread_host_reference(&value, environment) {
+            let fix = rv_maven_model::unread_property_fix(&name, environment);
+            return Err(MavenConfigError::UnreadHostProperty(name, fix));
+        }
+        refuse_rootless(&value)?;
+        for (inactive, profile) in profile_actions(&value) {
             let destination = if inactive {
                 &mut options.inactive_profiles
             } else {
@@ -569,15 +929,59 @@ pub fn parse_for(
     Ok(options)
 }
 
-/// The first `-s` file of `command_line`, `None` when it names none, as
-/// commons-cli's `getOptionValue` answers it, expanded against the
-/// command line's `-D` values and the system properties, with
-/// `${session.rootDirectory}`, `${session.topDirectory}` and
-/// `maven.multiModuleProjectDirectory` as `project_root`. A relative path is
-/// taken from the working directory. Unlike Maven, raeva takes neither a
-/// `-s` nor the `-D` values that expand one from `.mvn/maven.config`: the
-/// project would pick the mirrors, proxies, environment and local
-/// repository that only the user's own files may set.
+/// The `-D` and `-P` options `mvn` reads from `.mvn/maven.config`'s
+/// `content` and from `command_line`, as written: the file's `-D` values
+/// first, so a later one of the command line wins, and its `-P` values
+/// last. A file that does not parse adds none.
+pub fn with_maven_config(content: Option<&str>, command_line: &CommandLine) -> CommandLine {
+    let written = content
+        .and_then(|content| written_values(content).ok())
+        .unwrap_or_default();
+    CommandLine {
+        defines: (written.defines.into_iter())
+            .chain(command_line.defines.iter().cloned())
+            .collect(),
+        profiles: (command_line.profiles.iter().cloned())
+            .chain(written.profiles)
+            .collect(),
+        settings: (command_line.settings.iter().cloned())
+            .chain(written.settings)
+            .collect(),
+    }
+}
+
+/// Each profile id a `-P` value names, and whether it deselects it, as
+/// MavenCli reads the value: StringTokenizer skips empty tokens, then
+/// String.trim, then the action's prefix.
+pub fn profile_actions(value: &str) -> impl Iterator<Item = (bool, &str)> {
+    (value.split(',').filter(|action| !action.is_empty())).map(|action| {
+        let action = action.trim_matches(|c: char| c <= ' ');
+        match action.strip_prefix(['-', '!']) {
+            Some(id) => (true, id),
+            None => (false, action.strip_prefix('+').unwrap_or(action)),
+        }
+    })
+}
+
+/// One `-P` action as Maven reads it back: `!id` deselects, and an `id`
+/// that starts with `!` or `+` takes the `+` it needs to be selected.
+pub fn profile_action(inactive: bool, id: &str) -> String {
+    let prefix = match inactive {
+        true => "!",
+        false if id.starts_with(['!', '+']) => "+",
+        false => "",
+    };
+    format!("{prefix}{id}")
+}
+
+/// The first `-s` file of `command_line`, else of `.mvn/maven.config`
+/// `content`, `None` when neither names one, as commons-cli's
+/// `getOptionValue` answers it from `MavenCli`'s merge, which puts the
+/// command line first. It is expanded against the `-D` values of both
+/// and the system properties, with `${session.rootDirectory}` and
+/// `${session.topDirectory}` as `project_root` and
+/// `maven.multiModuleProjectDirectory` as the launcher's directory. A
+/// relative path is taken from the working directory, as Maven takes it.
 ///
 /// # Errors
 ///
@@ -587,25 +991,30 @@ pub fn settings_file(
     command_line: &CommandLine,
     environment: &ModelEnvironment,
     project_root: &Path,
+    user_home: Option<&Path>,
 ) -> Result<Option<PathBuf>, MavenConfigError> {
-    parse_for(content, command_line, &environment.detached(), project_root)?;
-    let Some(value) = command_line.settings.first() else {
+    let options = parse_for(content, command_line, &environment.detached(), project_root)?;
+    let written = content.map(written_values).transpose()?;
+    let Some(value) =
+        (command_line.settings.first()).or_else(|| written.as_ref()?.settings.as_ref())
+    else {
         return Ok(None);
     };
-    let options = parse_for(None, command_line, &environment.detached(), project_root)?;
     let mut session = PropertyMap::new();
-    let system_properties =
-        ActivationContext::new(environment.clone()).activation_system_properties();
-    for (name, value) in &system_properties {
+    for (name, value) in &host_system_properties(environment) {
         session.insert(name, value);
+    }
+    if let Some(home) = user_home.and_then(Path::to_str) {
+        session.insert("user.home", home);
     }
     for (name, value) in &options.properties {
         session.insert(name, value);
     }
-    insert_root(&mut session, project_root);
+    insert_root(&mut session, project_root, environment);
     let value = session
         .interpolate_str_exact(value, environment)
         .map_err(|error| MavenConfigError::Interpolation(error.to_string()))?;
+    refuse_rootless(&value)?;
     let path = std::path::absolute(&value).unwrap_or_else(|_| value.into());
     Ok(Some(
         (path.components())
@@ -615,19 +1024,23 @@ pub fn settings_file(
 }
 
 /// The options `.mvn/maven.config` names that raeva does not read from it:
-/// the settings options `-s` and `-gs`, and the reactor selection `-pl`,
-/// `-am` and `-amd`, since raeva locks the whole reactor.
+/// the [`REACTOR_SELECTION`], since raeva locks the whole reactor.
 ///
 /// # Errors
 ///
-/// When Maven refuses the file's syntax, before any value is expanded.
+/// When Maven refuses the file's syntax, before any value is expanded, and
+/// for `-gs`, a global settings file, which raeva does not read.
 pub fn ignored_options(content: &str) -> Result<Vec<&'static str>, MavenConfigError> {
     let written = written_values(content)?;
-    Ok([("-s", written.settings), ("-gs", written.global_settings)]
-        .into_iter()
-        .filter_map(|(option, named)| named.then_some(option))
-        .chain(written.selection)
-        .collect())
+    if written.global_settings {
+        return Err(MavenConfigError::GlobalSettings);
+    }
+    Ok(written.selection)
+}
+
+/// Whether `.mvn/maven.config` holds `-o` (`--offline`).
+pub(crate) fn sets_offline(content: Option<&str>) -> bool {
+    content.is_some_and(|content| written_values(content).is_ok_and(|written| written.offline))
 }
 
 /// Whether a `-P` value of `.mvn/maven.config` or `command_line` holds a
@@ -650,9 +1063,11 @@ pub(crate) fn selects_profiles_by_expression(
 struct Written {
     defines: Vec<String>,
     profiles: Vec<String>,
-    settings: bool,
+    /// The first `-s` value.
+    settings: Option<String>,
     global_settings: bool,
-    /// The reactor selection options, `-pl`, `-am` and `-amd`, each once.
+    offline: bool,
+    /// The [`REACTOR_SELECTION`] options, each once.
     selection: Vec<&'static str>,
 }
 
@@ -660,32 +1075,26 @@ fn written_values(content: &str) -> Result<Written, MavenConfigError> {
     let lines: Vec<&str> = java_lines(content)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .collect();
-    let tokens = flatten(clean_args(&lines)?);
-
+    let (words, _) = read_args(&lines)?;
     let mut written = Written::default();
     let mut entries = Vec::new();
-    let mut tokens = tokens.into_iter().peekable();
-    while let Some(token) = tokens.next() {
-        if token == "--" {
-            entries.extend(tokens.by_ref().filter(|token| token != "--"));
-            break;
-        }
-        if token == "-" || !token.starts_with('-') {
-            entries.push(token);
-            continue;
-        }
-        let Some(option) = option(&token) else {
-            return Err(MavenConfigError::UnrecognizedOption(token));
+    for word in words {
+        let (option, value) = match word {
+            Word::Argument(entry) => {
+                entries.push(entry);
+                continue;
+            }
+            Word::Unknown(token) => return Err(MavenConfigError::UnrecognizedOption(token)),
+            Word::Option { option, value, .. } => (option, value),
         };
-        if option.name == "llr" {
-            return Err(MavenConfigError::UnsupportedOption);
+        match option.name {
+            "llr" => return Err(MavenConfigError::UnsupportedOption),
+            "f" => return Err(MavenConfigError::ProjectFile),
+            "itr" => return Err(MavenConfigError::IgnoreTransitiveRepositories),
+            _ => {}
         }
-        if option.name == "f" {
-            return Err(MavenConfigError::ProjectFile);
-        }
-        if let Some(selection) = ["-pl", "-am", "-amd"]
-            .into_iter()
-            .find(|selection| selection[1..] == *option.name)
+        written.offline |= option.name == "o";
+        if let Some(selection) = reactor_selection(option)
             && !written.selection.contains(&selection)
         {
             written.selection.push(selection);
@@ -693,16 +1102,12 @@ fn written_values(content: &str) -> Result<Written, MavenConfigError> {
         if !option.takes_value {
             continue;
         }
-        let value = match tokens.peek() {
-            Some(next) if !(next.starts_with('-') && self::option(next).is_some()) => {
-                tokens.next().map(|next| strip_quotes(&next).to_string())
-            }
-            _ => None,
-        };
         match (option.name, value) {
             ("D", Some(value)) => written.defines.push(value),
             ("P", Some(value)) => written.profiles.push(value),
-            ("s", Some(_)) => written.settings = true,
+            ("s", Some(value)) => {
+                written.settings.get_or_insert(value);
+            }
             ("gs", Some(_)) => written.global_settings = true,
             (_, Some(_)) => {}
             (name, None) if !option.value_optional => {
@@ -721,30 +1126,237 @@ fn written_values(content: &str) -> Result<Written, MavenConfigError> {
 mod tests {
     use super::*;
 
+    /// `MAVEN_ARGS` reads its `-s` in each spelling `mvn` takes, and
+    /// refuses `-gs`, while its other options pass and its `-D` and `-P`
+    /// are read.
     #[test]
-    fn jvm_options_are_whitespace_separated_system_properties() {
+    fn maven_args_reads_a_settings_file() {
+        for args in [
+            "-s /b/settings.xml",
+            "-B -s/b/settings.xml",
+            "--settings=/b/settings.xml",
+            "--settings /b/settings.xml",
+            "-s \"/b/settings.xml\"",
+        ] {
+            // `mvn.cmd` reads a quote, so on Windows it refuses.
+            if cfg!(windows) && args.contains('"') {
+                assert_windows_refuses(args);
+                continue;
+            }
+            assert_eq!(
+                maven_args(args).unwrap().line.settings,
+                ["/b/settings.xml"],
+                "{args}"
+            );
+        }
+        for args in ["-gs /b/settings.xml", "--global-settings /b/settings.xml"] {
+            let error = maven_args(args).unwrap_err();
+            assert!(error.starts_with("holds -"), "{args}: {error}");
+        }
+        let read = maven_args("-B -V --show-version -nsu -ntp -T 1C -Duser.home=/a -Pci").unwrap();
         assert_eq!(
-            jvm_properties("-Xmx256m\n-Dflag -Dempty=\t-Dvalue=one=two\r\n-Dvalue=last -ea"),
-            HashMap::from([
-                ("flag".to_string(), String::new()),
-                ("empty".to_string(), String::new()),
-                ("value".to_string(), "last".to_string()),
-            ])
+            (read.line.defines, read.line.profiles),
+            (vec!["user.home=/a".into()], vec!["ci".into()])
         );
-        assert_eq!(jvm_properties("-Dvalue=one=two")["value"], "one=two");
+    }
+
+    /// The reactor selection of `MAVEN_ARGS` is read with its values, in
+    /// each spelling Maven takes, and named once each; the options that
+    /// pick other files still refuse.
+    #[test]
+    fn maven_args_reads_a_reactor_selection() {
+        for (args, selection) in [
+            ("-pl core -am", &["-pl", "-am"][..]),
+            ("--projects core --also-make", &["-pl", "-am"]),
+            ("-pl=core -Dx=1", &["-pl"]),
+            ("--projects=a,b -amd -pl c", &["-pl", "-amd"]),
+            ("-rf :core -N", &["-rf", "-N"]),
+            ("--resume-from core --non-recursive", &["-rf", "-N"]),
+        ] {
+            let read = maven_args(args).unwrap();
+            assert_eq!(read.selection, selection, "{args}");
+        }
+        let read = maven_args("-pl core -Pci").unwrap();
+        assert_eq!(read.line.profiles, ["ci"]);
+        assert!(read.line.defines.is_empty());
+        for (args, named) in [
+            ("-pl core -f other.xml", "-f"),
+            ("-t tc.xml -am", "-t"),
+            ("-gt tc.xml", "-gt"),
+            ("-itr", "-itr"),
+            ("-llr", "-llr"),
+            ("-pl", "-pl"),
+            ("-plcore", "-plcore"),
+        ] {
+            let error = maven_args(args).unwrap_err();
+            assert!(
+                error.starts_with(&format!("holds {named}")),
+                "{args}: {error}"
+            );
+        }
+    }
+
+    /// On Windows `MAVEN_ARGS` with a `"`, which `mvn.cmd` reads, refuses.
+    fn assert_windows_refuses(args: &str) {
+        let error = maven_args(args).unwrap_err();
+        assert!(error.contains("mvn.cmd"), "{args}: {error}");
+    }
+
+    /// `MAVEN_ARGS` takes Maven's quote cleaning after `sh` splits it,
+    /// as `.mvn/maven.config` does: a word that starts and ends with `"`
+    /// loses them, and a value apart from its option loses the quotes
+    /// around it, while a quote inside a word stays. A quote left open
+    /// joins `mvn`'s own arguments, so it refuses. On Windows a `"` refuses.
+    #[test]
+    fn maven_args_cleans_quotes_as_maven_does() {
+        for (args, defines, profiles) in [
+            ("-P \"b\"", &[][..], &["b"][..]),
+            ("\"-Pb\"", &[], &["b"]),
+            ("-P\"b\"", &[], &["b"]),
+            ("--activate-profiles=\"b\"", &[], &["b"]),
+            ("-D \"x=1\"", &["x=1"], &[]),
+            ("-D\"x=1\"", &["x=1"], &[]),
+            ("\"-Dx=1\"", &["x=1"], &[]),
+            ("-Dx=\"a\"", &["x=\"a\""], &[]),
+        ] {
+            if cfg!(windows) {
+                assert_windows_refuses(args);
+                continue;
+            }
+            let read = maven_args(args).unwrap();
+            assert_eq!(read.line.defines, defines, "{args}");
+            assert_eq!(read.line.profiles, profiles, "{args}");
+        }
+        #[cfg(unix)]
+        {
+            // `sh` keeps quotes and `!`, and splits at a line break.
+            let read = maven_args("-Dq=\"a\"\n-P!e,'f' -D\\x=\\").unwrap();
+            assert_eq!(read.line.defines, ["q=\"a\"", "\\x=\\"]);
+            assert_eq!(read.line.profiles, ["!e,'f'"]);
+        }
+        // Maven closes a quote only in the word that opens it, so
+        // `"-Dx=a b"` joins the goals after it, and the build has none.
+        for args in ["\"-Pb", "\"-Dx=a b\"", "\""] {
+            assert!(maven_args(args).is_err(), "{args}");
+        }
+    }
+
+    /// Each action reads back as the one it writes, and selecting `!c`
+    /// is written apart from deselecting `c`.
+    #[test]
+    fn a_profile_action_reads_back_as_written() {
+        for action in [
+            (false, "c"),
+            (true, "c"),
+            (false, "!c"),
+            (false, "+c"),
+            (true, "!c"),
+        ] {
+            let written = profile_action(action.0, action.1);
+            assert_eq!(profile_actions(&written).collect::<Vec<_>>(), [action]);
+        }
+        assert_eq!(profile_action(false, "c"), "c");
+        assert_eq!(profile_action(true, "c"), "!c");
+    }
+
+    /// A3: Maven 3.10's `mvn` writes the project directory in with `sed`,
+    /// where `&` is the text it replaces; a `\`, `|` or line break there
+    /// refuses. Maven 3.9's writes nothing in.
+    #[test]
+    fn maven_310_writes_the_project_directory_in_as_sed_does() {
+        let sed = |text: &str, root: &str| sed_project_basedir(text, root);
         assert_eq!(
-            jvm_properties(
-                "-Djava.version=1.4 -Djava.vm.version=1 -Djdk.debug=fastdebug -Dos.name=Other \
-                 -Duser.dir=/chosen -Djava.vm.custom=2 -Dline.separator=X \
-                 -Dmaven.multiModuleProjectDirectory=/other"
+            sed("-Duser.home=$MAVEN_PROJECTBASEDIR/hh", "/p/a&b"),
+            Ok("-Duser.home=/p/a$MAVEN_PROJECTBASEDIRb/hh".to_string())
+        );
+        assert_eq!(
+            sed(
+                "-Da=${MAVEN_PROJECTBASEDIR} -Db=$MAVEN_PROJECTBASEDIR",
+                "/r&"
             ),
-            HashMap::from([
-                ("os.name".to_string(), "Other".to_string()),
-                ("line.separator".to_string(), "X".to_string()),
-                ("user.dir".to_string(), "/chosen".to_string()),
-                ("java.vm.custom".to_string(), "2".to_string()),
-            ])
+            Ok("-Da=/r${MAVEN_PROJECTBASEDIR} -Db=/r$MAVEN_PROJECTBASEDIR".to_string())
         );
+        assert_eq!(sed("-Da=$MAVEN_PROJECTBASEDIR", "/r"), Ok("-Da=/r".into()));
+        for root in ["/a\\b", "/a|b", "/a\nb"] {
+            assert!(sed("-Da=$MAVEN_PROJECTBASEDIR", root).is_err(), "{root:?}");
+        }
+        assert_eq!(sed("-Da=1", "/a|b"), Ok("-Da=1".into()));
+        if !cfg!(windows) {
+            assert_eq!(
+                launcher_jvm_config(
+                    "-Da=$MAVEN_PROJECTBASEDIR",
+                    Some("/p&q"),
+                    MavenMode::Maven39
+                ),
+                Ok("-Da=$MAVEN_PROJECTBASEDIR".into())
+            );
+        }
+    }
+
+    /// A7, A8 and B1: `mvn.cmd` drops each `!` and `^` of the file and the
+    /// `!` of its directory, reads it in the console's code page, and
+    /// leaves quotes to java; Maven 3.10's writes the project directory in
+    /// ignoring case, dropping its `^`, as measured on Windows 11.
+    #[test]
+    fn mvn_cmd_reads_jvm_config_through_cmd() {
+        let windows =
+            |text: &str, root: &str| windows_jvm_config(text, Some(root), MavenMode::Maven310);
+        for (text, root) in [
+            ("-Duser.home=C:\\h!x", "C:\\p"),
+            ("-Dfoo=a!b -Duser.home=C:\\h", "C:\\p"),
+            ("-Duser.home=C:\\h^x", "C:\\p"),
+            ("-Duser.home=C:\\h\u{e9}", "C:\\p"),
+            ("-Duser.home=\"C:\\a b\"", "C:\\p"),
+            ("-Da=1", "C:\\p!q"),
+            ("-Duser.home=$MAVEN_PROJECTBASEDIR\\hh", "C:\\ca^ret"),
+        ] {
+            assert!(windows(text, root).is_err(), "{text} in {root}");
+        }
+        assert_eq!(
+            windows(
+                "-Da=$maven_projectbasedir\\h -Db=${MAVEN_PROJECTBASEDIR}",
+                "C:\\p"
+            ),
+            Ok("-Da=C:\\p\\h -Db=C:\\p".into())
+        );
+        assert_eq!(
+            windows_jvm_config(
+                "-Da=$MAVEN_PROJECTBASEDIR -Dq=\"x\"",
+                Some("C:\\p"),
+                MavenMode::Maven39
+            ),
+            Ok("-Da=$MAVEN_PROJECTBASEDIR -Dq=\"x\"".into())
+        );
+    }
+
+    /// A10: `mvn` passes the file through its `/bin/sh`'s `echo`, which
+    /// expands backslash escapes in some shells; raeva asks the shell, here
+    /// a bash that expands them as macOS's `/bin/sh` and dash do.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_the_launcher_echo_expands_refuses() {
+        if !Path::new("/bin/bash").is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("sh");
+        std::fs::write(&shell, "#!/bin/bash\nexec /bin/bash -O xpg_echo \"$@\"\n").unwrap();
+        let mut permissions = std::fs::metadata(&shell).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&shell, permissions).unwrap();
+        temp_env::with_var(LAUNCHER_SHELL_TEST_ENV, Some(&shell), || {
+            let config = |text: &str| launcher_jvm_config(text, None, MavenMode::Maven39);
+            assert!(config("-Dfoo=a\\cb -Duser.home=/b").is_err());
+            assert!(config("-Duser.home=/b\\\\x").is_err());
+            assert_eq!(
+                config("-Dpattern=\\d+ -Duser.home=/b"),
+                Ok("-Dpattern=\\d+ -Duser.home=/b".into())
+            );
+            assert_eq!(config("-Duser.home=/b"), Ok("-Duser.home=/b".into()));
+        });
+        temp_env::with_var(LAUNCHER_SHELL_TEST_ENV, Some("/nonexistent/sh"), || {
+            assert!(launcher_jvm_config("-Da=\\d", None, MavenMode::Maven39).is_err());
+        });
     }
 
     /// A lookup record encodes as it did before a model field joined it
@@ -773,6 +1385,7 @@ mod tests {
             &CommandLine::default(),
             &environment,
             Path::new("."),
+            None,
         )
         .unwrap();
         assert!(
@@ -1009,9 +1622,10 @@ mod tests {
         );
     }
 
-    /// The command line's first `-s` wins, and its value expands with the
-    /// command line's `-D` values and the project directory. Neither a `-s`
-    /// nor a `-D` value of the file counts.
+    /// The command line's first `-s` wins, else the file's first, and
+    /// either expands with the `-D` values of both, the command line's
+    /// winning, and the project directory, as Maven 3.9.12 and 3.10.0 read
+    /// them.
     #[test]
     fn the_settings_file_is_the_first_expanded() {
         let root = Path::new("/project");
@@ -1021,11 +1635,13 @@ mod tests {
                 command_line,
                 &ModelEnvironment::default(),
                 root,
+                None,
             )
         };
         let content = "-Ddir=ci\n--settings=${maven.multiModuleProjectDirectory}/.mvn/${dir}.xml\n\
                        -s\nsecond.xml\n-gs\ng.xml\n";
-        assert_eq!(file(content, &CommandLine::default()), Ok(None));
+        let in_root = file(content, &CommandLine::default()).unwrap().unwrap();
+        assert!(in_root.ends_with(".mvn/ci.xml"), "{in_root:?}");
         let given = CommandLine::new(
             vec!["dir=cd".into()],
             Vec::new(),
@@ -1036,9 +1652,12 @@ mod tests {
         let absolute = |path: &str| Ok(Some(std::path::absolute(path).expect("absolute")));
         assert_eq!(file(content, &given), absolute("/ci/cd.xml"));
         let undefined = CommandLine::new(Vec::new(), Vec::new(), vec!["/ci/${dir}.xml".into()]);
+        assert_eq!(file(content, &undefined.unwrap()), absolute("/ci/ci.xml"));
         assert_eq!(
-            file(content, &undefined.unwrap()),
-            absolute("/ci/${dir}.xml")
+            file("-s\nfirst.xml\n-s\nsecond.xml\n", &CommandLine::default()),
+            Ok(Some(
+                std::env::current_dir().expect("cwd").join("first.xml")
+            ))
         );
         let relative = CommandLine::new(Vec::new(), Vec::new(), vec!["here.xml".into()]).unwrap();
         assert_eq!(
@@ -1046,12 +1665,19 @@ mod tests {
             Ok(Some(std::env::current_dir().expect("cwd").join("here.xml")))
         );
         assert_eq!(file("-Dx=1\n", &CommandLine::default()), Ok(None));
-        assert_eq!(ignored_options(content), Ok(vec!["-s", "-gs"]));
-        assert_eq!(ignored_options("-s\nx.xml\n"), Ok(vec!["-s"]));
+        assert_eq!(
+            ignored_options(content),
+            Err(MavenConfigError::GlobalSettings)
+        );
+        assert_eq!(ignored_options("-s\nx.xml\n"), Ok(vec![]));
         assert_eq!(ignored_options("-Dx=1\n"), Ok(vec![]));
         assert_eq!(
             ignored_options("--projects=app\n-amd\n--also-make\n-pl\nlib\n-s\nx.xml\n"),
-            Ok(vec!["-s", "-pl", "-amd", "-am"])
+            Ok(vec!["-pl", "-amd", "-am"])
+        );
+        assert_eq!(
+            ignored_options("--resume-from\napp\n-N\n"),
+            Ok(vec!["-rf", "-N"])
         );
         assert_eq!(
             parse("-s\n").err(),
@@ -1062,9 +1688,50 @@ mod tests {
     /// Maven 3.9.12 expands these three names to the project directory in
     /// `-s` and `-D` values, ahead of a `-D` of the same name (trino reads
     /// its settings from `${session.rootDirectory}/.mvn/settings.xml`).
+    /// `session.rootDirectory` needs a `.mvn` there or above, and fails the
+    /// build without one.
     #[test]
     fn the_project_directory_names_expand_in_values() {
-        let root = Path::new("/project");
+        let dir = tempfile::tempdir().unwrap();
+        let root = &dir.path().join("project");
+        std::fs::create_dir_all(root).unwrap();
+        let rootless = rv_maven_model::HostSnapshot::capture(&[])
+            .with_reactor_root(root)
+            .host_environment();
+        assert_eq!(
+            parse_for(
+                Some("-Dx=${session.rootDirectory}"),
+                &CommandLine::default(),
+                &rootless,
+                root
+            )
+            .map(|_| ()),
+            Err(MavenConfigError::Interpolation(
+                "${session.rootDirectory} names the nearest directory from the project up that \
+                 holds a .mvn directory, and there is none, which fails Maven's build too; \
+                 create .mvn in the project's root directory"
+                    .to_string()
+            ))
+        );
+        let defined = CommandLine {
+            defines: vec!["session.rootDirectory=/fake".to_string()],
+            ..CommandLine::default()
+        };
+        assert!(
+            parse_for(
+                Some("-Dx=${session.rootDirectory}"),
+                &defined,
+                &rootless,
+                root
+            )
+            .is_err()
+        );
+        assert!(parse_for(None, &defined, &rootless, root).is_ok());
+        std::fs::create_dir(root.join(".mvn")).unwrap();
+        let environment = &rv_maven_model::HostSnapshot::capture(&[])
+            .with_reactor_root(root)
+            .host_environment();
+        let at = |path: &str| format!("{}{path}", root.display());
         for name in [
             "session.rootDirectory",
             "session.topDirectory",
@@ -1073,14 +1740,23 @@ mod tests {
             let content = format!(
                 "-s\n${{{name}}}/.mvn/s.xml\n-Dx=${{{name}}}/x\n-D{name}=/no\n-Pp${{{name}}}\n"
             );
+            // A `-D` of the launcher's name sets it as any system property;
+            // `MavenCli` gives only the session ones precedence.
+            let value = match name {
+                "maven.multiModuleProjectDirectory" => "/no".to_string(),
+                _ => at(""),
+            };
             assert_eq!(
                 settings_file(
                     Some(&content),
                     &CommandLine::default(),
-                    &ModelEnvironment::default(),
+                    environment,
                     root,
+                    None
                 ),
-                Ok(None),
+                Ok(Some(
+                    std::path::absolute(format!("{value}/.mvn/s.xml")).expect("absolute")
+                )),
                 "{name}"
             );
             let command_line = CommandLine {
@@ -1088,20 +1764,15 @@ mod tests {
                 ..CommandLine::default()
             };
             assert_eq!(
-                settings_file(None, &command_line, &ModelEnvironment::default(), root),
-                Ok(Some(std::path::absolute("/project/.mvn/s.xml").unwrap())),
+                settings_file(None, &command_line, environment, root, None),
+                Ok(Some(PathBuf::from(at("/.mvn/s.xml")))),
                 "{name}"
             );
-            let options = parse_for(
-                Some(&content),
-                &CommandLine::default(),
-                &ModelEnvironment::default(),
-                root,
-            )
-            .expect("parses");
-            assert_eq!(options.properties["x"], "/project/x", "{name}");
+            let options = parse_for(Some(&content), &CommandLine::default(), environment, root)
+                .expect("parses");
+            assert_eq!(options.properties["x"], format!("{value}/x"), "{name}");
             assert_eq!(options.properties[name], "/no", "{name}");
-            assert_eq!(options.active_profiles, ["p/project"], "{name}");
+            assert_eq!(options.active_profiles, [format!("p{value}")], "{name}");
             assert!(options.expanded_properties.contains("x"));
         }
     }

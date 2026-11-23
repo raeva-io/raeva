@@ -1,6 +1,6 @@
 //! Resolution context and state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,10 +13,11 @@ use rv_config::Config;
 use rv_lock::Platform;
 
 use rv_maven_model::Project;
-use rv_maven_types::{BlobId, Coord};
+use rv_maven_types::{BlobId, Coord, MavenMode, Version, VersionReq};
 use rv_repo::{Metadata, RepoClient, Repository};
 use rv_store::Store;
 
+use crate::error::{RepoSearchStatus, RepoStatus, ResolveError};
 use crate::graph::ExactCoord;
 use crate::parent_resolver::LocalParentCache;
 use crate::parsed_pom_cache::ParsedPomCache;
@@ -185,6 +186,21 @@ impl ResolveState {
         Arc::new(Self::default())
     }
 
+    /// Caches whose POMs keep their plugin sections.
+    pub(crate) fn with_plugin_sections() -> Arc<Self> {
+        let parsed_poms = Arc::new(ParsedPomCache::with_plugin_sections());
+        let local_parents = Arc::new(LocalParentCache::new(Arc::clone(&parsed_poms)));
+        Arc::new(Self::with_parsed_poms(parsed_poms, local_parents))
+    }
+
+    /// A state with nothing read yet, keeping the plugin sections as this
+    /// one does.
+    pub(crate) fn emptied(&self) -> Arc<Self> {
+        let parsed_poms = Arc::new(self.parsed_poms.emptied());
+        let local_parents = Arc::new(LocalParentCache::new(Arc::clone(&parsed_poms)));
+        Arc::new(Self::with_parsed_poms(parsed_poms, local_parents))
+    }
+
     fn with_parsed_poms(
         parsed_poms: Arc<ParsedPomCache>,
         local_parents: Arc<LocalParentCache>,
@@ -240,6 +256,77 @@ pub(crate) struct ResolveContext {
     /// What the builds of this context read from the host, besides the
     /// record of the whole run; see [`Self::recording_into`].
     pub(crate) reads: Option<rv_maven_model::HostReads>,
+    /// The versions a listing may choose, when a frozen check replays the
+    /// lock's choices.
+    pub(crate) version_caps: Option<Arc<crate::version_caps::VersionCaps>>,
+    /// Told the root repositories each time a remote parent adds to them.
+    pub(crate) root_repositories: Option<crate::RootRepositories>,
+    /// How the repositories answered for each parent or imported BOM found
+    /// missing, by `group:artifact:version` as its POM declares it, the
+    /// latest search first. Every module of the pass shares it, for the
+    /// error; see [`Self::naming_filtered_models`].
+    pub(crate) model_misses: ModelMisses,
+    /// Every version listing the pass read. Every module of the pass
+    /// shares it; see `backend::refuse_split_listings`.
+    pub(crate) id_listings: IdListings,
+    /// What the modules of the pass read of their build extensions'
+    /// realms. Every module of the pass shares it.
+    pub(crate) extension_realms: Arc<Mutex<ExtensionRealms>>,
+}
+
+/// The version a version listing's search takes in [`ModelMisses`], which
+/// no POM can declare.
+const LISTING: &str = "";
+
+pub(crate) type ModelMisses =
+    Arc<Mutex<HashMap<(String, String, String), Arc<[RepoSearchStatus]>>>>;
+
+/// Version listings by repository id after mirror selection, group and
+/// artifact.
+pub(crate) type IdListings = Arc<Mutex<BTreeMap<(String, String, String), IdListing>>>;
+
+/// The build extension realms the modules of a pass read.
+#[derive(Default)]
+pub(crate) struct ExtensionRealms {
+    /// The set Maven resolves for each build extension, but its own jar,
+    /// by set key.
+    pub(crate) closures: HashMap<String, RealmClosure>,
+    /// The artifact handlers each realm's jars define, by the jars, each
+    /// as its SHA-256 and name, in the realm's order.
+    pub(crate) handlers: HashMap<Vec<(BlobId, String)>, Vec<rv_maven_model::DefinedType>>,
+}
+
+/// The set Maven resolves for a build extension, but its own jar, and the
+/// SNAPSHOT parents and BOMs that resolution read, whose builds decide the
+/// set.
+#[derive(Clone)]
+pub(crate) struct RealmClosure {
+    pub(crate) jars: Arc<[crate::output::ResolvedPackage]>,
+    pub(crate) snapshot_poms: Arc<[(String, crate::SupportPomProvenance)]>,
+}
+
+/// The listings one repository id served for one `group:artifact`, and how
+/// they were read.
+#[derive(Default)]
+pub(crate) struct IdListing {
+    pub(crate) reads: BTreeSet<ListingRead>,
+    /// By URL, each different listing that URL served once.
+    pub(crate) by_url: BTreeMap<String, Vec<Arc<Metadata>>>,
+}
+
+/// What a read takes from a version listing. `among_others`: another
+/// repository's listing answered the same read, so `lastUpdated` picks
+/// between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ListingRead {
+    /// A range's: the versions as listed.
+    Range,
+    /// `RELEASE`'s `<release>`, or with `latest` `LATEST`'s `<latest>` and
+    /// `<release>`.
+    Marker { latest: bool, among_others: bool },
+    /// A plugin without a version: the versions, `<release>` and
+    /// `<latest>`, which count only with a `lastUpdated`.
+    Plugin { among_others: bool },
 }
 
 pub(crate) type ReactorAdmissions =
@@ -271,6 +358,62 @@ fn prefetcher_for(
 }
 
 impl ResolveContext {
+    /// Whether a listed `version` of `group:artifact` may be chosen for
+    /// `req`.
+    pub(crate) fn admits_listed(
+        &self,
+        group: &str,
+        artifact: &str,
+        req: &VersionReq,
+        version: &Version,
+        mode: MavenMode,
+    ) -> bool {
+        (self.version_caps.as_deref())
+            .is_none_or(|caps| caps.admits(group, artifact, req, version, mode))
+    }
+
+    /// [`VersionCaps::order_taken`], when a frozen replay caps versions.
+    pub(crate) fn order_taken<T>(
+        &self,
+        coordinate: (&str, &str),
+        listing: &mut [T],
+        version: impl Fn(&T) -> &Version,
+        mode: MavenMode,
+        first: bool,
+    ) {
+        if let Some(caps) = self.version_caps.as_deref() {
+            caps.order_taken(coordinate, listing, version, mode, first);
+        }
+    }
+
+    /// [`VersionCaps::order_parent_taken`], when a frozen replay caps
+    /// versions.
+    pub(crate) fn order_parent_taken(
+        &self,
+        coordinate: (&str, &str),
+        listing: &mut [Version],
+        mode: MavenMode,
+    ) {
+        if let Some(caps) = self.version_caps.as_deref() {
+            caps.order_parent_taken(coordinate, listing, mode);
+        }
+    }
+
+    /// Whether a frozen replay took `version` of `group:artifact` among
+    /// spellings of `listed` that compare equal, as the lock records, where
+    /// its caps left the others out.
+    pub(crate) fn replays_tie(
+        &self,
+        group: &str,
+        artifact: &str,
+        version: &Version,
+        listed: &indexmap::IndexSet<String>,
+        mode: MavenMode,
+    ) -> bool {
+        (self.version_caps.as_deref())
+            .is_some_and(|caps| caps.tied(group, artifact, version, listed, mode))
+    }
+
     pub(crate) fn environment(&self) -> rv_maven_model::ModelEnvironment {
         self.config
             .model_environment(
@@ -330,6 +473,21 @@ impl ResolveContext {
             config: self.config.recording_only_into(&reads),
             reads: Some(reads),
             ..self.clone()
+        }
+    }
+
+    /// This context, whose builds leave nothing in the record of the run:
+    /// not what they read from the host, nor a read of the classifier
+    /// likes, nor the reactor read through dependencies, nor a version
+    /// listing.
+    pub(crate) fn apart(&self) -> Self {
+        let likes = (self.classifier_likes.as_ref())
+            .map(|likes| rv_maven_model::ClassifierLikes::new(likes.value()));
+        Self {
+            classifier_likes: likes,
+            reactor_through_dependencies: Arc::default(),
+            id_listings: Arc::default(),
+            ..self.recording_only_into(rv_maven_model::HostReads::default())
         }
     }
 
@@ -395,6 +553,11 @@ impl ResolveContext {
             reactor_admissions: Arc::default(),
             reactor_through_dependencies: Arc::default(),
             reads: None,
+            version_caps: None,
+            root_repositories: None,
+            model_misses: Arc::default(),
+            id_listings: Arc::default(),
+            extension_realms: Arc::default(),
             state,
         }
     }
@@ -402,6 +565,17 @@ impl ResolveContext {
     #[cfg(test)]
     pub(crate) fn state(&self) -> Arc<ResolveState> {
         Arc::clone(&self.state)
+    }
+
+    /// This context with its own model caches, which keep each POM's plugin
+    /// sections. Its resolutions search plugin repositories, which are not
+    /// the project's root repositories, so it tells no observer of those.
+    pub(crate) fn with_plugin_sections(&self) -> Self {
+        Self {
+            state: ResolveState::with_plugin_sections(),
+            root_repositories: None,
+            ..self.clone()
+        }
     }
 
     pub(crate) fn for_module(&self, config: Config) -> Self {
@@ -517,9 +691,75 @@ impl ResolveContext {
         }
     }
 
-    pub(crate) fn mark_parent_missing(&self, key: MissingParentKey) {
-        let mut guard = lock(&self.state.missing_parents);
-        guard.put(key, Instant::now());
+    pub(crate) fn mark_parent_missing(
+        &self,
+        key: MissingParentKey,
+        searched: Vec<RepoSearchStatus>,
+    ) {
+        self.note_model_miss((&key.0, &key.1, &key.2), searched.into());
+        lock(&self.state.missing_parents).put(key, Instant::now());
+    }
+
+    /// Keeps `searched`, how the repositories answered for the parent or
+    /// imported BOM `gav`, for the error that names it.
+    pub(crate) fn note_model_miss(
+        &self,
+        (group, artifact, version): (&str, &str, &str),
+        searched: Arc<[RepoSearchStatus]>,
+    ) {
+        let key = (group.to_string(), artifact.to_string(), version.to_string());
+        lock(&self.model_misses).insert(key, searched);
+    }
+
+    /// Keeps `searched`, how the repositories answered for the version
+    /// listing of `group:artifact` when none listed it, which a parent's
+    /// range takes for its own.
+    pub(crate) fn note_listing_miss(
+        &self,
+        group: &str,
+        artifact: &str,
+        searched: Arc<[RepoSearchStatus]>,
+    ) {
+        self.note_model_miss((group, artifact, LISTING), searched);
+    }
+
+    /// How the repositories last answered for the version listing of
+    /// `group:artifact` when none listed it.
+    pub(crate) fn listing_miss(
+        &self,
+        group: &str,
+        artifact: &str,
+    ) -> Option<Arc<[RepoSearchStatus]>> {
+        self.model_miss((group, artifact, LISTING))
+    }
+
+    /// How the repositories last answered for the missing parent or
+    /// imported BOM `gav`.
+    pub(crate) fn model_miss(
+        &self,
+        (group, artifact, version): (&str, &str, &str),
+    ) -> Option<Arc<[RepoSearchStatus]>> {
+        let key = (group.to_string(), artifact.to_string(), version.to_string());
+        lock(&self.model_misses).get(&key).cloned()
+    }
+
+    /// `error` with how the repositories answered for a parent or imported
+    /// BOM it misses, when a remote repository filter kept one of them out.
+    pub(crate) fn naming_filtered_models(
+        misses: &ModelMisses,
+        error: ResolveError,
+    ) -> ResolveError {
+        let misses = lock(misses);
+        error.naming_filtered_models(&|(group, artifact, version)| {
+            let key = (group.to_string(), artifact.to_string(), version.to_string());
+            (misses.get(&key))
+                .filter(|searched| {
+                    searched
+                        .iter()
+                        .any(|entry| entry.status == RepoStatus::Filtered)
+                })
+                .cloned()
+        })
     }
 }
 
@@ -627,7 +867,7 @@ mod tests {
             )]),
         );
         assert!(!other.is_parent_missing(&v9));
-        ctx.mark_parent_missing(v9.clone());
+        ctx.mark_parent_missing(v9.clone(), Vec::new());
         assert!(other.is_parent_missing(&v9));
         assert!(!ctx.is_parent_missing(&v7));
         assert!(!ctx.is_parent_missing(&v9_extra));
@@ -655,7 +895,7 @@ mod tests {
             repo(),
         );
         module.insert_metadata(metadata.clone(), rv_repo::Metadata::default());
-        module.mark_parent_missing(missing.clone());
+        module.mark_parent_missing(missing.clone(), Vec::new());
 
         for platform_ctx in [&ctx, &other_platform] {
             let sibling = platform_ctx.for_module(platform_ctx.config.clone());

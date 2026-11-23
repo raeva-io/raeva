@@ -96,3 +96,115 @@ fn model_hash_covers_a_ci_friendly_parent() {
     assert!(note.contains("../parent/pom.xml changed"), "{note}");
     assert!(!super::frozen_models_match(&lock, &[edited]));
 }
+
+/// A build extension that maps a dependency's type resolves from the
+/// settings.xml plugin repositories, so the configuration hash covers those
+/// of an active profile and of a conditional one, and the condition that
+/// decides a profile with plugin repositories alone.
+#[test]
+fn config_hash_covers_settings_plugin_repositories() {
+    use std::fs;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (home, project) = (dir.path().join("home"), dir.path().join("project"));
+    fs::create_dir_all(home.join(".m2")).expect("mkdir .m2");
+    fs::create_dir_all(&project).expect("mkdir project");
+    fs::write(
+        project.join("pom.xml"),
+        "<project><groupId>g</groupId><artifactId>a</artifactId><version>1</version></project>",
+    )
+    .expect("write pom");
+    let profile = |id: &str, activation: &str, url: &str| {
+        format!(
+            "<profile><id>{id}</id>{activation}<pluginRepositories><pluginRepository>\
+             <id>{id}-plugins</id><url>{url}</url></pluginRepository></pluginRepositories>\
+             </profile>"
+        )
+    };
+    let load = |named: &str, conditional: &str| {
+        let settings = format!(
+            "<settings><profiles>{}{}</profiles><activeProfiles><activeProfile>named\
+             </activeProfile></activeProfiles></settings>",
+            profile("named", "", named),
+            profile(
+                "conditional",
+                "<activation><file><exists>marker</exists></file></activation>",
+                conditional
+            ),
+        );
+        fs::write(home.join(".m2/settings.xml"), settings).expect("write settings");
+        let home = home.to_string_lossy().into_owned();
+        temp_env::with_vars(
+            [
+                ("RAEVA_HOME", Some(home.as_str())),
+                ("HOME", Some(home.as_str())),
+                (rv_config::MAVEN_USER_HOME_TEST_ENV, Some(home.as_str())),
+            ],
+            || rv_config::Config::load(&project).expect("load config"),
+        )
+    };
+    let hash = |config: &rv_config::Config| {
+        super::resolution_config_hash(config, &Default::default()).expect("config hash")
+    };
+    let (a, b) = ("https://a.example/", "https://b.example/");
+    let config = load(a, a);
+    assert_ne!(hash(&config), hash(&load(b, a)), "an active profile's");
+    assert_ne!(hash(&config), hash(&load(a, b)), "a conditional profile's");
+    let platform = Platform::current().expect("platform");
+    let scoped = config.for_platforms([(platform.os(), platform.arch(), None)]);
+    let (ambient, _) = super::consulted_ambient(&scoped, false).expect("ambient");
+    assert!(
+        ambient
+            .iter()
+            .any(|input| matches!(input, rv_lock::AmbientInput::Condition { .. })),
+        "{ambient:?}"
+    );
+}
+
+/// With a filter basedir that names `${os.arch}`, the configuration hash
+/// covers the rule files of every platform, sorted, and not the host's
+/// first, so a lock of several platforms hashes alike on each of them.
+#[test]
+fn config_hash_covers_the_filter_rules_of_every_platform_alike() {
+    use std::fs;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (home, project) = (dir.path().join("home"), dir.path().join("project"));
+    fs::create_dir_all(home.join(".m2")).expect("mkdir .m2");
+    for (arch, group) in [("amd64", "a"), ("aarch64", "b")] {
+        let rules = project.join(".mvn/rrf").join(arch);
+        fs::create_dir_all(&rules).expect("mkdir rules");
+        fs::write(rules.join("groupId-r1.txt"), format!("{group}\n")).expect("write rules");
+    }
+    fs::write(
+        project.join(".mvn/maven.config"),
+        "-Daether.remoteRepositoryFilter.groupId=true\n\
+         -Daether.remoteRepositoryFilter.groupId.basedir=${session.rootDirectory}/.mvn/rrf/${os.arch}\n",
+    )
+    .expect("write maven.config");
+    let home = home.to_string_lossy().into_owned();
+    let config = temp_env::with_vars(
+        [
+            ("RAEVA_HOME", Some(home.as_str())),
+            ("HOME", Some(home.as_str())),
+            (rv_config::MAVEN_USER_HOME_TEST_ENV, Some(home.as_str())),
+        ],
+        || rv_config::Config::load(&project).expect("load config"),
+    );
+    let listed = |name: &str| rv_lock::AmbientInput::user_property(name).is_ok();
+    // What any host of these platforms sees: each one's rules.
+    let every: std::collections::BTreeSet<String> = ["linux", "macos", "windows"]
+        .into_iter()
+        .flat_map(|os| ["x86_64", "aarch64"].map(|arch| (os, arch)))
+        .filter_map(|(os, arch)| {
+            let scoped = config.for_platforms([(os, arch, None)]);
+            scoped.repository_filters().rule_input(listed)
+        })
+        .collect();
+    assert_eq!(every.len(), 2, "{every:?}");
+    let expected = (every.iter())
+        .map(|input| format!("platform\n{input}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(super::filter_rule_input(&config), Some(expected));
+}

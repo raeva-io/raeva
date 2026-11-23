@@ -63,11 +63,12 @@ fn test_client() -> (RepoClient, tempfile::TempDir) {
     client_for(router(Vec::new(), AuthStore::default()))
 }
 
+/// No retries, and the default timeout: under load macOS can hold a new
+/// loopback connection for several seconds before its handshake completes.
 fn mirrored_client(mirrors: Vec<MirrorConfig>) -> (RepoClient, tempfile::TempDir) {
     let (mut client, tmp) = client_for(router(mirrors, AuthStore::default()));
     client.fetch = FetchConfig {
         retries: 0,
-        timeout: Duration::from_secs(5),
         ..Default::default()
     };
     (client, tmp)
@@ -333,7 +334,7 @@ fn capture_warn_output(body: impl std::future::Future<Output = ()>) -> String {
 /// A metadata checksum mismatch refetches both files once, then warns and
 /// uses the metadata under `warn`, without secrets in the warning. The row
 /// is not reused once the update or checksum policy tightens, and a
-/// mismatch cannot stretch the update policy. A retry that matches warns
+/// mismatch cannot stretch the update policy past the run that fetched it. A retry that matches warns
 /// nothing, under either policy.
 #[test]
 fn metadata_checksum_mismatch_warns_after_retry_and_respects_cache_policy() {
@@ -347,37 +348,43 @@ fn metadata_checksum_mismatch_warns_after_retry_and_respects_cache_policy() {
             let metadata_coord = coord(&format!("com.example:demo:{version}"));
             let metadata = client.fetch_metadata(&repo, &metadata_coord).await.unwrap();
             assert_eq!(metadata.latest.as_deref(), Some("2"));
-            assert_eq!(server.connections(), 4, "both files are fetched twice");
+            assert_eq!(server.answered(), 4, "both files are fetched twice");
             client.fetch_metadata(&repo, &metadata_coord).await.unwrap();
-            assert_eq!(server.connections(), 4, "the daily cache applies");
+            assert_eq!(server.answered(), 4, "the daily cache applies");
             repo.releases_update_policy = UpdatePolicy::Always;
             repo.snapshots_update_policy = UpdatePolicy::Always;
             client.fetch_metadata(&repo, &metadata_coord).await.unwrap();
-            assert_eq!(server.connections(), 8, "a shorter update policy refetches");
+            assert_eq!(server.answered(), 8, "a shorter update policy refetches");
             repo.releases_checksum_policy = ChecksumPolicy::Fail;
             repo.snapshots_checksum_policy = ChecksumPolicy::Fail;
             assert!(matches!(
                 client.fetch_metadata(&repo, &metadata_coord).await,
                 Err(RepoError::ChecksumMismatch { .. })
             ));
-            assert_eq!(server.connections(), 12);
+            assert_eq!(server.answered(), 12);
         }
-        let (client, _cache) = test_client();
+        let (client, cache) = test_client();
         let (mut repo, server) = metadata_checksum_stub(false);
         repo.snapshots_update_policy = UpdatePolicy::Always;
-        for _ in 0..2 {
+        let later = || {
+            let http = rv_http::client_builder().no_proxy().build().unwrap();
+            let cache = MetadataCache::new(&cache.path().join("metadata.db")).unwrap();
+            RepoClient::for_test(
+                ClientSet::unscreened(http),
+                router(Vec::new(), AuthStore::default()),
+                cache,
+            )
+        };
+        for (run, answered) in [(client.clone(), 4), (client, 4), (later(), 8)] {
             let snapshot = coord("com.example:demo:1.0-SNAPSHOT");
-            let resolved = client
-                .resolve_snapshot_version(&repo, &snapshot)
-                .await
-                .unwrap();
-            assert_eq!(resolved.version, "1.0-20261011.010101-2");
+            let resolved = run.resolve_snapshot_version(&repo, &snapshot).await;
+            assert_eq!(resolved.unwrap().version, "1.0-20261011.010101-2");
+            assert_eq!(
+                server.answered(),
+                answered,
+                "a run reads what it fetched, and a mismatch cannot extend the policy"
+            );
         }
-        assert_eq!(
-            server.connections(),
-            8,
-            "a mismatch cannot extend the policy"
-        );
 
         for policy in [ChecksumPolicy::Warn, ChecksumPolicy::Fail] {
             let (client, _cache) = test_client();
@@ -389,7 +396,7 @@ fn metadata_checksum_mismatch_warns_after_retry_and_respects_cache_policy() {
                 .await
                 .unwrap();
             assert_eq!(resolved.version, "1.0-20261011.010101-2");
-            assert_eq!(server.connections(), 4);
+            assert_eq!(server.answered(), 4);
         }
     });
     assert_eq!(output.matches("METADATA_CHECKSUM_MISMATCH").count(), 6);
@@ -418,11 +425,7 @@ async fn metadata_warn_policy_does_not_relax_artifact_or_pom_checksums() {
                 .await,
             Err(RepoError::ChecksumMismatch { .. })
         ));
-        assert_eq!(
-            server.connections(),
-            4,
-            "only metadata gets a checksum retry"
-        );
+        assert_eq!(server.answered(), 4, "only metadata gets a checksum retry");
     }
 }
 
@@ -620,6 +623,244 @@ async fn a_blocked_mirror_sends_no_request() {
     assert_eq!(mirror_server.connections() + origin_server.connections(), 0);
 }
 
+fn group_filter(rules: &'static [u8]) -> Arc<rv_config::RepositoryFilters> {
+    let on = [("aether.remoteRepositoryFilter.groupId", "true")];
+    let files: &[(&str, &str, &[u8])] = &[("groupId", "groupId-r1.txt", rules)];
+    Arc::new(
+        rv_config::RepositoryFilters::from_files(rv_maven_types::MavenMode::Maven39, &on, files)
+            .unwrap(),
+    )
+}
+
+/// A group the groupId filter keeps from a repository is not asked of it,
+/// for a POM, metadata, an artifact or a prefetch, nor answered from the
+/// cache or the store; the miss is not kept, so a run without the filter
+/// asks. A mirror's id names its rule file, as in Maven.
+#[tokio::test]
+async fn a_filtered_repository_is_not_asked_for_what_its_rules_leave_out() {
+    let (_, server) = body_stub(b"<project><modelVersion>4.0.0</modelVersion></project>");
+    let url = format!("http://{}/", server.addr());
+    let r1 = Repository::new(Some("r1".to_string()), url.clone(), true, true);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let client_with = |filters: Option<Arc<rv_config::RepositoryFilters>>, mirrors| {
+        let cache = MetadataCache::new(&cache_dir.path().join("metadata.db")).unwrap();
+        let http = rv_http::client_builder().no_proxy().build().unwrap();
+        let mut client = RepoClient::for_test(
+            ClientSet::unscreened(http),
+            router(mirrors, AuthStore::default()),
+            cache,
+        );
+        if let Some(filters) = filters {
+            client.filters = filters;
+        }
+        client
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let key = ArtifactCoord::new("org.ex.a", "a1", "1.0", "jar", None);
+    let row = rv_store::Origin {
+        repo_url: url.clone(),
+        endpoint_url: url.clone(),
+        checksum_verified: true,
+        served: true,
+    };
+    let blob = rv_maven_types::BlobId::from_bytes(b"jar");
+    store
+        .record_origins(vec![(key.clone(), blob.clone(), row)])
+        .await
+        .unwrap();
+
+    let client = client_with(Some(group_filter(b"org.ex.b\n")), Vec::new());
+    let req = ArtifactRequest::new("org.ex.a", "a1", "1.0");
+    let pom = client.fetch_pom(&r1, &req).await.unwrap_err();
+    assert!(
+        pom.is_filtered() && pom.to_string().contains("groupId filter"),
+        "{pom}"
+    );
+    assert!(client.prefetch_pom(&r1, &req).await.is_err());
+    let metadata = client
+        .fetch_metadata(&r1, &coord("org.ex.a:a1:[1,2)"))
+        .await;
+    assert!(
+        matches!(metadata, Err(RepoError::NotFound(_))),
+        "{metadata:?}"
+    );
+    let group = client.fetch_group_metadata(&r1, "org.ex.a").await;
+    assert!(matches!(group, Err(RepoError::NotFound(_))), "{group:?}");
+    let jar = client.fetch_artifact_to_store(&r1, &req, &store).await;
+    assert!(matches!(jar, Err(RepoError::NotFound(_))), "{jar:?}");
+    client.prefetch_artifact(&r1, &req, &store, ()).await;
+    assert_eq!(
+        client.stored_artifact(&store, &r1, &key).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        client.served_artifact(&store, &r1, &key).await.unwrap(),
+        None
+    );
+    assert_eq!(server.connections(), 0, "{:?}", server.requests());
+
+    let allowed = ArtifactRequest::new("org.ex.b", "b1", "1.0");
+    client.fetch_pom(&r1, &allowed).await.unwrap();
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.path.ends_with(".pom"))
+            .count(),
+        1
+    );
+
+    let unfiltered = client_with(None, Vec::new());
+    unfiltered.fetch_pom(&r1, &req).await.unwrap();
+    assert_eq!(
+        unfiltered.stored_artifact(&store, &r1, &key).await.unwrap(),
+        Some(blob)
+    );
+
+    let mirrored = client_with(
+        Some(group_filter(b"org.ex.b\n")),
+        vec![mirror("m1", &url, "r1")],
+    );
+    let other = ArtifactRequest::new("org.ex.c", "c1", "1.0");
+    mirrored.fetch_pom(&r1, &other).await.unwrap();
+}
+
+/// Offline, a snapshot build raeva.lock pins does not resolve through a
+/// repository the filters refuse it from, so the search goes on to one
+/// they let serve it.
+#[tokio::test]
+async fn an_offline_pinned_snapshot_does_not_resolve_through_a_filtered_repository() {
+    let r1 = Repository::new(Some("r1".to_string()), "https://r1.invalid/", true, true);
+    let pom = ArtifactRequest::new("org.ex.s", "s1", "1.0-20240101.010101-1")
+        .pom()
+        .to_path_with_versions("1.0-SNAPSHOT", "1.0-20240101.010101-1");
+    let gav = rv_maven_types::Gav::new("org.ex.s", "s1", "1.0-SNAPSHOT");
+    let pin = rv_lock::PinnedSnapshot {
+        build: rv_maven_types::SnapshotStamp::of_version("1.0-20240101.010101-1"),
+        pom: rv_maven_types::SnapshotStamp::of_version("1.0-20240101.010101-1"),
+        file_origins: vec!["https://r1.invalid/".to_string()],
+        pom_origins: Vec::new(),
+        file: None,
+    };
+    let coord = Coord {
+        packaging: Some("pom".to_string()),
+        ..coord("org.ex.s:s1:1.0-SNAPSHOT")
+    };
+    for rules in [&b"org.ex.s\n"[..], b"org.other\n"] {
+        let (mut client, _cache) = test_client();
+        client.offline = true;
+        client.lock_snapshots = Arc::new(HashMap::from([(
+            gav.clone(),
+            std::collections::BTreeSet::from([pin.clone()]),
+        )]));
+        client.lock_missing_poms = Arc::new(std::collections::HashSet::from([pom.clone()]));
+        // r1 served the build's jar and answered 404 for its POM.
+        let absent = RepoClient::absence_scope(&client.router.route(&r1));
+        let checked = super::models::Checked::Verified;
+        let kept = client.cache_insert_bytes(
+            CacheTable::Miss,
+            &absent,
+            &pom,
+            b"404",
+            rv_store::metadata_cache::Expiry::After(3600),
+            checked,
+        );
+        assert!(kept.await);
+        let on = [("aether.remoteRepositoryFilter.groupId", "true")];
+        let files: &[(&str, &str, &[u8])] = &[("groupId", "groupId-r1.txt", rules)];
+        client.filters = Arc::new(
+            rv_config::RepositoryFilters::from_files(
+                rv_maven_types::MavenMode::Maven39,
+                &on,
+                files,
+            )
+            .unwrap(),
+        );
+        let resolved = client.resolve_snapshot_version(&r1, &coord).await;
+        if rules == b"org.ex.s\n" {
+            assert_eq!(resolved.unwrap().version, "1.0-20240101.010101-1");
+        } else {
+            assert!(
+                matches!(resolved, Err(RepoError::NotFound(_))),
+                "{resolved:?}"
+            );
+        }
+    }
+}
+
+/// The prefixes filter judges a snapshot by the path Maven's layout gives
+/// it: a timestamped build in its base version's directory, and a
+/// `-SNAPSHOT` request by the build its metadata resolves to.
+#[tokio::test]
+async fn the_prefixes_filter_judges_a_snapshot_by_its_layout_path() {
+    let server = StubServer::start(|request| {
+        let (path, sidecar) = match request.path.strip_suffix(".sha256") {
+            Some(path) => (path, true),
+            None => (request.path.as_str(), false),
+        };
+        let body = if path.ends_with("/maven-metadata.xml") {
+            "<metadata><groupId>org.ex.s</groupId><artifactId>s1</artifactId>\
+             <version>1.0-SNAPSHOT</version><versioning><snapshot>\
+             <timestamp>20240101.010101</timestamp><buildNumber>1</buildNumber>\
+             </snapshot></versioning></metadata>"
+        } else if path.ends_with(".pom") {
+            "<project><modelVersion>4.0.0</modelVersion></project>"
+        } else {
+            return Response::new(404, "");
+        };
+        if sidecar {
+            Response::new(200, sha256_hex(body))
+        } else {
+            Response::new(200, body)
+        }
+    });
+    let url = format!("http://{}/", server.addr());
+    let r1 = Repository::new(Some("r1".to_string()), url, true, true);
+    let client_with = |rules: &'static [u8]| {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = MetadataCache::new(&cache_dir.path().join("metadata.db")).unwrap();
+        let http = rv_http::client_builder().no_proxy().build().unwrap();
+        let mut client = RepoClient::for_test(
+            ClientSet::unscreened(http),
+            router(Vec::new(), AuthStore::default()),
+            cache,
+        );
+        let on = [("aether.remoteRepositoryFilter.prefixes", "true")];
+        let files: &[(&str, &str, &[u8])] = &[("prefixes", "prefixes-r1.txt", rules)];
+        client.filters = Arc::new(
+            rv_config::RepositoryFilters::from_files(
+                rv_maven_types::MavenMode::Maven39,
+                &on,
+                files,
+            )
+            .unwrap(),
+        );
+        (client, cache_dir)
+    };
+    let poms = || {
+        (server.requests().iter())
+            .filter(|request| request.path.ends_with(".pom"))
+            .count()
+    };
+
+    let (client, _cache) = client_with(b"/org/ex/s/s1/1.0-SNAPSHOT\n");
+    let build = ArtifactRequest::new("org.ex.s", "s1", "1.0-20240101.010101-1");
+    client.fetch_pom(&r1, &build).await.unwrap();
+    assert_eq!(poms(), 1, "{:?}", server.requests());
+
+    let (client, _cache) = client_with(
+        b"/org/ex/s/s1/1.0-SNAPSHOT/maven-metadata.xml\n/org/ex/s/s1/1.0-SNAPSHOT/s1-1.0-SNAPSHOT.pom\n",
+    );
+    let snapshot = ArtifactRequest::new("org.ex.s", "s1", "1.0-SNAPSHOT");
+    let refused = client.fetch_pom(&r1, &snapshot).await.unwrap_err();
+    assert!(
+        refused.is_filtered() && refused.to_string().contains("prefixes filter"),
+        "{refused}"
+    );
+    assert_eq!(poms(), 1, "{:?}", server.requests());
+}
+
 /// The checksum probe prefers SHA-256 and falls back to SHA-1 when the
 /// `.sha256` is missing, refused (as an object store answers for a missing
 /// key) or holds no digest. A sidecar holding no digest counts as missing, so
@@ -629,13 +870,18 @@ async fn a_blocked_mirror_sends_no_request() {
 async fn checksum_probe_falls_back_to_sha1_only_when_sha256_is_unusable() {
     const SHA1: &str = "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d";
     const GARBAGE: &str = "<html><body>404 not found</body></html>";
+    // Maven reads the first token only, which is no digest here.
+    const HEX_PAGE: &str = "<html><body>Not found request \
+        abababababababababababababababababababababababababababababababab extra</body></html>";
     const PATH: &str = "com/example/demo/1.0/demo-1.0.jar";
     for (sha256, sha1) in [
         ((404, ""), (200, SHA1)),
         ((403, ""), (200, SHA1)),
         ((401, ""), (200, SHA1)),
         ((200, GARBAGE), (200, SHA1)),
+        ((200, HEX_PAGE), (200, SHA1)),
         ((200, GARBAGE), (200, GARBAGE)),
+        ((200, HEX_PAGE), (200, HEX_PAGE)),
         ((403, ""), (403, "")),
     ] {
         let server = StubServer::start(move |request| {
@@ -680,6 +926,817 @@ async fn checksum_probe_falls_back_to_sha1_only_when_sha256_is_unusable() {
         .unwrap_err();
     assert!(err.tls_cause().is_some(), "{err:?}");
     assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+/// A client that checks `.sha256` answers late takes a POM on a `.sha1`
+/// that matches its bytes, once the repository has lacked another
+/// `.sha256` and the POM's release has not served one, and [`RepoClient::settle_checksums`] waits for its `.sha256`:
+/// a missing one gives the weak-hash warning then, and one that holds
+/// another digest fails the check and keeps the POM out of the cache. A
+/// `.sha1` that does not match waits for the `.sha256`, as does every read
+/// of a client that does not check late.
+#[test]
+fn a_late_sha256_is_checked_before_the_reads_are_settled() {
+    const HELD: std::time::Duration = std::time::Duration::from_secs(2);
+    let pom = |artifact: &str| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t.x</groupId>\
+             <artifactId>{artifact}</artifactId><version>1</version></project>"
+        )
+    };
+    let sha1 = |body: &str| rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, body.as_bytes());
+    let server = StubServer::start(move |request| {
+        let path = request.path.trim_start_matches('/');
+        let (file, sidecar) = path.rsplit_once(".pom").unwrap_or((path, ""));
+        let artifact = file.rsplit('/').next().unwrap_or("").trim_end_matches("-1");
+        let body = pom(artifact);
+        match (artifact, sidecar) {
+            (_, "") => Response::new(200, body),
+            ("first", ".sha256") => Response::new(404, ""),
+            ("stale" | "broken", ".sha1") => Response::new(200, "0".repeat(40)),
+            (_, ".sha1") => Response::new(200, sha1(&body).hex().to_string()),
+            ("stale" | "vouched", ".sha256") => Response::new(200, sha256_hex(&body)).delayed(HELD),
+            ("forged", ".sha256") => Response::new(200, "0".repeat(64)).delayed(HELD),
+            (_, ".sha256") => Response::new(404, "").delayed(HELD),
+            _ => Response::new(404, ""),
+        }
+    });
+    let repo = http_repo(&server);
+    let (plain, _tmp) = test_client();
+    let late = plain.clone().checking_sha256_late();
+    // Each in a release of its own: one that served a `.sha256` is waited
+    // for.
+    let timed = |client: &RepoClient, artifact: &'static str| {
+        let (client, repo) = (client.clone(), repo.clone());
+        async move {
+            let started = std::time::Instant::now();
+            let request = ArtifactRequest::new(format!("t.{artifact}"), artifact, "1");
+            let fetched = client.fetch_pom(&repo, &request).await;
+            (fetched, started.elapsed())
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let log = rv_test_support::capture_warnings(|| {
+        runtime.block_on(async {
+            timed(&late, "first").await.0.unwrap();
+            late.settle_checksums().await.unwrap();
+
+            for artifact in ["matched", "vouched"] {
+                let (read, waited) = timed(&late, artifact).await;
+                assert_eq!(read.unwrap(), pom(artifact).as_bytes());
+                assert!(
+                    waited < HELD,
+                    "{artifact} waited {waited:?} for its .sha256"
+                );
+            }
+            let started = std::time::Instant::now();
+            late.settle_checksums().await.unwrap();
+            assert!(
+                started.elapsed() > HELD / 2,
+                "settled before the .sha256 answered"
+            );
+            let (cached, waited) = timed(&plain, "matched").await;
+            assert_eq!(cached.unwrap(), pom("matched").as_bytes());
+            assert!(waited < HELD, "matched was not cached once checked");
+
+            let (forged, waited) = timed(&late, "forged").await;
+            assert_eq!(forged.unwrap(), pom("forged").as_bytes());
+            assert!(waited < HELD, "forged waited {waited:?} for its .sha256");
+            let failed = late.settle_checksums().await;
+            assert!(
+                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                "{failed:?}"
+            );
+            let (forged, waited) = timed(&plain, "forged").await;
+            assert!(
+                matches!(forged, Err(RepoError::ChecksumMismatch { .. })),
+                "a forged POM was kept: {forged:?}"
+            );
+            assert!(waited >= HELD, "failed after {waited:?}");
+
+            let (broken, waited) = timed(&late, "broken").await;
+            assert!(
+                matches!(broken, Err(RepoError::ChecksumMismatch { .. })),
+                "{broken:?}"
+            );
+            assert!(waited >= HELD, "failed on the .sha1 after {waited:?}");
+            let (stale, waited) = timed(&late, "stale").await;
+            assert_eq!(stale.unwrap(), pom("stale").as_bytes());
+            assert!(waited >= HELD, "took the stale .sha1 after {waited:?}");
+
+            let (plain_read, waited) = timed(&plain, "other").await;
+            plain_read.unwrap();
+            assert!(
+                waited >= HELD,
+                "a plain client took the .sha1 after {waited:?}"
+            );
+            let failed = late.settle_checksums().await;
+            assert!(
+                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                "a failed client settled: {failed:?}"
+            );
+        });
+    });
+    let weak = |artifact: &str| {
+        (log.lines())
+            .filter(|line| line.contains("falling back to SHA-1"))
+            .any(|line| line.contains(&format!("{artifact}-1.pom")))
+    };
+    assert!(weak("matched") && weak("other"), "{log}");
+    assert!(!weak("vouched") && !weak("forged"), "{log}");
+}
+
+/// Every read of a POM taken on its `.sha1` shares its `.sha256` check:
+/// another late client that reads the held bytes fails to settle too, and a
+/// client that waits for checksum files fails its read. A failed check
+/// waits for the others, which still log their warnings and cache their
+/// POMs.
+#[test]
+fn every_read_of_a_late_pom_shares_its_check() {
+    const HELD: std::time::Duration = std::time::Duration::from_secs(1);
+    let pom = |artifact: &str| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t.x</groupId>\
+             <artifactId>{artifact}</artifactId><version>1</version></project>"
+        )
+    };
+    let sha1 = |body: &str| rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, body.as_bytes());
+    let slow_asked = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let asked = slow_asked.clone();
+    let server = StubServer::start(move |request| {
+        let path = request.path.trim_start_matches('/');
+        let (file, sidecar) = path.rsplit_once(".pom").unwrap_or((path, ""));
+        let artifact = file.rsplit('/').next().unwrap_or("").trim_end_matches("-1");
+        let body = pom(artifact);
+        match (artifact, sidecar) {
+            (_, "") => Response::new(200, body),
+            ("first", ".sha256") => Response::new(404, ""),
+            (_, ".sha1") => Response::new(200, sha1(&body).hex().to_string()),
+            ("forged", ".sha256") => Response::new(200, "0".repeat(64)).delayed(HELD),
+            ("slow", ".sha256") => {
+                *asked.lock().unwrap() = Some(std::time::Instant::now());
+                Response::new(404, "").delayed(HELD * 3)
+            }
+            (_, ".sha256") => Response::new(404, "").delayed(HELD),
+            _ => Response::new(404, ""),
+        }
+    });
+    let repo = http_repo(&server);
+    let (plain, _tmp) = test_client();
+    let (late, other) = (
+        plain.clone().checking_sha256_late(),
+        plain.clone().checking_sha256_late(),
+    );
+    let read = |client: &RepoClient, artifact: &'static str| {
+        let (client, repo) = (client.clone(), repo.clone());
+        async move {
+            let started = std::time::Instant::now();
+            let request = ArtifactRequest::new(format!("t.{artifact}"), artifact, "1");
+            let fetched = client.fetch_pom(&repo, &request).await;
+            (fetched, started.elapsed())
+        }
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let log = rv_test_support::capture_warnings(|| {
+        runtime.block_on(async {
+            read(&late, "first").await.0.unwrap();
+            for artifact in ["forged", "slow"] {
+                let (fetched, waited) = read(&late, artifact).await;
+                assert_eq!(fetched.unwrap(), pom(artifact).as_bytes());
+                assert!(waited < HELD, "{artifact} waited {waited:?}");
+            }
+            let (held, waited) = read(&other, "forged").await;
+            assert_eq!(held.unwrap(), pom("forged").as_bytes());
+            assert!(waited < HELD, "the held POM waited {waited:?}");
+            let (waiting, _) = read(&plain, "forged").await;
+            assert!(
+                matches!(waiting, Err(RepoError::ChecksumMismatch { .. })),
+                "a client that waits took a forged POM: {waiting:?}"
+            );
+            let failed = other.settle_checksums().await;
+            assert!(
+                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                "{failed:?}"
+            );
+            let failed = late.settle_checksums().await;
+            assert!(
+                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                "{failed:?}"
+            );
+            assert!(late.late_check_failed());
+            // Measured from the slow check's request, not from the settle, so
+            // a loaded host that delays the steps above cannot fail it.
+            let asked = slow_asked
+                .lock()
+                .unwrap()
+                .expect("the slow check was asked");
+            assert!(
+                asked.elapsed() >= HELD * 3,
+                "a failed check did not wait for the slow one"
+            );
+            let (cached, waited) = read(&plain, "slow").await;
+            assert_eq!(cached.unwrap(), pom("slow").as_bytes());
+            assert!(waited < HELD, "slow was not cached once checked");
+            let (forged, _) = read(&plain, "forged").await;
+            assert!(
+                matches!(forged, Err(RepoError::ChecksumMismatch { .. })),
+                "a forged POM was kept: {forged:?}"
+            );
+        });
+    });
+    let weak = |artifact: &str| {
+        (log.lines())
+            .filter(|line| line.contains("falling back to SHA-1"))
+            .any(|line| line.contains(&format!("{artifact}-1.pom")))
+    };
+    assert!(weak("slow") && !weak("forged"), "{log}");
+}
+
+/// The POM [`late_server`] serves for `{artifact}`.
+fn late_pom(artifact: &str) -> String {
+    format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>t.x</groupId>\
+         <artifactId>{artifact}</artifactId><version>1</version></project>"
+    )
+}
+
+/// A repository of [`late_pom`]s with their `.sha1` and no `.sha256`;
+/// `answer` answers first, by artifact and sidecar suffix (empty for the
+/// POM itself).
+fn late_server(
+    answer: impl Fn(&str, &str) -> Option<Response> + Send + Sync + 'static,
+) -> StubServer {
+    StubServer::start(move |request| {
+        let path = request.path.trim_start_matches('/');
+        let (file, sidecar) = path.rsplit_once(".pom").unwrap_or((path, ""));
+        let artifact = file.rsplit('/').next().unwrap_or("").trim_end_matches("-1");
+        let body = late_pom(artifact);
+        if let Some(response) = answer(artifact, sidecar) {
+            return response;
+        }
+        match (artifact, sidecar) {
+            (_, "") => Response::new(200, body),
+            (_, ".sha1") => {
+                let sha1 = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, body.as_bytes());
+                Response::new(200, sha1.hex().to_string())
+            }
+            _ => Response::new(404, ""),
+        }
+    })
+}
+
+/// A client that checks `.sha256` answers late, once `first` has shown
+/// that `server` lacks one, on a runtime of its own.
+fn late_client(
+    server: &StubServer,
+) -> (
+    RepoClient,
+    Repository,
+    tempfile::TempDir,
+    tokio::runtime::Runtime,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (plain, tmp) = test_client();
+    let late = plain.checking_sha256_late();
+    let repo = http_repo(server);
+    runtime.block_on(async {
+        let first = ArtifactRequest::new("t.first", "first", "1");
+        late.fetch_pom(&repo, &first).await.unwrap();
+        late.settle_checksums().await.unwrap();
+    });
+    (late, repo, tmp, runtime)
+}
+
+fn late_request(artifact: &str) -> ArtifactRequest {
+    ArtifactRequest::new(format!("t.{artifact}"), artifact, "1")
+}
+
+/// Each read of a failed late check gets an error of the class the check
+/// failed with, a TLS failure included, and a copy where one can be made.
+#[tokio::test]
+async fn every_read_of_a_failed_late_check_keeps_its_class() {
+    let client = rv_http::client_builder().build().expect("client");
+    let (address, server) = rv_test_support::tls::reject_one_handshake(BAD_CERTIFICATE);
+    let tls = client
+        .get(format!("https://{address}/"))
+        .send()
+        .await
+        .expect_err("rejected");
+    server.join().expect("server");
+    let mismatch = RepoError::ChecksumMismatch {
+        subject: "t/a/1/a-1.pom".into(),
+        artifact: None,
+        expected: rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha256, b"a"),
+        actual: rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha256, b"b"),
+        check: IntegritySource::Sidecar,
+    };
+    let retried = RepoError::Retried {
+        attempts: 3,
+        error: Box::new(RepoError::Transfer(
+            std::io::ErrorKind::UnexpectedEof.into(),
+        )),
+    };
+    for failure in [RepoError::Http(tls), retried, mismatch] {
+        let (class, shown) = (failure.class(), failure.to_string());
+        let shared = Arc::new(failure);
+        for read in [
+            requests::unshared(shared.clone()),
+            requests::unshared(shared.clone()),
+        ] {
+            assert_eq!(read.class(), class, "{read:?}");
+            assert_eq!(read.to_string(), shown);
+        }
+    }
+    let copied = requests::unshared(Arc::new(RepoError::AuthSetup("no key".to_string())));
+    assert!(matches!(copied, RepoError::AuthSetup(_)), "{copied:?}");
+}
+
+/// A `.sha1` sent beside a `.sha256` that answers is one no read needed,
+/// and a busy answer to it changes no later read: `target`'s `.sha1` is
+/// sent early only once `held` has shown a `.sha256` missing, so whether it
+/// is asked for depends on the order of the reads and on a prefetch of
+/// `target`, and the outcome must not.
+#[test]
+fn a_busy_answer_to_a_sidecar_no_read_needed_refuses_no_later_read() {
+    let server = late_server(|artifact, sidecar| match (artifact, sidecar) {
+        ("target", ".sha256") => Some(
+            Response::new(200, sha256_hex(late_pom("target")))
+                .delayed(std::time::Duration::from_millis(300)),
+        ),
+        ("target", ".sha1") => Some(Response::new(429, "").header("Retry-After", "600")),
+        _ => None,
+    });
+    let mut outcomes = Vec::new();
+    for late in [true, false] {
+        for prefetch in [false, true] {
+            for order in [["held", "target"], ["target", "held"]] {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                let (client, _tmp) = test_client();
+                let client = if late {
+                    client.checking_sha256_late()
+                } else {
+                    client
+                };
+                let repo = http_repo(&server);
+                let outcome = runtime.block_on(async {
+                    if prefetch {
+                        client
+                            .prefetch_pom(&repo, &late_request("target"))
+                            .await
+                            .unwrap();
+                    }
+                    let mut reads = Vec::new();
+                    for artifact in order.into_iter().chain(["after"]) {
+                        let read = client.fetch_pom(&repo, &late_request(artifact)).await;
+                        reads.push(format!("{artifact} {:?}", read.map(|_| ())));
+                    }
+                    reads.sort();
+                    format!("{reads:?} {:?}", client.settle_checksums().await)
+                });
+                outcomes.push((late, prefetch, order, outcome));
+            }
+        }
+    }
+    let expected = r#"["after Ok(())", "held Ok(())", "target Ok(())"] Ok(())"#;
+    for (late, prefetch, order, outcome) in outcomes {
+        assert_eq!(
+            outcome, expected,
+            "late {late}, prefetch {prefetch}, {order:?}"
+        );
+    }
+}
+
+/// A needed `.sha1` takes the early one's refusal while it is in force, for
+/// every request, and once it is over is asked for again: one asked for then
+/// would meet the server's refusal afresh, so a `.md5` asked for after it
+/// does not decide the read only because the `.sha1` went out early.
+#[tokio::test(start_paused = true)]
+async fn a_needed_sidecar_whose_early_refusal_is_over_is_asked_again() {
+    use crate::fetch::OptionalAnswer;
+    use reqwest::StatusCode;
+    use std::time::Duration;
+
+    let url = Url::parse("https://repo.example/g/a/1/a-1.pom.sha1").unwrap();
+    let refused = || {
+        let refusal = OptionalAnswer::Refused {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Duration::from_secs(301),
+            answered: tokio::time::Instant::now(),
+        };
+        let error = RepoError::HttpStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            url: url.to_string(),
+            retry_after: Some(Duration::from_secs(301)),
+        };
+        (Err(error), refusal)
+    };
+    let fetch = FetchConfig::default();
+    let in_force = requests::needed_sha1(Some(refused()), &fetch, Some(&url));
+    assert!(
+        matches!(in_force, Some(Err(RepoError::HttpStatus { .. }))),
+        "{in_force:?}"
+    );
+    assert!(fetch.cooldowns.of(&url).refusal().is_some());
+    let other = url.join("b-1.pom").unwrap();
+    let held = fetch
+        .refusers
+        .refused(&other, StatusCode::SERVICE_UNAVAILABLE, Duration::ZERO);
+    assert!(
+        matches!(&held, RepoError::HttpStatus { status, url: named, .. }
+            if status.as_u16() == 429 && *named == url.to_string()),
+        "{held:?}"
+    );
+
+    let fetch = FetchConfig::default();
+    let early = refused();
+    tokio::time::advance(Duration::from_secs(301)).await;
+    let over = requests::needed_sha1(Some(early), &fetch, Some(&url));
+    assert!(over.is_none(), "{over:?}");
+    assert!(fetch.cooldowns.of(&url).refusal().is_none());
+
+    let unsent = (Ok(String::new()), OptionalAnswer::Unsent);
+    assert!(requests::needed_sha1(Some(unsent), &fetch, None).is_none());
+}
+
+/// Whether a refusal on an unneeded `.sha1` keeps the next `.sha1` from
+/// going out early changes nothing either: `next`'s `.sha256` refuses the
+/// server before its `.sha1` is needed, whether that `.sha1` went out
+/// beside it or would go out after it, so `next` fails the same way.
+#[test]
+fn an_unneeded_refusal_leaves_a_later_pair_to_fail_as_it_would() {
+    let server = late_server(|artifact, sidecar| match (artifact, sidecar) {
+        ("unused", ".sha256") => Some(
+            Response::new(200, sha256_hex(late_pom("unused")))
+                .delayed(std::time::Duration::from_millis(300)),
+        ),
+        ("unused", ".sha1") | ("next", ".sha256") => {
+            Some(Response::new(429, "").header("Retry-After", "600"))
+        }
+        _ => None,
+    });
+    for late in [true, false] {
+        for order in [["seed", "unused"], ["unused", "seed"]] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (client, _tmp) = test_client();
+            let client = if late {
+                client.checking_sha256_late()
+            } else {
+                client
+            };
+            let repo = http_repo(&server);
+            let failures = runtime.block_on(async {
+                let mut failures = Vec::new();
+                for artifact in order.into_iter().chain(["next"]) {
+                    if let Err(err) = client.fetch_pom(&repo, &late_request(artifact)).await {
+                        failures.push(format!("{artifact}: {err:?}"));
+                    }
+                }
+                if let Err(err) = client.settle_checksums().await {
+                    failures.push(format!("settled: {err:?}"));
+                }
+                failures
+            });
+            let case = format!("late {late}, {order:?}: {failures:?}");
+            assert_eq!(failures.len(), 1, "{case}");
+            assert!(
+                failures[0].contains("429") && failures[0].contains("next-1.pom.sha256"),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A read fails with the same message whether it met the refusing answer
+/// itself or a prefetch of its POM met it first and the read was refused
+/// unsent: the error names the answer, not the request kept unsent.
+#[test]
+fn a_read_a_refusal_kept_unsent_names_the_refusing_answer() {
+    let server = late_server(|artifact, sidecar| match (artifact, sidecar) {
+        ("busy", ".sha1") => Some(Response::new(429, "").header("Retry-After", "600")),
+        ("busy", ".sha256") => Some(Response::new(404, "")),
+        _ => None,
+    });
+    for late in [true, false] {
+        for prefetch in [true, false] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (client, _tmp) = test_client();
+            let client = if late {
+                client.checking_sha256_late()
+            } else {
+                client
+            };
+            let repo = http_repo(&server);
+            let read = runtime.block_on(async {
+                if prefetch {
+                    let prefetched = client.prefetch_pom(&repo, &late_request("busy")).await;
+                    assert!(prefetched.is_err(), "{prefetched:?}");
+                }
+                client.fetch_pom(&repo, &late_request("busy")).await
+            });
+            assert!(
+                matches!(&read, Err(RepoError::HttpStatus { status, url, .. })
+                    if status.as_u16() == 429 && url.ends_with("/busy-1.pom.sha1")),
+                "late {late}, prefetch {prefetch}: {:?}",
+                read.map(|_| ())
+            );
+        }
+    }
+}
+
+/// A `.sha1` that a missing `.sha256` makes needed fails the read when it
+/// answers with a `Retry-After` longer than raeva waits, and refuses every
+/// later request to the server, whether it was sent beside the `.sha256`
+/// or after it.
+#[test]
+fn a_needed_sidecar_that_is_refused_refuses_the_server() {
+    let server = late_server(|artifact, sidecar| {
+        (artifact == "busy" && sidecar == ".sha1")
+            .then(|| Response::new(429, "").header("Retry-After", "600"))
+    });
+    for late in [true, false] {
+        for early in [true, false] {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (client, _tmp) = test_client();
+            let client = if late {
+                client.checking_sha256_late()
+            } else {
+                client
+            };
+            let repo = http_repo(&server);
+            let before = server.requests().len();
+            let (read, after) = runtime.block_on(async {
+                if early {
+                    client
+                        .fetch_pom(&repo, &late_request("first"))
+                        .await
+                        .unwrap();
+                    client.settle_checksums().await.unwrap();
+                }
+                let read = client.fetch_pom(&repo, &late_request("busy")).await;
+                let after = client.fetch_pom(&repo, &late_request("after")).await;
+                (read.map(|_| ()), after.map(|_| ()))
+            });
+            let case = format!("late {late}, early {early}");
+            let refused = |read: &Result<()>, artifact: &str| {
+                matches!(read, Err(RepoError::HttpStatus { status, url, .. })
+                    if status.as_u16() == 429 && url.contains(artifact))
+            };
+            assert!(refused(&read, "busy-1.pom.sha1"), "{case}: {read:?}");
+            assert!(refused(&after, "busy-1.pom.sha1"), "{case}: {after:?}");
+            let paths: Vec<_> = server.requests()[before..]
+                .iter()
+                .map(|r| r.path.clone())
+                .collect();
+            assert!(
+                !paths.iter().any(|path| path.contains("after")),
+                "{case}: {paths:?}"
+            );
+        }
+    }
+}
+
+/// An early `.sha1` that an optional request's refusal kept from its retry
+/// is sent again once the `.sha256` proves missing: `slow`'s `.sha1` is
+/// busy once, late, and `other`'s, sent beside a `.sha256` that answers,
+/// refuses the optional requests before the retry.
+#[test]
+fn a_needed_sidecar_an_optional_refusal_kept_unsent_goes_out() {
+    let slow_sha1 = Arc::new(AtomicU32::new(0));
+    let asked = Arc::clone(&slow_sha1);
+    let server = late_server(move |artifact, sidecar| match (artifact, sidecar) {
+        ("slow", ".sha1") if asked.fetch_add(1, Ordering::SeqCst) == 0 => Some(
+            Response::new(503, "")
+                .header("Retry-After", "0")
+                .delayed(std::time::Duration::from_millis(400)),
+        ),
+        ("other", ".sha256") => Some(
+            Response::new(200, sha256_hex(late_pom("other")))
+                .delayed(std::time::Duration::from_millis(200)),
+        ),
+        ("other", ".sha1") => Some(Response::new(429, "").header("Retry-After", "600")),
+        _ => None,
+    });
+    let (late, repo, _tmp, runtime) = late_client(&server);
+    let (slow, other) = runtime.block_on(async {
+        let (slow, other) = (late_request("slow"), late_request("other"));
+        let (slow, other) = (late.fetch_pom(&repo, &slow), late.fetch_pom(&repo, &other));
+        let (slow, other) = tokio::join!(slow, other);
+        (slow.map(|_| ()), other.map(|_| ()))
+    });
+    assert!(
+        matches!((&slow, &other), (Ok(()), Ok(()))),
+        "{slow:?} {other:?}"
+    );
+    assert_eq!(slow_sha1.load(Ordering::SeqCst), 2);
+}
+
+/// Once a `.sha256` has been missing, the `.sha1` is sent beside the next
+/// one, and what a `Retry-After` longer than raeva waits on either does
+/// is the same whichever answers first: on the `.sha1`, which no read
+/// needs, nothing, and on the `.sha256` it refuses the server before the
+/// `.sha1` is needed, so the read fails, or with a late check its check
+/// does, as when the `.sha256` answers late. Each read is a client's first
+/// after `first`, which shows the `.sha256` missing, and checks the
+/// `.sha256` late or not.
+#[test]
+fn a_busy_answer_to_a_sidecar_of_a_pair_counts_the_same_whichever_comes_first() {
+    fn refused() -> Response {
+        Response::new(429, "").header("Retry-After", "600")
+    }
+    let cases: [fn(&str, &str) -> Option<Response>; 3] = [
+        |artifact, sidecar| match (artifact, sidecar) {
+            ("busy", ".sha1") => Some(refused()),
+            ("busy", ".sha256") => Some(Response::new(200, sha256_hex(late_pom("busy")))),
+            _ => None,
+        },
+        |artifact, sidecar| (artifact == "busy" && sidecar == ".sha256").then(refused),
+        |artifact, sidecar| {
+            (artifact == "busy" && sidecar == ".sha256")
+                .then(|| refused().delayed(std::time::Duration::from_millis(300)))
+        },
+    ];
+    for (case, answer) in cases.into_iter().enumerate() {
+        let server = late_server(answer);
+        for late in [true, false].repeat(16) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (client, _tmp) = test_client();
+            let client = if late {
+                client.checking_sha256_late()
+            } else {
+                client
+            };
+            let repo = http_repo(&server);
+            let read = runtime.block_on(async {
+                client
+                    .fetch_pom(&repo, &late_request("first"))
+                    .await
+                    .unwrap();
+                client.settle_checksums().await.unwrap();
+                let read = client.fetch_pom(&repo, &late_request("busy")).await;
+                (read.map(|_| ()), client.settle_checksums().await)
+            });
+            let failed = match &read {
+                (Ok(()), Ok(())) => None,
+                (Err(err), Ok(())) | (Ok(()), Err(err)) => Some(format!("{err:?}")),
+                (Err(_), Err(_)) => panic!("case {case} late {late}: {read:?}"),
+            };
+            match (case, &failed) {
+                (0, None) => {}
+                (1 | 2, Some(err)) if err.contains("429") && err.contains("busy-1.pom.sha256") => {}
+                _ => panic!("case {case} late {late}: {read:?}"),
+            }
+        }
+    }
+}
+
+/// A POM a prefetch took on its `.sha1` that no read went on to use has
+/// its `.sha256` answered before [`RepoClient::settle_checksums`] returns,
+/// so a settled resolution leaves no request running.
+#[test]
+fn settling_waits_for_the_check_of_a_pom_only_prefetched() {
+    const HELD: std::time::Duration = std::time::Duration::from_secs(1);
+    let server = late_server(|artifact, sidecar| {
+        (artifact == "spec" && sidecar == ".sha256").then(|| Response::new(404, "").delayed(HELD))
+    });
+    let (late, repo, _tmp, runtime) = late_client(&server);
+    runtime.block_on(async {
+        let started = std::time::Instant::now();
+        let prefetched = late.prefetch_pom(&repo, &late_request("spec")).await;
+        assert!(prefetched.unwrap().is_some());
+        assert!(
+            started.elapsed() < HELD,
+            "the prefetch waited for the .sha256"
+        );
+        late.settle_checksums().await.unwrap();
+        assert!(
+            started.elapsed() > HELD / 2,
+            "settled before the .sha256 answered"
+        );
+        assert_eq!(server.answered(), server.requests().len());
+    });
+}
+
+/// A settlement that is cancelled keeps the checks it had not finished, so
+/// the next one still fails on a `.sha256` that holds another digest.
+#[test]
+fn a_cancelled_settlement_keeps_its_checks() {
+    const HELD: std::time::Duration = std::time::Duration::from_secs(1);
+    let server = late_server(|artifact, sidecar| {
+        (artifact == "forged" && sidecar == ".sha256")
+            .then(|| Response::new(200, "0".repeat(64)).delayed(HELD))
+    });
+    let (late, repo, _tmp, runtime) = late_client(&server);
+    runtime.block_on(async {
+        late.fetch_pom(&repo, &late_request("forged"))
+            .await
+            .unwrap();
+        let cancelled = tokio::time::timeout(HELD / 4, late.settle_checksums()).await;
+        assert!(cancelled.is_err(), "settled before the .sha256 answered");
+        let settled = late.settle_checksums().await;
+        assert!(
+            matches!(settled, Err(RepoError::ChecksumMismatch { .. })),
+            "{settled:?}"
+        );
+        assert!(late.late_check_failed());
+    });
+}
+
+/// A check that another client relies on outlives the client that started
+/// it: dropping that one unsettled leaves the other the check's own answer.
+#[test]
+fn a_check_another_client_relies_on_outlives_the_client_that_started_it() {
+    const HELD: std::time::Duration = std::time::Duration::from_millis(500);
+    let server = late_server(|artifact, sidecar| {
+        (artifact == "forged" && sidecar == ".sha256")
+            .then(|| Response::new(200, "0".repeat(64)).delayed(HELD))
+    });
+    let (late, repo, _tmp, runtime) = late_client(&server);
+    let other = late.clone().checking_sha256_late();
+    runtime.block_on(async {
+        late.fetch_pom(&repo, &late_request("forged"))
+            .await
+            .unwrap();
+        other
+            .fetch_pom(&repo, &late_request("forged"))
+            .await
+            .unwrap();
+        drop(late);
+        let settled = other.settle_checksums().await;
+        assert!(
+            matches!(settled, Err(RepoError::ChecksumMismatch { .. })),
+            "{settled:?}"
+        );
+    });
+}
+
+/// A client made while a `.sha256` another one left running waits to be
+/// retried after a busy answer hears of that wait, as it may rely on the
+/// check.
+#[test]
+fn a_client_made_during_a_retry_wait_hears_of_it() {
+    let server = late_server(|artifact, sidecar| {
+        (artifact == "busy" && sidecar == ".sha256").then(|| Response::new(503, ""))
+    });
+    let (late, repo, _tmp, runtime) = late_client(&server);
+    let quiet = Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO));
+    runtime.block_on(async {
+        late.fetch_pom(&repo, &late_request("busy")).await.unwrap();
+        while server.answered() < server.requests().len()
+            || !(server.requests().iter())
+                .any(|request| request.path.ends_with("busy-1.pom.sha256"))
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let other = late.clone().checking_sha256_late();
+        let heard = Arc::clone(&quiet);
+        other.report_late_checks(move |quiet| *heard.lock().unwrap() = quiet);
+    });
+    let heard = *quiet.lock().unwrap();
+    assert!(heard > std::time::Duration::from_secs(1), "{heard:?}");
+}
+
+/// A `.sha256` asked for late that fails as a read waiting for it would,
+/// here a proxy that refuses it, fails the settlement with the same kind of
+/// error as that read, while another client still shares the check.
+#[test]
+fn a_late_sha256_fails_the_settlement_as_its_read_would() {
+    const HELD: std::time::Duration = std::time::Duration::from_millis(500);
+    let server = late_server(|artifact, sidecar| {
+        (artifact == "refused" && sidecar == ".sha256")
+            .then(|| Response::new(407, "").delayed(HELD))
+    });
+    let (late, repo, _tmp, runtime) = late_client(&server);
+    let other = late.clone().checking_sha256_late();
+    runtime.block_on(async {
+        late.fetch_pom(&repo, &late_request("refused"))
+            .await
+            .unwrap();
+        other
+            .fetch_pom(&repo, &late_request("refused"))
+            .await
+            .unwrap();
+        let settled = late.settle_checksums().await.unwrap_err();
+        let (plain, _plain_tmp) = test_client();
+        let read = plain
+            .fetch_pom(&repo, &late_request("refused"))
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(settled, RepoError::Internal(_)),
+            "{settled:?}, a read gives {read:?}"
+        );
+        assert_eq!(settled.to_string(), read.to_string());
+    });
 }
 
 /// A repository that publishes only `.md5` sidecars, as Central does for a
@@ -772,25 +1829,171 @@ async fn a_missing_or_refused_file_is_asked_for_once() {
     }
 }
 
+/// Maven Central's two names under one id share their files, as Maven's
+/// local repository tracks them by the id that served them: a POM and a jar
+/// fetched for `central` at repo1 are not asked for again for `central` at
+/// repo.maven.apache.org, nor prefetched. Under another mirror id, at the
+/// same URL, they are.
+#[tokio::test]
+async fn centrals_two_names_under_one_id_fetch_a_file_once() {
+    let (_, server) = body_stub(b"<project/>");
+    let url = format!("http://{}/", server.addr());
+    let mirrors = vec![
+        mirror("stub", &url, "central"),
+        mirror("other", &url, "other"),
+    ];
+    let (client, _tmp) = mirrored_client(mirrors);
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let central = |id: &str, url: &str| Repository::new(Some(id.into()), url, true, false);
+    let req = ArtifactRequest::new("com.example", "lib", "1.0.0");
+    let asked = |file: &str| {
+        let requests = server.requests();
+        requests
+            .iter()
+            .filter(|request| request.path.ends_with(file))
+            .count()
+    };
+    for (repo, asked_for) in [
+        (central("central", "https://repo1.maven.org/maven2/"), 1),
+        (
+            central("central", "https://repo.maven.apache.org/maven2/"),
+            1,
+        ),
+        (central("other", "https://repo.maven.apache.org/maven2/"), 2),
+    ] {
+        client.fetch_pom(&repo, &req).await.unwrap();
+        client.prefetch_artifact(&repo, &req, &store, ()).await;
+        let fetched = client.fetch_artifact(&repo, &req, &store, FetchArtifact::default());
+        fetched.await.unwrap();
+        for file in ["lib-1.0.0.pom", "lib-1.0.0.jar"] {
+            assert_eq!(asked(file), asked_for, "{} {file}", repo.url);
+        }
+    }
+}
+
+/// A pinned POM fetched as a file is taken from the POM cache a model read
+/// filled for the same repository, or for Central's other name under one
+/// id, not asked for again. Under another mirror id it is.
+#[tokio::test]
+async fn a_pinned_pom_fetched_as_a_file_reads_the_pom_cache() {
+    let body = b"<project/>";
+    let central = |id: &str, url: &str| Repository::new(Some(id.into()), url, true, false);
+    let (repo1, rma) = (
+        "https://repo1.maven.org/maven2/",
+        "https://repo.maven.apache.org/maven2/",
+    );
+    let req = ArtifactRequest::new("com.example", "lib", "1.0.0").pom();
+    let pin = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha256, body);
+    let options = FetchArtifact {
+        pin: Some(&pin),
+        index: None,
+    };
+    for fetched_at in [repo1, rma] {
+        let (_, server) = body_stub(body);
+        let url = format!("http://{}/", server.addr());
+        let mirrors = vec![
+            mirror("stub", &url, "central"),
+            mirror("other", &url, "other"),
+        ];
+        let (client, _tmp) = mirrored_client(mirrors);
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_in(&dir);
+        client
+            .fetch_pinned_pom_with_path(&central("central", repo1), &req, &pin)
+            .await
+            .unwrap();
+        for (repo, asked_for) in [
+            (central("central", fetched_at), 1),
+            (central("other", rma), 2),
+        ] {
+            let fetched = client.fetch_artifact(&repo, &req, &store, options).await;
+            assert_eq!(fetched.unwrap().blob, *pin.as_sha256().unwrap());
+            let asked = (server.requests().iter())
+                .filter(|request| request.path.ends_with("lib-1.0.0.pom"))
+                .count();
+            assert_eq!(
+                asked,
+                asked_for,
+                "{} {}",
+                repo.id.as_deref().unwrap(),
+                repo.url
+            );
+        }
+    }
+}
+
 /// A busy answer read again from the memo keeps its Retry-After and the
-/// attempts the first read made.
+/// attempts the first read made, and nothing is asked again. The answer is
+/// recorded as a fetch that outlasted its retries records it, so the test
+/// does not wait out a busy retry or race the sidecar a cancelled probe
+/// may still send.
 #[tokio::test]
 async fn a_kept_busy_answer_keeps_its_retries() {
-    let server = StubServer::start(|_| Response::new(503, "").header("Retry-After", "1"));
+    let server = StubServer::start(|_| Response::new(503, ""));
     let repo = http_repo(&server);
-    let (mut client, _tmp) = test_client();
-    client.fetch.retries = 1;
+    let (client, _tmp) = test_client();
     let parent = ArtifactRequest::new("com.example", "parent", "1.0.0");
-    let first = client.fetch_pom(&repo, &parent).await.unwrap_err();
-    let asked = server.requests().len();
+    let path = "com/example/parent/1.0.0/parent-1.0.0.pom";
+    let busy = RepoError::Retried {
+        attempts: 2,
+        error: Box::new(RepoError::HttpStatus {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            url: format!("{}{path}", repo.url),
+            retry_after: Some(Duration::from_secs(1)),
+        }),
+    };
+    let route = client.router.route(&repo);
+    let key = client.miss_key(&route, path).expect("a remote path");
+    client.record_miss(&route, key, &busy, client.credential_generation(), false);
     let kept = client.fetch_pom(&repo, &parent).await.unwrap_err();
-    assert_eq!(server.requests().len(), asked);
+    assert!(server.requests().is_empty());
     assert!(
         matches!(&kept, RepoError::Retried { attempts: 2, error }
             if matches!(**error, RepoError::HttpStatus { retry_after: Some(_), .. })),
         "{kept:?}"
     );
-    assert_eq!(kept.to_string(), first.to_string());
+    assert_eq!(kept.to_string(), busy.to_string());
+}
+
+/// After a `Retry-After` longer than raeva waits, the other requests to
+/// that server fail at once with the same answer, without being sent, and
+/// name the request it answered.
+#[tokio::test]
+async fn a_retry_after_past_the_cap_holds_back_the_other_requests() {
+    let server = StubServer::start(|_| Response::new(429, "").header("Retry-After", "600"));
+    let repo = http_repo(&server);
+    let (mut client, _tmp) = test_client();
+    client.fetch.retries = 3;
+    let first = ArtifactRequest::new("com.example", "first", "1.0.0");
+    let second = ArtifactRequest::new("com.example", "second", "1.0.0");
+    client.fetch_pom(&repo, &first).await.unwrap_err();
+    let paths: Vec<_> = server.requests().iter().map(|r| r.path.clone()).collect();
+    let asked = paths.len();
+    // The POM and its sidecar may go out together, but neither is retried.
+    assert!(
+        paths.iter().all(|path| path.contains("/first-"))
+            && paths.iter().collect::<std::collections::HashSet<_>>().len() == asked,
+        "{paths:?}"
+    );
+    let held = client.fetch_pom(&repo, &second).await.unwrap_err();
+    // The first POM's sidecar can still land after `fetch_pom` returns, so
+    // the log is checked again as a whole: nothing for the second POM, and
+    // nothing retried.
+    let sent: Vec<_> = server.requests().into_iter().map(|r| r.path).collect();
+    assert!(
+        sent.iter().all(|path| path.contains("/first-"))
+            && sent.iter().collect::<std::collections::HashSet<_>>().len() == sent.len(),
+        "{sent:?}"
+    );
+    assert!(
+        matches!(&held, RepoError::HttpStatus { status, url, retry_after: Some(wait) }
+            if status.as_u16() == 429
+                && url.ends_with("/first-1.0.0.pom")
+                && *wait > rv_http::retry::MAX_BUSY_WAIT
+                && *wait <= Duration::from_secs(600)),
+        "{held:?}"
+    );
 }
 
 /// A POM or artifact with no sidecar is refused by default, so a hostile
@@ -845,6 +2048,230 @@ async fn missing_sidecars_refuse_poms_and_artifacts_without_storing_them() {
             .sum()
     }
     assert_eq!(files_under(&dir.path().join("blobs")), 0);
+}
+
+/// A checksum file asked for beside an artifact that then fails to download
+/// logs nothing, however far its probe got: a weak hash the repository
+/// published for a file it does not serve is no warning.
+#[test]
+fn a_failed_download_logs_nothing_of_its_checksum_probe() {
+    let server = StubServer::start(|request| {
+        let path = request.path.as_str();
+        if path.ends_with(".sha1") {
+            Response::new(200, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d")
+        } else if path.ends_with(".jar") {
+            Response::new(404, "").delayed(Duration::from_millis(300))
+        } else {
+            Response::new(404, "")
+        }
+    });
+    let repo = http_repo(&server);
+    let (client, _tmp) = test_client();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut result = None;
+    let log = rv_test_support::capture_warnings(|| {
+        runtime.block_on(async {
+            let jar = ArtifactRequest::new("g", "a", "1");
+            result =
+                Some((client.fetch_artifact(&repo, &jar, &store, FetchArtifact::default())).await);
+        });
+    });
+    let result = result.unwrap();
+    assert!(matches!(result, Err(RepoError::NotFound(_))), "{result:?}");
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.path.ends_with(".jar.sha1")),
+        "the probe ran beside the file"
+    );
+    assert!(!log.contains("falling back"), "{log}");
+}
+
+/// A repository that has answered more file requests with a miss than with
+/// the file, as one listed before the repository that serves most files
+/// does, is asked for a file before its checksum file, so a miss sends no
+/// sidecar request. What it does serve is still checked against its
+/// checksum file: a missing or mismatched one still fails.
+#[tokio::test]
+async fn an_origin_that_mostly_misses_is_asked_for_the_file_first() {
+    const POM: &str = "<project><modelVersion>4.0.0</modelVersion></project>";
+    let server = StubServer::start(|request| {
+        let path = request.path.as_str();
+        let (file, sidecar) = match path.rsplit_once('.') {
+            Some((file, "sha256" | "sha1" | "md5")) => (file, true),
+            _ => (path, false),
+        };
+        match (file.contains("/served/"), sidecar) {
+            (true, false) => Response::new(200, POM),
+            (true, true) if file.contains("/served/1/") && path.ends_with(".sha256") => {
+                Response::new(200, sha256_hex(POM))
+            }
+            (true, true)
+                if (file.contains("/served/2/") || file.contains("/served/4/"))
+                    && path.ends_with(".sha256") =>
+            {
+                Response::new(200, sha256_hex("other bytes"))
+            }
+            (true, true) => Response::new(404, ""),
+            // A miss answers late, so a sidecar asked for beside it is sent.
+            (false, false) => Response::new(404, "").delayed(Duration::from_millis(300)),
+            (false, true) => Response::new(404, ""),
+        }
+    });
+    let repo = http_repo(&server);
+    let (client, _tmp) = test_client();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    for artifact in ["a", "b", "c"] {
+        let missing = ArtifactRequest::new("g", artifact, "1");
+        let pom = client.fetch_pom(&repo, &missing).await;
+        assert!(matches!(pom, Err(RepoError::NotFound(_))), "{pom:?}");
+        let jar = client
+            .fetch_artifact(&repo, &missing, &store, FetchArtifact::default())
+            .await;
+        assert!(matches!(jar, Err(RepoError::NotFound(_))), "{jar:?}");
+    }
+    let sidecars = |artifact: &str| {
+        (server.requests().iter())
+            .filter(|request| request.path.starts_with(&format!("/g/{artifact}/")))
+            .filter(|request| request.path.contains(".pom.") || request.path.contains(".jar."))
+            .count()
+    };
+    // The first miss was asked for with its sidecar, before the origin
+    // had answered anything.
+    assert!(sidecars("a") > 0, "{:?}", server.requests());
+    assert_eq!(sidecars("b") + sidecars("c"), 0, "{:?}", server.requests());
+
+    let served = ArtifactRequest::new("g", "served", "1");
+    assert_eq!(
+        client.fetch_pom(&repo, &served).await.unwrap().as_ref(),
+        POM.as_bytes()
+    );
+    let fetched = client
+        .fetch_artifact(&repo, &served, &store, FetchArtifact::default())
+        .await
+        .unwrap();
+    assert!(fetched.checksum_verified);
+    let tampered = ArtifactRequest::new("g", "served", "2");
+    let pom = client.fetch_pom(&repo, &tampered).await;
+    assert!(
+        matches!(pom, Err(RepoError::ChecksumMismatch { .. })),
+        "{pom:?}"
+    );
+    let jar = client
+        .fetch_artifact(&repo, &tampered, &store, FetchArtifact::default())
+        .await;
+    assert!(
+        matches!(jar, Err(RepoError::ChecksumMismatch { .. })),
+        "{jar:?}"
+    );
+    // A pin that is not a SHA-256 checks the bytes beside their checksum
+    // file, which is still asked for.
+    let sha1 = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, POM.as_bytes());
+    let pinned = FetchArtifact {
+        pin: Some(&sha1),
+        index: None,
+    };
+    let jar = (client.fetch_artifact(
+        &repo,
+        &ArtifactRequest::new("g", "served", "4"),
+        &store,
+        pinned,
+    ))
+    .await;
+    assert!(
+        matches!(jar, Err(RepoError::ChecksumMismatch { .. })),
+        "{jar:?}"
+    );
+    let unchecked = ArtifactRequest::new("g", "served", "3");
+    let pom = client.fetch_pom(&repo, &unchecked).await;
+    assert!(matches!(pom, Err(RepoError::MissingChecksum(_))), "{pom:?}");
+    let jar = client
+        .fetch_artifact(&repo, &unchecked, &store, FetchArtifact::default())
+        .await;
+    assert!(matches!(jar, Err(RepoError::MissingChecksum(_))), "{jar:?}");
+}
+
+/// Once an origin lacks a `.sha256`, the `.sha1` is asked for together with
+/// the `.sha256`, except for a file of a release whose last `.sha256` the
+/// origin served: the files of one release are published together. The
+/// `.sha256` still decides whenever it is served, and a file of that
+/// release without one still falls back to its `.sha1`.
+#[tokio::test]
+async fn a_release_that_serves_sha256_is_not_asked_for_sha1_beside_it() {
+    const BODY: &str = "<project><modelVersion>4.0.0</modelVersion></project>";
+    let sha1 = rv_maven_types::Digest::of_bytes(HashAlgorithm::Sha1, BODY.as_bytes());
+    let sha1_hex = sha1.hex().to_string();
+    let server = StubServer::start(move |request| {
+        let path = request.path.as_str();
+        if let Some(file) = path.strip_suffix(".sha256") {
+            if file.starts_with("/g/new/") && !file.ends_with("lone-2.jar") {
+                // Late, so a `.sha1` asked for beside it is sent.
+                return Response::new(200, sha256_hex(BODY)).delayed(Duration::from_millis(300));
+            }
+            return Response::new(404, "");
+        }
+        if path.ends_with(".sha1") {
+            return Response::new(200, sha1_hex.clone());
+        }
+        Response::new(200, BODY)
+    });
+    let repo = http_repo(&server);
+    let (client, _tmp) = test_client();
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    client
+        .fetch_pom(&repo, &ArtifactRequest::new("g.old", "x", "1"))
+        .await
+        .unwrap();
+    let first = ArtifactRequest::new("g.new", "a", "2");
+    client.fetch_pom(&repo, &first).await.unwrap();
+    let jar = client
+        .fetch_artifact(&repo, &first, &store, FetchArtifact::default())
+        .await
+        .unwrap();
+    assert!(jar.checksum_verified);
+    client
+        .fetch_pom(&repo, &ArtifactRequest::new("g.new", "b", "2"))
+        .await
+        .unwrap();
+    let lone = client
+        .fetch_artifact(
+            &repo,
+            &ArtifactRequest::new("g.new", "lone", "2"),
+            &store,
+            FetchArtifact::default(),
+        )
+        .await
+        .unwrap();
+    assert!(lone.checksum_verified);
+    let asked = |path: &str| {
+        (server.requests().iter())
+            .filter(|r| r.path == path)
+            .count()
+    };
+    assert_eq!(asked("/g/old/x/1/x-1.pom.sha1"), 1);
+    // A release asked about for the first time keeps the origin's hedge.
+    assert_eq!(asked("/g/new/a/2/a-2.pom.sha1"), 1);
+    assert_eq!(
+        asked("/g/new/a/2/a-2.jar.sha1"),
+        0,
+        "{:?}",
+        server.requests()
+    );
+    assert_eq!(
+        asked("/g/new/b/2/b-2.pom.sha1"),
+        0,
+        "{:?}",
+        server.requests()
+    );
+    assert_eq!(asked("/g/new/lone/2/lone-2.jar.sha1"), 1);
 }
 
 /// A wildcard mirror on another host does not receive the default (no-id)
@@ -954,7 +2381,7 @@ async fn offline_remote_reads_never_connect() {
             client.resolve_snapshot_version(&remote, &snapshot).await
         ));
         assert!(client.prefetch_pom(&remote, &req).await.unwrap().is_none());
-        client.prefetch_artifact(&remote, &req, &store).await;
+        client.prefetch_artifact(&remote, &req, &store, ()).await;
         // Each attempt guards its own endpoint too.
         let route = client.router.route(&remote);
         let path = req.to_path();
@@ -978,7 +2405,9 @@ async fn offline_remote_reads_never_connect() {
         .unwrap_err()
         .to_string();
     assert!(
-        rendered.contains("(repo: https://repo.example/m2/?***)"),
+        rendered.contains("offline mode")
+            && !rendered.contains("s3cret")
+            && !rendered.contains("t0k"),
         "{rendered}"
     );
     assert!(
@@ -1048,6 +2477,53 @@ async fn an_unusable_snapshot_value_is_not_echoed() {
         "{message}"
     );
     assert!(message.contains("(15 bytes)"), "{message}");
+}
+
+/// Maven 3.10 takes snapshot metadata whose timestamp is no path component
+/// for invalid, so the repository names no build and the base version
+/// stands, with a warning; Maven 3.9 reads the snapshot versions.
+#[test]
+fn maven_310_ignores_snapshot_metadata_with_an_invalid_token() {
+    const METADATA: &[u8] = b"<metadata><version>1.0-SNAPSHOT</version><versioning>\
+        <snapshot><timestamp>20240101:010101</timestamp><buildNumber>7</buildNumber></snapshot>\
+        <snapshotVersions><snapshotVersion><extension>jar</extension>\
+        <value>1.0-20240101.010101-7</value></snapshotVersion></snapshotVersions>\
+        </versioning></metadata>";
+    use rv_maven_types::MavenMode;
+    let mut warnings = Vec::new();
+    for (mode, version, candidate) in [
+        (
+            MavenMode::Maven39,
+            "1.0-20240101.010101-7",
+            SnapshotCandidate::Specific,
+        ),
+        (
+            MavenMode::Maven310,
+            "1.0-SNAPSHOT",
+            SnapshotCandidate::Absent,
+        ),
+    ] {
+        let output = capture_warn_output(async {
+            let (mut client, _tmp) = test_client();
+            client.maven_mode = mode;
+            let (repo, _server) = body_stub(METADATA);
+            let resolved = client
+                .resolve_snapshot_version(&repo, &coord("test:demo:1.0-SNAPSHOT"))
+                .await
+                .unwrap();
+            // The metadata was served, though Maven 3.10 reads it as empty.
+            assert_eq!(
+                (
+                    resolved.version.as_str(),
+                    resolved.candidate,
+                    resolved.metadata_served
+                ),
+                (version, candidate, true)
+            );
+        });
+        warnings.push(output.matches("POM_PROBLEM").count());
+    }
+    assert_eq!(warnings, [0, 1]);
 }
 
 /// A prefetched version list is requested once, and its warnings are
@@ -1198,6 +2674,276 @@ fn a_prefetch_warning_shown_into_a_dropped_hold_is_given_again() {
     );
 }
 
+/// A `-SNAPSHOT` POM is prefetched through its `maven-metadata.xml`, both
+/// held for the read, which then asks nothing and caches both; a parent or
+/// BOM chain of snapshots, as spring-cloud-gateway's, was read one hop of
+/// two round trips after another. Nothing reaches the metadata cache before
+/// that read.
+#[tokio::test]
+async fn a_snapshot_pom_prefetch_leaves_its_metadata_and_build_to_the_read() {
+    const POM: &[u8] = b"<project><version>1.0-SNAPSHOT</version></project>";
+    const METADATA: &[u8] = b"<metadata><versioning><snapshotVersions><snapshotVersion>\
+        <extension>pom</extension><value>1.0-20240101.010101-7</value>\
+        </snapshotVersion></snapshotVersions></versioning></metadata>";
+    let sha1 = |bytes: &[u8]| Response::new(200, hex::encode(sha1::Sha1::digest(bytes)));
+    let server = StubServer::start(move |request| match request.path.as_str() {
+        "/g/s/1.0-SNAPSHOT/maven-metadata.xml" => Response::new(200, METADATA),
+        "/g/s/1.0-SNAPSHOT/maven-metadata.xml.sha1" => sha1(METADATA),
+        "/g/s/1.0-SNAPSHOT/s-1.0-20240101.010101-7.pom" => Response::new(200, POM),
+        "/g/s/1.0-SNAPSHOT/s-1.0-20240101.010101-7.pom.sha1" => sha1(POM),
+        _ => Response::new(404, ""),
+    });
+    let (client, _cache) = test_client();
+    let repo = http_repo(&server);
+    let req = ArtifactRequest::new("g", "s", "1.0-SNAPSHOT");
+    let prefetched = client.prefetch_pom(&repo, &req).await.unwrap();
+    assert_eq!(prefetched.as_deref(), Some(POM));
+    let scope = cache_scope_key(&repo.url, &repo);
+    let metadata = "g/s/1.0-SNAPSHOT/maven-metadata.xml";
+    let pom = "g/s/1.0-SNAPSHOT/s-1.0-20240101.010101-7.pom";
+    let listed = RepoClient::metadata_scope(&repo, &scope, &req.version);
+    let cached = |table, path| {
+        let scope = if matches!(table, CacheTable::Pom) {
+            &scope
+        } else {
+            &listed
+        };
+        client.cache.get(table, scope, path).unwrap().is_some()
+    };
+    assert!(!cached(CacheTable::VersionList, metadata) && !cached(CacheTable::Pom, pom));
+    let asked = server.requests().len();
+    let (bytes, path) = client.fetch_pom_with_path(&repo, &req).await.unwrap();
+    assert_eq!((bytes.as_ref(), path.as_str()), (POM, pom));
+    assert_eq!(server.requests().len(), asked);
+    assert!(cached(CacheTable::VersionList, metadata) && cached(CacheTable::Pom, pom));
+}
+
+#[tokio::test]
+async fn a_snapshot_artifact_prefetch_downloads_the_build_its_read_takes() {
+    const JAR: &[u8] = b"snapshot jar bytes";
+    const METADATA: &[u8] = b"<metadata><versioning><snapshotVersions><snapshotVersion>\
+        <extension>jar</extension><value>1.0-20240101.010101-7</value>\
+        </snapshotVersion></snapshotVersions></versioning></metadata>";
+    const BUILD: &str = "g/s/1.0-SNAPSHOT/s-1.0-20240101.010101-7.jar";
+    let sha1 = |bytes: &[u8]| Response::new(200, hex::encode(sha1::Sha1::digest(bytes)));
+    let server = StubServer::start(move |request| match request.path.as_str() {
+        "/g/s/1.0-SNAPSHOT/maven-metadata.xml" => Response::new(200, METADATA),
+        "/g/s/1.0-SNAPSHOT/maven-metadata.xml.sha1" => sha1(METADATA),
+        "/g/s/1.0-SNAPSHOT/s-1.0-20240101.010101-7.jar" => Response::new(200, JAR),
+        "/g/s/1.0-SNAPSHOT/s-1.0-20240101.010101-7.jar.sha1" => sha1(JAR),
+        _ => Response::new(404, ""),
+    });
+    let (client, _cache) = test_client();
+    let repo = http_repo(&server);
+    let store_dir = tempfile::tempdir().unwrap();
+    let store = store_in(&store_dir);
+    let req = ArtifactRequest::new("g", "s", "1.0-SNAPSHOT");
+    client.prefetch_artifact(&repo, &req, &store, ()).await;
+    let asked = server.requests();
+    assert!(asked.iter().any(|request| request.path[1..] == *BUILD));
+    let fetched = (client.fetch_artifact(&repo, &req, &store, FetchArtifact::default()))
+        .await
+        .unwrap();
+    assert_eq!(fetched.path, BUILD);
+    assert_eq!(server.requests().len(), asked.len());
+}
+
+/// A prefetch asks repositories the read may never reach. Whether a
+/// checksum file admitted a POM is the read's: here the read takes the
+/// first repository's copy, which has none, not the second's, downloaded
+/// or cached by an earlier run.
+#[tokio::test]
+async fn a_pom_is_admitted_as_its_read_found_it() {
+    const POM: &[u8] = b"<project/>";
+    let bare = StubServer::start(|request| match request.path.as_str() {
+        "/g/a/1/a-1.pom" => Response::new(200, POM),
+        _ => Response::new(404, ""),
+    });
+    let checked = StubServer::start(|request| match request.path.as_str() {
+        "/g/a/1/a-1.pom" => Response::new(200, POM),
+        "/g/a/1/a-1.pom.sha256" => Response::new(200, sha256_hex(POM)),
+        _ => Response::new(404, ""),
+    });
+    let req = ArtifactRequest::new("g", "a", "1");
+    for cached in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        // Each run is a new process over the same metadata.db.
+        let run = || {
+            let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
+            let http = rv_http::client_builder().no_proxy().build().unwrap();
+            let router = router(Vec::new(), AuthStore::default());
+            RepoClient::for_test(ClientSet::unscreened(http), router, cache)
+                .with_allow_missing_checksums(true)
+        };
+        if cached {
+            run().fetch_pom(&http_repo(&checked), &req).await.unwrap();
+        }
+        let client = run();
+        client
+            .prefetch_pom(&http_repo(&checked), &req)
+            .await
+            .unwrap();
+        client.fetch_pom(&http_repo(&bare), &req).await.unwrap();
+        let admitted = client.admissions().get("g/a/1/a-1.pom").copied();
+        assert_eq!(admitted, Some(false), "cached: {cached}");
+    }
+}
+
+/// A file or POM a prefetch fetched before the credential changed is
+/// fetched again under the new one, as the read would have: here the
+/// checksum file answers only to the credential. A -SNAPSHOT jar counts
+/// under the credential its metadata read picked, here before the change
+/// that lands while the metadata is on its way; b's metadata names a build
+/// only the credential sees.
+#[tokio::test]
+async fn a_prefetched_file_is_not_taken_under_another_credential() {
+    const JAR: &[u8] = b"jar";
+    const POM: &[u8] = b"<project><version>1</version></project>";
+    let server = StubServer::start(|request| {
+        let path = request.path.as_str();
+        let authorized = request.header("authorization").is_some();
+        let build = if authorized && path.starts_with("/g/b/") {
+            2
+        } else {
+            1
+        };
+        let metadata = format!(
+            "<metadata><versioning><snapshotVersions><snapshotVersion><extension>jar\
+             </extension><value>1.0-20240101.010101-{build}</value></snapshotVersion>\
+             <snapshotVersion><extension>pom</extension><value>1.0-20240101.010101-{build}\
+             </value></snapshotVersion></snapshotVersions></versioning></metadata>"
+        );
+        let body = match path.split_once(".sha256").map_or(path, |(file, _)| file) {
+            file if file.ends_with(".pom") => POM,
+            file if file.ends_with(".xml") => metadata.as_bytes(),
+            _ => JAR,
+        };
+        match path {
+            _ if path.ends_with("/maven-metadata.xml") => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Response::new(200, body)
+            }
+            _ if path.ends_with(".xml.sha256") => Response::new(200, sha256_hex(body)),
+            _ if path.ends_with(".sha256") && authorized => Response::new(200, sha256_hex(body)),
+            _ if path.ends_with(".sha256") => Response::new(401, ""),
+            "/g/a/1/a-1.pom"
+            | "/g/a/1/a-1.jar"
+            | "/g/a/1.0-SNAPSHOT/a-1.0-20240101.010101-1.jar"
+            | "/g/a/1.0-SNAPSHOT/a-1.0-20240101.010101-1.pom"
+            | "/g/b/1.0-SNAPSHOT/b-1.0-20240101.010101-2.jar" => Response::new(200, body),
+            _ => Response::new(404, ""),
+        }
+    });
+    let url = format!("http://{}/", server.addr());
+    let snapshot = "1.0-SNAPSHOT";
+    for (artifact, version, pom) in [
+        ("a", "1", false),
+        ("a", "1", true),
+        ("a", snapshot, false),
+        ("b", snapshot, false),
+        ("a", snapshot, true),
+    ] {
+        let mut auth = rv_config::AuthConfig::new(Some("corp"));
+        auth.token = Some(SecretString::from("dummy-token".to_string()));
+        let auth = AuthStore::from_auth_configs(&[auth])
+            .expect("auth")
+            .with_configured_urls(&[]);
+        let (client, _cache) = client_for(router(Vec::new(), auth));
+        let client = client.with_allow_missing_checksums(pom);
+        let mut fetched = Repository::new(Some("corp".into()), url.clone(), true, true);
+        fetched.set_provenance(crate::Provenance::FetchedPom);
+        let request = ArtifactRequest::new("g", artifact, version);
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = store_in(&store_dir);
+        let admit = async {
+            if version == snapshot {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let declared = Repository::new(Some("corp".into()), url.clone(), true, true);
+            (client.policy()).admit([declared], crate::Declaration::LocalPom);
+        };
+        if pom {
+            let (prefetched, ()) = tokio::join!(client.prefetch_pom(&fetched, &request), admit);
+            assert!(prefetched.unwrap().is_some());
+            assert_eq!(client.fetch_pom(&fetched, &request).await.unwrap(), POM);
+            let dir = format!("/g/a/{version}/");
+            let sidecar = |r: &rv_test_support::http::Request| {
+                r.path.starts_with(&dir) && r.path.ends_with(".pom.sha256")
+            };
+            let mut asked = server.requests().into_iter().filter(sidecar);
+            assert!(
+                asked.any(|r| r.header("authorization").is_some()),
+                "{version}"
+            );
+            continue;
+        }
+        tokio::join!(
+            client.prefetch_artifact(&fetched, &request, &store, ()),
+            admit
+        );
+        let jar = client
+            .fetch_artifact_to_store(&fetched, &request, &store)
+            .await;
+        assert_eq!(
+            jar.unwrap(),
+            rv_maven_types::BlobId::from_bytes(JAR),
+            "{artifact}"
+        );
+    }
+}
+
+/// A miss a prefetch met is kept for later runs only once a read uses it,
+/// as the read would have kept it had it asked, also when the read joins
+/// the prefetch's request.
+#[tokio::test]
+async fn a_prefetched_miss_is_kept_by_its_read() {
+    let server = StubServer::start(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        Response::new(404, "")
+    });
+    let (repo, req) = (http_repo(&server), ArtifactRequest::new("g", "a", "1"));
+    // A checksum probe the miss cancels may or may not reach the server.
+    let asked = || {
+        (server.requests().iter())
+            .filter(|r| r.path.ends_with(".pom"))
+            .count()
+    };
+    for (read, joined) in [(false, false), (true, false), (true, true)] {
+        let tmp = tempfile::tempdir().unwrap();
+        // Each run is a new process over the same metadata.db.
+        let run = || {
+            let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
+            let http = rv_http::client_builder().no_proxy().build().unwrap();
+            let router = router(Vec::new(), AuthStore::default());
+            RepoClient::for_test(ClientSet::unscreened(http), router, cache)
+        };
+        let client = run();
+        let before = asked();
+        let joining = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(client.fetch_pom(&repo, &req).await.is_err());
+        };
+        if joined {
+            tokio::join!(client.prefetch_pom(&repo, &req), joining)
+                .0
+                .unwrap_err();
+        } else {
+            assert!(client.prefetch_pom(&repo, &req).await.is_err());
+            if read {
+                joining.await;
+            }
+        }
+        assert_eq!(asked() - before, 1, "the read takes the prefetch's miss");
+        let before = asked();
+        assert!(run().fetch_pom(&repo, &req).await.is_err());
+        assert_eq!(
+            asked() == before,
+            read,
+            "a later run asks again unless the read kept it"
+        );
+    }
+}
+
 #[test]
 fn prefetches_are_checked_and_logged_by_their_reads() {
     const POM: &[u8] = b"<project><version>1</version></project>";
@@ -1243,7 +2989,7 @@ fn prefetches_are_checked_and_logged_by_their_reads() {
                 Some(UNUSED)
             );
             for req in [&used, &bad, &pinned] {
-                client.prefetch_artifact(&repo, req, &store).await;
+                client.prefetch_artifact(&repo, req, &store, ()).await;
             }
         });
     });
@@ -1331,7 +3077,7 @@ fn a_prefetched_file_answers_its_read_when_the_sidecar_failed() {
         .build()
         .unwrap();
     let fetched = runtime.block_on(async {
-        client.prefetch_artifact(&repo, &req, &store).await;
+        client.prefetch_artifact(&repo, &req, &store, ()).await;
         client.fetch_artifact_to_store(&repo, &req, &store).await
     });
     assert!(fetched.is_err(), "{fetched:?}");
@@ -1420,12 +3166,17 @@ async fn update_refetches_mutable_rows_cached_before_the_run() {
     read_all(run()).await;
     assert_eq!(server.answered(), answered, "the cache serves a plain run");
 
-    // Rows record whole seconds; a row written in the second the run
-    // starts counts as written by it.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
-    read_all(run().with_update(true).with_offline(true)).await;
+    // No pause: rows record whole seconds, and those an earlier run wrote
+    // in the second this one starts are still fetched again.
+    read_all(
+        run()
+            .with_freshness(Freshness::update_from_now())
+            .with_offline(true),
+    )
+    .await;
     assert_eq!(server.answered(), answered, "offline uses the cache");
-    let updating = run().with_update(true);
+    let update = Freshness::update_from_now();
+    let updating = run().with_freshness(update);
     read_all(updating.clone()).await;
     let requests = server.requests();
     let refetched: Vec<&str> = requests[answered..]
@@ -1443,11 +3194,12 @@ async fn update_refetches_mutable_rows_cached_before_the_run() {
     );
     let answered = server.answered();
     read_all(updating).await;
+    read_all(run().with_freshness(update)).await;
     read_all(run()).await;
     assert_eq!(
         server.answered(),
         answered,
-        "rows this run wrote are reused"
+        "rows this run wrote are reused, by another client of it too"
     );
 }
 
@@ -1485,13 +3237,18 @@ async fn rows_dated_in_the_future_are_fetched_again() {
     read_all(client).await;
     for update in [true, false] {
         let conn = rusqlite::Connection::open(&db).expect("metadata.db");
-        for table in ["pom_cache_v4", "version_list_cache_v3"] {
+        for table in ["pom_cache_v5", "version_list_cache_v4"] {
             let sql = format!("UPDATE {table} SET fetched_at = unixepoch() + 3600");
             conn.execute(&sql, []).expect("date rows ahead");
         }
         drop(conn);
         let answered = server.answered();
-        read_all(run().with_update(update)).await;
+        read_all(run().with_freshness(if update {
+            Freshness::update_from_now()
+        } else {
+            Freshness::Policy
+        }))
+        .await;
         let requests = server.requests();
         let mut refetched: Vec<&str> = requests[answered..]
             .iter()
@@ -1586,7 +3343,12 @@ async fn a_miss_is_kept_across_runs(status: u16) {
     assert!(asked() > before, "{status}: the lock's origin asks again");
     let before = asked();
     assert_eq!(
-        read(anonymous().with_update(true), repo.clone(), "a").await,
+        read(
+            anonymous().with_freshness(Freshness::update_from_now()),
+            repo.clone(),
+            "a"
+        )
+        .await,
         live
     );
     assert!(asked() > before, "{status}: --update asks again");
@@ -1630,6 +3392,151 @@ async fn a_miss_is_kept_across_runs(status: u16) {
     assert!(asked() > before, "{status}: nothing is kept under always");
 }
 
+/// The `maven-metadata.xml` of `t:s:1.0-SNAPSHOT` at build `n`.
+fn snapshot_metadata(n: usize) -> String {
+    format!(
+        "<metadata><groupId>t</groupId><artifactId>s</artifactId><version>1.0-SNAPSHOT</version>\
+         <versioning><snapshot><timestamp>20260101.12000{n}</timestamp>\
+         <buildNumber>{n}</buildNumber></snapshot></versioning></metadata>"
+    )
+}
+
+/// A process that shares the store can write the metadata it fetched
+/// before a deploy over the row this one wrote after it. A run still
+/// resolves the SNAPSHOT from the metadata it fetched, plain or under
+/// `--update`, and another client of an update fetches the file again
+/// rather than take the replacement for this run's.
+#[tokio::test]
+async fn a_run_resolves_from_the_metadata_it_fetched_when_another_process_replaces_it() {
+    let server = StubServer::start(|request| {
+        let body = match request.path.trim_end_matches(".sha256") {
+            "/t/s/1.0-SNAPSHOT/maven-metadata.xml" => snapshot_metadata(2),
+            path if path.ends_with(".pom") => {
+                "<project><modelVersion>4.0.0</modelVersion></project>".to_string()
+            }
+            _ => return Response::new(404, ""),
+        };
+        if request.path.ends_with(".sha256") {
+            Response::new(200, sha256_hex(body))
+        } else {
+            Response::new(200, body)
+        }
+    });
+    let repo = http_repo(&server);
+    let snapshot = coord("t:s:1.0-SNAPSHOT");
+    let build_2 = "1.0-20260101.120002-2";
+    for update in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let freshness = if update {
+            Freshness::update_from_now()
+        } else {
+            Freshness::Policy
+        };
+        let run = || {
+            let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
+            let http = rv_http::client_builder().no_proxy().build().unwrap();
+            RepoClient::for_test(
+                ClientSet::unscreened(http),
+                router(Vec::new(), AuthStore::default()),
+                cache,
+            )
+            .with_freshness(freshness)
+        };
+        let client = run();
+        let request = ArtifactRequest::new("t", "s", "1.0-SNAPSHOT");
+        let (_, pom) = client.fetch_pom_with_path(&repo, &request).await.unwrap();
+        assert!(pom.ends_with(&format!("s-{build_2}.pom")), "{pom}");
+        let older = snapshot_metadata(1);
+        let replaced = rusqlite::Connection::open(tmp.path().join("metadata.db"))
+            .unwrap()
+            .execute(
+                "UPDATE version_list_cache_v4 SET content = ?1, sha256 = ?2 WHERE path = ?3",
+                rusqlite::params![
+                    older.as_bytes(),
+                    sha256_hex(&older),
+                    "t/s/1.0-SNAPSHOT/maven-metadata.xml"
+                ],
+            )
+            .unwrap();
+        assert_eq!(replaced, 1);
+        let answered = server.answered();
+        let jar = client.resolve_snapshot_version(&repo, &snapshot).await;
+        assert_eq!(jar.unwrap().version, build_2, "update: {update}");
+        assert_eq!(server.answered(), answered, "update: {update}");
+        if update {
+            let other = run().resolve_snapshot_version(&repo, &snapshot).await;
+            assert_eq!(other.unwrap().version, build_2);
+            assert!(server.answered() > answered, "another client fetches again");
+        }
+    }
+}
+
+/// A run reads each metadata file once: a cached row that expires between
+/// two reads of a client, while the repository deploys a new build, still
+/// gives the second read what the first found, for a SNAPSHOT's metadata
+/// and a group's alike. The next run fetches the new build.
+#[tokio::test]
+async fn a_run_keeps_the_metadata_it_read_when_the_row_expires_meanwhile() {
+    let build = Arc::new(AtomicU32::new(1));
+    let served = Arc::clone(&build);
+    let server = StubServer::start(move |request| {
+        let n = served.load(Ordering::SeqCst) as usize;
+        let body = match request.path.trim_end_matches(".sha256") {
+            "/t/s/1.0-SNAPSHOT/maven-metadata.xml" => snapshot_metadata(n),
+            "/t/maven-metadata.xml" => {
+                format!(
+                    "<metadata><versioning><versions><version>{n}</version></versions></versioning></metadata>"
+                )
+            }
+            _ => return Response::new(404, ""),
+        };
+        if request.path.ends_with(".sha256") {
+            Response::new(200, sha256_hex(body))
+        } else {
+            Response::new(200, body)
+        }
+    });
+    let repo = http_repo(&server);
+    let snapshot = coord("t:s:1.0-SNAPSHOT");
+    let tmp = tempfile::tempdir().unwrap();
+    let run = || {
+        let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
+        let http = rv_http::client_builder().no_proxy().build().unwrap();
+        RepoClient::for_test(
+            ClientSet::unscreened(http),
+            router(Vec::new(), AuthStore::default()),
+            cache,
+        )
+    };
+    let read = |client: RepoClient| {
+        let (repo, snapshot) = (&repo, &snapshot);
+        async move {
+            let resolved = client.resolve_snapshot_version(repo, snapshot).await;
+            let group = client.fetch_group_metadata(repo, "t").await.unwrap();
+            (resolved.unwrap().version, group.versions)
+        }
+    };
+    let first = ("1.0-20260101.120001-1".to_string(), vec!["1".to_string()]);
+    assert_eq!(read(run()).await, first, "an earlier run caches build 1");
+    rusqlite::Connection::open(tmp.path().join("metadata.db"))
+        .unwrap()
+        .execute(
+            "UPDATE version_list_cache_v4 SET expires_at = unixepoch() + 1",
+            [],
+        )
+        .unwrap();
+    let client = run();
+    let answered = server.answered();
+    assert_eq!(read(client.clone()).await, first);
+    assert_eq!(server.answered(), answered, "the run reads the cached rows");
+    build.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    assert_eq!(read(client).await, first, "the run keeps what it read");
+    assert_eq!(server.answered(), answered);
+    let next = ("1.0-20260101.120002-2".to_string(), vec!["2".to_string()]);
+    assert_eq!(read(run()).await, next, "the next run fetches build 2");
+}
+
 /// Maven reads any version ending in `SNAPSHOT` as a snapshot, so a
 /// non-unique `1.0SNAPSHOT` POM is fetched again under `--update` too.
 #[tokio::test]
@@ -1661,7 +3568,7 @@ async fn update_refetches_a_snapshot_pom_spelled_without_a_hyphen() {
     client.fetch_pom(&repo, &snapshot).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let answered = server.answered();
-    let mut updating = client.with_update(true);
+    let mut updating = client.with_freshness(Freshness::update_from_now());
     updating.pom_memo = Arc::default();
     updating.metadata_memo = MetadataMemo::default();
     updating.fetch_pom(&repo, &snapshot).await.unwrap();
@@ -1851,7 +3758,7 @@ async fn pins_skip_sidecars_and_stored_files_are_not_downloaded_again() {
             .get_path(&rv_maven_types::BlobId::from_bytes(OTHER))
             .exists()
     );
-    let updating = client.clone().with_update(true);
+    let updating = client.clone().with_freshness(Freshness::update_from_now());
     let verified = updating.fetch_artifact(&repo, &b, &store, FetchArtifact::default());
     assert!(verified.await.unwrap().checksum_verified);
     let lenient = client.clone().with_allow_missing_checksums(true);
@@ -2157,9 +4064,13 @@ async fn a_refusal_counts_from_when_its_route_picked_the_credential() {
             "1",
             None,
             &mut super::requests::DeferredWarnings::default(),
+            super::models::PomRead::Use,
         )
         .await;
-    assert_eq!(refused.unwrap_err().status_code(), Some(401));
+    let Err(refused) = refused else {
+        panic!("the repository refused the credential")
+    };
+    assert_eq!(refused.status_code(), Some(401));
     let request = ArtifactRequest::new("g", "a", "1");
     assert_eq!(
         client.fetch_pom(&fetched, &request).await.unwrap().as_ref(),
@@ -2205,7 +4116,7 @@ async fn a_missing_file_does_not_wait_for_its_sidecars() {
     let repo = Repository::new(None, format!("http://{addr}/"), true, true);
     let started = std::time::Instant::now();
     client
-        .prefetch_artifact(&repo, &ArtifactRequest::new("g", "b", "1"), &store)
+        .prefetch_artifact(&repo, &ArtifactRequest::new("g", "b", "1"), &store, ())
         .await;
     let prefetched = started.elapsed();
     let started = std::time::Instant::now();
@@ -2309,7 +4220,11 @@ async fn stored_fixed_files_must_match_lock_pins_under_update_too() {
                     let (mut client, _tmp) = test_client();
                     let pin = rv_maven_types::Digest::of_bytes(algorithm, bytes);
                     client.lock_pins = unserved_pins([(file_path(&key), pin)]);
-                    let client = client.with_update(update);
+                    let client = client.with_freshness(if update {
+                        Freshness::update_from_now()
+                    } else {
+                        Freshness::Policy
+                    });
                     let accepted = !fixed || bytes == b"stored";
                     assert_eq!(
                         client.stored_artifact(&store, &repo, &key).await.unwrap(),
@@ -2341,7 +4256,14 @@ async fn explicit_pom_pins_filter_cached_bytes() {
             let scope = client.router.route(&repo).scope;
             client
                 .cache
-                .insert_with_ttl(CacheTable::Pom, &scope, &path, POM, i64::MAX, true)
+                .insert(
+                    CacheTable::Pom,
+                    &scope,
+                    &path,
+                    POM,
+                    rv_store::metadata_cache::Expiry::NEVER,
+                    true,
+                )
                 .unwrap();
             let client = client.with_offline(true);
             assert_eq!(
@@ -2479,4 +4401,80 @@ async fn explicit_pom_pins_check_local_bytes() {
             );
         }
     }
+}
+
+/// Offline, a version list or group listing an online run found missing is
+/// missing, as a POM is, so a search goes on to the next repository rather
+/// than fail as not downloaded.
+#[tokio::test]
+async fn offline_a_kept_metadata_miss_is_not_found() {
+    let server = StubServer::start(|_| Response::new(404, ""));
+    let repo = http_repo(&server);
+    let tmp = tempfile::tempdir().unwrap();
+    let run = || {
+        let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
+        let http = rv_http::client_builder().no_proxy().build().unwrap();
+        let router = router(Vec::new(), AuthStore::default());
+        RepoClient::for_test(ClientSet::unscreened(http), router, cache)
+    };
+    let reads = |client: RepoClient| {
+        let repo = repo.clone();
+        async move {
+            [
+                client.fetch_metadata(&repo, &coord("g:a:1")).await.err(),
+                client.fetch_group_metadata(&repo, "g").await.err(),
+            ]
+            .map(Option::unwrap)
+        }
+    };
+    for err in reads(run()).await {
+        assert!(matches!(err, RepoError::NotFound(_)), "{err:?}");
+    }
+    let asked = server.requests().len();
+    for err in reads(run().with_offline(true)).await {
+        assert!(matches!(err, RepoError::NotFound(_)), "{err:?}");
+    }
+    assert_eq!(server.requests().len(), asked);
+    let (client, _tmp) = test_client();
+    for err in reads(client.with_offline(true)).await {
+        assert!(matches!(err, RepoError::OfflineNotCached(_)), "{err:?}");
+    }
+}
+
+/// A cached row of a SNAPSHOT version that a read takes is counted, so the
+/// SNAPSHOT check knows when it falls due; a release row is not.
+#[tokio::test]
+async fn a_cached_snapshot_row_a_read_takes_is_counted() {
+    use rv_store::metadata_cache::{Expiry, RowsDue};
+    let (client, _cache) = test_client();
+    let scope = "https://r.example/";
+    let now = rv_store::metadata_cache::now_epoch_seconds();
+    let rows = [
+        ("g/a/1-SNAPSHOT/maven-metadata.xml", Expiry::After(600)),
+        ("g/b/1-SNAPSHOT/maven-metadata.xml", Expiry::Daily),
+        ("g/c/1/maven-metadata.xml", Expiry::After(60)),
+    ];
+    for (path, expiry) in rows {
+        (client.cache)
+            .insert_fetched_at(
+                CacheTable::VersionList,
+                scope,
+                path,
+                b"<metadata/>",
+                expiry,
+                now,
+                true,
+            )
+            .unwrap();
+    }
+    assert_eq!(*client.snapshot_rows.lock().unwrap(), RowsDue::default());
+    for (path, _) in rows {
+        let read = client.cache_get_bytes(CacheTable::VersionList, scope, path);
+        assert!(read.await.unwrap().is_some(), "{path}");
+    }
+    let expected = RowsDue {
+        expire_at: Some(now + 600),
+        daily_from: Some(now),
+    };
+    assert_eq!(*client.snapshot_rows.lock().unwrap(), expected);
 }

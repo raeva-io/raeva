@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -26,6 +26,32 @@ use rv_store::{Expect, Expectation, PutError, Staged, Store, Verified};
 /// How one attempt of a repository request failed, for the shared retry
 /// rule in [`rv_http::retry`].
 type RetryError = Outcome<RepoError>;
+
+/// Test hook: a build with the `testing` feature sends a request for Maven
+/// Central's host to the loopback address this names, over plain HTTP, so a
+/// test that leaves Central unstubbed never reaches the real one. Only the
+/// request changes: the client, origins, messages and raeva.lock keep
+/// Central's URL.
+#[cfg(any(test, feature = "testing"))]
+pub const CENTRAL_TEST_ENV: &str = "RAEVA_TEST_CENTRAL_ADDR";
+
+/// The URL a request for `url` is sent to.
+fn wire_url(url: &Url) -> std::borrow::Cow<'_, str> {
+    #[cfg(any(test, feature = "testing"))]
+    if url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some("repo1.maven.org" | "repo.maven.apache.org")
+        )
+        && let Some(addr) = std::env::var(CENTRAL_TEST_ENV)
+            .ok()
+            .and_then(|addr| addr.parse::<std::net::SocketAddr>().ok())
+            .filter(|addr| addr.ip().is_loopback())
+    {
+        return format!("http://{addr}{}", &url[url::Position::BeforePath..]).into();
+    }
+    url.as_str().into()
+}
 
 fn request_error(error: reqwest::Error, url: &Url) -> RetryError {
     if let Some((kind, details)) = crate::transport::redirect_rejection_from_reqwest(&error) {
@@ -76,6 +102,8 @@ pub(crate) struct FetchConfig {
     pub low_speed_time: Duration,
     /// Shared by every request of a run, see [`rv_http::retry::Cooldown`].
     pub cooldowns: Arc<Cooldowns>,
+    /// Which answer refused each origin of `cooldowns`.
+    pub refusers: Arc<Refusers>,
     /// Told of every retry, checksum sidecars' included.
     pub progress: Option<Arc<dyn FetchProgress>>,
 }
@@ -90,6 +118,7 @@ impl Default for FetchConfig {
             low_speed_limit: network.low_speed_limit,
             low_speed_time: Duration::from_secs(network.low_speed_time),
             cooldowns: Arc::default(),
+            refusers: Arc::default(),
             progress: None,
         }
     }
@@ -211,7 +240,7 @@ fn classify_response_status_with_headers(
     let url = redact_url(url);
     Err(match status {
         StatusCode::NOT_FOUND => {
-            RetryError::permanent(RepoError::NotFound(format!("{url} (HTTP 404)")))
+            RetryError::permanent(RepoError::NotFound(format!("{url} (HTTP 404)").into()))
         }
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             RetryError::permanent(RepoError::Unauthorized {
@@ -235,6 +264,7 @@ fn classify_response_status_with_headers(
                     url,
                     retry_after,
                 },
+                status,
                 retry_after,
             }
         }
@@ -271,16 +301,178 @@ async fn drain_error_body(response: reqwest::Response) {
     .await;
 }
 
-async fn execute_retry<F, Fut, T>(config: &FetchConfig, url: &Url, op: F) -> Result<T>
+tokio::task_local! {
+    static ADMITTED: bool;
+    static OPTIONAL: Arc<Mutex<OptionalAnswer>>;
+}
+
+/// What became of a request run with [`optional`] that a caller may come to
+/// need after all.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum OptionalAnswer {
+    /// It got some other answer, or none yet.
+    #[default]
+    Other,
+    /// It was not sent: an optional request to the server, or another
+    /// request, had been refused.
+    Unsent,
+    /// The server answered `status` with a `Retry-After` past
+    /// [`rv_http::retry::MAX_BUSY_WAIT`], at `answered`.
+    Refused {
+        status: StatusCode,
+        retry_after: Duration,
+        answered: tokio::time::Instant,
+    },
+}
+
+/// The answers that refused each origin, so that a request a refusal keeps
+/// unsent fails as such an answer did: of those in force, the first by URL,
+/// so that one input fails with one message whichever of its requests met a
+/// refusal first.
+#[derive(Debug, Default)]
+pub(crate) struct Refusers(Mutex<HashMap<String, Vec<Refuser>>>);
+
+#[derive(Debug)]
+struct Refuser {
+    until: tokio::time::Instant,
+    /// Redacted, as the answer's error names it.
+    url: String,
+    status: StatusCode,
+    retry_after: Duration,
+}
+
+impl Refusers {
+    /// Note that the answer `status` to `url` at `answered` refused its
+    /// origin for `retry_after`.
+    pub(crate) fn note(
+        &self,
+        url: &Url,
+        status: StatusCode,
+        retry_after: Duration,
+        answered: tokio::time::Instant,
+    ) {
+        let until = answered + retry_after.min(Duration::from_secs(100 * 365 * 24 * 60 * 60));
+        let mut refusers = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = refusers
+            .entry(url.origin().ascii_serialization())
+            .or_default();
+        let url = redact_url(url);
+        let now = tokio::time::Instant::now();
+        if (held.iter()).any(|refuser| refuser.url == url && refuser.until >= until) {
+            return;
+        }
+        held.retain(|refuser| refuser.until > now && refuser.url != url);
+        held.push(Refuser {
+            until,
+            url,
+            status,
+            retry_after,
+        });
+    }
+
+    /// The error of a request to `url` a refusal keeps unsent: that of an
+    /// answer whose refusal of its origin is in force, or else one with
+    /// `status` and `retry_after` for `url` itself.
+    pub(crate) fn refused(
+        &self,
+        url: &Url,
+        status: StatusCode,
+        retry_after: Duration,
+    ) -> RepoError {
+        let refusers = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = tokio::time::Instant::now();
+        let refuser = (refusers.get(&url.origin().ascii_serialization())).and_then(|held| {
+            (held.iter())
+                .filter(|refuser| refuser.until > now)
+                .min_by(|a, b| a.url.cmp(&b.url))
+        });
+        match refuser {
+            Some(refuser) => RepoError::HttpStatus {
+                status: refuser.status,
+                url: refuser.url.clone(),
+                retry_after: Some(refuser.retry_after),
+            },
+            None => RepoError::HttpStatus {
+                status,
+                url: redact_url(url),
+                retry_after: Some(retry_after),
+            },
+        }
+    }
+}
+
+/// Run `fetch` as a request whose answer no caller may need: its busy
+/// answers hold back only other such requests (see
+/// [`rv_http::retry::Cooldowns::of_optional`]), and what became of it is
+/// returned beside its output.
+pub(crate) async fn optional<T>(fetch: impl Future<Output = T>) -> (T, OptionalAnswer) {
+    let answer = Arc::new(Mutex::new(OptionalAnswer::default()));
+    let output = OPTIONAL.scope(Arc::clone(&answer), fetch).await;
+    let answer = *answer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (output, answer)
+}
+
+/// Run `fetch`, when `admitted` a request that
+/// [`rv_http::retry::Cooldown::ready`] let through with others to its
+/// server, with no await since: see [`rv_http::retry::run_admitted`].
+pub(crate) async fn admitted<T>(admitted: bool, fetch: impl Future<Output = T>) -> T {
+    ADMITTED.scope(admitted, fetch).await
+}
+
+async fn execute_retry<F, Fut, T>(config: &FetchConfig, url: &Url, mut op: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = std::result::Result<T, RetryError>>,
 {
     let mut retries = 0;
-    let result = rv_http::retry::run(
+    let refused = AtomicBool::new(false);
+    let optional = OPTIONAL.try_with(Arc::clone).ok();
+    let cooldown = match optional {
+        Some(_) => config.cooldowns.of_optional(url),
+        None => config.cooldowns.of(url),
+    };
+    let result = rv_http::retry::run_admitted(
+        ADMITTED.try_with(|admitted| *admitted).unwrap_or(false),
         &RetryPolicy::new(config.retries, config.timeout),
-        &config.cooldowns.of(url),
-        op,
+        &cooldown,
+        || {
+            let attempt = op();
+            let optional = optional.clone();
+            async move {
+                let outcome = attempt.await;
+                if let Err(Outcome::Busy {
+                    status,
+                    retry_after: Some(retry_after),
+                    ..
+                }) = &outcome
+                    && *retry_after > rv_http::retry::MAX_BUSY_WAIT
+                {
+                    let answered = tokio::time::Instant::now();
+                    match optional {
+                        Some(optional) => {
+                            *optional
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                OptionalAnswer::Refused {
+                                    status: *status,
+                                    retry_after: *retry_after,
+                                    answered,
+                                };
+                        }
+                        None => config.refusers.note(url, *status, *retry_after, answered),
+                    }
+                }
+                outcome
+            }
+        },
         |error, wait| {
             retries += 1;
             // A prefetch prints too: the read that needs the file joins it
@@ -290,10 +482,22 @@ where
                 progress.on_retry(&redact_url(url), error, wait, retries + 1, attempts);
             }
         },
+        |status, retry_after| {
+            refused.store(true, Ordering::Relaxed);
+            config.refusers.refused(url, status, retry_after)
+        },
     )
     .await;
+    if let Some(optional) = &optional
+        && refused.load(Ordering::Relaxed)
+    {
+        *optional
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = OptionalAnswer::Unsent;
+    }
     result.map_err(|error| {
-        if retries == 0 || !error.is_transient() {
+        // A refusal was never sent, so it ends the attempts unwrapped.
+        if retries == 0 || refused.load(Ordering::Relaxed) || !error.is_transient() {
             return error;
         }
         RepoError::Retried {
@@ -351,8 +555,11 @@ async fn fetch_bounded(
     if url.scheme() == "file" {
         return read_local_bytes(url, repository_root, bounded.limit, progress).await;
     }
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(RepoError::NoTransport);
+    }
     execute_retry(config, url, || async {
-        let mut request = client.get(url.as_str()).timeout(config.timeout);
+        let mut request = client.get(wire_url(url).as_ref()).timeout(config.timeout);
         if let Some(auth) = auth {
             request = auth.apply(request);
         }
@@ -377,6 +584,10 @@ async fn fetch_bounded(
             .await
             .map_err(|error| match error {
                 BodyError::Transport(error) => request_error(error, url),
+                BodyError::Truncated { declared, read } => {
+                    let context = download_context(None, url);
+                    RetryError::transient(RepoError::Transfer(truncated(declared, read, &context)))
+                }
                 BodyError::TooLarge { limit, declared } => {
                     RetryError::permanent(RepoError::TooLarge {
                         subject: format!("{} at {}", bounded.what, redact_url(url)),
@@ -411,6 +622,15 @@ fn download_context(coordinate: Option<&ArtifactCoord>, url: &Url) -> String {
     }
 }
 
+/// The error of a body that ended after `read` of the `declared` bytes of
+/// its Content-Length.
+fn truncated(declared: u64, read: u64, context: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("the body ended after {read} of its {declared} bytes{context}"),
+    )
+}
+
 type ByteStream = std::pin::Pin<
     Box<dyn futures_core::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send>,
 >;
@@ -422,7 +642,7 @@ type ByteStream = std::pin::Pin<
 /// encoding can hide them from the URL join check.
 fn local_path(url: &Url) -> Result<std::path::PathBuf> {
     let path = rv_lock::file_url_path(url).ok_or_else(|| {
-        RepoError::InvalidCoord(format!("'{}' is not a usable file:// path", url.path()))
+        RepoError::InvalidFileUrl(format!("'{}' names no local path", redact_url(url)))
     })?;
     if path
         .components()
@@ -430,20 +650,40 @@ fn local_path(url: &Url) -> Result<std::path::PathBuf> {
     {
         return Err(RepoError::InvalidCoord(format!(
             "file:// path '{}' contains a parent-directory segment",
-            path.display()
+            redact_url(url)
         )));
     }
     Ok(path)
 }
 
-fn local_open_error(err: std::io::Error, path: &std::path::Path) -> RepoError {
+/// Why a `file:` repository read was refused: a link that leads out of the
+/// repository, or too many links.
+#[derive(Debug)]
+struct Confinement(&'static str);
+
+impl std::fmt::Display for Confinement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for Confinement {}
+
+fn refused(reason: &'static str) -> std::io::Error {
+    std::io::Error::other(Confinement(reason))
+}
+
+/// The error for reading the file at `url`, which names it by its URL as
+/// messages show it: the path may hold a secret a mirror URL takes.
+fn local_open_error(err: std::io::Error, url: &Url) -> RepoError {
+    let shown = redact_url(url);
+    if let Some(refusal) = (err.get_ref()).and_then(|inner| inner.downcast_ref::<Confinement>()) {
+        return RepoError::InvalidCoord(format!("file:// path {shown}: {refusal}"));
+    }
     if err.kind() == std::io::ErrorKind::NotFound {
-        RepoError::NotFound(path.display().to_string())
+        RepoError::NotFound(shown.into())
     } else {
-        RepoError::Io(std::io::Error::new(
-            err.kind(),
-            format!("{}: {err}", path.display()),
-        ))
+        RepoError::Io(std::io::Error::new(err.kind(), format!("{shown}: {err}")))
     }
 }
 
@@ -466,67 +706,171 @@ async fn open_local_file(url: &Url, repository_root: Option<&Url>) -> Result<tok
             "file:// path names the repository root".to_string(),
         ));
     }
+    let (root_url, file_url) = (repository_root.cloned(), url.clone());
     let file = tokio::task::spawn_blocking(move || {
         let canonical_root = root
             .canonicalize()
-            .map_err(|err| local_open_error(err, &root))?;
-        open_confined_file(&canonical_root, &relative).map_err(|err| local_open_error(err, &path))
+            .map_err(|err| local_open_error(err, root_url.as_ref().unwrap_or(&file_url)))?;
+        open_confined_file(&canonical_root, &root, &relative)
+            .map_err(|err| local_open_error(err, &file_url))
     })
     .await
     .map_err(|err| RepoError::Internal(format!("local read task failed: {err}")))??;
     Ok(tokio::fs::File::from_std(file))
 }
 
-/// Open a file relative to a directory descriptor, rejecting symlinks in every component.
-/// Walk the canonical root too, preventing ancestor substitution after canonicalization.
+/// Open a file relative to a directory descriptor, never letting the kernel
+/// follow a link. A link is read instead and its target walked as the
+/// kernel would walk it, a `..` after a link going up from where the link
+/// led. The walk opens nothing outside the root: above it, it goes only
+/// down the root's own path, and a step anywhere else is refused, even if
+/// a link out there would lead back in. An absolute target may name the
+/// root as `given_root` spells it. Walking the canonical `root` from `/`
+/// prevents ancestor substitution after canonicalization.
 #[cfg(unix)]
-fn open_confined_file(root: &std::path::Path, relative: &std::path::Path) -> std::io::Result<File> {
-    use rustix::fs::{Mode, OFlags, open, openat};
-    use std::path::Component;
+fn open_confined_file(
+    root: &std::path::Path,
+    given_root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<File> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, readlinkat, statat};
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path, PathBuf};
 
+    /// As many as Linux follows in one path.
+    const MAX_LINKS: usize = 40;
     let directory_flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY;
-    let mut directory = open("/", directory_flags, Mode::empty())?;
+    let mut root_directory = open("/", directory_flags, Mode::empty())?;
     for component in root.components() {
         match component {
             Component::RootDir => {}
             Component::Normal(name) => {
-                directory = openat(&directory, name, directory_flags, Mode::empty())?
+                root_directory = openat(&root_directory, name, directory_flags, Mode::empty())?
             }
             _ => return Err(std::io::Error::other("invalid canonical repository root")),
         }
     }
-    let mut components = relative.components().peekable();
-    while let Some(component) = components.next() {
-        let Component::Normal(name) = component else {
+    // The parts still to walk, the next one last.
+    let mut pending: Vec<OsString> = Vec::new();
+    let push = |pending: &mut Vec<OsString>, path: &Path| {
+        let parts = path.components().filter(|part| *part != Component::RootDir);
+        pending.extend(parts.rev().map(|part| part.as_os_str().to_owned()));
+    };
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
             return Err(std::io::Error::other("invalid repository path component"));
-        };
-        if components.peek().is_some() {
-            directory = openat(&directory, name, directory_flags, Mode::empty())?;
-        } else {
-            // NONBLOCK prevents an adversarial FIFO from hanging the read before
-            // the regular-file check can reject it.
-            let fd = openat(
-                &directory,
-                name,
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                Mode::empty(),
-            )?;
-            let file = File::from(fd);
-            if !file.metadata()?.is_file() {
-                return Err(std::io::Error::other(
-                    "repository entry is not a regular file",
-                ));
-            }
-            return Ok(file);
         }
     }
-    Err(std::io::Error::other("empty repository path"))
+    push(&mut pending, relative);
+    // The directories opened below the root, with their names, or the
+    // ancestor of the root the walk is in.
+    let mut walked: Vec<(OsString, rustix::fd::OwnedFd)> = Vec::new();
+    let mut above: Option<PathBuf> = None;
+    let mut links = 0;
+    let not_a_file = || refused("the repository entry is not a regular file");
+    while let Some(part) = pending.pop() {
+        let last = pending.is_empty();
+        if part == "." || part == ".." {
+            if part == ".." {
+                match &mut above {
+                    Some(ancestor) => {
+                        ancestor.pop();
+                    }
+                    None if walked.pop().is_none() => above = root.parent().map(Into::into),
+                    None => {}
+                }
+            }
+            if last {
+                return Err(not_a_file());
+            }
+            continue;
+        }
+        if let Some(ancestor) = &above {
+            let next = ancestor.join(&part);
+            if next == root {
+                above = None;
+            } else if root.starts_with(&next) {
+                above = Some(next);
+            } else {
+                return Err(refused("a symbolic link leads out of the repository"));
+            }
+            if last {
+                return Err(not_a_file());
+            }
+            continue;
+        }
+        let directory = walked.last().map_or(&root_directory, |(_, fd)| fd);
+        let opened = if last {
+            // NONBLOCK prevents an adversarial FIFO from hanging the read before
+            // the regular-file check can reject it.
+            openat(
+                directory,
+                &part,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+        } else {
+            openat(directory, &part, directory_flags, Mode::empty())
+        };
+        let err = match opened {
+            Ok(fd) if last => {
+                let file = File::from(fd);
+                if !file.metadata()?.is_file() {
+                    return Err(not_a_file());
+                }
+                return Ok(file);
+            }
+            Ok(fd) => {
+                walked.push((part, fd));
+                continue;
+            }
+            Err(err) => err,
+        };
+        let Ok(target) = readlinkat(directory, &part, Vec::new()) else {
+            // A socket cannot be opened at all.
+            let kind = statat(directory, &part, AtFlags::SYMLINK_NOFOLLOW)
+                .map(|stat| FileType::from_raw_mode(stat.st_mode));
+            if last && kind.is_ok_and(|kind| kind != FileType::RegularFile) {
+                return Err(not_a_file());
+            }
+            return Err(err.into());
+        };
+        links += 1;
+        if links > MAX_LINKS {
+            return Err(refused("too many symbolic links"));
+        }
+        let target = Path::new(OsStr::from_bytes(target.as_bytes()));
+        if target.has_root() {
+            walked.clear();
+            above = (root != Path::new("/")).then(|| PathBuf::from("/"));
+            // Through `given_root`, a `..` would go up from where it leads,
+            // which only the kernel knows.
+            let aliased = (target.strip_prefix(given_root).ok())
+                .filter(|inside| !inside.components().any(|part| part == Component::ParentDir));
+            match aliased {
+                Some(inside) => {
+                    push(&mut pending, inside);
+                    above = None;
+                }
+                None => push(&mut pending, target),
+            }
+        } else {
+            push(&mut pending, target);
+        }
+    }
+    // The last link led to the root itself.
+    Err(not_a_file())
 }
 
 /// Check each resolved component, not only the final target: a directory link
 /// must not leave the repository even if a later link points back inside it.
 #[cfg(not(unix))]
-fn open_confined_file(root: &std::path::Path, relative: &std::path::Path) -> std::io::Result<File> {
+fn open_confined_file(
+    root: &std::path::Path,
+    _given_root: &std::path::Path,
+    relative: &std::path::Path,
+) -> std::io::Result<File> {
     let mut path = root.to_path_buf();
     for component in relative.components() {
         let std::path::Component::Normal(name) = component else {
@@ -535,9 +879,7 @@ fn open_confined_file(root: &std::path::Path, relative: &std::path::Path) -> std
         path.push(name);
         path = path.canonicalize()?;
         if !path.starts_with(root) {
-            return Err(std::io::Error::other(
-                "file:// path escapes the repository root",
-            ));
+            return Err(refused("a symbolic link leads out of the repository"));
         }
     }
     open_checked_repository_entry(&path)
@@ -551,13 +893,14 @@ fn open_checked_repository_entry(path: &std::path::Path) -> std::io::Result<File
     {
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        // Without it a directory does not open, and fails as a store error
+        // instead of the refusal below.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other(
-            "repository entry is not a regular file",
-        ));
+        return Err(refused("the repository entry is not a regular file"));
     }
     Ok(file)
 }
@@ -569,17 +912,16 @@ async fn read_local_bytes(
     progress: Option<&Arc<dyn FetchProgress>>,
 ) -> Result<Bytes> {
     use tokio::io::AsyncReadExt;
-    let path = local_path(url)?;
     let file = open_local_file(url, repository_root).await?;
     let mut bytes = Vec::new();
     // Read one byte past the limit so an oversized file is detected, not truncated.
     file.take(limit + 1)
         .read_to_end(&mut bytes)
         .await
-        .map_err(|err| local_open_error(err, &path))?;
+        .map_err(|err| local_open_error(err, url))?;
     if bytes.len() as u64 > limit {
         return Err(RepoError::TooLarge {
-            subject: path.display().to_string(),
+            subject: redact_url(url),
             limit,
             declared: None,
             setting: None,
@@ -596,12 +938,11 @@ async fn open_local_stream(
     repository_root: Option<&Url>,
 ) -> Result<(Option<u64>, ByteStream)> {
     use tokio::io::AsyncReadExt;
-    let path = local_path(url)?;
     let file = open_local_file(url, repository_root).await?;
     let len = file
         .metadata()
         .await
-        .map_err(|err| local_open_error(err, &path))?
+        .map_err(|err| local_open_error(err, url))?
         .len();
     let stream = futures::stream::unfold(file, |mut file| async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -802,12 +1143,13 @@ fn low_speed_body_stream(
     }))
 }
 
-/// Enforce the size cap, track body progress for the idle deadline and
-/// report each chunk to `progress`. Return the deadline separately so it can
-/// be polled even when the store is awaiting filesystem work rather than
-/// polling this stream.
+/// Enforce the size cap and the `total` length, track body progress for the
+/// idle deadline and report each chunk to `progress`. Return the deadline
+/// separately so it can be polled even when the store is awaiting
+/// filesystem work rather than polling this stream.
 fn artifact_body_stream(
     raw_stream: ByteStream,
+    total: Option<u64>,
     context: String,
     config: &FetchConfig,
     progress: Option<Arc<dyn FetchProgress>>,
@@ -823,7 +1165,7 @@ fn artifact_body_stream(
     let idle = ArtifactIdleDeadline {
         activity: activity.clone(),
         timeout: config.timeout,
-        context,
+        context: context.clone(),
     };
     let mut read = 0u64;
     let stream = futures::stream::poll_fn(move |cx| {
@@ -844,7 +1186,8 @@ fn artifact_body_stream(
             }
             None => {
                 *activity.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                None
+                let short = total.filter(|total| *total != read);
+                short.map(|total| Err(BodyFault::Transfer(truncated(total, read, &context))))
             }
             Some(Err(error)) => Some(Err(BodyFault::Transfer(error))),
         })
@@ -916,6 +1259,9 @@ pub(crate) async fn fetch_artifact_staged(
 ) -> Result<(Staged, Transfer)> {
     let attempts = AtomicU64::new(0);
     let local = url.scheme() == "file";
+    if !local && !matches!(url.scheme(), "http" | "https") {
+        return Err(RepoError::NoTransport);
+    }
     execute_retry(config, url, || async {
         let retry = attempts.fetch_add(1, Ordering::Relaxed) != 0;
         let context = download_context(index, url);
@@ -924,7 +1270,7 @@ pub(crate) async fn fetch_artifact_staged(
                 .await
                 .map_err(RetryError::permanent)?
         } else {
-            let mut request = client.get(url.as_str());
+            let mut request = client.get(wire_url(url).as_ref());
             // Dropping an incomplete HTTP/1 body discards its connection.
             // Close retry connections too, preserving the configured proxy, TLS, and redirect policy.
             if retry {
@@ -977,8 +1323,13 @@ pub(crate) async fn fetch_artifact_staged(
         }
 
         let transfer = Transfer::start(progress, url, total);
-        let (body, idle) =
-            artifact_body_stream(raw_stream, context.clone(), config, progress.cloned());
+        let (body, idle) = artifact_body_stream(
+            raw_stream,
+            total,
+            context.clone(),
+            config,
+            progress.cloned(),
+        );
         match idle.run(store.stage_stream(body, sha1)).await {
             Ok(staged) => Ok((staged, transfer)),
             Err(PutError::Stream(BodyFault::TooLarge)) => Err(too_large(None)),
@@ -1074,11 +1425,28 @@ pub(crate) async fn fetch_text(
     Ok(text.trim().to_string())
 }
 
-/// The `algorithm` digest a checksum sidecar holds, if it holds one.
-/// Maven sidecars are a hex token, optionally followed by a filename.
+/// The `algorithm` digest a checksum sidecar holds, read as Maven's
+/// `DefaultChecksumProcessor.readChecksum` reads one: its first non-empty
+/// line, and of that the text after the last space when the line ends in
+/// `= ` and hex, as in `SHA256(file)= <hex>`, else the text before the
+/// first space. A body whose token is no such digest, such as an HTML error
+/// page, holds none.
 pub(crate) fn parse_checksum(text: &str, algorithm: HashAlgorithm) -> Option<Digest> {
-    text.split_whitespace()
-        .find_map(|token| Digest::from_hex(algorithm, token).ok())
+    // Java's `trim` drops every character up to the space.
+    let trim = |line: &str| line.trim_matches(|c: char| c <= ' ').to_string();
+    let line = (text.split(['\n', '\r']).map(trim)).find(|line| !line.is_empty())?;
+    let token = match line.rsplit_once(' ') {
+        Some((head, hex))
+            if head.len() > 1
+                && head.ends_with('=')
+                && !hex.is_empty()
+                && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            hex
+        }
+        _ => line.split(' ').next().unwrap_or_default(),
+    };
+    Digest::from_hex(algorithm, token).ok()
 }
 
 pub(crate) fn verify_checksum(bytes: &[u8], checksum: &Digest, path: &str) -> Result<()> {
@@ -1114,13 +1482,16 @@ mod tests {
 
     use super::{
         ArtifactChecks, Digest, FetchConfig, FetchProgress, HashAlgorithm, MAX_CHECKSUM_SIZE,
-        RetryError, classify_response_status_with_headers, fetch_artifact_into_store, fetch_text,
-        parse_checksum, verify_checksum,
+        RetryError, classify_response_status_with_headers, execute_retry,
+        fetch_artifact_into_store, fetch_text, parse_checksum, verify_checksum, wire_url,
     };
     use crate::error::{IntegritySource, RepoError};
 
     fn client() -> reqwest::Client {
-        rv_http::client_builder().build().expect("client")
+        rv_http::client_builder()
+            .no_proxy()
+            .build()
+            .expect("client")
     }
 
     fn config(retries: usize, timeout: Duration) -> FetchConfig {
@@ -1128,6 +1499,36 @@ mod tests {
             retries,
             timeout,
             ..Default::default()
+        }
+    }
+
+    /// The default timeout, for tests whose subject is not a deadline:
+    /// under load macOS can hold a new loopback connection for several
+    /// seconds before its handshake completes.
+    fn retrying(retries: usize) -> FetchConfig {
+        FetchConfig {
+            retries,
+            ..Default::default()
+        }
+    }
+
+    /// The Central hook moves only Central's requests, and only to loopback.
+    #[test]
+    fn the_central_hook_sends_only_central_to_loopback() {
+        let central = Url::parse("https://repo1.maven.org/maven2/g/a/1/a-1.pom?q=1").unwrap();
+        let other = Url::parse("https://repo.example/maven2/g/a/1/a-1.pom").unwrap();
+        let hook = super::CENTRAL_TEST_ENV;
+        temp_env::with_var(hook, Some("127.0.0.1:9"), || {
+            assert_eq!(
+                wire_url(&central),
+                "http://127.0.0.1:9/maven2/g/a/1/a-1.pom?q=1"
+            );
+            assert_eq!(wire_url(&other), other.as_str());
+        });
+        for value in [Some("192.0.2.1:80"), Some("127.0.0.1"), None] {
+            temp_env::with_var(hook, value, || {
+                assert_eq!(wire_url(&central), central.as_str(), "{value:?}");
+            });
         }
     }
 
@@ -1155,6 +1556,83 @@ mod tests {
             .map(|verified| verified.blob)
     }
 
+    /// A request a refusal keeps unsent fails as the first by URL of the
+    /// answers that refused the server did, its status and wait with its
+    /// URL, whichever answered first.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_kept_unsent_fails_as_one_refusing_answer_did() {
+        use reqwest::StatusCode;
+
+        let busy = |status: u16, wait: u64, after: u64| async move {
+            tokio::time::sleep(Duration::from_secs(after)).await;
+            Err::<(), _>(RetryError::Busy {
+                error: RepoError::Transfer(std::io::ErrorKind::Other.into()),
+                status: StatusCode::from_u16(status).unwrap(),
+                retry_after: Some(Duration::from_secs(wait)),
+            })
+        };
+        let base = Url::parse("https://repo.example/").unwrap();
+        let (a, b) = (
+            base.join("a.pom.sha256").unwrap(),
+            base.join("b.pom.sha256").unwrap(),
+        );
+        for order in [(1, 2), (2, 1)] {
+            let cfg = config(0, Duration::from_secs(30));
+            let (sent_a, sent_b) = tokio::join!(
+                execute_retry(&cfg, &a, || busy(503, 600, order.0)),
+                execute_retry(&cfg, &b, || busy(429, 900, order.1)),
+            );
+            assert!(sent_a.is_err() && sent_b.is_err());
+            let c = base.join("c.pom").unwrap();
+            let held =
+                (execute_retry(&cfg, &c, || async { Ok::<(), RetryError>(()) }).await).unwrap_err();
+            assert!(
+                matches!(&held, RepoError::HttpStatus { status, url, retry_after: Some(wait) }
+                    if status.as_u16() == 503
+                        && url.ends_with("/a.pom.sha256")
+                        && *wait == Duration::from_secs(600)),
+                "{order:?}: {held:?}"
+            );
+        }
+    }
+
+    /// A request whose retry another request's refusal ends reports that
+    /// refusal, not the attempts it never made.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_retry_reports_the_refusal() {
+        use reqwest::StatusCode;
+
+        let cfg = config(3, Duration::from_secs(30));
+        let url = Url::parse("https://repo.example/a.pom").unwrap();
+        let tried = AtomicUsize::new(0);
+        let first = execute_retry(&cfg, &url, || {
+            tried.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(RetryError::transient(RepoError::Transfer(
+                    std::io::ErrorKind::ConnectionReset.into(),
+                )))
+            }
+        });
+        let busy = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            execute_retry(&cfg, &url, || async {
+                Err::<(), _>(RetryError::Busy {
+                    error: RepoError::Transfer(std::io::ErrorKind::Other.into()),
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    retry_after: Some(Duration::from_secs(600)),
+                })
+            })
+            .await
+        };
+        let (first, _) = tokio::join!(first, busy);
+        assert_eq!(tried.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(&first, Err(RepoError::HttpStatus { status, retry_after: Some(wait), .. })
+                if status.as_u16() == 429 && *wait == Duration::from_secs(600)),
+            "{first:?}"
+        );
+    }
+
     #[test]
     fn checksums_parse_and_verify() {
         let sha1 = parse_checksum(
@@ -1170,6 +1648,21 @@ mod tests {
         )
         .unwrap();
         verify_checksum(b"hello", &sha256, "hello.txt").unwrap();
+        let hex = sha256.hex();
+        for (text, digest) in [
+            (format!("SHA256(hello.txt)= {hex}"), true),
+            (format!("\n  \r\n{hex}\nother"), true),
+            (format!("{hex}\tfile.jar"), false),
+            (format!("name\n{hex}"), false),
+            (
+                format!("<html><body>Not found {hex} extra</body></html>"),
+                false,
+            ),
+            (format!("= {hex}"), false),
+        ] {
+            let parsed = parse_checksum(&text, HashAlgorithm::Sha256);
+            assert_eq!(parsed.is_some(), digest, "{text:?}");
+        }
 
         // A `:` in the path, as on a Windows `file://` repository, keeps the
         // failure a sidecar one, with the sidecar's algorithm.
@@ -1262,7 +1755,7 @@ mod tests {
         let url = Url::parse(&format!("http://{}/a.jar", server.addr())).expect("url");
         let key = ArtifactCoord::new("com.example", "a", "1.0.0", "jar", None);
         let wrong = Digest::Sha256("1".repeat(64).parse().unwrap());
-        let cfg = config(2, Duration::from_secs(5));
+        let cfg = retrying(2);
         let checks = ArtifactChecks {
             pin: Some(&wrong),
             index: Some(&key),
@@ -1333,7 +1826,7 @@ mod tests {
         let url = format!("http://user:secret@{}/a.jar?token=t0k", server.addr());
         let url = Url::parse(&url).expect("url");
         let shown = rv_config::redact_url(&url);
-        let cfg = config(0, Duration::from_secs(5));
+        let cfg = retrying(0);
         let recorded = Arc::new(RecordedProgress::default());
         let progress: Arc<dyn FetchProgress> = recorded.clone();
         let wrong = Digest::Sha256("1".repeat(64).parse().unwrap());
@@ -1343,7 +1836,7 @@ mod tests {
                 ..Default::default()
             };
             let progress = Some(&progress);
-            let _ = fetch_artifact_into_store(
+            let result = fetch_artifact_into_store(
                 &client(),
                 &url,
                 None,
@@ -1354,6 +1847,7 @@ mod tests {
                 checks,
             )
             .await;
+            assert_eq!(result.is_ok(), pin == &digest, "{result:?}");
         }
         server.stop();
         assert!(!shown.contains("secret") && !shown.contains("t0k"));
@@ -1366,7 +1860,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_text_caps_sidecars() {
-        let cfg = config(0, Duration::from_secs(5));
+        let cfg = retrying(0);
         let cap = MAX_CHECKSUM_SIZE as usize;
         let declared = StubServer::start(move |_| Response::new(200, vec![b'a'; cap + 1]));
         let (streamed, _) =
@@ -1393,9 +1887,7 @@ mod tests {
         assert_eq!(text, "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d  foo.jar");
 
         // A missing sidecar's 404 body is drained, so its connection is reused.
-        let server = StubServer::start(|_| {
-            Response::new(404, "<html>no such key</html>").header("Connection", "keep-alive")
-        });
+        let server = StubServer::start(|_| Response::new(404, "<html>no such key</html>"));
         let client = client();
         for name in ["a", "b", "c"] {
             let url = Url::parse(&format!("http://{}/{name}.jar.sha256", server.addr())).unwrap();
@@ -1437,7 +1929,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_lookup_is_tried_once_more() {
         let server = StubServer::start(|_| Response::new(200, "abc"));
-        let cfg = config(3, Duration::from_secs(5));
+        let cfg = retrying(3);
         for fails in [1, 2] {
             let resolver = Arc::new(FlakyResolver {
                 addr: server.addr(),
@@ -1532,11 +2024,11 @@ mod tests {
             let cfg = FetchConfig {
                 low_speed_limit: 10000,
                 low_speed_time: Duration::from_millis(300),
-                ..config(1, Duration::from_secs(5))
+                ..retrying(1)
             };
             let key = big_key();
             let fetch = fetch_into(&url, None, &cfg, &store, Some(&key), None);
-            let result = tokio::time::timeout(Duration::from_secs(6), fetch)
+            let result = tokio::time::timeout(Duration::from_secs(30), fetch)
                 .await
                 .unwrap();
             if fast_retry {
@@ -1619,7 +2111,7 @@ mod tests {
             spawn_chunked_server(move |_| (8, 1024, Duration::from_millis(1)), false).await;
         let small = FetchConfig {
             max_artifact_size: 2048,
-            ..config(2, Duration::from_secs(5))
+            ..retrying(2)
         };
         let msg = fetch_into(&url, None, &small, &store, None, None)
             .await
@@ -1717,6 +2209,114 @@ mod tests {
             }
             assert!(!store.exists_async(&BlobId::from_bytes(secret)).await);
         }
+    }
+
+    /// A link that stays inside the repository is followed, as Maven and
+    /// raeva 0.5 follow it, however it gets there. One that leads out, or
+    /// round a loop, is refused as a repository failure, and one inside
+    /// that names nothing is a missing file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_reads_follow_links_that_stay_inside() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        for dir in ["g/a/1", "g/real", "g/dir", "g/nested/deeper"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("g/real/real.jar"), b"inside").unwrap();
+        std::fs::write(root.join("g/dir/d.jar"), b"inside").unwrap();
+        std::fs::write(root.join("g/nested/file.jar"), b"nested").unwrap();
+        std::fs::write(root.join("g/file.jar"), b"shallow").unwrap();
+        // rustix has no mknodat on macOS.
+        let made = std::process::Command::new("mkfifo")
+            .arg(root.join("g/fifo"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let _socket = std::os::unix::net::UnixListener::bind(root.join("g/socket")).unwrap();
+        std::fs::write(outside.join("a.jar"), b"outside").unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let links: [(&str, std::path::PathBuf); 17] = [
+            ("g/a/1/relative.jar", "../../real/real.jar".into()),
+            // `..` goes up from where a link led, as the kernel takes it.
+            ("g/alias", "nested/deeper".into()),
+            ("g/through.jar", "alias/../file.jar".into()),
+            ("g/missing.jar", "none/../file.jar".into()),
+            ("g/a/1/to-dir.jar", "../../dir".into()),
+            ("g/a/1/to-fifo.jar", "../../fifo".into()),
+            ("g/a/1/absolute.jar", canonical.join("g/real/real.jar")),
+            ("g/a/1/round.jar", "../../../../repo/g/real/real.jar".into()),
+            ("g/a/1/chain.jar", "relative.jar".into()),
+            ("g/linked-dir", "dir".into()),
+            ("g/a/1/out.jar", "../../../../outside/a.jar".into()),
+            ("g/a/1/out-absolute.jar", outside.join("a.jar")),
+            ("g/out-dir", "../../outside".into()),
+            ("g/a/1/loop.jar", "loop.jar".into()),
+            ("g/a/1/dangling.jar", "../../real/none.jar".into()),
+            ("g/a/1/to-root.jar", canonical.clone()),
+            ("g/a/1/to-socket.jar", "../../socket".into()),
+        ];
+        for (link, target) in links {
+            symlink(target, root.join(link)).unwrap();
+        }
+        let root_url = Url::from_directory_path(&root).unwrap();
+        let read = |path: &str| {
+            let url = root_url.join(path).unwrap();
+            let root_url = root_url.clone();
+            async move { super::read_local_bytes(&url, Some(&root_url), 100, None).await }
+        };
+        for path in [
+            "g/a/1/relative.jar",
+            "g/a/1/absolute.jar",
+            "g/a/1/round.jar",
+            "g/a/1/chain.jar",
+            "g/linked-dir/d.jar",
+        ] {
+            assert_eq!(&read(path).await.expect(path)[..], b"inside", "{path}");
+        }
+        assert_eq!(&read("g/through.jar").await.unwrap()[..], b"nested");
+        let missing = read("g/missing.jar").await;
+        assert!(
+            matches!(missing, Err(RepoError::NotFound(_))),
+            "{missing:?}"
+        );
+        for path in [
+            "g/a/1/out.jar",
+            "g/a/1/out-absolute.jar",
+            "g/out-dir/a.jar",
+            "g/a/1/loop.jar",
+            "g/a/1/to-dir.jar",
+            "g/a/1/to-fifo.jar",
+            "g/fifo",
+            "g/a/1/to-root.jar",
+            "g/a/1/to-socket.jar",
+            "g/socket",
+        ] {
+            let read = read(path).await;
+            assert!(
+                matches!(read, Err(RepoError::InvalidCoord(_))),
+                "{path}: {read:?}"
+            );
+        }
+        let read = read("g/a/1/dangling.jar").await;
+        assert!(matches!(read, Err(RepoError::NotFound(_))), "{read:?}");
+
+        // An absolute target may spell the root as its configuration does.
+        let alias = tmp.path().join("alias");
+        symlink(&root, &alias).unwrap();
+        symlink(alias.join("g/real/real.jar"), root.join("g/a/1/alias.jar")).unwrap();
+        let alias_url = Url::from_directory_path(&alias).unwrap();
+        let url = alias_url.join("g/a/1/alias.jar").unwrap();
+        let bytes = super::read_local_bytes(&url, Some(&alias_url), 100, None).await;
+        assert_eq!(&bytes.unwrap()[..], b"inside");
+        symlink(&alias, root.join("g/a/1/alias-root.jar")).unwrap();
+        let url = alias_url.join("g/a/1/alias-root.jar").unwrap();
+        let read = super::read_local_bytes(&url, Some(&alias_url), 100, None).await;
+        assert!(matches!(read, Err(RepoError::InvalidCoord(_))), "{read:?}");
     }
 
     #[tokio::test]

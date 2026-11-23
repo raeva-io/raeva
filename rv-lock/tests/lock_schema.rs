@@ -17,7 +17,7 @@ fn every_field_lock() -> String {
     let digest = "a".repeat(64);
     format!(
         r#"
-schema_version = 8
+schema_version = 9
 config_hash = "{MODEL_HASH}"
 
 [resolution]
@@ -107,10 +107,16 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         "coordinate = \"com.example:parent:1\"" => "x = 1\ncoordinate = \"com.example:parent:1\"", r#"field "x" in support POM 'com.example:parent:1'"#;
         "parent/\"\n" => "parent/\"\nsnapshot = { timestamp = \"20240101.010101\" }\n", r#"missing field "build_number" in the snapshot table of support POM"#;
         // Schema versions.
-        "schema_version = 8" => "schema_version = 5", "unsupported lockfile schema version 5";
-        "schema_version = 8" => "schema_version = 99", "unsupported lockfile schema version 99";
-        "schema_version = 8" => "schema_version = \"6\"", "must be a whole number";
-        "schema_version = 8" => "", r#"missing field "schema_version""#;
+        "schema_version = 9" => "schema_version = 5", "unsupported lockfile schema version 5";
+        "schema_version = 9" => "schema_version = 99", "unsupported lockfile schema version 99";
+        "schema_version = 9" => "schema_version = \"6\"", "must be a whole number";
+        "schema_version = 9" => "", r#"missing field "schema_version""#;
+        "schema_version = 9" => "schema_version = 8", "unsupported lockfile schema version 8";
+        // The shared record of a target.
+        "\n\n[resolution]" => "\nmaven = \"3.10\"\n\n[resolution]", "";
+        "\n\n[resolution]" => "\nmaven = \"3.9\"\n\n[resolution]", r#"maven "3.9" must be "3.10" or left out"#;
+        "\n\n[resolution]" => "\nmaven = \"4.0\"\n\n[resolution]", r#"must be "3.10" or left out"#;
+        "profiles = [\"ci\"]\n" => "maven = \"3.10\"\nprofiles = [\"ci\"]\n", r#"unknown field "maven" in target inputs"#;
         // Digests and checksums.
         "digest = \"{A}\"" => "digest = \"aaaa\"", "expected 64 hex characters";
         "algorithm = \"sha256\"" => "algorithm = \"md5\"", "unsupported checksum algorithm 'md5'";
@@ -119,6 +125,7 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         "pom_sha256 = \"{A}\"" => "pom_sha256 = \"nothex\"", "must be 64 hex characters";
         // A row without a companion POM is a dependency no repository has one for.
         "pom_sha256 = \"{A}\"\n" => "", "";
+        "version = \"1.0-SNAPSHOT\"" => "version = \"1.0\"", "artifact 'com.example:alpha:1.0:jar:tests' on platform 'linux-x86_64' records a snapshot build, but its version is not a SNAPSHOT";
         // Other origins are sorted, distinct and leave out repo_url.
         "pom_sha256 = \"{A}\"\n" => "pom_sha256 = \"{A}\"\nother_repo_urls = [\"https://b.example/\", \"https://c.example/\"]\n", "";
         "pom_sha256 = \"{A}\"\n" => "pom_sha256 = \"{A}\"\nother_repo_urls = [\"https://c.example/\", \"https://b.example/\"]\n", "other_repo_urls for artifact";
@@ -149,18 +156,33 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         "profiles = [\"ci\"]\n" => "profiles = [\"ci\"]\nrepo_ids = \"\"\n", "metadata.repo_ids lists repository id \"central\"";
         "[\"env.CI\"]\n\n[metadata]\nrepo_ids = \"https://repo.example/maven2/\tcentral\"\n\n[[inputs]]\ntarget = \"linux-x86_64\"\n" => "[\"env.CI\", \"java.version\"]\n\n[metadata]\nrepo_ids = \"https://repo.example/maven2/\tcentral\"\n\n[[inputs]]\ntarget = \"linux-x86_64\"\nhost_inputs = []\n", "host input \"java.version\", which no target's inputs list";
         // Module and package rows.
-        "path = \"pom.xml\"" => "path = \"app/mypom.xml\"", "normalized root-relative pom.xml";
-        "path = \"pom.xml\"" => "path = \"../pom.xml\"", "normalized root-relative pom.xml";
+        // A `<module>` entry may name its POM file under any name.
+        "path = \"pom.xml\"" => "path = \"app/mypom.xml\"", "";
+        "path = \"pom.xml\"" => "path = \"../pom.xml\"", "normalized root-relative POM path";
+        "path = \"pom.xml\"" => "path = \"app/..\"", "normalized root-relative POM path";
         "classifier = \"tests\"" => "classifier = \"\"", "must be omitted rather than empty";
         "gav = \"com.example:root:1\"" => "gav = \"com.example:root\"", "must be 'group:artifact:version'";
         "\"0 1 system\"" => "\"0 5 system\"", "edge (0 -> 5) is out of bounds for 2 packages";
-        "\"0 1 system\"" => "\"0 1 merged\"", "expected one of compile, provided";
+        "\"0 1 system\"" => "\"0 1 a\\u00a0b\"", "which is not a scope";
+        "\"0 1 system\"" => "\"0 1 a\\u200bb\"", "which is not a scope";
+        // A scope Maven does not know is kept, `optional` among them.
+        "\"0 1 system\"" => "\"0 1 merged\"", "";
+        "\"0 1 system\"" => "\"0 1 foo:bar\"", "";
+        "\"0 1 system\"" => "\"0 1 a/b optional\"", "";
+        "\"0 1 system\"" => "\"0 1 optional\"", "";
+        "\"0 1 system\"" => "\"0 1 optional optional\"", "";
         "\"0 1 system\"" => "\"0 1 system optional\"", "";
-        "\"0 1 system\"" => "\"0 1 optional system\"", "is not 'from to [scope] [optional]'";
-        "\"0 1 system\"" => "\"0 x\"", "is not 'from to [scope] [optional]'";
+        "\"0 1 system\"" => "\"0 1 optional system\"", "is not 'from to scope [optional]'";
+        "\"0 1 system\"" => "\"0 1\"", "is not 'from to scope [optional]'";
+        "\"0 1 system\"" => "\"0 x\"", "is not 'from to scope [optional]'";
         "\"0 1 system\"\n" => "\"0 1 system\"\nsupport_poms = \"com.example:parent:1\"\n", "";
         "\"0 1 system\"\n" => "\"0 1 system\"\nsupport_poms = \"com.example:other:1\"\n", "support POM 'com.example:other:1' of module 'pom.xml' on platform 'linux-x86_64' has no support_poms row";
         "\"0 1 system\"\n" => "\"0 1 system\"\nsupport_poms = \"com.example:parent\"\n", "must be 'group:artifact:version'";
+        "\"0 1 system\"\n" => "\"0 1 system\"\nsupport_poms = \"com.example:parent:1\"\nparents = \"com.example:parent:1\"\n", "";
+        "\"0 1 system\"\n" => "\"0 1 system\"\nparents = \"com.example:parent:1\"\n", "parent 'com.example:parent:1' of module 'pom.xml' on platform 'linux-x86_64' is not one of its support POMs";
+        // A list out of order is still the module's list.
+        "\"0 1 system\"\n\n" => "\"0 1 system\"\nsupport_poms = \"com.example:parent:1\\ncom.example:c:1\\ncom.example:b:1\"\nparents = \"com.example:parent:1\"\n\n{MORE}", "";
+        "\"0 1 system\"\n" => "\"0 1 system\"\nsupport_poms = \"com.example:parent:1\"\nparents = \"com.example:parent:1\\ncom.example:parent:1\"\n", "or is named twice";
         "jar:tests\\t" => "jar:\\t", "it must start with group:artifact:version";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT", "package line 1 of module 'pom.xml'";
         "{A}\"\"\"" => "{A}\\tx\"\"\"", "more than seven columns";
@@ -176,7 +198,13 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         "\\tsystem\\t\\t\\tlib" => "\\tsystem\\tsystem\\t\\tlib", "must be empty when it is the direct scope";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t\\tcompile", "must be empty when it is the direct scope";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t\\ttest", "";
-        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\tmerged", "the scope in the package line 1";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\tmerged", "";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\ta b", "the scope in the package line 1";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tfoo:bar\\tx/y", "";
+        // `?` is the empty scope, only as the scope a package resolves to.
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t\\t?", "";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t?", "the direct scope in the package line 1";
+        "\"0 1 system\"" => "\"0 1 ?\"", "which is not a scope";
         "\\t\\tlib/tools.jar\\t" => "\\t\\t\\t", "has a system_sha256 but no system_path";
         "\\tjar\\tsystem\\t\\t\\tlib/tools.jar\\t{A}" => "\\tjar\\tsystem", "has no artifact-table row";
         // Resolution settings and snapshot builds.
@@ -218,6 +246,13 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
                  repo_url = \"https://other.example/\"\nsha256 = \"{A}\"\n{BUILD}\
                  [[platforms.support_poms]]\ncoordinate = \"com.example:snap:1-20240101.010101-3\"\n\
                  repo_url = \"https://other.example/\"\nsha256 = \"{B}\"\n",
+            )
+            .replace(
+                "{MORE}",
+                "[[platforms.support_poms]]\ncoordinate = \"com.example:b:1\"\n\
+                 repo_url = \"https://other.example/\"\nsha256 = \"{A}\"\n\n\
+                 [[platforms.support_poms]]\ncoordinate = \"com.example:c:1\"\n\
+                 repo_url = \"https://other.example/\"\nsha256 = \"{A}\"\n\n",
             )
             .replace(
                 "{BUILD}",
@@ -269,15 +304,19 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
 fn a_lock_left_with_merge_conflict_markers_names_the_first_marker() {
     let lock = every_field_lock();
     let (head, tail) = lock.split_at(lock.find("[metadata]").expect("metadata"));
-    let conflicted = format!("{head}<<<<<<< HEAD\n=======\n>>>>>>> topic\n{tail}");
     let line = head.lines().count() + 1;
-    let message = read(&conflicted).expect_err("conflicted").to_string();
-    assert!(
-        message.ends_with(&format!(
-            "it has a Git merge conflict marker at line {line}"
-        )),
-        "{message}"
-    );
+    // Git writes longer markers under the `conflict-marker-size` attribute.
+    for size in [7, 9] {
+        let [open, split, close] = ['<', '=', '>'].map(|c| c.to_string().repeat(size));
+        let conflicted = format!("{head}{open} HEAD\n{split}\n{close} topic\n{tail}");
+        let message = read(&conflicted).expect_err("conflicted").to_string();
+        assert!(
+            message.ends_with(&format!(
+                "it has a Git merge conflict marker at line {line}"
+            )),
+            "{size}: {message}"
+        );
+    }
 }
 
 #[test]
@@ -416,6 +455,36 @@ fn lock_of(rows: Vec<LockArtifact>) -> Lockfile {
     lock
 }
 
+/// A symbolic link where other bytes are written is refused, whatever it
+/// names, and left as it is with the file it names. The same bytes are
+/// kept, as for a regular file.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_lock_is_not_written() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = dir.path().join("shared.lock");
+    let lock = lock_with_origin("https://repo.example/maven2/");
+    lock.write_atomic(&target).expect("write the target");
+    let before = fs::read(&target).unwrap();
+    let link = dir.path().join("raeva.lock");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    lock.write_atomic(&link).expect("the same bytes");
+    let dangling = dir.path().join("dangling.lock");
+    std::os::unix::fs::symlink(dir.path().join("missing.lock"), &dangling).unwrap();
+    for (link, written) in [
+        (&link, lock_with_origin("https://other.example/")),
+        (&dangling, lock.clone()),
+    ] {
+        let err = written.write_atomic(link).expect_err("a link").to_string();
+        assert!(err.contains("it is a symbolic link"), "{err}");
+    }
+    for link in [&link, &dangling] {
+        assert!(fs::symlink_metadata(link).unwrap().is_symlink());
+    }
+    assert_eq!(fs::read(&target).unwrap(), before);
+    assert!(!dir.path().join("missing.lock").exists());
+}
+
 fn lock_with_origin(repo_url: &str) -> Lockfile {
     let mut external = row("alpha", 'a');
     external.repo_url = repo_url.to_string();
@@ -483,7 +552,7 @@ fn a_lock_that_breaks_a_rule_is_not_written() {
             package.system_path = Some("lib/a.jar".into());
         };
         "out of bounds": |p| {
-            let edge = rv_lock::LockEdge::new(0, 9, Some(Scope::Compile), false);
+            let edge = rv_lock::LockEdge::new(0, 9, Scope::Compile, false);
             p.modules[0].edges.push(edge);
         };
         "has no modules": |p| p.modules.clear();
@@ -665,8 +734,6 @@ fn rows_naming_one_file_must_pin_the_same_bytes() {
         let err = write(&two_platforms(linux, darwin)).expect_err("two pins for one file");
         assert!(err.to_string().contains("conflicting pins"), "{err}");
     };
-    let mut other_build = row("alpha", 'a');
-    other_build.snapshot = SnapshotStamp::new("20240101.010101", 1);
     let snapshot = |version: &str, digest: char| {
         let mut row = row("alpha", digest);
         row.coordinate = ArtifactCoord::new("com.example", "alpha", version, "jar", Some("x"));
@@ -677,7 +744,6 @@ fn rows_naming_one_file_must_pin_the_same_bytes() {
     resolved.snapshot = SnapshotStamp::new("20240101.010101", 7);
 
     refused(vec![row("alpha", 'a')], vec![row("alpha", 'b')]);
-    refused(vec![row("alpha", 'a')], vec![other_build]);
     let tar_gz = || spelled("x", "tar.gz", 'b');
     refused(vec![spelled("x.tar", "gz", 'a'), tar_gz()], vec![]);
     refused(vec![spelled("x.tar", "gz", 'a')], vec![tar_gz()]);
@@ -747,7 +813,7 @@ fn origins_are_validated_and_never_leak_a_credential() {
     for bad in [
         "./../outside/",
         "./a\\b/",
-        "../outside/",
+        "../a/../outside/",
         ".https://user:s3cret@repo.example/",
     ] {
         let err = lock_with_origin(bad).write_atomic(&path).expect_err(bad);
@@ -792,7 +858,9 @@ fn origins_are_validated_and_never_leak_a_credential() {
 
     // An absolute `file:` origin inside the project ties the lock to one
     // checkout path, so it is refused; relativizing records the token. One
-    // outside the project stays absolute.
+    // outside the project is read as written, where it matches no
+    // declaration, and relativizing records it from the directory both
+    // share.
     let absolute = file_url(&root.join("repository"));
     let err = lock_with_origin(&absolute)
         .write_atomic(&path)
@@ -816,6 +884,14 @@ fn origins_are_validated_and_never_leak_a_credential() {
     assert_eq!(
         Lockfile::read(&path).unwrap().platforms[0].artifacts[0].repo_url,
         outside_url
+    );
+    let mut lock = lock_with_origin(&outside_url);
+    lock.relativize_origins(&rv_lock::LockOrigins::for_root(&root))
+        .unwrap();
+    let name = outside.path().file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        lock.platforms[0].artifacts[0].repo_url,
+        format!("../{name}/")
     );
 }
 
@@ -851,13 +927,13 @@ fn other_origins_are_sorted_after_relativizing() {
         );
     }
     assert_eq!(recorded[0], recorded[1]);
-    assert_eq!(recorded[0], ["./repo/".to_string(), outside]);
+    assert_eq!(recorded[0], ["../../m/outside/", "./repo/"]);
 }
 
-/// `raeva sync` reads the lockfile's modification time as when SNAPSHOTs were
-/// last refreshed: an unchanged lockfile keeps its file but moves that time.
+/// An unchanged lockfile is left as it is, its modification time too, so a
+/// sync that changes nothing leaves no change for a build tool or git to see.
 #[test]
-fn an_unchanged_lockfile_is_kept_with_a_new_modification_time() {
+fn an_unchanged_lockfile_is_left_as_it_is() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("raeva.lock");
     let mut lock = lock_with_origin("https://repo.example/maven2/");
@@ -875,7 +951,7 @@ fn an_unchanged_lockfile_is_kept_with_a_new_modification_time() {
     lock.write_atomic(&path).unwrap();
     assert_eq!(fs::read(&marker).unwrap(), fs::read(&path).unwrap());
     let modified = fs::metadata(&path).unwrap().modified().unwrap();
-    assert!(modified > old + std::time::Duration::from_secs(86_400));
+    assert!(modified < old + std::time::Duration::from_secs(60));
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1012,6 +1088,267 @@ fn companion_snapshot_build_round_trips_and_is_strict() {
 }
 
 #[test]
+fn missing_checksum_markers_round_trip_and_are_strict() {
+    let base = every_field_lock();
+    let marked = base
+        .replace(
+            "snapshot =",
+            "missing_checksum = true\npom_missing_checksum = true\nsnapshot =",
+        )
+        .replace(
+            "repo_url = \"https://repo.example/parent/\"",
+            "repo_url = \"https://repo.example/parent/\"\nmissing_checksum = true",
+        );
+    let lock = read(&marked).unwrap();
+    let row = &lock.platforms[0].artifacts[0];
+    assert!(row.missing_checksum && row.pom_missing_checksum);
+    assert!(
+        lock.platforms[0]
+            .support_poms
+            .values()
+            .all(|pin| pin.missing_checksum)
+    );
+    assert_eq!(lock.missing_checksum_files().len(), 3);
+    let text = lock.to_toml().unwrap();
+    assert_eq!(text.matches("\nmissing_checksum = true\n").count(), 2);
+    assert_eq!(text.matches("\npom_missing_checksum = true\n").count(), 1);
+    assert_eq!(read(&text).unwrap().to_toml().unwrap(), text);
+    assert!(
+        !read(&base)
+            .unwrap()
+            .to_toml()
+            .unwrap()
+            .contains("missing_checksum")
+    );
+    for (raw, expected) in [
+        (
+            base.replace("snapshot =", "missing_checksum = false\nsnapshot ="),
+            "written only as true",
+        ),
+        (
+            base.replace("snapshot =", "pom_missing_checksum = false\nsnapshot ="),
+            "written only as true",
+        ),
+        (
+            base.replace("snapshot =", "pom_missing_checksum = true\nsnapshot =")
+                .replace(&format!("pom_sha256 = \"{}\"\n", "a".repeat(64)), ""),
+            "needs pom_sha256",
+        ),
+        (
+            base.replace(
+                "repo_url = \"https://repo.example/parent/\"",
+                "repo_url = \"https://repo.example/parent/\"\nmissing_checksum = false",
+            ),
+            "written only as true",
+        ),
+    ] {
+        let err = read(&raw).unwrap_err().to_string();
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+#[test]
+fn managed_sources_round_trip_and_are_strict() {
+    let base = every_field_lock();
+    let with = |managed: &str| {
+        base.replace(
+            "edges = \"0 1 system\"",
+            &format!("edges = \"0 1 system\"\nmanaged = \"{managed}\""),
+        )
+    };
+    let lock = read(&with(
+        r"pom\tcom.example:root\t\t1\nimport\tcom.example:bom\tbom.version\t0",
+    ))
+    .unwrap();
+    let packages = &lock.platforms[0].modules[0].packages;
+    let source = packages[0].managed.as_deref().unwrap();
+    assert_eq!(source.kind, rv_maven_types::ManagedKind::Import);
+    assert_eq!(source.pom, "com.example:bom");
+    assert_eq!(source.property.as_deref(), Some("bom.version"));
+    assert_eq!(packages[1].managed.as_deref().unwrap().property, None);
+    let text = lock.to_toml().unwrap();
+    assert_eq!(
+        read(&text).unwrap().platforms[0].modules,
+        lock.platforms[0].modules
+    );
+    assert_eq!(read(&text).unwrap().to_toml().unwrap(), text);
+    for (managed, expected) in [
+        (
+            r"bom\tcom.example:bom\t\t0",
+            "kind must be pom, import or property",
+        ),
+        (r"import\tcom.example\t\t0", "must be 'group:artifact'"),
+        (
+            r"import\tcom.example:bom:1\t\t0",
+            "must be 'group:artifact'",
+        ),
+        (r"import\tcom.example:bom\t$${x}\t0", "not a property name"),
+        (
+            r"property\tcom.example:parent\t\t0",
+            "a property line names its property",
+        ),
+        (
+            r"import\tcom.example:bom\t\t2",
+            "ascending and name packages",
+        ),
+        (
+            r"import\tcom.example:bom\t\t1 0",
+            "ascending and name packages",
+        ),
+        (
+            r"import\tcom.example:bom\t\t",
+            "ascending and name packages",
+        ),
+        (
+            r"import\tcom.example:bom\t\t0\nimport\tcom.example:bom\t\t1",
+            "sorted",
+        ),
+        (
+            r"import\tcom.example:bom\t\t0\npom\tcom.example:root\t\t1",
+            "sorted",
+        ),
+        (
+            r"import\tcom.example:a\t\t0\nimport\tcom.example:b\t\t0",
+            "one source",
+        ),
+        (r"import\tcom.example:bom\t0", "expected kind"),
+        (
+            r"import\tcom.example:bom\t\t+0",
+            "ascending and name packages",
+        ),
+        (
+            r"import\tcom.example:bom\t\t01",
+            "ascending and name packages",
+        ),
+    ] {
+        let err = read(&with(managed)).unwrap_err().to_string();
+        assert!(err.contains(expected), "{managed}: {err}");
+    }
+}
+
+/// A module's evicted ranges read back as written, sorted and checked in
+/// the lock's Maven order, and a malformed line is refused.
+#[test]
+fn evicted_ranges_round_trip_and_are_strict() {
+    let base = every_field_lock();
+    let with = |evicted: &str| {
+        base.replace(
+            "edges = \"0 1 system\"",
+            &format!("edges = \"0 1 system\"\nevicted_ranges = \"{evicted}\""),
+        )
+    };
+    let lock = read(&with(
+        r"com.example:a\t[1,3)\t./repo/\t1 1.0 2\ncom.example:a\t[1,3)\thttps://repo.example/m2/\t2\ncom.example:b\t[1.0,2),[3,)\thttps://repo.example/m2/\t3.1",
+    ))
+    .unwrap();
+    let ranges = &lock.platforms[0].modules[0].evicted_ranges;
+    assert_eq!(
+        ranges,
+        &[
+            rv_lock::EvictedRange {
+                group: "com.example".into(),
+                artifact: "a".into(),
+                range: "[1,3)".into(),
+                origin: "./repo/".into(),
+                versions: vec!["1".into(), "1.0".into(), "2".into()],
+            },
+            rv_lock::EvictedRange {
+                group: "com.example".into(),
+                artifact: "a".into(),
+                range: "[1,3)".into(),
+                origin: "https://repo.example/m2/".into(),
+                versions: vec!["2".into()],
+            },
+            rv_lock::EvictedRange {
+                group: "com.example".into(),
+                artifact: "b".into(),
+                range: "[1.0,2),[3,)".into(),
+                origin: "https://repo.example/m2/".into(),
+                versions: vec!["3.1".into()],
+            },
+        ]
+    );
+    let text = lock.to_toml().unwrap();
+    assert_eq!(
+        read(&text).unwrap().platforms[0].modules,
+        lock.platforms[0].modules
+    );
+    assert_eq!(read(&text).unwrap().to_toml().unwrap(), text);
+    // 3.9 orders `alpha` the same as `0`, so by their text; 3.10 below.
+    let in_mode = |mode: &str| {
+        let text = with(r"com.example:a\t(,1)\t./repo/\talpha 0")
+            .replace("\n\n[resolution]", &format!("\n{mode}\n[resolution]"));
+        read(&text).map(|_| ())
+    };
+    let err = in_mode("").unwrap_err().to_string();
+    assert!(err.contains("sorted, each once"), "{err}");
+    in_mode("maven = \"3.10\"").unwrap();
+    // The empty origin names a mirrored repository the lock cannot record.
+    let empty = read(&with(r"com.example:a\t[1,3)\t\t1")).unwrap();
+    assert_eq!(empty.platforms[0].modules[0].evicted_ranges[0].origin, "");
+    for (evicted, expected) in [
+        (r"com.example:a\t[1,3)", "expected group:artifact"),
+        (r"com.example:a\t[1,3)\t1", "expected group:artifact"),
+        (
+            r"com.example:a\t[1,3)\t./repo/ ./b/\t1",
+            "contains whitespace",
+        ),
+        (
+            r"com.example:a\t[1,3)\thttps://b.example/\t1\ncom.example:a\t[1,3)\thttps://a.example/\t1",
+            "one per range and origin",
+        ),
+        (
+            r"com.example:a\t[1,3)\t./repo/\t1\ncom.example:a\t[1,3)\t./repo/\t2",
+            "one per range and origin",
+        ),
+        (
+            r"com.example:a\t[1,3)\thttps://user:secret@b.example/\t1",
+            "may hold a credential",
+        ),
+        (
+            r"com.example:a\t[1,3)\t../a/../out/\t1",
+            "project-relative origin",
+        ),
+        (r"com.example\t[1,3)\t./repo/\t1", "expected group:artifact"),
+        (r"com.example:a:1\t[1,3)\t./repo/\t1", "not a coordinate"),
+        (
+            r"com.example:a\t1.0\t./repo/\t1.0",
+            "not a range as raeva writes it",
+        ),
+        (
+            r"com.example:a\t[1.0]\t./repo/\t1.0",
+            "not a range as raeva writes it",
+        ),
+        (
+            r"com.example:a\t[1, 3)\t./repo/\t1",
+            "not a range as raeva writes it",
+        ),
+        (
+            r"com.example:a\t[1,3)\t./repo/\t",
+            "not one the range matches",
+        ),
+        (
+            r"com.example:a\t[1,3)\t./repo/\t4",
+            "not one the range matches",
+        ),
+        (
+            r"com.example:a\t[1,3)\t./repo/\t1 x\u001b",
+            "not one the range matches",
+        ),
+        (r"com.example:a\t[1,3)\t./repo/\t2 1", "sorted, each once"),
+        (r"com.example:a\t[1,3)\t./repo/\t1 1", "sorted, each once"),
+        (
+            r"com.example:b\t[1,3)\t./repo/\t1\ncom.example:a\t[1,3)\t./repo/\t1",
+            "one per range and origin",
+        ),
+    ] {
+        let err = read(&with(evicted)).unwrap_err().to_string();
+        assert!(err.contains(expected), "{evicted}: {err}");
+        assert!(!err.contains('\u{1b}'), "{evicted}: {err}");
+    }
+}
+
+#[test]
 fn shared_graphs_require_one_input_record_per_target() {
     let base = every_field_lock();
     let extra = |target: &str| {
@@ -1086,6 +1423,15 @@ fn parent_range_evidence_is_checked_and_controls_shared_graphs_and_drift() {
     ] {
         assert!(read(&raw.replace(from, to)).is_err(), "accepted {to}");
     }
+    // A remote parent is selected in the resolver's order: 3.10 orders `ga`
+    // below `0`, 3.9 the same.
+    let odd = raw.replace(
+        "parent = \"com.example:parent:[1,3)\", selected = \"com.example:parent:1\"",
+        "parent = \"com.example:parent:(,0)\", selected = \"com.example:parent:ga\"",
+    );
+    assert_ne!(odd, raw);
+    assert!(read(&odd).is_err());
+    read(&odd.replace("\n\n[resolution]", "\nmaven = \"3.10\"\n\n[resolution]")).unwrap();
     let mut duplicate = lock.clone();
     duplicate.platforms[0].modules[0]
         .parent_ranges
@@ -1100,7 +1446,10 @@ fn parent_range_evidence_is_checked_and_controls_shared_graphs_and_drift() {
     assert_eq!(decoded["platforms"].as_array().unwrap().len(), 1);
     let mut changed = lock.clone();
     changed.platforms[1].modules[0].parent_ranges[0].selected = "com.example:parent:2".into();
-    assert!(lock.resolution_drift(&changed, |_, _| true).is_some());
+    assert!(
+        lock.resolution_drift(&changed, |_, _| true, |_, _, _| false)
+            .is_some()
+    );
     let text = changed.to_toml().unwrap();
     let decoded: toml::Value = toml::from_str(&text).unwrap();
     assert_eq!(decoded["platforms"].as_array().unwrap().len(), 2);

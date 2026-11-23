@@ -2,10 +2,14 @@ use rv_maven_types::bounded;
 use serde::Deserialize;
 
 use crate::dependency::{Dependency, DependencyManagement, deserialize_dependencies};
+use crate::plugin::{BuildPlugins, PluginSource};
 use crate::profile::Profile;
 use crate::properties::PropertyMap;
 use crate::repository::{Repository, deserialize_repositories};
 use crate::{PomError, Provenance};
+
+/// A POM's own `<pluginRepositories>`, and each of its profiles', in order.
+pub(crate) type PluginRepositoryLists = (Vec<Repository>, Vec<Vec<Repository>>);
 
 /// A license declared in a Maven POM.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -49,14 +53,68 @@ pub struct Relocation {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub(crate) struct DistributionManagement {
     pub relocation: Option<Relocation>,
+    pub repository: Option<DeploymentRepository>,
+    pub snapshot_repository: Option<DeploymentRepository>,
 }
 
-/// The `<build>` values `${project.build.*}` reads, trimmed and not
-/// interpolated. Its lists and plugins are not read. A profile's `<build>`
-/// sets only `directory`, `finalName` and `defaultGoal`.
+/// A `<repository>` or `<snapshotRepository>` of `<distributionManagement>`,
+/// read only for the id Maven validates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct DeploymentRepository {
+    pub id: Option<String>,
+}
+
+impl DistributionManagement {
+    /// The repository ids of `management` over those of `recessive`, as
+    /// Maven merges a parent's or a profile's: an id one lacks comes from
+    /// the other. The relocation stays `management`'s.
+    pub(crate) fn merge_ids(management: Option<Self>, recessive: Option<&Self>) -> Option<Self> {
+        let Some(recessive) = recessive else {
+            return management;
+        };
+        let mut merged = management.unwrap_or_default();
+        for (slot, other) in [
+            (&mut merged.repository, &recessive.repository),
+            (
+                &mut merged.snapshot_repository,
+                &recessive.snapshot_repository,
+            ),
+        ] {
+            let Some(id) = other.as_ref().and_then(|repository| repository.id.as_ref()) else {
+                continue;
+            };
+            let repository = slot.get_or_insert_default();
+            if repository.id.is_none() {
+                repository.id = Some(id.clone());
+            }
+        }
+        Some(merged)
+    }
+
+    /// Each deployment repository id with its field, as Maven names it.
+    pub(crate) fn repository_ids(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("distributionManagement.repository.id", &self.repository),
+            (
+                "distributionManagement.snapshotRepository.id",
+                &self.snapshot_repository,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, repository)| Some((field, repository.as_ref()?.id.as_deref()?)))
+    }
+}
+
+/// The model fields Maven's interpolation reads by name, `${project.NAME}`,
+/// `${pom.NAME}` or `${NAME}`: the `<build>` values and
+/// `<reporting><outputDirectory>`, trimmed and not interpolated.
+/// [`BuildPlugins`] holds the plugin sections, read only for a project
+/// build. A profile's `<build>` sets only `directory`, `finalName` and
+/// `defaultGoal`.
 #[derive(
     Debug,
     Clone,
@@ -79,26 +137,178 @@ pub(crate) struct Build {
     pub source_directory: Option<String>,
     pub test_source_directory: Option<String>,
     pub script_source_directory: Option<String>,
+    /// Not a `<build>` element: [`Pom::parse`] moves it here from
+    /// `<reporting>`.
+    #[serde(
+        rename = "reporting.outputDirectory",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub reporting_output_directory: Option<String>,
+    /// Nor these: [`Pom::parse`] moves the project's plain text fields
+    /// here, which no profile sets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inception_year: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
+    #[serde(rename = "organization.name", skip_serializing_if = "Option::is_none")]
+    pub organization_name: Option<String>,
+    #[serde(rename = "organization.url", skip_serializing_if = "Option::is_none")]
+    pub organization_url: Option<String>,
+    /// Whether the POM declares `<organization>`, empty or not: Maven then
+    /// inherits none of its parent's.
+    #[serde(skip)]
+    pub organization: bool,
+}
+
+/// Whether `name`, after `project.` or `pom.`, reaches a field of Maven's
+/// model that raeva does not read, such as `url` or `build.plugins`: a list,
+/// an object, or `url`, which a module inherits with its own path added.
+/// Maven's interpolation reads the model ahead of the properties, so a
+/// property of that name does not give Maven's value. A name no getter of
+/// the model reads, such as `build.sourceEncoding`, is left to the
+/// properties, as Maven leaves it.
+pub(crate) fn is_unread_model_field(name: &str) -> bool {
+    // A getter of a field's value, such as `name.empty`, which Maven reads
+    // from the `String`.
+    if (Build::FIELDS.iter())
+        .any(|field| (name.strip_prefix(field.name)).is_some_and(|rest| rest.starts_with('.')))
+    {
+        return true;
+    }
+    let (first, second) = match name.split_once('.') {
+        Some((first, rest)) => (first, rest.split('.').next()),
+        None => (name, None),
+    };
+    // Getters of `Parent`, `Prerequisites`, `Organization`, `Build` and
+    // `Reporting` that neither `resolve_builtin` nor [`Build::FIELDS`] reads.
+    let unread: &[&str] = match first {
+        "parent" => &["relativePath", "id"],
+        "prerequisites" | "organization" => &[],
+        "build" => &[
+            "resources",
+            "testResources",
+            "filters",
+            "extensions",
+            "plugins",
+            "pluginManagement",
+            "pluginsAsMap",
+        ],
+        "reporting" => &["excludeDefaults", "plugins", "reportPluginsAsMap"],
+        _ => {
+            return [
+                "url",
+                "licenses",
+                "developers",
+                "contributors",
+                "mailingLists",
+                "modules",
+                "scm",
+                "issueManagement",
+                "ciManagement",
+                "distributionManagement",
+                "dependencyManagement",
+                "dependencies",
+                "repositories",
+                "pluginRepositories",
+                "reports",
+                "profiles",
+                "id",
+                "pomFile",
+                "projectDirectory",
+                "modelEncoding",
+                "childProjectUrlInheritAppendPath",
+            ]
+            .contains(&first);
+        }
+    };
+    second.is_none_or(|second| unread.contains(&second))
+}
+
+/// A model field [`Build`] holds, as Maven's interpolation reads it.
+pub(crate) struct ModelField {
+    /// The name after `project.`, as `${project.build.directory}` spells it.
+    pub name: &'static str,
+    /// The super POM's value, which every lineage inherits where none of
+    /// its POMs sets one.
+    pub super_pom: Option<&'static str>,
+    /// Whether Maven's path translator aligns the value to the project
+    /// directory: `AbstractStringBasedModelInterpolator`'s
+    /// `TRANSLATED_PATH_EXPRESSIONS`, all of them.
+    pub translated: bool,
+    /// How a module takes its parent's value.
+    pub inherited: Inheritance,
+    /// Whether a profile's `<build>` or `<reporting>` sets it.
+    pub profile: bool,
+    /// Keeps a field out of reach of a literal outside this module, so
+    /// every one is in [`Build::FIELDS`].
+    _sealed: (),
+}
+
+/// How Maven's inheritance fills a [`ModelField`] a module does not set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Inheritance {
+    /// From the parent.
+    Inherited,
+    /// Not at all: `<name>` and `<modelVersion>`.
+    NotInherited,
+    /// With the parent's whole `<organization>`, where the module declares
+    /// none.
+    WithOrganization,
 }
 
 impl Build {
-    /// The field names, as `${project.build.NAME}` spells them, in the
-    /// order of [`Self::fields`].
-    pub(crate) const NAMES: [&'static str; 8] = [
-        "directory",
-        "finalName",
-        "defaultGoal",
-        "outputDirectory",
-        "testOutputDirectory",
-        "sourceDirectory",
-        "testSourceDirectory",
-        "scriptSourceDirectory",
+    /// The fields, in the order of [`Self::fields`].
+    pub(crate) const FIELDS: [ModelField; 15] = [
+        ModelField::path("build.directory", Some("${project.basedir}/target")).in_profiles(),
+        ModelField::text(
+            "build.finalName",
+            Some("${project.artifactId}-${project.version}"),
+        )
+        .in_profiles(),
+        ModelField::text("build.defaultGoal", None).in_profiles(),
+        ModelField::path(
+            "build.outputDirectory",
+            Some("${project.build.directory}/classes"),
+        ),
+        ModelField::path(
+            "build.testOutputDirectory",
+            Some("${project.build.directory}/test-classes"),
+        ),
+        ModelField::path(
+            "build.sourceDirectory",
+            Some("${project.basedir}/src/main/java"),
+        ),
+        ModelField::path(
+            "build.testSourceDirectory",
+            Some("${project.basedir}/src/test/java"),
+        ),
+        ModelField::path(
+            "build.scriptSourceDirectory",
+            Some("${project.basedir}/src/main/scripts"),
+        ),
+        ModelField::path(
+            "reporting.outputDirectory",
+            Some("${project.build.directory}/site"),
+        )
+        .in_profiles(),
+        ModelField::plain("name", Inheritance::NotInherited),
+        ModelField::plain("description", Inheritance::Inherited),
+        ModelField::plain("inceptionYear", Inheritance::Inherited),
+        ModelField::plain("modelVersion", Inheritance::NotInherited),
+        ModelField::plain("organization.name", Inheritance::WithOrganization),
+        ModelField::plain("organization.url", Inheritance::WithOrganization),
     ];
 
-    /// The fields a profile's `<build>` sets.
-    pub(crate) const PROFILE_NAMES: [&'static str; 3] = ["directory", "finalName", "defaultGoal"];
+    /// The field `name` names, as [`ModelField::name`] spells it.
+    pub(crate) fn model_field(name: &str) -> Option<&'static ModelField> {
+        Self::FIELDS.iter().find(|field| field.name == name)
+    }
 
-    pub(crate) fn fields(&self) -> [&Option<String>; 8] {
+    pub(crate) fn fields(&self) -> [&Option<String>; 15] {
         [
             &self.directory,
             &self.final_name,
@@ -108,10 +318,17 @@ impl Build {
             &self.source_directory,
             &self.test_source_directory,
             &self.script_source_directory,
+            &self.reporting_output_directory,
+            &self.name,
+            &self.description,
+            &self.inception_year,
+            &self.model_version,
+            &self.organization_name,
+            &self.organization_url,
         ]
     }
 
-    fn fields_mut(&mut self) -> [&mut Option<String>; 8] {
+    fn fields_mut(&mut self) -> [&mut Option<String>; 15] {
         [
             &mut self.directory,
             &mut self.final_name,
@@ -121,39 +338,195 @@ impl Build {
             &mut self.source_directory,
             &mut self.test_source_directory,
             &mut self.script_source_directory,
+            &mut self.reporting_output_directory,
+            &mut self.name,
+            &mut self.description,
+            &mut self.inception_year,
+            &mut self.model_version,
+            &mut self.organization_name,
+            &mut self.organization_url,
         ]
     }
 
-    /// The value of the field `name`, or `None` for a name not in
-    /// [`Self::NAMES`].
-    pub(crate) fn field(&self, name: &str) -> Option<&Option<String>> {
-        let index = Self::NAMES.iter().position(|known| *known == name)?;
-        Some(self.fields()[index])
+    /// The value of `field`, one of [`Self::FIELDS`], the only ones there
+    /// are: a name finds its field through [`Self::model_field`].
+    pub(crate) fn value(&self, field: &ModelField) -> &Option<String> {
+        let index = (Self::FIELDS.iter())
+            .position(|known| known.name == field.name)
+            .expect("a field of Build::FIELDS");
+        self.fields()[index]
     }
 
     /// Fill each field `self` does not set from `parent`, as Maven's
     /// inheritance does.
     pub(crate) fn inherit(&mut self, parent: &Build) {
-        for (own, inherited) in self.fields_mut().into_iter().zip(parent.fields()) {
-            if own.is_none() {
+        let organization = !self.organization && parent.organization;
+        let fields = self.fields_mut().into_iter().zip(parent.fields());
+        for ((own, inherited), field) in fields.zip(&Self::FIELDS) {
+            let take = match field.inherited {
+                Inheritance::Inherited => own.is_none(),
+                Inheritance::NotInherited => false,
+                Inheritance::WithOrganization => organization,
+            };
+            if take {
                 own.clone_from(inherited);
             }
         }
+        self.organization |= parent.organization;
     }
 
-    /// Put an active profile's `directory`, `finalName` and `defaultGoal`
-    /// over this build's.
+    /// This build without the plain text fields, which a replayed lookup
+    /// does without.
+    pub(crate) fn without_project_text(&self) -> Build {
+        let mut build = self.clone();
+        build.take_project_text(None);
+        build
+    }
+
+    /// Take the plain text fields from `pom`, which reads them outside
+    /// `<build>`; a profile, `None`, sets none of them.
+    fn take_project_text(&mut self, pom: Option<&mut Pom>) {
+        let Some(pom) = pom else {
+            *self = Self {
+                name: None,
+                description: None,
+                inception_year: None,
+                model_version: None,
+                organization_name: None,
+                organization_url: None,
+                organization: false,
+                ..std::mem::take(self)
+            };
+            return;
+        };
+        self.name = pom.name.take();
+        self.description = pom.description.take();
+        self.inception_year = pom.inception_year.take();
+        self.model_version.clone_from(&pom.model_version);
+        let organization = pom.organization.take();
+        self.organization = organization.is_some();
+        (self.organization_name, self.organization_url) = organization
+            .map_or((None, None), |organization| {
+                (organization.name, organization.url)
+            });
+    }
+
+    /// Put the fields an active profile sets over this build's.
     pub(crate) fn inject_profile(&mut self, profile: &Build) {
-        for (own, injected) in [
-            (&mut self.directory, &profile.directory),
-            (&mut self.final_name, &profile.final_name),
-            (&mut self.default_goal, &profile.default_goal),
-        ] {
-            if injected.is_some() {
+        let fields = self.fields_mut().into_iter().zip(profile.fields());
+        for ((own, injected), field) in fields.zip(&Self::FIELDS) {
+            if field.profile && injected.is_some() {
                 own.clone_from(injected);
             }
         }
     }
+}
+
+impl ModelField {
+    const fn path(name: &'static str, super_pom: Option<&'static str>) -> Self {
+        Self {
+            name,
+            super_pom,
+            translated: true,
+            inherited: Inheritance::Inherited,
+            profile: false,
+            _sealed: (),
+        }
+    }
+
+    const fn text(name: &'static str, super_pom: Option<&'static str>) -> Self {
+        Self {
+            name,
+            super_pom,
+            translated: false,
+            inherited: Inheritance::Inherited,
+            profile: false,
+            _sealed: (),
+        }
+    }
+
+    const fn in_profiles(self) -> Self {
+        Self {
+            profile: true,
+            ..self
+        }
+    }
+
+    const fn plain(name: &'static str, inherited: Inheritance) -> Self {
+        Self {
+            name,
+            super_pom: None,
+            translated: false,
+            inherited,
+            profile: false,
+            _sealed: (),
+        }
+    }
+}
+
+/// `<organization>`, read only for the [`Build`] fields it holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default)]
+pub(crate) struct Organization {
+    #[serde(deserialize_with = "deserialize_text")]
+    pub name: Option<String>,
+    #[serde(deserialize_with = "deserialize_text")]
+    pub url: Option<String>,
+}
+
+/// The text of a plain text field, `None` where it holds markup: Maven's
+/// reader refuses that, and raeva, which reads the field only for
+/// `${project.x}`, keeps the POM as it did before it read the field.
+fn deserialize_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    struct Text;
+    impl<'de> serde::de::Visitor<'de> for Text {
+        type Value = Option<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("text")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Ok(Some(text.to_owned()))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Some(String::new()))
+        }
+
+        // An element's text comes as its `$text` entry and its attributes
+        // as `@` ones; any other entry is markup.
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut text = Some(String::new());
+            while let Some(key) = map.next_key::<String>()? {
+                if key.starts_with('@') {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                } else if key == "$text" {
+                    let part = map.next_value::<String>()?;
+                    if let Some(text) = &mut text {
+                        text.push_str(&part);
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    text = None;
+                }
+            }
+            Ok(text)
+        }
+    }
+    deserializer.deserialize_any(Text)
+}
+
+/// `<reporting>`, read only for the [`Build`] field it holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct Reporting {
+    pub output_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -193,6 +566,32 @@ pub struct Pom {
     pub dependency_management: Option<DependencyManagement>,
     pub(crate) distribution_management: Option<DistributionManagement>,
     pub(crate) build: Box<Build>,
+    pub(crate) reporting: Reporting,
+    /// Moved to [`Build`] when parsed, with `inceptionYear` and
+    /// `organization`.
+    #[serde(deserialize_with = "deserialize_text")]
+    pub(crate) name: Option<String>,
+    #[serde(deserialize_with = "deserialize_text")]
+    pub(crate) description: Option<String>,
+    #[serde(deserialize_with = "deserialize_text")]
+    pub(crate) inception_year: Option<String>,
+    pub(crate) organization: Option<Organization>,
+    /// The plugins, managed plugins and extensions of `<build>`, empty
+    /// until [`Self::load_plugins`] reads them; for a project build, merged
+    /// with its parents' and active profiles'.
+    #[serde(skip)]
+    pub(crate) plugins: Option<Box<BuildPlugins>>,
+    /// The text [`Self::load_plugins`] reads the plugin sections from.
+    #[serde(skip)]
+    pub(crate) plugin_source: PluginSource,
+    /// The `<pluginRepositories>`, in declaration order, read with
+    /// [`Self::plugins`]; for a project build, merged as it is.
+    #[serde(skip)]
+    pub(crate) plugin_repositories: Vec<Repository>,
+    /// Set by [`Self::mark_root_repositories`], for the plugin
+    /// repositories read later.
+    #[serde(skip)]
+    pub(crate) root_declared: bool,
     /// The `<properties>`, with any user properties
     /// [`Self::overlay_user_properties`] put over them.
     pub properties: PropertyMap,
@@ -233,6 +632,10 @@ pub struct Pom {
     /// `<parent>` element.
     #[serde(skip)]
     pub(crate) unread_parent: Option<bool>,
+    /// The `<relativePath>` as written, `Some` once
+    /// [`Self::anchor_relative_path`] replaced it with a resolved path.
+    #[serde(skip)]
+    pub(crate) written_relative_path: Option<Option<String>>,
 }
 
 element_list!(fn deserialize_profiles, "profile", Profile);
@@ -262,6 +665,108 @@ impl Pom {
         }
     }
 
+    /// Read the plugin sections of this POM and of its profiles into
+    /// [`Self::plugins`] and each [`Profile`]'s, once. A POM that
+    /// [`Self::parse_with_plugins`] did not make has none to read.
+    pub(crate) fn load_plugins(&mut self) -> Result<(), PomError> {
+        let source = match std::mem::replace(&mut self.plugin_source, PluginSource::Read) {
+            PluginSource::Kept(source) => source,
+            PluginSource::Read => return Ok(()),
+            PluginSource::Dropped => {
+                self.plugin_source = PluginSource::Dropped;
+                return Err(PomError::InvalidModel(
+                    "the POM was read without its plugin sections".to_string(),
+                ));
+            }
+        };
+        let (own, profiles) = crate::plugin::read_sections(&source)?;
+        self.plugins = Some(Box::new(own.0));
+        self.plugin_repositories = own.1;
+        for (profile, (plugins, repositories)) in self.profiles.iter_mut().zip(profiles) {
+            profile.plugins = Some(Box::new(plugins));
+            profile.plugin_repositories = repositories;
+        }
+        if self.root_declared {
+            self.mark_root_repositories();
+        }
+        Ok(())
+    }
+
+    /// Read only the `<pluginRepositories>` of this POM and of its profiles,
+    /// for a model built without its plugin sections. Sections that do not
+    /// parse give none.
+    pub(crate) fn load_plugin_repositories(&mut self) {
+        let Ok(Some((own, profiles))) = self.plugin_repository_lists() else {
+            return;
+        };
+        self.plugin_repositories = own;
+        for (profile, repositories) in self.profiles.iter_mut().zip(profiles) {
+            profile.plugin_repositories = repositories;
+        }
+        if self.root_declared {
+            self.mark_root_repositories();
+        }
+    }
+
+    /// Whether this POM keeps its plugin sections, read or not.
+    pub fn keeps_plugin_sections(&self) -> bool {
+        !matches!(self.plugin_source, PluginSource::Dropped)
+    }
+
+    /// The `<pluginRepositories>` of this POM and of each of its profiles,
+    /// read from the kept text without loading the plugin sections; `None`
+    /// for a POM read without them. Fails where the sections do not parse.
+    pub fn plugin_repository_lists(&self) -> Result<Option<PluginRepositoryLists>, PomError> {
+        match &self.plugin_source {
+            PluginSource::Dropped => Ok(None),
+            PluginSource::Read => Ok(Some((
+                self.plugin_repositories.clone(),
+                (self.profiles.iter())
+                    .map(|profile| profile.plugin_repositories.clone())
+                    .collect(),
+            ))),
+            PluginSource::Kept(source) => {
+                let (own, profiles) = crate::plugin::read_sections(source)?;
+                let profiles = profiles.into_iter().map(|(_, repositories)| repositories);
+                Ok(Some((own.1, profiles.collect())))
+            }
+        }
+    }
+
+    /// The `(groupId, artifactId)`, as written, of each build plugin and
+    /// build extension this POM or one of its profiles declares without a
+    /// version; `None` for a POM read without its plugin sections.
+    pub fn unversioned_plugins(&self) -> Result<Option<Vec<(String, String)>>, PomError> {
+        let read;
+        let sections: Vec<&BuildPlugins> = match &self.plugin_source {
+            PluginSource::Dropped => return Ok(None),
+            PluginSource::Read => (self.plugins.iter().map(Box::as_ref))
+                .chain(
+                    self.profiles
+                        .iter()
+                        .flat_map(|profile| profile.plugins.as_deref()),
+                )
+                .collect(),
+            PluginSource::Kept(source) => {
+                read = crate::plugin::read_sections(source)?;
+                std::iter::once(&read.0.0)
+                    .chain(read.1.iter().map(|(plugins, _)| plugins))
+                    .collect()
+            }
+        };
+        let mut unversioned = Vec::new();
+        for section in sections {
+            let plugins = (section.plugins.iter())
+                .filter(|plugin| plugin.version.is_none())
+                .map(|plugin| (plugin.group_id.clone(), plugin.artifact_id.clone()));
+            let extensions = (section.extensions.iter())
+                .filter(|extension| extension.version.is_none())
+                .map(|extension| (extension.group_id.clone(), extension.artifact_id.clone()));
+            unversioned.extend(plugins.chain(extensions));
+        }
+        Ok(Some(unversioned))
+    }
+
     /// Where this POM was read from, when its loader recorded it.
     pub fn provenance(&self) -> Option<&Provenance> {
         self.provenance.as_ref()
@@ -273,6 +778,24 @@ impl Pom {
         self.provenance = Some(provenance);
     }
 
+    /// Replace the `<relativePath>` with `path`, resolved by the code that
+    /// read this POM, and keep the text as written for the checks Maven
+    /// makes on it.
+    pub fn anchor_relative_path(&mut self, path: String) {
+        if let Some(parent) = &mut self.parent {
+            let written = parent.relative_path.replace(path);
+            self.written_relative_path.get_or_insert(written);
+        }
+    }
+
+    /// The `<relativePath>` as written, before any anchoring.
+    pub(crate) fn written_relative_path(&self) -> Option<&str> {
+        match &self.written_relative_path {
+            Some(written) => written.as_deref(),
+            None => self.parent.as_ref()?.relative_path.as_deref(),
+        }
+    }
+
     /// `<properties>` as written, before any user property overlay.
     pub(crate) fn declared_properties(&self) -> &PropertyMap {
         self.own_properties.as_ref().unwrap_or(&self.properties)
@@ -281,11 +804,15 @@ impl Pom {
     /// Mark declarations loaded from a user-owned POM. Call only at the local
     /// model boundary, never when decoding repository or lockfile payloads.
     pub fn mark_root_repositories(&mut self) {
-        for repo in self.repositories.iter_mut().chain(
-            self.profiles
-                .iter_mut()
-                .flat_map(|profile| profile.repositories.iter_mut()),
-        ) {
+        self.root_declared = true;
+        let profiles = self.profiles.iter_mut();
+        let repositories = profiles.flat_map(|profile| {
+            (profile.repositories.iter_mut()).chain(profile.plugin_repositories.iter_mut())
+        });
+        for repo in (self.repositories.iter_mut())
+            .chain(self.plugin_repositories.iter_mut())
+            .chain(repositories)
+        {
             repo.root_declared = true;
         }
     }
@@ -293,7 +820,7 @@ impl Pom {
     /// Upper bound on parseable POM size. Real-world POMs sit well under
     /// 200 KiB; 5 MiB is generous headroom that still keeps a hostile or
     /// malformed input from exhausting memory.
-    const MAX_SIZE: usize = 5 * 1024 * 1024;
+    pub(crate) const MAX_SIZE: usize = 5 * 1024 * 1024;
 
     /// Upper bound on the number of `<properties>` entries accepted from a
     /// single POM. A 5 MiB POM stuffed with `<p>val</p>` entries can produce
@@ -312,8 +839,18 @@ impl Pom {
     /// element, has a byte below 0x20 in its own `groupId`, `artifactId`,
     /// `version` or `packaging`, or has more than 10 000 entries in its
     /// `<properties>` or in one profile's. Nothing is inherited or
-    /// interpolated.
+    /// interpolated, and the plugin sections are not kept.
     pub fn parse(xml: &str) -> Result<Self, PomError> {
+        Self::read(xml, false)
+    }
+
+    /// [`Self::parse`], keeping the text of the plugin sections for a
+    /// build with [`crate::ModelPolicy::PROJECT_PLUGINS`].
+    pub fn parse_with_plugins(xml: &str) -> Result<Self, PomError> {
+        Self::read(xml, true)
+    }
+
+    fn read(xml: &str, plugins: bool) -> Result<Self, PomError> {
         if xml.len() > Self::MAX_SIZE {
             return Err(PomError::Deserialize(quick_xml::de::DeError::Custom(
                 "POM file exceeds 5MB limit".to_string(),
@@ -324,6 +861,9 @@ impl Pom {
         let mut deserializer =
             quick_xml::de::Deserializer::from_str_with_resolver(root, crate::xml::MavenEntities);
         let mut pom = Pom::deserialize(&mut deserializer)?;
+        if plugins {
+            pom.plugin_source = PluginSource::Kept(root.into());
+        }
         pom.trim_text();
         // A coordinate field carrying a NUL byte (or any other ASCII
         // control character) sails through XML deserialization but then
@@ -358,6 +898,17 @@ impl Pom {
                 trim_str(relative_path);
             }
         }
+        if let Some(management) = &mut self.distribution_management {
+            for repository in [
+                &mut management.repository,
+                &mut management.snapshot_repository,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                trim_opt(&mut repository.id);
+            }
+        }
         if let Some(relocation) = self
             .distribution_management
             .as_mut()
@@ -371,6 +922,10 @@ impl Pom {
         if let Some(prerequisites) = &mut self.prerequisites {
             trim_opt(&mut prerequisites.maven);
         }
+        self.build.reporting_output_directory = self.reporting.output_directory.take();
+        let mut build = std::mem::take(&mut self.build);
+        build.take_project_text(Some(self));
+        self.build = build;
         self.build.fields_mut().into_iter().for_each(trim_opt);
         self.properties.values_mut().for_each(trim_str);
         trim_repositories(&mut self.repositories);
@@ -380,6 +935,8 @@ impl Pom {
         }
         for profile in &mut self.profiles {
             trim_str(&mut profile.id);
+            profile.build.reporting_output_directory = profile.reporting.output_directory.take();
+            profile.build.take_project_text(None);
             profile.build.fields_mut().into_iter().for_each(trim_opt);
             profile.properties.values_mut().for_each(trim_str);
             trim_repositories(&mut profile.repositories);
@@ -455,7 +1012,7 @@ impl Pom {
 }
 
 /// Trim characters through U+0020, as Java's `String.trim()` does for Maven element text.
-fn trim_str(value: &mut String) {
+pub(crate) fn trim_str(value: &mut String) {
     let trimmed = value.trim_matches(|c| c <= ' ');
     if trimmed.len() != value.len() {
         *value = trimmed.to_owned();
@@ -480,13 +1037,13 @@ fn trim_activation(activation: &mut crate::Activation) {
     }
 }
 
-fn trim_opt(value: &mut Option<String>) {
+pub(crate) fn trim_opt(value: &mut Option<String>) {
     if let Some(v) = value {
         trim_str(v);
     }
 }
 
-fn trim_repositories(repositories: &mut [Repository]) {
+pub(crate) fn trim_repositories(repositories: &mut [Repository]) {
     for repo in repositories {
         trim_opt(&mut repo.id);
         trim_str(&mut repo.url);
@@ -497,7 +1054,7 @@ fn trim_repositories(repositories: &mut [Repository]) {
     }
 }
 
-fn trim_dependencies(deps: &mut [Dependency]) {
+pub(crate) fn trim_dependencies(deps: &mut [Dependency]) {
     for dep in deps {
         trim_str(&mut dep.group_id);
         trim_str(&mut dep.artifact_id);
@@ -625,6 +1182,71 @@ mod tests {
         let profile = &pom.profiles[0];
         assert_eq!(profile.id, "ci");
         assert_eq!(profile.properties.get("q").map(String::as_str), Some("w"));
+    }
+
+    /// `<reporting><outputDirectory>` is read as a model field beside the
+    /// `<build>` ones, in a profile too; a `<build>` element of its name is
+    /// not Maven's and is not read.
+    #[test]
+    fn the_reporting_directory_is_a_model_field() {
+        let pom = Pom::parse(
+            "<project><artifactId>a</artifactId><build><reporting.outputDirectory>b\
+             </reporting.outputDirectory></build><reporting><outputDirectory>\n r \n\
+             </outputDirectory></reporting><profiles><profile><reporting>\
+             <outputDirectory>p</outputDirectory></reporting></profile></profiles></project>",
+        )
+        .unwrap();
+        assert_eq!(pom.build.reporting_output_directory, Some("r".into()));
+        let profile = &pom.profiles[0].build;
+        assert_eq!(profile.reporting_output_directory.as_deref(), Some("p"));
+        let pom = Pom::parse(
+            "<project><artifactId>a</artifactId><build><reporting.outputDirectory>b\
+             </reporting.outputDirectory></build></project>",
+        )
+        .unwrap();
+        assert_eq!(pom.build.reporting_output_directory, None);
+    }
+
+    /// The plain text fields are read from the project, trimmed, never from
+    /// `<build>` or a profile, and a description with markup in it does not
+    /// cost the POM.
+    #[test]
+    fn the_plain_text_fields_are_read_from_the_project() {
+        let pom = Pom::parse(
+            "<project><modelVersion>4.0.0</modelVersion><artifactId>a</artifactId>\
+             <name> n </name><description>d<!-- c -->e</description>\
+             <inceptionYear>2001</inceptionYear><organization/><build><name>b</name>\
+             <description>b</description></build><profiles><profile><build><name>p</name>\
+             </build></profile></profiles></project>",
+        )
+        .unwrap();
+        let build = &pom.build;
+        assert_eq!(build.name.as_deref(), Some("n"));
+        assert_eq!(build.description.as_deref(), Some("de"));
+        assert_eq!(build.inception_year.as_deref(), Some("2001"));
+        assert_eq!(build.model_version.as_deref(), Some("4.0.0"));
+        assert!(build.organization);
+        assert_eq!(build.organization_name, None);
+        assert_eq!(pom.profiles[0].build.name, None);
+        let pom = Pom::parse(
+            "<project><artifactId>a</artifactId><build><name>b</name></build>\
+             <description>a <b>bold</b> one</description></project>",
+        );
+        let pom = pom.unwrap();
+        assert_eq!(pom.build.name, None);
+        assert!(!pom.build.organization);
+        let pom = Pom::parse(
+            "<project><modelVersion>4.0.0</modelVersion><artifactId>a</artifactId>\
+             <name xml:lang=\"en\">n</name><description>d</description></project>",
+        )
+        .unwrap();
+        assert_eq!(pom.build.name.as_deref(), Some("n"));
+        // A replayed lookup, which the lock keeps, holds none of them.
+        let plain = Pom::parse("<project><artifactId>a</artifactId></project>").unwrap();
+        assert_eq!(
+            crate::ModelLookup::new(&pom, None),
+            crate::ModelLookup::new(&plain, None)
+        );
     }
 
     /// Maven reads `<activeByDefault>` with `Boolean.valueOf` on the trimmed

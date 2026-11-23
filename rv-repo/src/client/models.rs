@@ -10,20 +10,20 @@ use url::Url;
 
 use rv_config::redact_url;
 use rv_maven_types::{
-    Coord, CoordinateField, Digest, Gav, Sha256, is_snapshot_version, layout::metadata_path,
-    resolves_through_snapshot_metadata,
+    Coord, CoordinateField, Digest, Gav, HashAlgorithm, Sha256, is_snapshot_version,
+    layout::metadata_path, resolves_through_snapshot_metadata,
 };
 
-use super::requests::DeferredWarnings;
+use super::requests::{self, DeferredWarnings, LateCheck, LateSha256};
 use super::{RepoClient, SnapshotResolution, validate_coord_components};
 use crate::artifact::ArtifactRequest;
 use crate::auth::{Auth, SentCredential};
 use crate::error::{IntegritySource, RepoError, Result};
 use crate::fetch::verify_checksum;
-use crate::metadata::Metadata;
+use crate::metadata::{Metadata, MetadataReader};
 use crate::repository::Repository;
 use crate::routing::Route;
-use rv_store::metadata_cache::{CacheEntry, CacheTable, MetadataCache, now_epoch_seconds};
+use rv_store::metadata_cache::{CacheEntry, CacheTable, Expiry, MetadataCache, now_epoch_seconds};
 
 /// What sees the bytes of a POM as soon as they arrive; see
 /// [`announcing_poms`].
@@ -50,8 +50,9 @@ pub(super) struct MissKey {
     path: String,
 }
 
-/// Each miss, with the credential generation it was recorded under.
-pub(super) type AbsentPaths = Arc<Mutex<HashMap<MissKey, (Miss, u64)>>>;
+/// Each miss, with the credential generation it was recorded under and
+/// whether a prefetch met it, so that the read that uses it keeps it.
+pub(super) type AbsentPaths = Arc<Mutex<HashMap<MissKey, (Miss, u64, bool)>>>;
 
 /// A remote answer the same request gets again in this run: a 404, a 401
 /// or 403 to the same credential, or a busy answer to the file itself, not
@@ -59,7 +60,7 @@ pub(super) type AbsentPaths = Arc<Mutex<HashMap<MissKey, (Miss, u64)>>>;
 /// the read that joins it would otherwise each wait out.
 #[derive(Clone)]
 pub(super) enum Miss {
-    Absent(String),
+    Absent(crate::Missing),
     Refused {
         status: reqwest::StatusCode,
         url: String,
@@ -118,7 +119,7 @@ impl Miss {
     fn kept(status: &[u8], route: &Route<'_>, path: &str, sent: Option<&Auth>) -> Option<Self> {
         let url = redact_url(route.endpoint.url_for_path(path).ok()?);
         match status {
-            b"404" => Some(Self::Absent(format!("{url} (HTTP 404)"))),
+            b"404" => Some(Self::Absent(format!("{url} (HTTP 404)").into())),
             b"401" | b"403" => Some(Self::Refused {
                 status: reqwest::StatusCode::from_bytes(status).ok()?,
                 url,
@@ -161,17 +162,21 @@ impl Miss {
 /// worker runs other work, which stalls every reader queued behind it.
 pub(super) type MetadataFlights = Arc<Mutex<HashMap<MissKey, Arc<futures::lock::Mutex<()>>>>>;
 
-pub(super) type PomInflight = Arc<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Bytes>>>>>;
+pub(super) type PomInflight =
+    Arc<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<(Bytes, Option<LateCheck>)>>>>>;
 
 /// What this client's reads of the metadata cache found, by scope and path,
-/// then by the settings that decide whether a row is usable: the metadata
-/// with the time its row expires, or `None` when no row was usable. A write
-/// through this client or a clone forgets the scope and path. Every module
-/// of a reactor reads the same snapshot and version metadata, and reading it
-/// from `metadata.db` each time was much of a warm resolution's time.
+/// then by the settings that decide whether a row is usable: the metadata, or
+/// `None` when no row was usable. What this client or a clone fetches
+/// replaces the reads of its scope and path. A read stands for the client's
+/// life, which is one run, so the run sees one version of each file though
+/// its row expires or another process replaces it meanwhile: a SNAPSHOT's jar
+/// and POM resolve from one version of its metadata. Every module of a
+/// reactor reads the same snapshot and version metadata, and reading it from
+/// `metadata.db` each time was much of a warm resolution's time.
 pub(super) type MetadataMemo = Arc<Mutex<HashMap<String, HashMap<String, MemoizedMetadata>>>>;
 
-type MemoizedMetadata = Option<(Metadata, i64)>;
+type MemoizedMetadata = Option<Metadata>;
 
 const MAX_MEMO_BYTES: usize = 64 * 1024 * 1024;
 
@@ -201,6 +206,8 @@ impl PomMemo {
 
 const MAX_HELD_BYTES: usize = 64 * 1024 * 1024;
 
+type AdoptedPom = (Bytes, Expiry, Checked, DeferredWarnings, Option<LateCheck>);
+
 /// POMs [`RepoClient::prefetch_pom`] fetched and verified, by in-flight
 /// key, held in memory until a [`RepoClient::fetch_pom`] reads them. Only
 /// that read writes one to the metadata cache and logs its warnings, so a
@@ -214,10 +221,12 @@ pub(super) struct HeldPoms {
 
 struct HeldPom {
     bytes: Bytes,
-    ttl: i64,
+    expiry: Expiry,
     checked: Checked,
     /// `None` once a read adopted the POM and is writing it to the cache.
     warnings: Option<DeferredWarnings>,
+    /// The check of its `.sha256`, for every read that uses it.
+    check: Option<LateCheck>,
 }
 
 impl HeldPoms {
@@ -225,8 +234,8 @@ impl HeldPoms {
         self.bytes >= MAX_HELD_BYTES
     }
 
-    fn get(&self, key: &str) -> Option<Bytes> {
-        self.poms.get(key).map(|held| held.bytes.clone())
+    fn get(&self, key: &str) -> Option<(Bytes, Option<LateCheck>)> {
+        (self.poms.get(key)).map(|held| (held.bytes.clone(), held.check.clone()))
     }
 
     fn insert(&mut self, key: String, held: HeldPom) {
@@ -239,10 +248,16 @@ impl HeldPoms {
     /// The POM held under `key` and its warnings, for the one read that
     /// adopts it. The bytes stay held until [`Self::remove`], so a read
     /// arriving before the cache has them still finds them here.
-    fn adopt(&mut self, key: &str) -> Option<(Bytes, i64, Checked, DeferredWarnings)> {
+    fn adopt(&mut self, key: &str) -> Option<AdoptedPom> {
         let held = self.poms.get_mut(key)?;
         let warnings = held.warnings.take()?;
-        Some((held.bytes.clone(), held.ttl, held.checked, warnings))
+        Some((
+            held.bytes.clone(),
+            held.expiry,
+            held.checked,
+            warnings,
+            held.check.clone(),
+        ))
     }
 
     fn remove(&mut self, key: &str) {
@@ -250,11 +265,18 @@ impl HeldPoms {
             self.bytes -= held.bytes.len();
         }
     }
+
+    /// Stop holding `bytes` under `key`, which failed their check.
+    fn remove_failed(&mut self, key: &str, bytes: &Bytes) {
+        if self.poms.get(key).is_some_and(|held| held.bytes == *bytes) {
+            self.remove(key);
+        }
+    }
 }
 
 /// Who a POM or version list is read for.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PomRead {
+pub(super) enum PomRead {
     Use,
     /// [`RepoClient::prefetch_pom`] or [`RepoClient::prefetch_metadata`]:
     /// its warnings wait for a use.
@@ -297,6 +319,50 @@ impl RepoClient {
         .await
     }
 
+    /// The group-level `maven-metadata.xml` of `group_id` from `repo` or the
+    /// mirror that serves it, whose `<plugins>` give the goal prefixes of
+    /// the group's plugins. Cached, checked and refused offline as
+    /// [`Self::fetch_metadata`] is for a release version list.
+    ///
+    /// # Errors
+    ///
+    /// [`RepoError::InvalidCoord`] for an unsafe group, and the errors of
+    /// [`Self::fetch_metadata`].
+    pub async fn fetch_group_metadata(
+        &self,
+        repo: &Repository,
+        group_id: &str,
+    ) -> Result<Metadata> {
+        // Any release version: the release policies apply.
+        const RELEASE: &str = "0";
+        rv_maven_types::validate_coordinate_component(
+            rv_maven_types::CoordinateField::Group,
+            group_id,
+        )
+        .map_err(|err| RepoError::InvalidCoord(err.to_string()))?;
+        let route = self.router.route(repo);
+        self.ensure_repo_allows_version(&route.endpoint, RELEASE)?;
+        let path = format!("{}/maven-metadata.xml", group_id.replace('.', "/"));
+        self.ensure_filters_admit(&route, group_id, &path)?;
+        let _turn = self.metadata_turn(&route, &path).await;
+        let scope = Self::metadata_cache_scope(&route, RELEASE);
+        let (memo_key, read_key) = self.metadata_memo_keys(&scope, &path);
+        if let Some(metadata) = (self.cached_metadata(&scope, &path, &memo_key, &read_key)).await? {
+            return Ok(metadata);
+        }
+        let mut warnings = DeferredWarnings::default();
+        let fetched = self
+            .fetch_model_bytes(&route, &path, RELEASE, None, &mut warnings, PomRead::Use)
+            .await;
+        warnings.emit();
+        let (bytes, checked, _) = fetched?;
+        let metadata = Metadata::from_bytes(&bytes)?;
+        self.cache_insert_metadata(&route, &path, bytes.as_ref(), RELEASE, checked)
+            .await;
+        self.keep_fetched_metadata(memo_key, read_key, &metadata);
+        Ok(metadata)
+    }
+
     /// Read the `maven-metadata.xml` for `coord` from `repo` ahead of a
     /// [`Self::fetch_metadata`] for it, as that would, and return it. As
     /// for [`Self::prefetch_pom`], a fetched file is held in memory until
@@ -337,24 +403,34 @@ impl RepoClient {
             )));
         }
         let route = self.router.route(repo);
-        self.resolve_snapshot_version_routed(&route, coord).await
+        (self.resolve_snapshot_version_routed(&route, coord, PomRead::Use, None)).await
     }
 
     /// Snapshot-metadata resolution on a route the caller already decided,
     /// so the metadata sub-fetch of an artifact or POM request sends the
-    /// credential that request sends.
+    /// credential that request sends. A restore of the file raeva.lock pins
+    /// to `restored` asks every repository for the pinned build.
     pub(super) async fn resolve_snapshot_version_routed(
         &self,
         route: &Route<'_>,
         coord: &Coord,
+        read: PomRead,
+        restored: Option<&Digest>,
     ) -> Result<SnapshotResolution> {
         let version = coord.version.to_string();
         self.ensure_repo_allows_version(&route.endpoint, &version)?;
+        // Maven resolves a snapshot only through the repositories the
+        // filters let serve its file, the pinned build too.
+        let request = ArtifactRequest::from_coord(coord);
+        self.ensure_filters_admit(route, &request.group_id, &super::filter_path(&request))?;
         // A restore fetches the pinned build without its metadata, and the
         // cached metadata may name another build. Offline, which sees no
         // upstream change anyway, and in a frozen check, a pinned build this
         // repository served stands.
-        if (self.offline && !route.endpoint.is_local()) || self.pinned_snapshots {
+        if (self.offline && !route.endpoint.is_local())
+            || self.pinned_snapshots()
+            || restored.is_some()
+        {
             let gav = Gav::new(
                 coord.group_id.as_str(),
                 coord.artifact_id.as_str(),
@@ -398,13 +474,23 @@ impl RepoClient {
                 // repository the lock records for the POM, and a file's from
                 // any the lock records for the file.
                 let recorded = |origin: &String| self.origins.matches(origin, &route.origin);
+                // A POM recorded as missing is so on the repository that
+                // served its file, offline as an online run's 404 proves.
+                let missing = self.lock_missing_poms.contains(&pom)
+                    && pin.file_origins.iter().any(recorded)
+                    && (!self.offline || self.proven_absent(route, &pom).await);
                 let served = if is_pom {
-                    self.lock_missing_poms.contains(&pom)
-                        || (self.pinned_snapshots && pin.pom_origins.iter().any(recorded))
+                    missing || (self.pinned_snapshots() && pin.pom_origins.iter().any(recorded))
                 } else {
                     pin.file_origins.iter().any(recorded)
                 };
+                let restores = restored.is_some_and(|restored| {
+                    let path =
+                        request.to_path_with_versions(&resolved_directory(&resolved), &resolved);
+                    self.lock_pin(&path) == Some(restored)
+                });
                 if served
+                    || restores
                     || matches!(
                         self.cache_get_bytes(CacheTable::Pom, &route.scope, &pom)
                             .await,
@@ -442,7 +528,7 @@ impl RepoClient {
                 coord.group_id.as_str(),
                 coord.artifact_id.as_str(),
                 &version,
-                PomRead::Use,
+                read,
             )
             .await
         {
@@ -455,6 +541,26 @@ impl RepoClient {
             Err(err) => return Err(err),
         };
 
+        // Maven 3.10 takes metadata with a version token that is no path
+        // component for invalid and reads it as empty, so this repository
+        // names no build.
+        if self.maven_mode == rv_maven_types::MavenMode::Maven310
+            && metadata.has_invalid_token(MetadataReader::Version)
+        {
+            // The read that uses the metadata warns.
+            if read == PomRead::Prefetch {
+                return Ok(SnapshotResolution::base(version));
+            }
+            warn!(
+                sec_code = "POM_PROBLEM",
+                repository = %redact_url(&route.endpoint.url),
+                "ignoring {coord} snapshot metadata with an invalid version token"
+            );
+            return Ok(SnapshotResolution {
+                metadata_served: true,
+                ..SnapshotResolution::base(version)
+            });
+        }
         let extension = coord.packaging.as_deref().unwrap_or("jar");
         let resolved = metadata
             .snapshot_version_for(coord.classifier.as_deref(), extension)
@@ -513,10 +619,11 @@ impl RepoClient {
     /// for it, as that would, and return its bytes. A fetched POM is held
     /// in memory until `fetch_pom` reads it; only then does it reach the
     /// metadata cache and are its warnings logged, so a POM that is never
-    /// used leaves nothing behind. Offline, for a `-SNAPSHOT` and once the
-    /// held POMs fill their budget this asks nothing and returns `None`, and
-    /// the later `fetch_pom` makes its own requests. A failed fetch keeps
-    /// only the miss a `fetch_pom` would keep.
+    /// used leaves nothing behind. A `-SNAPSHOT`'s `maven-metadata.xml` is
+    /// held the same way. Offline and once the held POMs fill their budget
+    /// this asks nothing and returns `None`, and the later `fetch_pom` makes
+    /// its own requests. A failed fetch keeps only the miss a `fetch_pom`
+    /// would keep.
     ///
     /// # Errors
     ///
@@ -526,8 +633,7 @@ impl RepoClient {
         repo: &Repository,
         req: &ArtifactRequest,
     ) -> Result<Option<Bytes>> {
-        if self.offline || req.validate().is_err() || req.pom().is_snapshot() || self.held().full()
-        {
+        if self.offline || req.validate().is_err() || self.held().full() {
             return Ok(None);
         }
         let read = self.read_pom(repo, req, PomRead::Prefetch, None);
@@ -560,9 +666,9 @@ impl RepoClient {
         self.read_pom(repo, req, PomRead::Use, Some(pin)).await
     }
 
-    /// The time before which a row of `path` in `table` is fetched again,
-    /// under `--update`.
-    fn renew_before(&self, table: CacheTable, path: &str) -> Option<i64> {
+    /// The time before which a row of `path` in `table` that this process
+    /// wrote is fetched again under `--update`, as is one it did not write.
+    fn renew_before(&self, table: CacheTable, path: &str) -> Option<std::time::Instant> {
         // A release or timestamped POM names fixed content; `--update`
         // renews only what a deploy can change.
         let mutable = !matches!(table, CacheTable::Pom)
@@ -570,12 +676,13 @@ impl RepoClient {
                 .rsplit('/')
                 .next()
                 .is_some_and(|file| file.ends_with("SNAPSHOT.pom"));
-        self.refresh_before.filter(|_| mutable && !self.offline)
+        self.refresh_before().filter(|_| mutable && !self.offline)
     }
 
     /// Which of `poms` [`Self::seed_pinned_pom`] would cache: raeva.lock pins
-    /// those bytes for the file and the cache holds no current copy of them.
-    /// One cache read covers them all.
+    /// those bytes for the file and the cache holds no current copy of them,
+    /// nor, for [`RepoClient::keeping_cached_poms`], other bytes. One cache
+    /// read covers them all.
     pub(crate) async fn unseeded_poms(
         &self,
         poms: &[(&Repository, ArtifactRequest, &Sha256)],
@@ -604,9 +711,12 @@ impl RepoClient {
             .collect();
         let probed: Vec<_> = keys.iter().flatten().cloned().collect();
         let cache = self.cache.clone();
-        let now = (!self.offline).then(now_epoch_seconds);
+        let (now, other) = (
+            (!self.offline).then(now_epoch_seconds),
+            self.keep_cached_poms,
+        );
         let mut cached =
-            tokio::task::spawn_blocking(move || cache.holds(CacheTable::Pom, &probed, now))
+            tokio::task::spawn_blocking(move || cache.holds(CacheTable::Pom, &probed, now, other))
                 .await
                 .map_err(|e| RepoError::Internal(format!("cache task panicked: {e}")))??
                 .into_iter();
@@ -615,46 +725,39 @@ impl RepoClient {
             .collect())
     }
 
-    /// Cache the POM of `req` that `repo` serves from the store file `blob`,
-    /// when raeva.lock pins `pinned` for that file, the file holds those
-    /// bytes, and the cache has no row yet. A restore uses this for each
-    /// platform whose lock records `repo`, so an offline resolution of that
-    /// platform finds the POM.
+    /// Cache the POM of `req` that `repo` serves from the store blob `pinned`,
+    /// when [`Self::unseeded_poms`] counts it and the file holds the pinned
+    /// bytes. A restore uses this for each platform whose lock records
+    /// `repo`, so an offline resolution of that platform finds the POM.
     pub(crate) async fn seed_pinned_pom(
         &self,
         repo: &Repository,
         req: &ArtifactRequest,
         pinned: &Sha256,
-        blob: &std::path::Path,
+        store: &rv_store::Store,
     ) -> Result<()> {
+        if !self.unseeded_poms(&[(repo, req.clone(), pinned)]).await?[0] {
+            return Ok(());
+        }
         let route = self.router.route(repo);
         let pom_req = req.pom();
         let path =
             pom_req.to_path_with_versions(&resolved_directory(&pom_req.version), &pom_req.version);
-        if self.lock_pin(&path).and_then(Digest::as_sha256) != Some(pinned)
-            || (self
-                .cache_get_bytes(CacheTable::Pom, &route.scope, &path)
-                .await?)
-                .is_some()
-        {
+        let Some(bytes) = store.read_blob_async(pinned).await? else {
             return Ok(());
-        }
-        let bytes = match tokio::fs::read(blob).await {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            read => read?,
         };
         if Sha256::from_bytes(&bytes) != *pinned {
             return Ok(());
         }
         // Only the pin vouches for the bytes, so a client without it still
         // asks for a checksum file.
-        let ttl = route.endpoint.update_policy_ttl(&pom_req.version);
-        (self.cache_insert_bytes_with_ttl(
+        let expiry = route.endpoint.update_policy_expiry(&pom_req.version);
+        (self.cache_insert_bytes(
             CacheTable::Pom,
             &route.scope,
             &path,
             &bytes,
-            ttl,
+            expiry,
             Checked::Missing,
         ))
         .await;
@@ -668,27 +771,52 @@ impl RepoClient {
         read: PomRead,
         pin: Option<&Digest>,
     ) -> Result<(Bytes, String)> {
+        // Bytes another read held failed their `.sha256` and are no longer
+        // held, so reading again asks for the POM and fails as that read
+        // would have.
+        match self.read_pom_once(repo, req, read, pin).await? {
+            Ok(read) => Ok(read),
+            Err(_) => (self.read_pom_once(repo, req, read, pin).await?).map_err(requests::unshared),
+        }
+    }
+
+    /// [`Self::read_pom`], or the error of a check this client waited for
+    /// on bytes another read fetched.
+    async fn read_pom_once(
+        &self,
+        repo: &Repository,
+        req: &ArtifactRequest,
+        read: PomRead,
+        pin: Option<&Digest>,
+    ) -> Result<std::result::Result<(Bytes, String), Arc<RepoError>>> {
         let route = self.router.route(repo);
         self.ensure_repo_allows_version(&route.endpoint, &req.version)?;
 
         let pom_req = req.pom();
-        let snapshot = self.resolve_snapshot_for_request(&route, &pom_req).await?;
+        self.ensure_filters_admit(&route, &pom_req.group_id, &super::filter_path(&pom_req))?;
+        let snapshot = (self.resolve_snapshot_for_request(&route, &pom_req, read, pin)).await?;
         let path = pom_req.to_path_with_versions(&snapshot.dir_version, &snapshot.file_version);
-        // A release or timestamped snapshot POM path names fixed content, so
-        // a verified copy never expires, as Maven never re-downloads one it
-        // has. A non-unique `-SNAPSHOT` file is replaced in place, and a copy
-        // accepted without a checksum file ages out too. A run that requires
-        // checksums never reads a copy accepted without a checksum file.
+        // Maven judges a snapshot by the build its metadata resolves to.
+        self.ensure_filters_admit(&route, &pom_req.group_id, &path)?;
+        // A verified copy never expires, as Maven never re-downloads a POM
+        // it has, even a non-unique `-SNAPSHOT` one replaced in place: that
+        // one is fetched again only under `--update`, so it stays with its
+        // jar. A copy accepted without a checksum file ages out. A run that
+        // requires checksums never reads a copy accepted without a checksum
+        // file.
         let fixed_content = !resolves_through_snapshot_metadata(&snapshot.file_version);
-        let policy_ttl = route.endpoint.update_policy_ttl(&pom_req.version);
+        let policy_expiry = route.endpoint.update_policy_expiry(&pom_req.version);
         let cache_scope = route.scope.as_str();
         // Concurrent requests for the same parent or BOM share one download.
         // The repository id, checksum requirement and lock pin are in the
         // key: clones share the map, a credential's answer is its own, and a
         // strict client must not take bytes a lenient one, or one with
-        // another pin, accepted without a checksum file.
+        // another pin, accepted without a checksum file. A read under a later
+        // credential generation does not take a prefetch's bytes; a -SNAPSHOT
+        // route picked its credential for the metadata.
         let flight_key = format!(
-            "{cache_scope}\n{path}\n{}\n{}\n{}",
+            "{cache_scope}\n{path}\n{}\n{}\n{}\n{}",
+            route.picked_under(self.credential_generation()),
             self.require_checksums,
             pin.is_some(),
             pin.or_else(|| self.lock_pin(&path))
@@ -699,25 +827,29 @@ impl RepoClient {
         // Only a copy that never expires is kept in memory, so the memo
         // answers exactly as the metadata cache would.
         if fixed_content && let Some(bytes) = self.memo().get(&flight_key) {
-            return Ok((bytes, path));
+            return Ok(Ok((bytes, path)));
         }
         if let Some((bytes, expires_at)) = self
-            .cache_get_entry(CacheTable::Pom, cache_scope, &path, pin)
+            .cache_get_entry(CacheTable::Pom, cache_scope, &path, pin, read)
             .await?
         {
-            if fixed_content && expires_at == i64::MAX {
+            // The memo answers without noting the admission.
+            if read == PomRead::Use && fixed_content && expires_at == i64::MAX {
                 self.memo().insert(&flight_key, &bytes);
             }
-            return Ok((bytes, path));
+            return Ok(Ok((bytes, path)));
         }
         // Bound first, so the guard is released before the adoption locks
         // the held POMs again.
         let held = self.held().get(&flight_key);
-        if let Some(bytes) = held {
+        if let Some((bytes, check)) = held {
             if read == PomRead::Use {
-                self.adopt_held_pom(&flight_key, cache_scope, &path).await;
+                let adopted = (self.adopt_held_pom(&route, &flight_key, cache_scope, &path)).await;
+                if let Err(err) = self.rely_on(adopted, check).await {
+                    return Ok(Err(err));
+                }
             }
-            return Ok((bytes, path));
+            return Ok(Ok((bytes, path)));
         }
 
         let cell = {
@@ -727,23 +859,30 @@ impl RepoClient {
                 .map_err(|_| RepoError::Internal("POM in-flight map poisoned".to_string()))?;
             Arc::clone(inflight.entry(flight_key.clone()).or_default())
         };
-        let result = cell
+        let result: Result<(Bytes, Option<LateCheck>)> = cell
             .get_or_try_init(|| async {
                 // Another initializer may fill the cache, or hold a prefetched
                 // copy, before this caller acquires the cell.
                 if let Some((bytes, _)) = self
-                    .cache_get_entry(CacheTable::Pom, cache_scope, &path, pin)
+                    .cache_get_entry(CacheTable::Pom, cache_scope, &path, pin, read)
                     .await?
                 {
-                    return Ok(bytes);
+                    return Ok((bytes, None));
                 }
                 let held = self.held().get(&flight_key);
-                if let Some(bytes) = held {
-                    return Ok(bytes);
+                if let Some(held) = held {
+                    return Ok(held);
+                }
+                if fixed_content && let Some(twin) = self.router.central_twin(&route) {
+                    let cached =
+                        self.cache_get_entry(CacheTable::Pom, &twin.scope, &path, pin, read);
+                    if let Some((bytes, _)) = cached.await? {
+                        return Ok((bytes, None));
+                    }
                 }
                 let mut warnings = DeferredWarnings::default();
                 let fetched = self
-                    .fetch_model_bytes(&route, &path, &pom_req.version, pin, &mut warnings)
+                    .fetch_model_bytes(&route, &path, &pom_req.version, pin, &mut warnings, read)
                     .await;
                 // A read that uses the POM logs its warnings now; a
                 // prefetch holds them with the bytes.
@@ -754,52 +893,152 @@ impl RepoClient {
                     }
                     PomRead::Prefetch => Some(warnings.after_logged()),
                 };
-                let (bytes, checked) = fetched?;
-                let ttl = if fixed_content && matches!(checked, Checked::Verified | Checked::Pinned)
-                {
-                    i64::MAX
+                let (bytes, checked, late) = fetched?;
+                let expiry = if matches!(checked, Checked::Verified | Checked::Pinned(_)) {
+                    Expiry::NEVER
                 } else {
-                    policy_ttl
+                    policy_expiry
                 };
-                if let Some(warnings) = held_warnings {
-                    self.held().insert(
+                // A POM whose `.sha256` is still being asked for is held as
+                // a prefetched one is, and a read that uses it adopts it.
+                if held_warnings.is_some() || late.is_some() {
+                    // Held before a failed check can stop holding it.
+                    let mut held = self.held();
+                    let check = late.zip(self.late_checks.as_ref()).map(|(late, checks)| {
+                        // Weak: the held POM holds the check.
+                        let (poms, key, failed) = (
+                            Arc::downgrade(&self.held_poms),
+                            flight_key.clone(),
+                            bytes.clone(),
+                        );
+                        let failed = move || {
+                            if let Some(poms) = poms.upgrade() {
+                                (poms.lock())
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .remove_failed(&key, &failed);
+                            }
+                        };
+                        late.spawn(bytes.clone(), failed, checks)
+                    });
+                    // A prefetch may ask a repository the read never
+                    // reaches, so only the read notes the admission.
+                    held.insert(
                         flight_key.clone(),
                         HeldPom {
                             bytes: bytes.clone(),
-                            ttl,
+                            expiry,
                             checked,
-                            warnings: Some(warnings),
+                            warnings: Some(held_warnings.unwrap_or_default()),
+                            check: check.clone(),
                         },
                     );
-                    return Ok(bytes);
+                    return Ok((bytes, check));
                 }
-                self.cache_pom(&flight_key, cache_scope, &path, &bytes, ttl, checked)
+                self.note_pom_admission(&route, &path, checked);
+                self.note_fetched_pom(&path, checked);
+                self.cache_pom(&flight_key, cache_scope, &path, &bytes, expiry, checked)
                     .await;
-                Ok(bytes)
+                Ok((bytes, None))
             })
             .await
             .cloned();
         if let Ok(mut inflight) = self.pom_inflight.lock() {
             inflight.remove(&flight_key);
         }
-        if read == PomRead::Use && result.is_ok() {
+        let (bytes, check) = result?;
+        if read == PomRead::Use {
             // This read may have joined a prefetch's download.
-            self.adopt_held_pom(&flight_key, cache_scope, &path).await;
+            let adopted = (self.adopt_held_pom(&route, &flight_key, cache_scope, &path)).await;
+            if let Err(err) = self.rely_on(adopted, check).await {
+                return Ok(Err(err));
+            }
         }
-        result.map(|bytes| (bytes, path))
+        Ok(Ok((bytes, path)))
     }
 
-    /// Take the POM a prefetch holds under `flight_key`, if any, for a read
-    /// that uses it: write it to the metadata cache and log its warnings,
-    /// as the read would have had it fetched the POM itself. Only one read
-    /// takes it.
-    async fn adopt_held_pom(&self, flight_key: &str, cache_scope: &str, path: &str) {
-        let Some((bytes, ttl, checked, warnings)) = self.held().adopt(flight_key) else {
-            return;
-        };
+    /// Take the POM held under `flight_key`, if any, for a read that uses
+    /// it: write it to the metadata cache and log its warnings, as the read
+    /// would have had it fetched the POM itself. Only one read takes it. A
+    /// POM whose `.sha256` is still being asked for is written once that is
+    /// checked, by a task whose check this returns.
+    async fn adopt_held_pom(
+        &self,
+        route: &Route<'_>,
+        flight_key: &str,
+        cache_scope: &str,
+        path: &str,
+    ) -> Option<LateCheck> {
+        let (bytes, expiry, checked, warnings, check) = self.held().adopt(flight_key)?;
         warnings.emit();
-        (self.cache_pom(flight_key, cache_scope, path, &bytes, ttl, checked)).await;
-        self.held().remove(flight_key);
+        self.note_pom_admission(route, path, checked);
+        self.note_fetched_pom(path, checked);
+        // A clone that leaves no check behind, which settling would wait for.
+        let mut client = self.clone();
+        client.late_checks = None;
+        let (flight_key, cache_scope, path) = (
+            flight_key.to_string(),
+            cache_scope.to_string(),
+            path.to_string(),
+        );
+        let cache = async move {
+            (client.cache_pom(&flight_key, &cache_scope, &path, &bytes, expiry, checked)).await;
+            client.held().remove(&flight_key);
+        };
+        match check {
+            Some(check) => Some(check.then(cache)),
+            None => {
+                cache.await;
+                None
+            }
+        }
+    }
+
+    /// Rely on bytes whose `.sha256` is `check`, or `adopted` for the read
+    /// that adopted them, which logs the weak-hash warning: a client that
+    /// [`RepoClient::checking_sha256_late`] leaves the check to
+    /// [`RepoClient::settle_checksums`], and another waits for it.
+    async fn rely_on(
+        &self,
+        adopted: Option<LateCheck>,
+        check: Option<LateCheck>,
+    ) -> std::result::Result<(), Arc<RepoError>> {
+        let (check, warns) = match (adopted, check) {
+            (Some(adopted), _) => (adopted, true),
+            (None, Some(check)) => (check, false),
+            (None, None) => return Ok(()),
+        };
+        if let Some(checks) = &self.late_checks {
+            checks.rely_on(check, warns);
+            return Ok(());
+        }
+        if check.outcome().await? && warns {
+            check.weak_hash()();
+        }
+        Ok(())
+    }
+
+    /// Note for raeva.lock whether a repository checksum file admitted the
+    /// POM at `path` that a read uses.
+    fn note_pom_admission(&self, route: &Route<'_>, path: &str, checked: Checked) {
+        if route.endpoint.is_local() {
+            return;
+        }
+        match checked {
+            Checked::Verified | Checked::Pinned(true) => self.note_admission(path, true),
+            Checked::Missing => self.note_admission(path, false),
+            Checked::Mismatched | Checked::Pinned(false) => {}
+        }
+    }
+
+    /// Note a non-unique `-SNAPSHOT` POM at `path` that a read uses as
+    /// fetched, unless raeva.lock pins these bytes: its files are fetched
+    /// again too, as the store may hold them from another build.
+    fn note_fetched_pom(&self, path: &str, checked: Checked) {
+        if path.ends_with("SNAPSHOT.pom") && !matches!(checked, Checked::Pinned(_)) {
+            (self.fetched_snapshots.lock())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(path.to_string());
+        }
     }
 
     /// Write a POM to the metadata cache, and to the memo when it never
@@ -810,27 +1049,24 @@ impl RepoClient {
         cache_scope: &str,
         path: &str,
         bytes: &Bytes,
-        ttl: i64,
+        expiry: Expiry,
         checked: Checked,
     ) {
         // Other bytes than the ones a fixed file is pinned to are not kept,
         // so another project cannot take them for verified.
-        if self.release_lock_pin(path).is_some() && checked != Checked::Pinned {
+        if self.release_lock_pin(path).is_some() && !matches!(checked, Checked::Pinned(_)) {
             return;
         }
-        let cached = (self.cache_insert_bytes_with_ttl(
-            CacheTable::Pom,
-            cache_scope,
-            path,
-            bytes,
-            ttl,
-            checked,
-        ))
-        .await;
+        let cached =
+            (self.cache_insert_bytes(CacheTable::Pom, cache_scope, path, bytes, expiry, checked))
+                .await;
         // Bytes checked against their checksum file while a pin names the
         // path are other bytes than the pinned ones.
         let pin = self.lock_pin(path).and_then(Digest::as_sha256);
-        if cached && ttl == i64::MAX && (pin.is_none() || checked == Checked::Pinned) {
+        if cached
+            && expiry == Expiry::NEVER
+            && (pin.is_none() || matches!(checked, Checked::Pinned(_)))
+        {
             self.memo().insert(flight_key, bytes);
         }
     }
@@ -861,18 +1097,20 @@ impl RepoClient {
         path: &str,
     ) -> Result<Option<Bytes>> {
         Ok(self
-            .cache_get_entry(table, repo_url, path, None)
+            .cache_get_entry(table, repo_url, path, None, PomRead::Use)
             .await?
             .map(|(bytes, _)| bytes))
     }
 
-    /// [`Self::cache_get_bytes`], with the time the row expires.
-    async fn cache_get_entry(
+    /// [`Self::cache_get_bytes`], with the time the row expires. Only a
+    /// POM `read` uses notes its admission.
+    pub(super) async fn cache_get_entry(
         &self,
         table: CacheTable,
         repo_url: &str,
         path: &str,
         pin: Option<&Digest>,
+        read: PomRead,
     ) -> Result<Option<(Bytes, i64)>> {
         // Local `file://` repositories are mutable by the user and cheap to
         // read; caching them would only serve stale content.
@@ -888,10 +1126,17 @@ impl RepoClient {
             .filter(|_| !matches!(table, CacheTable::Miss))
             .cloned();
         let refresh_before = self.renew_before(table, path);
+        let pinned = pin.is_some();
+        // `--update` asks again for the checksum file of a POM raeva.lock
+        // marks as accepted without one.
+        let recheck = matches!(table, CacheTable::Pom)
+            && self.updates()
+            && self.lock_unverified.contains(path);
         let repo_url: Arc<str> = repo_url.into();
         let path: Arc<str> = path.into();
+        let note = path.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let found = tokio::task::spawn_blocking(move || {
             // A copy that differs from the pin is a miss, so a repository
             // that once served other bytes does not wedge every later run.
             let differs = |entry: &CacheEntry| {
@@ -905,18 +1150,16 @@ impl RepoClient {
             let unchecked =
                 |entry: &CacheEntry| require_checksum && !entry.checksum_checked && pin.is_none();
             let entry = cache.get(table, &repo_url, &path).map_err(|err| {
-                // The scope starts with the repository URL; the rest is the
-                // mirror URL and policy flags.
-                let repository = repo_url.split('\u{1f}').next().unwrap_or_default();
-                err.for_repository(&redact_url(repository))
+                err.for_repository(&redact_url(crate::cache_scope_repository(&repo_url)))
             })?;
             match entry {
                 Some(entry)
                     if differs(&entry)
-                        || refresh_before.is_some_and(|start| entry.fetched_at < start) =>
+                        || refresh_before.is_some_and(|start| !entry.written_since(start)) =>
                 {
                     Ok(None)
                 }
+                Some(entry) if recheck && !entry.checksum_checked => Ok(None),
                 // Read inside "offline mode: ... not available in local cache".
                 Some(entry) if offline && unchecked(&entry) => {
                     Err(RepoError::OfflineNotCached(format!(
@@ -935,24 +1178,36 @@ impl RepoClient {
                 {
                     Ok(None)
                 }
-                Some(entry) => Ok(Some((Bytes::from(entry.content), entry.expires_at))),
+                Some(entry) => Ok(Some((
+                    Bytes::from(entry.content),
+                    entry.fetched_at,
+                    entry.expires_at,
+                    entry.checksum_checked,
+                ))),
                 None => Ok(None),
             }
         })
         .await
-        .map_err(|e| RepoError::Internal(format!("cache task panicked: {e}")))?
+        .map_err(|e| RepoError::Internal(format!("cache task panicked: {e}")))??;
+        Ok(found.map(|(bytes, fetched_at, expires_at, checked)| {
+            if matches!(table, CacheTable::Pom) && (checked || !pinned) && read == PomRead::Use {
+                self.note_admission(&note, checked);
+            }
+            self.note_cached_row(&note, fetched_at, expires_at);
+            (bytes, expires_at)
+        }))
     }
 
     // These TTL rows are disposable fetch accelerators. Blob persistence,
     // artifact indexing and lockfile POM pins use Store and must still fail
     // if their writes fail.
-    pub(super) async fn cache_insert_bytes_with_ttl(
+    pub(super) async fn cache_insert_bytes(
         &self,
         table: CacheTable,
         repo_url: &str,
         path: &str,
         content: &[u8],
-        ttl: i64,
+        expiry: Expiry,
         checked: Checked,
     ) -> bool {
         if Self::cache_scope_is_local(repo_url) {
@@ -963,10 +1218,13 @@ impl RepoClient {
         let path: Arc<str> = path.into();
         let content = content.to_vec();
         // Bytes accepted by a lock pin alone are not served to a run without it.
-        let checksum_checked = matches!(checked, Checked::Verified | Checked::Mismatched);
+        let checksum_checked = matches!(
+            checked,
+            Checked::Verified | Checked::Mismatched | Checked::Pinned(true)
+        );
 
         tokio::task::spawn_blocking(move || {
-            cache.insert_with_ttl(table, &repo_url, &path, &content, ttl, checksum_checked)
+            cache.insert(table, &repo_url, &path, &content, expiry, checksum_checked)
         })
         .await
         .is_ok_and(|written| written.is_ok())
@@ -980,13 +1238,13 @@ impl RepoClient {
         version: &str,
         checked: Checked,
     ) {
-        let ttl = route.endpoint.update_policy_ttl(version);
-        self.cache_insert_bytes_with_ttl(
+        let expiry = route.endpoint.update_policy_expiry(version);
+        self.cache_insert_bytes(
             CacheTable::VersionList,
             &Self::metadata_cache_scope(route, version),
             path,
             content,
-            ttl,
+            expiry,
             checked,
         )
         .await;
@@ -1080,8 +1338,8 @@ impl RepoClient {
         version: &str,
         pin: Option<&Digest>,
         warnings: &mut DeferredWarnings,
-    ) -> Result<(Bytes, Checked)> {
-        let repo = &route.endpoint;
+        read: PomRead,
+    ) -> Result<(Bytes, Checked, Option<LateSha256>)> {
         let key = self.miss_key(route, path);
         let generation = self.credential_generation();
         // A repository may answer 404 for a request whose credentials it
@@ -1092,12 +1350,15 @@ impl RepoClient {
         let sent = (!route.endpoint.is_local())
             .then(|| route.auth().ok())
             .flatten();
+        let miss_scope = sent.and_then(|auth| self.miss_scope(route, version, auth));
         if let Some(key) = &key
             && let Some(miss) = self.recorded_miss(key)
         {
+            if read == PomRead::Use && self.take_unkept(key) {
+                (self.keep_miss(route, path, version, miss_scope.as_deref(), &miss)).await;
+            }
             return Err(miss);
         }
-        let miss_scope = sent.and_then(|auth| self.miss_scope(route, version, auth));
         // A file raeva.lock records this repository as serving is asked
         // for again, and so is every file under `--update`.
         let served = (self.lock_pins.get(path)).is_some_and(|(_, origins)| {
@@ -1117,7 +1378,7 @@ impl RepoClient {
         {
             let miss = miss.error();
             if let Some(key) = &key {
-                self.record_miss(route, key.clone(), &miss, generation);
+                self.record_miss(route, key.clone(), &miss, generation, false);
             }
             return Err(miss);
         }
@@ -1125,25 +1386,61 @@ impl RepoClient {
             .fetch_with_checksums(route, path, version, pin, warnings)
             .await;
         if let (Some(key), Err(err)) = (key, &result) {
-            self.record_miss(route, key, err, generation);
-            let ttl = repo.update_policy_ttl(version);
-            if let (Some(status), Some(scope)) = (
-                Miss::of(err, path).and_then(|miss| miss.kept_status()),
-                miss_scope,
-            ) && ttl > 0
-            {
-                self.cache_insert_bytes_with_ttl(
-                    CacheTable::Miss,
-                    &scope,
-                    path,
-                    status.to_string().as_bytes(),
-                    ttl,
-                    Checked::Verified,
-                )
-                .await;
+            // A prefetch may ask a repository the read never reaches.
+            let keep = read == PomRead::Use;
+            self.record_miss(route, key, err, generation, !keep);
+            if keep {
+                (self.keep_miss(route, path, version, miss_scope.as_deref(), err)).await;
             }
         }
         result
+    }
+
+    /// Keep `err` under `scope` if it is a 404, 401 or 403, for as long as
+    /// the repository's update policy keeps a found file. A 404 is also
+    /// kept under [`Self::absence_scope`], whatever credential asked, as the
+    /// proof an offline run takes that the file is missing; offline a stale
+    /// row stands, so it is kept even when the policy keeps nothing.
+    async fn keep_miss(
+        &self,
+        route: &Route<'_>,
+        path: &str,
+        version: &str,
+        scope: Option<&str>,
+        err: &RepoError,
+    ) {
+        let Some(status) = Miss::of(err, path).and_then(|miss| miss.kept_status()) else {
+            return;
+        };
+        let expiry = route.endpoint.update_policy_expiry(version);
+        let absent = (status == 404).then(|| Self::absence_scope(route));
+        for scope in scope.map(str::to_string).into_iter().chain(absent) {
+            self.cache_insert_bytes(
+                CacheTable::Miss,
+                &scope,
+                path,
+                status.to_string().as_bytes(),
+                expiry,
+                Checked::Verified,
+            )
+            .await;
+        }
+    }
+
+    /// The metadata cache scope of the 404s `route` answered, with no
+    /// credential in it, so a seed carries them to another home.
+    pub(super) fn absence_scope(route: &Route<'_>) -> String {
+        format!("{}\u{1f}absent", route.scope)
+    }
+
+    /// Whether an online run kept a 404 for `path` from `route`, which is
+    /// what proves a POM raeva.lock records as missing missing offline.
+    pub(super) async fn proven_absent(&self, route: &Route<'_>, path: &str) -> bool {
+        let scope = Self::absence_scope(route);
+        let kept = self.cache_get_bytes(CacheTable::Miss, &scope, path).await;
+        kept.ok()
+            .flatten()
+            .is_some_and(|status| &status[..] == b"404")
     }
 
     /// The key of remote `path` on `route`, which remembers its misses and
@@ -1170,26 +1467,35 @@ impl RepoClient {
     pub(super) fn recorded_miss(&self, key: &MissKey) -> Option<RepoError> {
         let generation = self.credential_generation();
         let misses = self.absent_paths.lock().ok()?;
-        let (miss, at) = misses.get(key)?;
+        let (miss, at, _) = misses.get(key)?;
         (*at == generation).then(|| miss.clone().error())
     }
 
+    /// Whether the miss recorded for `key` is not kept yet, which it now is.
+    fn take_unkept(&self, key: &MissKey) -> bool {
+        let mut misses =
+            (self.absent_paths.lock()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        misses
+            .get_mut(key)
+            .is_some_and(|(_, _, unkept)| std::mem::take(unkept))
+    }
+
     /// Remember `err` for `key` if it is a [`Miss`], under `generation` or
-    /// the earlier one `route` picked its credential under.
+    /// the earlier one `route` picked its credential under; `unkept` when
+    /// the metadata cache does not have it yet.
     pub(super) fn record_miss(
         &self,
         route: &Route<'_>,
         key: MissKey,
         err: &RepoError,
         generation: u64,
+        unkept: bool,
     ) {
-        let generation = route
-            .auth_generation()
-            .map_or(generation, |at| at.min(generation));
+        let generation = route.picked_under(generation);
         if let Some(miss) = Miss::of(err, &key.path)
             && let Ok(mut misses) = self.absent_paths.lock()
         {
-            misses.insert(key, (miss, generation));
+            misses.insert(key, (miss, generation, unkept));
         }
     }
 
@@ -1230,105 +1536,114 @@ impl RepoClient {
             artifact_id,
             is_snapshot_version(version).then_some(version),
         );
+        self.ensure_filters_admit(route, group_id, &path)?;
         let _turn = self.metadata_turn(route, &path).await;
         let scope = Self::metadata_cache_scope(route, version);
-        let memo_key = format!("{scope}\n{path}");
-        let read_key = format!(
-            "{} {} {}",
-            self.offline,
-            self.require_checksums,
-            self.lock_pin(&path)
-                .map(ToString::to_string)
-                .unwrap_or_default()
+        let (memo_key, read_key) = self.metadata_memo_keys(&scope, &path);
+        let held_key = format!(
+            "{memo_key}\n{read_key}\n{}",
+            route.picked_under(self.credential_generation())
         );
-        let held_key = format!("{memo_key}\n{read_key}");
-        let cached = match self.memoized_metadata(&memo_key, &read_key) {
-            Some(cached) => cached,
-            None => {
-                let cached = match self
-                    .cache_get_entry(CacheTable::VersionList, &scope, &path, None)
-                    .await?
-                {
-                    Some((bytes, expires_at)) => Some((Metadata::from_bytes(&bytes)?, expires_at)),
-                    None => None,
-                };
-                self.metadata_memo()
-                    .entry(memo_key.clone())
-                    .or_default()
-                    .insert(read_key, cached.clone());
-                cached.map(|(metadata, _)| metadata)
-            }
-        };
-        if let Some(metadata) = cached {
+        if let Some(metadata) = (self.cached_metadata(&scope, &path, &memo_key, &read_key)).await? {
             return Ok(metadata);
         }
         match read {
             PomRead::Use => {
                 let held = self.held().adopt(&held_key);
-                if let Some((bytes, _, checked, warnings)) = held {
+                if let Some((bytes, _, checked, warnings, _)) = held {
                     warnings.emit();
                     self.cache_insert_metadata(route, &path, bytes.as_ref(), version, checked)
                         .await;
-                    self.metadata_memo().remove(&memo_key);
                     self.held().remove(&held_key);
-                    return Metadata::from_bytes(&bytes);
+                    let metadata = Metadata::from_bytes(&bytes)?;
+                    self.keep_fetched_metadata(memo_key, read_key, &metadata);
+                    return Ok(metadata);
                 }
             }
             PomRead::Prefetch => {
                 let held = self.held().get(&held_key);
-                if let Some(bytes) = held {
+                if let Some((bytes, _)) = held {
                     return Metadata::from_bytes(&bytes);
                 }
             }
         }
 
-        // Offline blocks remote access, including after mirror substitution;
-        // file repositories remain readable. `fetch_path` also guards remote
-        // requests, but reporting this here preserves the metadata diagnostic.
-        if self.offline && !repo.is_local() {
-            return Err(RepoError::OfflineNotCached(format!(
-                "{path} (repo: {})",
-                rv_config::redact_url(&repo.url)
-            )));
-        }
-
         let mut warnings = DeferredWarnings::default();
         let fetched = self
-            .fetch_model_bytes(route, &path, version, None, &mut warnings)
+            .fetch_model_bytes(route, &path, version, None, &mut warnings, read)
             .await;
         // A prefetch holds its warnings with the file, for the read that
         // uses it; a miss stands for both, as it does for a POM.
         if read == PomRead::Prefetch {
-            let (bytes, checked) = fetched?;
+            let (bytes, checked, _) = fetched?;
             let metadata = Metadata::from_bytes(&bytes)?;
             let held = HeldPom {
                 bytes,
-                ttl: 0,
+                expiry: Expiry::After(0),
                 checked,
                 warnings: Some(warnings.after_logged()),
+                check: None,
             };
             self.held().insert(held_key, held);
             return Ok(metadata);
         }
         warnings.emit();
-        let (bytes, checked) = fetched?;
+        let (bytes, checked, _) = fetched?;
         let metadata = Metadata::from_bytes(&bytes)?;
         self.cache_insert_metadata(route, &path, bytes.as_ref(), version, checked)
             .await;
-        self.metadata_memo().remove(&memo_key);
+        self.keep_fetched_metadata(memo_key, read_key, &metadata);
         Ok(metadata)
     }
 
-    /// What a read under `key` would find in the metadata cache, when an
-    /// earlier read found it: a row expires meanwhile, and a missing or
-    /// unusable one stays so until this client writes it.
-    fn memoized_metadata(&self, key: &str, read_key: &str) -> Option<Option<Metadata>> {
-        let memo = self.metadata_memo();
-        let read = memo.get(key)?.get(read_key)?;
-        Some(read.as_ref().and_then(|(metadata, expires_at)| {
-            (self.offline || !MetadataCache::is_expired(*expires_at, now_epoch_seconds()))
-                .then(|| metadata.clone())
-        }))
+    /// The keys of `path` in `scope` in the metadata memo: the file, then
+    /// the settings that decide whether a row of it is usable.
+    fn metadata_memo_keys(&self, scope: &str, path: &str) -> (String, String) {
+        let read_key = format!(
+            "{} {} {}",
+            self.offline,
+            self.require_checksums,
+            self.lock_pin(path)
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
+        (format!("{scope}\n{path}"), read_key)
+    }
+
+    /// The metadata at `path` in `scope` that this client read or fetched
+    /// before under `key` and `read_key`, else that a usable row of the
+    /// metadata cache holds. `None` when there is no usable row, which stays
+    /// so until this client fetches the file.
+    async fn cached_metadata(
+        &self,
+        scope: &str,
+        path: &str,
+        key: &str,
+        read_key: &str,
+    ) -> Result<Option<Metadata>> {
+        let memoized =
+            (self.metadata_memo().get(key)).and_then(|reads| reads.get(read_key).cloned());
+        if let Some(read) = memoized {
+            return Ok(read);
+        }
+        let read = match self
+            .cache_get_entry(CacheTable::VersionList, scope, path, None, PomRead::Use)
+            .await?
+        {
+            Some((bytes, _)) => Some(Metadata::from_bytes(&bytes)?),
+            None => None,
+        };
+        (self.metadata_memo().entry(key.to_string()).or_default())
+            .insert(read_key.to_string(), read.clone());
+        Ok(read)
+    }
+
+    /// Serve `metadata`, which this client fetched, to its later reads under
+    /// `key` and `read_key` instead of the row it wrote, which another
+    /// process can replace with what it fetched before.
+    fn keep_fetched_metadata(&self, key: String, read_key: String, metadata: &Metadata) {
+        let reads = HashMap::from([(read_key, Some(metadata.clone()))]);
+        self.metadata_memo().insert(key, reads);
     }
 
     fn metadata_memo(
@@ -1343,6 +1658,8 @@ impl RepoClient {
         &self,
         route: &Route<'_>,
         req: &ArtifactRequest,
+        read: PomRead,
+        pin: Option<&Digest>,
     ) -> Result<SnapshotPath> {
         if !req.is_snapshot() {
             return Ok(SnapshotPath {
@@ -1360,7 +1677,7 @@ impl RepoClient {
                 packaging: Some(req.packaging.clone()),
                 classifier: req.classifier.clone(),
             };
-            let resolved = self.resolve_snapshot_version_routed(route, &coord).await?;
+            let resolved = (self.resolve_snapshot_version_routed(route, &coord, read, pin)).await?;
             return Ok(SnapshotPath {
                 dir_version: resolved_directory(&resolved.version),
                 file_version: resolved.version,
@@ -1376,7 +1693,9 @@ impl RepoClient {
     }
 
     /// The bytes at `path`, checked against its checksum sidecar. Warnings
-    /// go to `warnings`, for the caller to log.
+    /// go to `warnings`, for the caller to log. For a POM that
+    /// [`RepoClient::checking_sha256_late`] took on its `.sha1`, the check of
+    /// its `.sha256` comes with them, for the caller to finish.
     pub(super) async fn fetch_with_checksums(
         &self,
         route: &Route<'_>,
@@ -1384,7 +1703,7 @@ impl RepoClient {
         version: &str,
         pin: Option<&Digest>,
         warnings: &mut DeferredWarnings,
-    ) -> Result<(Bytes, Checked)> {
+    ) -> Result<(Bytes, Checked, Option<LateSha256>)> {
         let repo = &route.endpoint;
         // Only repository metadata is mutable enough to tolerate stale
         // sidecars. POMs and artifact payloads retain mandatory verification.
@@ -1407,12 +1726,26 @@ impl RepoClient {
             // request failed first; the probe's warnings are logged only once
             // the file has arrived.
             let mut probed = DeferredWarnings::default();
+            let mut late = None;
             let (bytes, checksum) = match sha256 {
                 Some(pin) => {
                     let bytes = self.fetch_path(route, path).await?;
                     let actual = Sha256::from_bytes(&bytes);
                     if actual == *pin {
-                        return Ok((bytes, Checked::Pinned));
+                        // A POM raeva.lock marks as accepted without a
+                        // checksum file asks for one again.
+                        let mut verified = false;
+                        if !repo.is_local() && self.lock_unverified.contains(path) {
+                            let mut probed = DeferredWarnings::default();
+                            if let Some(checksum) =
+                                self.probe_checksum(route, path, &mut probed, None).await?
+                            {
+                                verify_checksum(&bytes, &checksum, path)?;
+                                verified = true;
+                            }
+                            warnings.append(probed);
+                        }
+                        return Ok((bytes, Checked::Pinned(verified), None));
                     }
                     if required_pin.is_some() {
                         return Err(RepoError::ChecksumMismatch {
@@ -1423,9 +1756,13 @@ impl RepoClient {
                             check: IntegritySource::LockPin,
                         });
                     }
-                    (bytes, self.probe_checksum(route, path, &mut probed).await)
+                    (
+                        bytes,
+                        self.probe_checksum(route, path, &mut probed, None).await,
+                    )
                 }
                 None => {
+                    let (sha1, arrived) = tokio::sync::watch::channel(None);
                     let fetch = async {
                         let bytes = self.fetch_path(route, path).await?;
                         // A SNAPSHOT POM read fetches metadata first, in the
@@ -1433,11 +1770,22 @@ impl RepoClient {
                         if path.ends_with(".pom") {
                             let _ = ARRIVAL.try_with(|arrived| arrived(&bytes));
                         }
+                        sha1.send_replace(Some(Digest::of_bytes(HashAlgorithm::Sha1, &bytes)));
                         Ok::<_, RepoError>(bytes)
                     };
-                    tokio::try_join!(fetch, async {
-                        Ok(self.probe_checksum(route, path, &mut probed).await)
-                    })?
+                    let defer = self.late_checks.is_some() && path.ends_with(".pom");
+                    let probe = self.probe_checksum(
+                        route,
+                        path,
+                        &mut probed,
+                        defer.then_some((arrived, &mut late)),
+                    );
+                    if self.sidecar_hints.file_first(&repo.url) {
+                        let bytes = fetch.await?;
+                        (bytes, probe.await)
+                    } else {
+                        tokio::try_join!(fetch, async { Ok(probe.await) })?
+                    }
                 }
             };
             // A pin of another algorithm than SHA-256 decides the bytes as a
@@ -1453,7 +1801,7 @@ impl RepoClient {
                         check: IntegritySource::LockPin,
                     });
                 }
-                return Ok((bytes, Checked::Pinned));
+                return Ok((bytes, Checked::Pinned(false), None));
             }
             warnings.append(probed);
             let checksum = checksum?;
@@ -1495,7 +1843,10 @@ impl RepoClient {
                 }
                 None => {
                     if !repo.is_local() {
-                        let (repository_url, path) = (redact_url(&repo.url), path.to_string());
+                        let (repository_url, path) = (
+                            rv_config::redact_repository_url(&repo.url),
+                            path.to_string(),
+                        );
                         warnings.push(move || {
                             warn!(
                                 sec_code = "CHECKSUM_MISSING",
@@ -1507,7 +1858,7 @@ impl RepoClient {
                     Checked::Missing
                 }
             };
-            return Ok((bytes, checked));
+            return Ok((bytes, checked, late));
         }
         unreachable!("the second metadata fetch returns a result")
     }
@@ -1521,8 +1872,10 @@ pub(super) enum Checked {
     Mismatched,
     /// There was no checksum file, and the run accepts that.
     Missing,
-    /// raeva.lock pins the bytes, so the checksum file was not read.
-    Pinned,
+    /// raeva.lock pins the bytes, so the checksum file was not read, unless
+    /// the lock marks the file as accepted without one: then `true` when
+    /// one verified them.
+    Pinned(bool),
 }
 
 /// The directory of the resolved snapshot file version `resolved`. Maven

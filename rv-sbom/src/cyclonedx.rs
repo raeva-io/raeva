@@ -12,14 +12,14 @@ pub struct CycloneDxGenerator {
     /// `version` of the tool entry.
     pub tool_version: String,
     /// The project the document describes, written as `metadata.component`
-    /// of type `application` (its hashes are not written). It is
-    /// validated with the other components, and its `dependencies` become
-    /// the first `dependencies` entry.
+    /// of type `application` (its hashes, scope and properties are not
+    /// written). It is validated with the other components, and its
+    /// `dependencies` become the first `dependencies` entry.
     pub root_component: Component,
     /// `serialNumber`, written as given.
     pub serial_number: String,
     /// `vulnerabilities`, in the order given; left out when empty. Each
-    /// `affects` purl must be a component of the document.
+    /// `affects` reference must be a component's of the document.
     pub vulnerabilities: Vec<VulnerabilityAnalysis>,
 }
 
@@ -27,8 +27,9 @@ impl CycloneDxGenerator {
     /// Validates `components` together with `root_component` and renders
     /// them as pretty-printed CycloneDX JSON.
     ///
-    /// Each component becomes a `library` entry whose `bom-ref` is its purl,
-    /// in input order, and gets one `dependencies` entry.
+    /// Each component becomes a `library` entry whose `bom-ref` is its
+    /// [`Component::reference`], in input order, and gets one `dependencies`
+    /// entry.
     ///
     /// # Errors
     ///
@@ -49,10 +50,10 @@ impl CycloneDxGenerator {
         let root = &self.root_component;
         validate_components(std::iter::once(root).chain(components))?;
         for vulnerability in &self.vulnerabilities {
-            for purl in &vulnerability.affects {
-                if *purl != root.purl && !components.iter().any(|c| c.purl == *purl) {
+            for reference in &vulnerability.affects {
+                if (std::iter::once(root).chain(components)).all(|c| c.reference() != reference) {
                     return Err(SbomError::InvalidComponent(format!(
-                        "vulnerability {} affects {purl}, which is not a component",
+                        "vulnerability {} affects {reference}, which is not a component",
                         vulnerability.id
                     )));
                 }
@@ -82,7 +83,7 @@ impl CycloneDxGenerator {
                     group: root.group.as_deref(),
                     name: &root.name,
                     version: &root.version,
-                    bom_ref: &root.purl,
+                    bom_ref: root.reference(),
                     purl: &root.purl,
                     licenses: root
                         .licenses
@@ -95,7 +96,7 @@ impl CycloneDxGenerator {
             dependencies: std::iter::once(root)
                 .chain(components)
                 .map(|component| Dependency {
-                    reference: &component.purl,
+                    reference: component.reference(),
                     depends_on: &component.dependencies,
                 })
                 .collect(),
@@ -110,7 +111,7 @@ impl CycloneDxGenerator {
                         detail: vulnerability.detail.as_deref(),
                     },
                     affects: (vulnerability.affects.iter())
-                        .map(|purl| Affects { reference: purl })
+                        .map(|reference| Affects { reference })
                         .collect(),
                 })
                 .collect(),
@@ -121,7 +122,7 @@ impl CycloneDxGenerator {
 
 fn library(component: &Component) -> Library<'_> {
     Library {
-        bom_ref: &component.purl,
+        bom_ref: component.reference(),
         component_type: "library",
         group: component.group.as_deref(),
         name: &component.name,
@@ -143,6 +144,13 @@ fn library(component: &Component) -> Library<'_> {
                     HashAlgorithm::Sha1 => "SHA-1",
                 },
                 value: &hash.value,
+            })
+            .collect(),
+        scope: component.scope,
+        properties: (component.properties.iter())
+            .map(|property| Property {
+                name: &property.name,
+                value: &property.value,
             })
             .collect(),
     }
@@ -242,6 +250,10 @@ struct Library<'a> {
     purl: &'a str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hashes: Vec<Hash<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<crate::ComponentScope>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    properties: Vec<Property<'a>>,
 }
 
 #[derive(Serialize)]

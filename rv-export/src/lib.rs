@@ -18,7 +18,7 @@
 //! reads no settings from the environment. Every byte it writes must
 //! already be in the content store; a caller that wants classifier jars
 //! fetches them for the candidates [`ExportPlan::authorize_classifiers`] accepts and passes them to
-//! [`Exporter::export_items`]. The support-POM limit override is read by the
+//! [`Exporter::export`]. The support-POM limit override is read by the
 //! caller from [`MAX_SUPPORT_POM_NODES_ENV`] and passed to
 //! [`Exporter::with_support_pom_limit`].
 
@@ -30,7 +30,11 @@ mod plan;
 mod warning;
 
 pub use error::{ExportError, ExportFailure, LinkError};
-pub use export::{ExportOptions, ExportStats, Exporter, MAX_SUPPORT_POM_NODES_ENV};
+pub use export::{
+    ExportOptions, ExportStats, Exporter, MAX_SUPPORT_POM_NODES_ENV, RemoteFile, RepositoryLayout,
+    plain_support_pom_copy,
+};
 pub use link::LinkStrategy;
+pub use metadata::parse_remote_repositories;
 pub use plan::{AuthorizedClassifier, ClassifierCandidate, ExportPlan, ProjectPom, Reactor};
 pub use warning::ExportWarning;

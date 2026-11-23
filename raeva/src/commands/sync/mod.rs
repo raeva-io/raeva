@@ -2,10 +2,25 @@ mod disk;
 mod download;
 mod drift;
 mod merge;
+mod mode;
+mod plugins;
 mod regenerate;
 mod resolve;
+mod trace;
 pub(crate) use drift::lock_needs_fresh_resolution;
-pub(crate) use resolve::{WORKSPACE_STALL_TIMEOUT_ENV, count_stored, validate_frozen_resolution};
+use mode::Intent;
+pub(crate) use mode::Mode;
+pub(crate) use plugins::{
+    check_frozen as check_frozen_plugins, check_held as check_plugin_tables,
+    check_resolved as check_resolved_plugins, check_traced as check_plugin_trace,
+};
+pub(crate) use resolve::{
+    WORKSPACE_STALL_TIMEOUT_ENV, count_stored, platform_clients, platform_configs,
+    resolution_trust, restore_contexts, validate_frozen_resolution,
+};
+pub(crate) use trace::traced_on;
+#[cfg(test)]
+pub(crate) use {plugins::inputs_digest, trace::trace_key};
 mod system_scope;
 #[cfg(test)]
 mod tests;
@@ -21,6 +36,7 @@ use rv_config::Config;
 use rv_lock::{LockOrigins, Lockfile, LockfileGuard, Platform};
 use rv_repo::{RepoClient, Repository, RestoreContext};
 use rv_store::Store;
+use rv_store::metadata_cache::SnapshotCheck;
 
 use crate::commands::util::{count_dependencies, read_lockfile_at};
 use crate::commands::{lock_diff as diff, read_lockfile};
@@ -33,20 +49,19 @@ use self::disk::check_disk_space;
 use self::download::ensure_artifacts;
 use self::drift::{lock_references_unconfigured_origin, lock_requires_snapshot_refresh};
 use self::merge::merge_previous;
-use self::resolve::{
-    ResolvedReactorLock, check_origin_aliases, check_resolution, resolve_reactor_lock,
-};
+use self::resolve::{ResolvedReactorLock, check_origin_aliases, resolve_reactor_lock};
 use self::system_scope::warn_system_scope_from_lock;
 use crate::commands::lock_inputs::{
-    ReactorModel, check_recorded_freshness, declared_repository_urls, discover_reactor_models,
-    frozen_models_match, recorded_ambient, resolution_config_hash,
+    ReactorModel, check_recorded_freshness, command_line_names, declared_repository_urls,
+    discover_reactor_models, frozen_models_match, hides_host_directories, reads_hidden_env,
+    recorded_ambient, resolution_config_hash,
 };
 
 #[derive(Debug, Args)]
 #[command(
     after_long_help = crate::commands::util::help_examples(&[
         ("sync", "Resolve and lock dependencies"),
-        ("sync --frozen", "CI mode: fail if lockfile would change"),
+        ("sync --frozen", "CI mode: resolve again and fail on any difference"),
         ("sync --update", "Force fresh resolution"),
         ("sync --offline", "Use cached data and file repositories"),
         ("sync --platforms linux-x86_64,macos-aarch64", ""),
@@ -56,7 +71,8 @@ pub(crate) struct SyncArgs {
     #[arg(
         long,
         short = 'f',
-        help = "Fail if raeva.lock would change, using the locked SNAPSHOT builds (CI mode)"
+        help = "Resolve again and fail if the result differs from raeva.lock, keeping the locked \
+                SNAPSHOT builds (CI mode)"
     )]
     pub frozen: bool,
     #[arg(
@@ -98,8 +114,10 @@ pub(crate) fn refuse_module_directory(root: &Path) -> Result<()> {
     )))
 }
 
-/// The topmost directory whose pom.xml lists `root` as a module, unless a
-/// raeva.lock or raeva.toml in `root` means it is locked on its own on purpose.
+/// The topmost directory whose pom.xml lists `root`'s pom.xml as a module,
+/// directly or through the module POMs of the directories between them,
+/// unless a raeva.lock or raeva.toml in `root` means it is locked on its own
+/// on purpose.
 pub(crate) fn enclosing_reactor(root: &Path) -> Option<PathBuf> {
     if ["raeva.lock", "raeva.toml"]
         .iter()
@@ -109,34 +127,66 @@ pub(crate) fn enclosing_reactor(root: &Path) -> Option<PathBuf> {
         return None;
     }
     let start = std::fs::canonicalize(root).ok()?;
-    let lists = |dir: &Path, member: &Path| {
-        let Ok(bytes) = std::fs::read(dir.join("pom.xml")) else {
-            return false;
+    let member = start.join("pom.xml");
+    // The POM files the literal top-level entries of `pom` name, with either
+    // separator, as discovery reads them. A profile, even one active by
+    // default, and a property may be switched off or overridden from outside
+    // the POM, and a refusal must never be wrong; a miss only writes the
+    // second lock.
+    let entries = |pom: &Path| -> Vec<PathBuf> {
+        // As discovery reads a POM: a regular file, of a bounded size.
+        let read = || {
+            pom.is_file()
+                .then(|| rv_config::read_project_input(pom).ok())?
         };
-        let pom = rv_maven_model::decode_pom(&bytes)
+        let (Some(dir), Some(bytes)) = (pom.parent(), read()) else {
+            return Vec::new();
+        };
+        let Some(pom) = rv_maven_model::decode_pom(&bytes)
             .ok()
-            .and_then(|text| rv_maven_model::Pom::parse(&text).ok());
-        // Only the literal top-level entries, with either separator, as
-        // discovery reads them. A profile, even one active by default, and a
-        // property may be switched off or overridden from outside the POM, and
-        // a refusal must never be wrong; a miss only writes the second lock.
-        pom.is_some_and(|pom| {
-            pom.modules.iter().any(|entry| {
-                let entry = entry.trim().replace('\\', "/");
-                !entry.contains("${")
-                    && std::fs::canonicalize(rv_fs::join_pom_entry(dir, &entry))
-                        .is_ok_and(|path| path == member || path == member.join("pom.xml"))
+            .and_then(|text| rv_maven_model::Pom::parse(&text).ok())
+        else {
+            return Vec::new();
+        };
+        (pom.modules.iter())
+            .map(|entry| entry.trim().replace('\\', "/"))
+            .filter(|entry| !entry.contains("${"))
+            .filter_map(|entry| std::fs::canonicalize(rv_fs::join_pom_entry(dir, &entry)).ok())
+            .map(|path| {
+                if path.is_dir() {
+                    path.join("pom.xml")
+                } else {
+                    path
+                }
             })
-        })
+            .collect()
     };
-    // An entry may skip a directory without a pom.xml, as `modules/io` does.
-    let mut reactor: Option<&Path> = None;
-    for dir in start.ancestors().skip(1) {
-        if lists(dir, reactor.unwrap_or(&start)) {
-            reactor = Some(dir);
+    // An entry may skip a directory without a pom.xml, as `modules/io` does,
+    // or name a module's POM file under another name, which may list
+    // `member` in turn; only POM files in the directories above `member`
+    // can.
+    let reaches = |pom: PathBuf| {
+        let mut seen = std::collections::HashSet::new();
+        let mut pending = vec![pom];
+        while let Some(pom) = pending.pop() {
+            if !seen.insert(pom.clone()) {
+                continue;
+            }
+            for listed in entries(&pom) {
+                if listed == member {
+                    return true;
+                }
+                if listed.parent().is_some_and(|dir| start.starts_with(dir)) {
+                    pending.push(listed);
+                }
+            }
         }
-    }
-    reactor.map(rv_fs::plain_path)
+        false
+    };
+    (start.ancestors().skip(1))
+        .filter(|dir| reaches(dir.join("pom.xml")))
+        .last()
+        .map(rv_fs::plain_path)
 }
 
 pub(crate) async fn run(args: &SyncArgs, session: &Session) -> Result<Report> {
@@ -144,7 +194,13 @@ pub(crate) async fn run(args: &SyncArgs, session: &Session) -> Result<Report> {
     // One timer for the whole run, so the JSON `duration_ms` and the
     // durations in text mode agree.
     let start = Instant::now();
-    let outcome = run_inner(
+    if let Some(trace) = config.plugin_trace() {
+        trace.launcher(&config.project_root)?;
+        if !args.frozen && !session.offline() {
+            trace::check_forwarded(&config)?;
+        }
+    }
+    let mut outcome = run_inner(
         args,
         session.offline(),
         session.project_root(),
@@ -153,6 +209,71 @@ pub(crate) async fn run(args: &SyncArgs, session: &Session) -> Result<Report> {
         session.output(),
     )
     .await?;
+    // A failed trace may put back the lock the sync found, which the
+    // SNAPSHOT check is not of.
+    let mut record = outcome.snapshot_check.take();
+    if (outcome.trace.as_ref()).is_none_or(|start| start.previous.is_none())
+        && let Some(record) = record.take()
+    {
+        record();
+    }
+    // The trace runs the project's build, so never to check a lock.
+    if !args.frozen && config.plugin_trace().is_some() {
+        if let Some(start) = outcome.trace.take() {
+            // `--update` drops the trace before it runs it again, so its
+            // changes are those from the lock it found.
+            let found = (start.previous.clone()).and_then(|bytes| {
+                let lock = Lockfile::from_toml(&String::from_utf8_lossy(&bytes)).ok()?;
+                Some((bytes, lock))
+            });
+            let before = lock_bytes(&config.lock_path);
+            let traced = trace::trace(
+                session,
+                &config,
+                start,
+                args.update,
+                args.allow_missing_checksums,
+            )
+            .await?;
+            if let Some(written) = &traced {
+                record_traced(&config, before.as_deref(), written).await;
+            }
+            match (traced, found) {
+                (None, _) => {}
+                (Some(written), Some((bytes, _)))
+                    if written.to_toml().is_ok_and(|text| text.as_bytes() == bytes) =>
+                {
+                    outcome.headline = Headline::UpToDate;
+                    outcome.changes.clear();
+                }
+                // The trace's platform may be one the sync did not resolve.
+                (Some(written), Some((_, found))) => {
+                    let platforms: Vec<Platform> = (found.platforms.iter())
+                        .chain(&written.platforms)
+                        .map(|entry| entry.platform.clone())
+                        .collect();
+                    let verbose = session.output().is_verbose();
+                    outcome.headline = Headline::Updated;
+                    outcome.changes = lock_diff(&found, &written, &platforms, verbose);
+                }
+                (Some(_), None) => {
+                    outcome.headline = match outcome.headline {
+                        Headline::Wrote => Headline::Wrote,
+                        _ => Headline::Updated,
+                    };
+                    outcome.changes.push("  plugin trace added".to_string());
+                }
+            }
+        } else if !trace::traced_here(&config, &read_lockfile_at(&config.lock_path)?.platforms)? {
+            session.output().note(
+                "raeva.lock has no trace of the build [plugins] trace names, which runs online \
+                 only: run 'raeva sync' online",
+            );
+        }
+    }
+    if let Some(record) = record {
+        record();
+    }
     Ok(Report::data(SyncReport {
         outcome,
         elapsed: start.elapsed(),
@@ -165,10 +286,15 @@ struct SyncOutcome {
     platforms: Vec<Platform>,
     changes: Vec<String>,
     headline: Headline,
+    /// What the trace after an online sync starts from.
+    trace: Option<trace::Start>,
+    /// Records the SNAPSHOT check of the resolution.
+    snapshot_check: Option<Box<dyn FnOnce() + Send>>,
 }
 
 enum Headline {
-    /// `--frozen`, or a lock reused as written: nothing was resolved.
+    /// `--frozen` resolved again and raeva.lock already held the result, or
+    /// a plain sync reused it as written.
     Checked,
     /// `--frozen --offline`: the lock is current and the store has its
     /// files, this many, unhashed.
@@ -237,16 +363,14 @@ async fn run_inner(
     start: Instant,
     output: &Output,
 ) -> Result<SyncOutcome> {
-    let mode = if args.frozen {
-        "frozen"
-    } else if args.update {
-        "update"
-    } else {
-        "normal"
-    };
+    let mode = Mode::sync(args, offline);
     tracing::info!(
         path = %project_root.display(),
-        mode,
+        mode = match mode.intent() {
+            Intent::Plain => "normal",
+            Intent::Update => "update",
+            Intent::Frozen => "frozen",
+        },
         offline,
         "sync started"
     );
@@ -254,49 +378,38 @@ async fn run_inner(
     let pom_path = config.project_root.join("pom.xml");
     let pom_exists = pom_path.is_file();
 
-    // Hold an exclusive advisory lock on the project-level lockfile guard
-    // for the entire read-resolve-write sequence. It keeps two concurrent
-    // `raeva sync` runs with disjoint --platform sets from racing on raeva.lock,
-    // where the last writer would win and drop the other's platform
-    // entries. It lives in the cache directory, so only runs that share it
-    // take turns. The guard is released when this binding goes out of scope.
-    //
-    // The async variant waits on the blocking pool, so the wait does not pin
-    // a tokio worker, and gives up after 60 s, as `rv-store`'s
-    // `StoreLock` does, so a wedged holder surfaces as an error.
-    //
-    // Acquire before the local --frozen checks so those checks read the same
-    // raeva.lock a concurrent writer cannot rewrite. --frozen never writes
-    // raeva.lock; the race is another process writing while this one keeps a
-    // pre-guard snapshot. Local frozen checks still run before the store or
-    // metadata cache open.
-    let _lockfile_guard = LockfileGuard::acquire_async(
-        &config.paths.cache_dir,
-        project_root,
-        std::time::Duration::from_secs(60),
-        {
-            let output = output.clone();
-            move || output.step("Waiting for another raeva sync of this project to finish...")
-        },
-    )
-    .await
-    .map_err(|err| {
-        if err.kind() == std::io::ErrorKind::TimedOut {
-            CliError::LockfileBusy {
-                project_root: project_root.to_path_buf(),
-                source: err,
-            }
-        } else {
-            CliError::io_at(&config.paths.cache_dir)(err)
-        }
-    })?;
+    // Held for the entire read-resolve-write sequence, and acquired before
+    // the local --frozen checks so those checks read the same raeva.lock a
+    // concurrent writer cannot rewrite. --frozen never writes raeva.lock;
+    // the race is another process writing while this one keeps a pre-guard
+    // snapshot. Local frozen checks still run before the store or metadata
+    // cache open.
+    let _lockfile_guard = lockfile_guard(config, project_root, output).await?;
+    // `--update` drops the trace it runs again, which a failed build would
+    // leave raeva.lock without.
+    let previous = (args.update && config.plugin_trace().is_some())
+        .then(|| lock_bytes(&config.lock_path))
+        .flatten();
     let frozen = (args.frozen)
-        .then(|| check_frozen_local(config, args, pom_exists))
+        .then(|| check_frozen_local(config, args, pom_exists, true))
         .transpose()?;
     // raeva.lock as it is under the guard: a plain sync takes the recorded
     // platforms from it, so it keeps a platform a concurrent sync just added,
     // and starts from it.
-    let on_disk = (!args.frozen).then(|| read_lockfile_at(&config.lock_path));
+    let mut on_disk = (!args.frozen).then(|| read_lockfile_at(&config.lock_path));
+    // A lock reused as it is is still written when its text is not raeva's.
+    let written = match &on_disk {
+        Some(Ok(lock)) if !args.update => Some(crate::commands::util::check_written(
+            lock,
+            &config.lock_path,
+        )),
+        _ => None,
+    };
+    // The dependency resolution neither reads nor writes the plugin tables.
+    let held = match on_disk.as_mut() {
+        Some(Ok(lock)) => plugins::strip(lock),
+        _ => None,
+    };
     let unreadable = match &on_disk {
         Some(Err(CliError::LockfileTooNew { found, expected })) => {
             return Err(CliError::LockfileTooNew {
@@ -305,15 +418,7 @@ async fn run_inner(
             });
         }
         Some(Err(CliError::LockfileIncompatible { reason, .. })) => Some(
-            regenerate::Unreadable::read(&config.lock_path, reason).ok_or_else(|| {
-                CliError::InvalidProjectInput {
-                    path: config.lock_path.clone(),
-                    reason: format!(
-                        "{reason}; a sync cannot read it whole to keep the platforms it names, \
-                         so delete it and run 'raeva sync'"
-                    ),
-                }
-            })?,
+            regenerate::Unreadable::read(&config.lock_path, reason, args.update)?,
         ),
         _ => None,
     };
@@ -339,14 +444,30 @@ async fn run_inner(
                 .iter()
                 .map(|platform| (platform.os(), platform.arch(), platform.jdk())),
         );
+        scoped.settings_activation()?;
         (checked.platforms.clone(), &scoped)
     } else {
+        let mut requested = args.platforms.clone();
         let recorded = match (on_disk.as_ref(), unreadable.as_ref()) {
             (Some(Ok(lock)), _) => recorded_platforms(lock),
-            (_, Some(unreadable)) => unreadable.platforms.clone(),
+            // Nothing carries forward from a lock it cannot read, so the
+            // platforms it records are resolved alongside `--platforms`.
+            (_, Some(unreadable)) => {
+                if !requested.is_empty() {
+                    requested.extend(unreadable.platforms.iter().cloned());
+                }
+                unreadable.platforms.clone()
+            }
             _ => Vec::new(),
         };
-        let platforms = resolve_platforms(args, &recorded, &config.lock.jdks)?;
+        let platforms = resolve_platforms(&requested, &recorded, &config.lock.jdks)?;
+        // The recorded platforms this run keeps without resolving them fail
+        // as the ones it resolves do.
+        (config.for_platforms(
+            (platforms.iter().chain(&recorded))
+                .map(|platform| (platform.os(), platform.arch(), platform.jdk())),
+        ))
+        .settings_activation()?;
         scoped = config.for_platforms(
             platforms
                 .iter()
@@ -357,16 +478,10 @@ async fn run_inner(
 
     let store = Arc::new(Store::open(&config.paths.store_dir)?);
     check_disk_space(&config.paths.store_dir);
-    let client = RepoClient::new(config)
-        .await?
-        .with_progress(output.progress())
-        .with_offline(offline)
-        .with_update(args.update)
-        .with_pinned_snapshots(args.frozen)
-        .with_allow_missing_checksums(args.allow_missing_checksums);
+    let client = mode.client(config).await?.with_progress(output.progress());
     let mut run = SyncRun {
         args,
-        offline,
+        mode,
         config,
         platforms,
         store,
@@ -376,9 +491,34 @@ async fn run_inner(
         output,
     };
 
-    if let Some(checked) = frozen {
-        run.client = run.client.with_lock_pins(&checked.lock);
-        return run.frozen(checked).await;
+    if let Some(mut checked) = frozen {
+        run.client = (run.client).with_lock_pins(checked.held.as_ref().unwrap_or(&checked.lock));
+        let unverified = (checked.held.as_ref().unwrap_or(&checked.lock)).missing_checksum_files();
+        let validated = checked.held.clone().unwrap_or_else(|| checked.lock.clone());
+        let held = checked.held.take();
+        let written = checked.written.take();
+        let (models, platforms) = (checked.models.clone(), checked.platforms.clone());
+        let mut outcome = run.frozen(checked).await?;
+        plugins::check_frozen(
+            config,
+            run.store.clone(),
+            run.client.clone(),
+            held.as_ref(),
+            &models,
+            &platforms,
+        )
+        .await?;
+        // The plugin tables' files are in the store too, as checked against
+        // their pins.
+        if let (Headline::CheckedStored(files), Some(held)) = (&mut outcome.headline, &held) {
+            *files = pinned_count(held, &platforms);
+        }
+        written.map_or(Ok(()), crate::commands::util::not_written)?;
+        record_checked(config, &run.client, &platforms, Some(&validated));
+        if !args.allow_missing_checksums {
+            warn_locked_missing_checksums(&unverified, output);
+        }
+        return Ok(outcome);
     }
 
     if !pom_exists {
@@ -387,45 +527,157 @@ async fn run_inner(
         });
     }
     if !config.lock.jdks.is_empty() {
-        let host_jdk = config.host().java_version();
-        if !config
-            .lock
-            .jdks
-            .iter()
-            .any(|jdk| rv_config::jdk_matches_target(jdk, host_jdk))
-        {
-            let listed = config.lock.jdks.join(", ");
-            tracing::warn!(
+        let listed = config.lock.jdks.join(", ");
+        match config.host().named_java_version() {
+            None => tracing::warn!(
                 sec_code = "JDK_NOT_LOCKED",
-                jdk = %host_jdk,
-                "[lock] jdks ({listed}) does not include this JDK ({host_jdk}); resolving the listed JDKs"
-            );
+                "[lock] jdks ({listed}) cannot be checked, as the version of this JDK is \
+                 unknown: {}; resolving the listed JDKs",
+                unnamed_jdk(config)
+            ),
+            Some(host_jdk)
+                if !(config.lock.jdks.iter())
+                    .any(|jdk| rv_config::jdk_matches_target(jdk, host_jdk)) =>
+            {
+                tracing::warn!(
+                    sec_code = "JDK_NOT_LOCKED",
+                    jdk = %host_jdk,
+                    "[lock] jdks ({listed}) does not include this JDK ({host_jdk}); resolving the listed JDKs"
+                );
+            }
+            Some(_) => {}
         }
     }
     let models = discover_reactor_models(config, &run.platforms)?;
 
     check_origin_aliases(config, declared_repository_urls(config, &models))?;
+    plugins::refuse_split_repository_id(config, &models)?;
     // Read once: an incompatible lockfile is replaced whole, so it neither
-    // short-circuits this run nor carries pins or metadata forward.
+    // short-circuits this run nor carries platforms or metadata forward. Its
+    // pins still hold.
     let previous_lock = match on_disk {
         Some(Ok(lock)) => Some(lock),
         Some(Err(CliError::LockfileMissing { .. } | CliError::LockfileIncompatible { .. }))
         | None => None,
         Some(Err(err)) => return Err(err),
     };
-    if let Some(lock) = previous_lock.as_ref() {
+    // The plugin rows too, which a resolution of the plugin tables fetches.
+    let pins = (held.as_ref().or(previous_lock.as_ref())).or_else(|| {
+        unreadable
+            .as_ref()
+            .and_then(|unreadable| unreadable.pins.as_ref())
+    });
+    if let Some(lock) = pins {
         run.client = run.client.with_lock_pins(lock);
     }
 
-    if !args.update
-        && let Some(lock) = previous_lock.as_ref()
-        && let Some(outcome) = run.reuse(lock, &models, false).await?
-    {
-        return Ok(outcome);
+    let reused = match previous_lock.as_ref() {
+        Some(lock) if !args.update => run.reuse(lock, held.as_ref(), &models, written).await?,
+        _ => None,
+    };
+    let mut outcome = match reused {
+        Some(outcome) => outcome,
+        None => {
+            run.resolve_and_write(
+                &models,
+                previous_lock.as_ref(),
+                held.as_ref(),
+                pins,
+                unreadable.as_ref(),
+            )
+            .await?
+        }
+    };
+    // Under the guard: a lock another sync writes once it is released is
+    // not this one's to put back.
+    if config.plugin_trace().is_some() && !offline {
+        outcome.trace = Some(trace::Start {
+            models,
+            written: lock_bytes(&config.lock_path),
+            previous,
+        });
     }
-    let baseline = unreadable.and_then(|unreadable| unreadable.head);
-    run.resolve_and_write(&models, previous_lock.as_ref(), baseline.as_ref())
-        .await
+    Ok(outcome)
+}
+
+/// How many files `lock` pins on `platforms`, its plugin tables' included,
+/// each once, as `raeva lock verify` hashes them.
+fn pinned_count(lock: &Lockfile, platforms: &[Platform]) -> usize {
+    let mut files = std::collections::BTreeSet::new();
+    for entry in (lock.platforms.iter()).filter(|entry| platforms.contains(&entry.platform)) {
+        files.extend((entry.pinned_files()).map(|file| (file.key, file.pin)));
+        if let Some(plugins) = entry.plugin_files() {
+            files.extend((plugins.pinned_files()).map(|file| (file.key, file.pin)));
+        }
+    }
+    files.len()
+}
+
+/// Hold an exclusive advisory lock on the project-level lockfile guard,
+/// which keeps two concurrent `raeva sync` runs with disjoint --platform
+/// sets from racing on raeva.lock, where the last writer would win and drop
+/// the other's platform entries. It lives in the cache directory, so only
+/// runs that share it take turns.
+///
+/// The wait is on the blocking pool, so it does not pin a tokio worker, and
+/// gives up after 60 s, as `rv-store`'s `StoreLock` does, so a wedged
+/// holder surfaces as an error.
+async fn lockfile_guard(
+    config: &Config,
+    project_root: &Path,
+    output: &Output,
+) -> Result<LockfileGuard> {
+    LockfileGuard::acquire_async(
+        &config.paths.cache_dir,
+        project_root,
+        std::time::Duration::from_secs(60),
+        {
+            let output = output.clone();
+            move || output.step("Waiting for another raeva sync of this project to finish...")
+        },
+    )
+    .await
+    .map_err(|err| {
+        if err.kind() == std::io::ErrorKind::TimedOut {
+            CliError::LockfileBusy {
+                project_root: project_root.to_path_buf(),
+                source: err,
+            }
+        } else {
+            CliError::io_at(&config.paths.cache_dir)(err)
+        }
+    })
+}
+
+/// How many files [`warn_locked_missing_checksums`] names.
+const SHOWN_UNVERIFIED: usize = 5;
+
+/// Warn that raeva.lock pins files a repository published no checksum file
+/// for, which `--allow-missing-checksums` accepted when they were locked.
+fn warn_locked_missing_checksums(
+    files: &std::collections::BTreeMap<String, rv_maven_types::Digest>,
+    output: &Output,
+) {
+    if files.is_empty() {
+        return;
+    }
+    let paths: Vec<&str> = files.keys().map(String::as_str).collect();
+    let mut named = paths[..paths.len().min(SHOWN_UNVERIFIED)].join(", ");
+    if paths.len() > SHOWN_UNVERIFIED {
+        named.push_str(&format!(" and {} more", paths.len() - SHOWN_UNVERIFIED));
+    }
+    output.warn(
+        crate::output::Warning::new(
+            crate::output::WarningCode::ChecksumMissingLocked,
+            format!(
+                "raeva.lock pins {} that no repository checksum file verified \
+                 (--allow-missing-checksums accepted them): {named}. The pins check the bytes; \
+                 pass --allow-missing-checksums to accept them without this warning",
+                crate::commands::util::plural(paths.len(), "file", "files")
+            ),
+        )
+        .with_context(serde_json::json!({ "files": paths })),
+    );
 }
 
 pub(crate) struct LockDownloadContext {
@@ -441,23 +693,17 @@ impl LockDownloadContext {
         lock: &Lockfile,
         platform: &Platform,
         output: &Output,
-        offline: bool,
-        allow_missing_checksums: bool,
-        update: bool,
+        mode: &Mode,
     ) -> Result<Self> {
         let config = config.for_platforms([(platform.os(), platform.arch(), platform.jdk())]);
-        let client = RepoClient::new(&config)
-            .await?
+        let client = (mode.restore_client(&config).await?)
             .with_progress(output.progress())
-            .with_offline(offline)
-            .with_update(update)
-            .with_pinned_snapshots(!update)
-            .with_allow_missing_checksums(allow_missing_checksums)
             .with_lock_pins(lock);
         Ok(Self::from_client(config, client, platform.clone()))
     }
 
     pub(crate) fn from_client(config: Config, client: RepoClient, platform: Platform) -> Self {
+        let client = client.for_platform(&config);
         Self {
             config,
             client,
@@ -522,12 +768,18 @@ impl LockDownloadContext {
         let resolve = always
             || rv_repo::restore_needs_discovery(store.as_ref(), lock, &[self.as_restore()]).await?;
         if resolve {
+            // The restore after it fetches what the lock pins: fetch that
+            // beside the resolution.
+            let (_prefetch, observer) =
+                download::prefetch_pinned(&self.config, &self.client, &store, lock, models);
             self.trusted = resolve_reactor_lock(
                 &self.config,
                 store,
                 self.client.clone(),
                 &self.platforms,
                 models,
+                None,
+                observer,
             )
             .await?
             .trusted_repositories;
@@ -565,7 +817,7 @@ impl LockDownloadContext {
 
 struct SyncRun<'a> {
     args: &'a SyncArgs,
-    offline: bool,
+    mode: Mode,
     config: &'a Config,
     platforms: Vec<Platform>,
     store: Arc<Store>,
@@ -578,59 +830,73 @@ struct SyncRun<'a> {
 }
 
 impl SyncRun<'_> {
-    /// `--frozen` after [`check_frozen_local`]: reuse current pins or compare a
-    /// fresh resolution, without writing the lockfile.
+    /// `--frozen` after [`check_frozen_local`]: resolve again and compare the
+    /// result with the lock, without writing it, then download what it pins.
+    /// Unchanged inputs replay the lock's version choices, so only an edit of
+    /// the lock itself, or bytes that changed under a pin, can make them
+    /// differ.
     async fn frozen(&self, checked: FrozenLocal) -> Result<SyncOutcome> {
         let config = self.config;
         let FrozenLocal {
             lock,
+            held: _,
             models,
             platforms,
             models_match,
+            unselected,
+            written: _,
         } = checked;
         let selected = lock
             .select_platforms(&platforms)
             .expect("recorded platform");
-        if self.offline {
-            // Offline freshness checks keep their existing model scope and
-            // do not refresh SNAPSHOTs or restore artifacts.
+        if self.mode.offline() {
+            // Offline the resolution reads only the store, the metadata cache
+            // and local repositories, and nothing is downloaded, so then
+            // check that the store has what an offline build needs.
+            self.output.step("Resolving dependencies...");
+            let (fresh, resolved) = validate_frozen_resolution(
+                config,
+                self.store.clone(),
+                self.client.clone(),
+                &lock,
+                &models,
+                models_match,
+                self.output,
+            )
+            .await?;
             // The repositories a resolution trusts, a remote parent's
             // included: files they served count as stored.
-            let mut resolved = None;
-            if !models_match || lock_references_unconfigured_origin(&selected, config, &models) {
-                resolved = Some(
-                    validate_frozen_resolution(
-                        config,
-                        self.store.clone(),
-                        self.client.clone(),
-                        &lock,
-                        &models,
-                        self.output,
-                    )
-                    .await?
-                    .1,
-                );
-            }
-            // Offline nothing is downloaded, so check that the store has
-            // what an offline build needs, apart from whether the lock is
-            // current.
             let mut trusted = (self.client.policy())
                 .admit(
                     models.iter().flat_map(ReactorModel::declared_repositories),
                     rv_repo::Declaration::LocalPom,
                 )
                 .admitted;
-            let resolve = resolved.is_none().then_some(models.as_slice());
-            trusted.extend(resolved.unwrap_or_default());
-            let store = self.store.clone();
+            trusted.extend(resolved);
+            // A file another platform's repository served for a row of these
+            // counts as well, as the online check fetches it there.
+            trusted.extend(
+                rv_repo::RepositoryPolicy::screen(
+                    config,
+                    unselected
+                        .iter()
+                        .flat_map(ReactorModel::declared_repositories),
+                    rv_repo::Declaration::LocalPom,
+                )
+                .admitted,
+            );
+            // A support POM counts under the repository the resolution read
+            // it from, as online it is downloaded from there: the lock's may
+            // be one only an imported BOM declares, which a mirror replaces.
+            let counted = with_origins_of(&selected, &fresh, true);
             let (missing, files) = count_stored(
                 config,
-                store,
+                self.store.clone(),
                 &self.client,
-                &selected,
+                &counted,
                 &platforms,
                 &mut trusted,
-                resolve,
+                None,
             )
             .await?;
             if missing > 0 {
@@ -644,48 +910,71 @@ impl SyncRun<'_> {
                 ));
             }
             return Ok(self.finish(&selected, Vec::new(), Headline::CheckedStored(files)));
-        } else {
-            // Use the same reuse decision and restoration as plain sync. A
-            // changed model of a platform not selected resolves them all.
-            if models_match && let Some(outcome) = self.reuse(&lock, &models, models_match).await? {
-                return Ok(outcome);
-            }
-            let resolving: Vec<_> = models.iter().map(|model| model.platform.clone()).collect();
-            let mut resolved = resolve_reactor_lock(
-                self.config,
-                self.store.clone(),
-                self.client.clone(),
-                &resolving,
-                &models,
-            )
-            .await?;
-            let downloads = with_origins_of(&selected, &resolved.lock);
-            merge_previous(
-                config,
-                &mut resolved.lock,
-                Some(&lock),
-                &models,
-                &resolved.reads,
-                &resolved.trusted_repositories,
-            )?;
-            check_resolution(config, &lock, &resolved, &models, self.output)?;
-            self.download_lock(&downloads, &models, Some(&resolved))
-                .await?;
         }
+        self.output.step("Resolving dependencies...");
+        let resolved = match resolve::recompute(
+            config,
+            self.store.clone(),
+            self.client.clone(),
+            &lock,
+            &models,
+            models_match,
+            self.output,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            // A pinned file gone from its repository, or replaced there,
+            // fails the resolution among every repository searched; the
+            // restore of the lock as written names it as such.
+            Err(err) if models_match && !matches!(err, CliError::LockfileMismatch { .. }) => {
+                self.output.step("Downloading the locked artifacts...");
+                self.download_lock(&selected, &models, None, None).await?;
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        let downloads = with_origins_of(&selected, &resolved.lock, false);
+        self.output.step("Downloading the locked artifacts...");
+        self.download_lock(
+            &downloads,
+            &models,
+            Some(&resolved),
+            Some((&lock, &unselected)),
+        )
+        .await?;
         Ok(self.finish(&selected, Vec::new(), Headline::Checked))
     }
 
-    /// `matched` when [`frozen_models_match`] already holds for `previous`
-    /// and `models`: it then holds for any selection of their platforms.
+    /// A plain sync's reuse of `previous` as written, when its inputs are
+    /// unchanged and no SNAPSHOT check is due.
     async fn reuse(
         &self,
         previous: &Lockfile,
+        held: Option<&Lockfile>,
         models: &[ReactorModel],
-        matched: bool,
+        written: Option<std::thread::JoinHandle<bool>>,
     ) -> Result<Option<SyncOutcome>> {
         let config = self.config;
-        let config_hash = resolution_config_hash(config, &recorded_ambient(previous))?;
-        if previous.config_hash.as_deref() != Some(config_hash.as_str()) {
+        let ambient = recorded_ambient(previous);
+        let config_hash = resolution_config_hash(config, &ambient)?;
+        // The option names too, which a frozen check compares.
+        if crate::commands::lock_inputs::reads_unnamed_jdk(config, &ambient)
+            || previous.config_hash.as_deref() != Some(config_hash.as_str())
+            || previous.maven != config.lock.maven.mode
+            || previous.resolution.command_line != command_line_names(config, &ambient)
+            || previous.unread_property_name().is_some()
+            || reads_hidden_env(config, previous)
+        {
+            return Ok(None);
+        }
+        // The hash reads the project and home directories as markers, so a
+        // copy keeps it while a value a POM compares names another
+        // directory: the lock stands only where this home wrote or checked
+        // it with the directories as they are here.
+        if hides_host_directories(config, previous)?
+            && !checked_here(config, &self.client, &self.platforms)
+        {
             return Ok(None);
         }
         // A requested platform missing from the lockfile is a cache miss:
@@ -693,36 +982,137 @@ impl SyncRun<'_> {
         let Ok(selected) = previous.select_platforms(&self.platforms) else {
             return Ok(None);
         };
-        // A plain online sync restores a lock whose origins only a remote
-        // POM declares, establishing that trust while it restores;
-        // `--frozen` and `--offline` resolve to check them.
-        let check_origins = self.args.frozen || self.offline;
-        // Only a plain sync looks for newer SNAPSHOT builds once their update
-        // policy expires; `--frozen` restores the locked ones. A changed
-        // system file drops the platform that records it, selected or not.
+        // Online, a lock whose origins only a remote POM declares is
+        // restored, establishing that trust while it restores; offline it
+        // is resolved to check them. Newer SNAPSHOT builds are looked for
+        // once their update policy expires. A changed system file drops the
+        // platform that records it, selected or not.
+        // A row whose checksums a resolution would not write is written
+        // again, as a frozen check refuses it.
+        let rows = (selected.platforms.iter()).flat_map(|entry| &entry.artifacts);
         if previous.system_file_drift(&config.project_root).is_some()
-            || !(matched || frozen_models_match(&selected, models))
-            || (!self.args.frozen && lock_requires_snapshot_refresh(&selected, config, models))
-            || (check_origins && lock_references_unconfigured_origin(&selected, config, models))
+            || !rows
+                .clone()
+                .all(rv_lock::LockArtifact::checksums_as_resolved)
+            || !frozen_models_match(&selected, models)
+            || lock_requires_snapshot_refresh(&selected, config, models, self.checked())
+            || (self.mode.offline()
+                && lock_references_unconfigured_origin(&selected, config, models))
         {
             return Ok(None);
         }
-        // `--offline` opts out of any network call; treat the fast-path
-        // as resolution-only and skip the artifact download.
-        if !self.offline {
-            self.output.step("Downloading the locked artifacts...");
-            if !self.download_lock(&selected, models, None).await? {
+        // A platform not selected is kept only with plugin tables that hold;
+        // the resolution drops one without.
+        let unselected =
+            (previous.platforms.iter()).filter(|entry| !self.platforms.contains(&entry.platform));
+        for entry in unselected {
+            if !plugins::kept(config, held.unwrap_or(previous), &entry.platform)? {
                 return Ok(None);
             }
         }
-        Ok(Some(self.finish(&selected, Vec::new(), Headline::Checked)))
+        // raeva.lock records no repository for a build extension's jars, so
+        // only a resolution fetches them: one the store lacks is fetched by
+        // the frozen check's, and a lock that check does not reproduce is
+        // resolved again.
+        let resolved = if extension_jars_stored(config, &self.store, &selected, models).await? {
+            None
+        } else {
+            self.output.step("Resolving dependencies...");
+            let (store, client) = (self.store.clone(), self.client.clone());
+            let resolved =
+                resolve::recompute(config, store, client, &selected, models, true, self.output);
+            match resolved.await {
+                Ok(resolved) => Some(resolved),
+                Err(CliError::LockfileMismatch { .. }) => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        };
+        // Offline, the restore reads only the store and local repositories,
+        // and fails on a file they lack.
+        if !self.mode.offline() {
+            self.output.step("Downloading the locked artifacts...");
+        }
+        let restored = match &resolved {
+            Some(resolved) => {
+                let downloads = with_origins_of(&selected, &resolved.lock, false);
+                (self.download_lock(&downloads, models, Some(resolved), None)).await?
+            }
+            None => self.download_lock(&selected, models, None, None).await?,
+        };
+        if !restored {
+            return Ok(None);
+        }
+        let written = written.is_some_and(|written| written.join().unwrap_or(false));
+        let found = held.unwrap_or(previous);
+        let (store, client) = (self.store.clone(), self.client.clone());
+        // The plugin tables of a lock this home neither wrote nor checked
+        // stay only once the frozen check of them passes.
+        let recorded = self.recorded();
+        let mut failed = recorded.then(Vec::new);
+        let keep = match held.filter(|_| plugins::wanted(config)) {
+            Some(held)
+                if plugins::fresh(config, client.policy(), held, models, &self.platforms)? =>
+            {
+                if !recorded {
+                    self.output.step("Checking plugins...");
+                    let checking = self.mode.restoring(client.clone());
+                    let platforms = &self.platforms;
+                    failed = Some(
+                        plugins::checked(config, store.clone(), checking, held, models, platforms)
+                            .await,
+                    );
+                }
+                failed.as_ref().is_some_and(Vec::is_empty)
+            }
+            _ => false,
+        };
+        let (mut lock, kept) = match (plugins::wanted(config), held) {
+            (false, None) => (previous.clone(), written),
+            (true, Some(held)) if keep => {
+                plugins::fetch(config, store, client, held, models, &self.platforms, &[]).await?;
+                (held.clone(), written)
+            }
+            // The Maven 3.9 checks of new plugin tables read what the
+            // modules' resolution reads, which raeva.lock does not hold.
+            (true, _) if config.lock.maven.mode == rv_maven_types::MavenMode::Maven39 => {
+                return Ok(None);
+            }
+            (true, held) => {
+                let mut lock = found.clone();
+                (self.attach_plugins(&mut lock, models, held, None, failed, None)).await?;
+                (lock, false)
+            }
+            (false, Some(_)) => (previous.clone(), false),
+        };
+        // A file downloaded again drops the marker a checksum file now
+        // verifies.
+        lock.mark_missing_checksums(&self.client.admissions(), Some(found));
+        if kept && lock == *found {
+            if !recorded && keep {
+                record_checked(config, &self.client, &self.platforms, Some(found));
+            }
+            return Ok(Some(self.finish(&selected, Vec::new(), Headline::Checked)));
+        }
+        let before = lock_bytes(&config.lock_path);
+        self.write(&lock)?;
+        record_checked(config, &self.client, &self.platforms, None);
+        // Plugin tables resolved again can come out as they were.
+        if before.is_some() && lock_bytes(&config.lock_path) == before {
+            return Ok(Some(self.finish(&selected, Vec::new(), Headline::UpToDate)));
+        }
+        let changes = lock_diff(found, &lock, &self.platforms, self.output.is_verbose());
+        Ok(Some(self.finish(&selected, changes, Headline::Updated)))
     }
 
+    /// `pins` holds the pins of `previous`, or of `unreadable`, which other
+    /// bytes must not replace without `--update`.
     async fn resolve_and_write(
         &self,
         models: &[ReactorModel],
         previous: Option<&Lockfile>,
-        baseline: Option<&Lockfile>,
+        held: Option<&Lockfile>,
+        pins: Option<&Lockfile>,
+        unreadable: Option<&regenerate::Unreadable>,
     ) -> Result<SyncOutcome> {
         let config = self.config;
         self.output.step("Resolving dependencies...");
@@ -732,33 +1122,58 @@ impl SyncRun<'_> {
             self.client.clone(),
             &self.platforms,
             models,
+            None,
+            None,
         )
         .await?;
         if !self.args.update
-            && let Some(previous) = previous
+            && let Some(pins) = pins
         {
-            download::check_repinned(previous, &resolved.lock)?;
+            download::check_repinned(pins, &resolved.lock, &self.store).await?;
         }
         self.output.step("Downloading artifacts...");
-        self.download_lock(&resolved.lock, models, Some(&resolved))
+        self.download_lock(&resolved.lock, models, Some(&resolved), None)
             .await?;
-        let mut lock = resolved.lock;
+        let mut resolved = resolved;
+        let fetched: std::collections::BTreeSet<_> =
+            resolved.lock.pinned_files().into_keys().collect();
+        let mut lock = std::mem::take(&mut resolved.lock);
         merge_previous(
             config,
             &mut lock,
             previous,
+            held.or(previous),
             models,
             &resolved.reads,
             &resolved.trusted_repositories,
         )?;
+        self.download_merged(&lock, &fetched, models, &resolved)
+            .await?;
         warn_system_scope_from_lock(&lock);
-        lock.warn_on_env_values(config.host().env_values());
+        if plugins::wanted(config) {
+            let carried = unreadable.and_then(|unreadable| unreadable.pins.as_ref());
+            let failed = self.recorded().then(Vec::new);
+            let reads = Some(&resolved.pom_reads);
+            self.attach_plugins(&mut lock, models, held, carried, failed, reads)
+                .await?;
+        }
+        // After the merge and the plugin tables, so a platform kept from the
+        // previous lock and a plugin file take what this run learned of the
+        // same file too.
+        lock.mark_missing_checksums(&self.client.admissions(), pins);
         let before = lock_bytes(&config.lock_path);
-        lock.write_atomic(&config.lock_path)
-            .map_err(|err| match err {
-                rv_lock::LockError::Io { source, .. } => CliError::io_at(&config.lock_path)(source),
-                other => other.into(),
-            })?;
+        self.write(&lock)?;
+        record_checked(config, &self.client, &self.platforms, None);
+        let (client, project) = (self.client.clone(), project_key(config));
+        let (checked, started) = (
+            self.snapshot_checks(previous, &lock, models),
+            self.mode.started(),
+        );
+        let others: Vec<_> = (self.platforms.iter())
+            .map(ToString::to_string)
+            .filter(|platform| !checked.contains(platform))
+            .collect();
+        let record = move || client.record_snapshot_check(&project, &checked, &others, started);
         let headline = match before {
             None => Headline::Wrote,
             Some(before) if lock_bytes(&config.lock_path).as_deref() == Some(&before[..]) => {
@@ -767,14 +1182,16 @@ impl SyncRun<'_> {
             Some(_) => Headline::Updated,
         };
         // A regenerated lock lists its changes against the one git has.
-        let changes = match (&headline, previous.or(baseline)) {
+        let baseline = unreadable.and_then(|unreadable| unreadable.head.as_ref());
+        let changes = match (&headline, held.or(previous).or(baseline)) {
             (Headline::Updated, Some(previous)) => {
                 lock_diff(previous, &lock, &self.platforms, self.output.is_verbose())
             }
             _ => Vec::new(),
         };
 
-        let outcome = self.finish(&lock, changes, headline);
+        let mut outcome = self.finish(&lock, changes, headline);
+        outcome.snapshot_check = Some(Box::new(record));
         tracing::info!(
             artifacts = outcome.dep_count,
             elapsed_ms = self.start.elapsed().as_millis() as u64,
@@ -783,17 +1200,76 @@ impl SyncRun<'_> {
         Ok(outcome)
     }
 
+    /// Give `lock` the plugin tables of its platforms.
+    async fn attach_plugins(
+        &self,
+        lock: &mut Lockfile,
+        models: &[ReactorModel],
+        held: Option<&Lockfile>,
+        carried: Option<&Lockfile>,
+        failed: Option<Vec<Platform>>,
+        pom_reads: Option<&resolve::ModulePomReads>,
+    ) -> Result<()> {
+        let (store, client) = (self.store.clone(), self.client.clone());
+        let output = self.output;
+        plugins::attach(
+            self.config,
+            store,
+            client,
+            lock,
+            models,
+            held,
+            carried,
+            failed,
+            output,
+            pom_reads,
+        )
+        .await
+    }
+
+    /// Whether raeva.lock as it is now is one this home wrote, or checked,
+    /// for every platform of this run.
+    fn recorded(&self) -> bool {
+        let Some(bytes) = lock_bytes(&self.config.lock_path) else {
+            return false;
+        };
+        let sha256 = lock_digest(&bytes);
+        (self.client.checked_lock(&checked_key(self.config, &bytes))).is_some_and(
+            |(recorded, platforms)| {
+                recorded == sha256
+                    && (self.platforms.iter())
+                        .all(|platform| platforms.lines().any(|line| line == platform.to_string()))
+            },
+        )
+    }
+
+    /// Write `lock`, after warning of each field that holds an allowlisted
+    /// variable's value, plugin tables included.
+    fn write(&self, lock: &Lockfile) -> Result<()> {
+        lock.warn_on_env_values(self.config.host().env_values());
+        let path = &self.config.lock_path;
+        lock.write_atomic(path).map_err(|err| match err {
+            rv_lock::LockError::Io { source, .. } => CliError::io_at(path)(source),
+            other => other.into(),
+        })
+    }
+
     /// Restore each platform with its own settings, declarations and policies.
     /// Without `resolved`, a platform whose rows name a repository only a
     /// remote POM declares is resolved first to establish that trust, and
     /// the result is false, with nothing restored, when a row or a file to
     /// restore still names a repository no declaration of its platform
     /// does: the lock must be resolved again.
+    ///
+    /// With `resolved`, `unselected` holds the recorded lock and the models
+    /// of the platforms the run does not check, whose trust the restore
+    /// takes too; see [`Self::trust_unselected`].
     async fn download_lock(
         &self,
         lock: &Lockfile,
         models: &[ReactorModel],
         resolved: Option<&ResolvedReactorLock>,
+        unselected: Option<(&Lockfile, &[ReactorModel])>,
     ) -> Result<bool> {
         let mut contexts = Vec::new();
         for entry in &lock.platforms {
@@ -807,27 +1283,26 @@ impl SyncRun<'_> {
                 LockDownloadContext::from_client(
                     self.config
                         .for_platforms([(platform.os(), platform.arch(), platform.jdk())]),
-                    self.client.clone(),
+                    self.mode.restoring(self.client.clone()),
                     platform.clone(),
                 )
             } else {
-                LockDownloadContext::new(
-                    self.config,
-                    lock,
-                    platform,
-                    self.output,
-                    self.offline,
-                    self.args.allow_missing_checksums,
-                    self.args.update,
-                )
-                .await?
+                LockDownloadContext::new(self.config, lock, platform, self.output, &self.mode)
+                    .await?
             };
             if let Some(resolved) = resolved {
+                // A platform's own client trusts what the run's resolution
+                // admitted, as the run's client does.
                 context.trusted = resolved.repositories_for(platform).to_vec();
+                context.client.policy().grant_admitted(&context.trusted);
             } else {
                 context.trust_model(std::slice::from_ref(model_for(models, platform)));
             }
             contexts.push(context);
+        }
+        if let (Some(_), Some(unselected)) = (resolved, unselected) {
+            self.trust_unselected(&mut contexts, lock, unselected.1)
+                .await?;
         }
         // Each context's lock, model, and whether its trust was resolved.
         let mut undiscovered = Vec::new();
@@ -869,7 +1344,13 @@ impl SyncRun<'_> {
         let Err(err) = restored else {
             return Ok(true);
         };
-        if self.offline {
+        let err = match unselected {
+            Some((recorded, others)) if !others.is_empty() => {
+                other_platform_origin(err, lock, recorded)
+            }
+            _ => err,
+        };
+        if self.mode.offline() {
             return Err(err);
         }
         let mut retry = false;
@@ -897,13 +1378,137 @@ impl SyncRun<'_> {
         Ok(true)
     }
 
+    /// Let `contexts`, of a run that checks only some of the platforms
+    /// `recorded` holds, also fetch the files `lock` pins from the
+    /// repositories the POMs of the platforms it does not check declare,
+    /// their `others` models: a row can take the POM another platform read
+    /// from its repository. The pins decide the bytes, and nothing this run
+    /// checks is resolved through these repositories: a context that takes
+    /// one gets its own client. A file to restore whose repository only
+    /// another platform's resolution trusts, as a remote parent's profile
+    /// declares it, fails the restore; see [`other_platform_origin`].
+    async fn trust_unselected(
+        &self,
+        contexts: &mut [LockDownloadContext],
+        lock: &Lockfile,
+        others: &[ReactorModel],
+    ) -> Result<()> {
+        if others.is_empty() {
+            return Ok(());
+        }
+        let found = rv_repo::RepositoryPolicy::screen(
+            self.config,
+            others.iter().flat_map(ReactorModel::declared_repositories),
+            rv_repo::Declaration::LocalPom,
+        )
+        .admitted;
+        for context in contexts.iter_mut() {
+            let mut extra: Vec<Repository> = Vec::new();
+            for repo in &found {
+                if !context.trusted.contains(repo) && !extra.contains(repo) {
+                    extra.push(repo.clone());
+                }
+            }
+            if extra.is_empty() {
+                continue;
+            }
+            let platform = &context.platforms[0];
+            context.client =
+                (LockDownloadContext::new(self.config, lock, platform, self.output, &self.mode))
+                    .await?
+                    .client;
+            context.client.policy().grant_admitted(&context.trusted);
+            context.client.policy().grant_admitted(&extra);
+            context.trusted.extend(extra);
+        }
+        Ok(())
+    }
+
+    /// Download the files the merge of `lock` added to the platforms this
+    /// run resolved, beside the `fetched` ones: a row can take the pin of
+    /// the POM a platform it keeps read, which a later offline check needs.
+    /// They come through the repositories the kept platforms' POMs declare
+    /// too, as `--frozen` of the platforms fetches them.
+    async fn download_merged(
+        &self,
+        lock: &Lockfile,
+        fetched: &std::collections::BTreeSet<(
+            rv_maven_types::ArtifactCoord,
+            rv_maven_types::Digest,
+        )>,
+        models: &[ReactorModel],
+        resolved: &ResolvedReactorLock,
+    ) -> Result<()> {
+        let Ok(selected) = lock.select_platforms(&self.platforms) else {
+            return Ok(());
+        };
+        if (selected.pinned_files().keys()).all(|key| fetched.contains(key)) {
+            return Ok(());
+        }
+        let kept: Vec<Platform> = (lock.platforms.iter())
+            .map(|entry| entry.platform.clone())
+            .filter(|platform| !self.platforms.contains(platform))
+            .collect();
+        let others = if kept.is_empty() {
+            Vec::new()
+        } else {
+            let config = self.config.for_platforms(
+                (kept.iter()).map(|platform| (platform.os(), platform.arch(), platform.jdk())),
+            );
+            discover_reactor_models(&config, &kept)?
+        };
+        self.download_lock(&selected, models, Some(resolved), Some((lock, &others)))
+            .await?;
+        Ok(())
+    }
+
+    /// When the SNAPSHOT builds of a platform were last checked.
+    fn checked(&self) -> impl Fn(&Platform) -> Option<SnapshotCheck> {
+        let project = project_key(self.config);
+        move |platform| (self.client).snapshot_check(&project, &platform.to_string())
+    }
+
+    /// The platforms whose SNAPSHOT builds a resolution of this run checked:
+    /// under `--update` every one, else those whose check was due in
+    /// `previous` or in the `written` lock, or that `previous` lacks.
+    /// Another one read the metadata cached by its last check, which stays
+    /// its time.
+    fn snapshot_checks(
+        &self,
+        previous: Option<&Lockfile>,
+        written: &Lockfile,
+        models: &[ReactorModel],
+    ) -> Vec<String> {
+        let checked = self.checked();
+        let due = |lock: &Lockfile, platform: &Platform| match lock
+            .select_platforms(std::slice::from_ref(platform))
+        {
+            Ok(selected) => {
+                lock_requires_snapshot_refresh(&selected, self.config, models, &checked)
+            }
+            Err(_) => true,
+        };
+        (self.platforms.iter())
+            .filter(|platform| {
+                self.mode.intent() == Intent::Update
+                    || previous.is_none_or(|lock| due(lock, platform))
+                    || due(written, platform)
+            })
+            .map(ToString::to_string)
+            .collect()
+    }
+
     /// What every successful mode ends with.
     fn finish(&self, lock: &Lockfile, changes: Vec<String>, headline: Headline) -> SyncOutcome {
         SyncOutcome {
-            dep_count: count_dependencies(lock),
+            dep_count: count_dependencies(
+                (lock.platforms.iter()).filter(|entry| self.platforms.contains(&entry.platform)),
+            ),
             platforms: self.platforms.clone(),
             changes,
             headline,
+            trace: None,
+            snapshot_check: None,
         }
     }
 }
@@ -911,34 +1516,80 @@ impl SyncRun<'_> {
 /// A lockfile that passed the checks of `--frozen` that need no store,
 /// network or cache.
 struct FrozenLocal {
+    /// The lock without its plugin tables.
     lock: Lockfile,
+    /// The lock as written, when it has plugin tables.
+    held: Option<Lockfile>,
     models: Vec<ReactorModel>,
     platforms: Vec<Platform>,
     /// [`frozen_models_match`] of `lock` and `models`.
     models_match: bool,
+    /// The models of the recorded platforms not checked.
+    unselected: Vec<ReactorModel>,
+    /// Whether raeva.lock holds the text raeva writes for it, which the
+    /// run checks last.
+    written: Option<std::thread::JoinHandle<bool>>,
 }
 
 /// The `[lock] jdks` entry that covers `host_jdk`: its feature release, as
-/// `25` covers `25.0.1`.
+/// `25` covers `25.0.1` and `1.8` covers `1.8.0_442`.
 fn jdk_entry(host_jdk: &str) -> String {
     let host = host_jdk.trim();
-    match host.split(['.', '_', '-', '+']).next() {
-        Some(major) if major != "1" && rv_config::is_valid_jdk(major) => major.to_string(),
-        _ => crate::output::inline_text(host).into_owned(),
+    let mut parts = host.split(['.', '_', '-', '+']);
+    let entry = match (parts.next(), parts.next()) {
+        (Some("1"), Some(feature)) => format!("1.{feature}"),
+        (Some(major), _) => major.to_string(),
+        (None, _) => String::new(),
+    };
+    match rv_config::is_valid_jdk(&entry) && rv_config::jdk_matches_target(&entry, host) {
+        true => entry,
+        false => crate::output::inline_text(host).into_owned(),
     }
+}
+
+/// The checks `sync --frozen` makes before it reads a repository, for a
+/// command that relies on one having passed.
+pub(crate) fn check_frozen_inputs(config: &Config) -> Result<()> {
+    let args = SyncArgs {
+        frozen: true,
+        update: false,
+        platforms: Vec::new(),
+        allow_missing_checksums: false,
+    };
+    let pom_exists = config.project_root.join("pom.xml").is_file();
+    check_frozen_local(config, &args, pom_exists, false).map(drop)
 }
 
 /// Discover the current models and check `config_hash` and the recorded
 /// system files without resolving.
-fn check_frozen_local(config: &Config, args: &SyncArgs, pom_exists: bool) -> Result<FrozenLocal> {
-    let lock = read_lockfile(config)?;
+/// `warn` warns of the lock's system-scoped files.
+fn check_frozen_local(
+    config: &Config,
+    args: &SyncArgs,
+    pom_exists: bool,
+    warn: bool,
+) -> Result<FrozenLocal> {
+    let mut lock = read_lockfile(config)?;
+    let written = crate::commands::util::check_written(&lock, &config.lock_path);
+    // `config_hash` does not cover the name of a property no target reads,
+    // which a hand edit can add. A lock raeva derives for one platform, as a
+    // trace exports, keeps the other platforms' names, so only the lock as
+    // written is checked.
+    if let Some(input) = lock.unread_property_name() {
+        return Err(CliError::lockfile_mismatch(format!(
+            "raeva.lock lists {} under [resolution] ambient_inputs, which no target's inputs \
+             list as read; run 'raeva sync' to write it again",
+            rv_maven_types::bounded(&input.to_string())
+        )));
+    }
+    let held = plugins::strip(&mut lock);
     if !pom_exists {
         return Err(CliError::ProjectFileMissing {
             path: config.project_root.join("pom.xml"),
         });
     }
     let recorded = recorded_platforms(&lock);
-    let platforms = resolve_platforms(args, &recorded, &config.lock.jdks)?;
+    let platforms = resolve_platforms(&args.platforms, &recorded, &config.lock.jdks)?;
     let missing = |os_arch: String| {
         let mut recorded: Vec<String> = (lock.platforms.iter())
             .map(|entry| entry.platform.os_arch())
@@ -969,60 +1620,177 @@ fn check_frozen_local(config: &Config, args: &SyncArgs, pom_exists: bool) -> Res
         }
         missing(os_arch)
     })?;
-    warn_system_scope_from_lock(&selected);
+    if warn {
+        warn_system_scope_from_lock(&selected);
+    }
     let config = &config.for_platforms(
         recorded
             .iter()
             .map(|platform| (platform.os(), platform.arch(), platform.jdk())),
     );
+    config.settings_activation()?;
     let mut models = discover_reactor_models(config, &recorded)?;
     let models_match = frozen_models_match(&lock, &models);
     // A changed model resolves every recorded platform, as a plain --frozen
     // does: a platform not selected cannot be kept without resolving it.
+    let mut unselected = Vec::new();
     if models_match {
-        models.retain(|model| platforms.contains(&model.platform));
+        (models, unselected) =
+            (models.into_iter()).partition(|model| platforms.contains(&model.platform));
     }
     check_origin_aliases(config, declared_repository_urls(config, &models))?;
+    plugins::refuse_split_repository_id(config, &models)?;
+    crate::commands::lock_inputs::refuse_unnamed_jdk_reads(config, &recorded_ambient(&lock))?;
     check_recorded_freshness(
         config,
         &lock,
         &models,
         models_match,
+        true,
         "raeva.lock has no config_hash, so --frozen cannot check it against the configuration",
     )?;
-    if !config.lock.jdks.is_empty() {
-        let host_jdk = config.host().java_version();
-        if !config
-            .lock
-            .jdks
-            .iter()
-            .any(|jdk| rv_config::jdk_matches_target(jdk, host_jdk))
-        {
-            return Err(CliError::lockfile_mismatch_with(
+    if let Some((reason, hint)) = unlisted_host_jdk(config) {
+        return Err(CliError::lockfile_mismatch_with(reason, hint));
+    }
+    Ok(FrozenLocal {
+        lock,
+        held,
+        models,
+        platforms,
+        models_match,
+        unselected,
+        written: Some(written),
+    })
+}
+
+/// `err`, a restore of `lock`, a selection of `recorded`, that refused a
+/// repository no configuration or declaration of its platforms names, as
+/// [`CliError::OtherPlatformOrigin`] when a platform `lock` leaves out
+/// records a file from it: only that platform's build declares it.
+fn other_platform_origin(err: CliError, lock: &Lockfile, recorded: &Lockfile) -> CliError {
+    let CliError::Download {
+        failures,
+        first: rv_repo::RepoError::UntrustedRepoUrl(repo),
+    } = &err
+    else {
+        return err;
+    };
+    let platforms: Vec<String> = (recorded.platforms.iter())
+        .filter(|entry| !(lock.platforms.iter()).any(|kept| kept.platform == entry.platform))
+        .filter(|entry| {
+            (entry.pinned_files()).any(|file| {
+                (file.origins.iter()).any(|origin| rv_lock::redact_origin(origin) == *repo)
+            })
+        })
+        .map(|entry| entry.platform.to_string())
+        .collect();
+    if platforms.is_empty() {
+        return err;
+    }
+    let file = (failures.first())
+        .and_then(|failure| failure.split_once(": "))
+        .map_or_else(String::new, |(package, _)| package.to_string());
+    CliError::OtherPlatformOrigin {
+        file,
+        repo: repo.clone(),
+        platforms,
+    }
+}
+
+/// Why `--frozen` refuses this JDK, and what to do, when raeva.toml sets
+/// `[lock] jdks` and this JDK's version is unknown or matches none of them.
+pub(crate) fn unlisted_host_jdk(config: &Config) -> Option<(String, String)> {
+    if config.lock.jdks.is_empty() {
+        return None;
+    }
+    let jdks = config.lock.jdks.join(", ");
+    let Some(host_jdk) = config.host().named_java_version() else {
+        return Some((
+            format!(
+                "raeva.lock covers the JDKs in [lock] jdks ({jdks}), and the version of this JDK \
+                 is unknown: {}",
+                unnamed_jdk(config)
+            ),
+            "Set JAVA_HOME to the JDK the build uses, or JAVA_VERSION to its version".to_string(),
+        ));
+    };
+    (!(config.lock.jdks.iter()).any(|jdk| rv_config::jdk_matches_target(jdk, host_jdk))).then(
+        || {
+            (
                 format!(
-                    "raeva.lock covers the JDKs in [lock] jdks ({}), not this JDK ({host_jdk})",
-                    config.lock.jdks.join(", ")
+                    "raeva.lock covers the JDKs in [lock] jdks ({jdks}), not this JDK ({host_jdk})"
                 ),
                 format!(
                     "Run on a listed JDK, or add {} to [lock] jdks in raeva.toml and run \
                      'raeva sync'",
                     jdk_entry(host_jdk)
                 ),
-            ));
-        }
-    }
-    Ok(FrozenLocal {
-        lock,
-        models,
-        platforms,
-        models_match,
-    })
+            )
+        },
+    )
 }
 
-/// `lock` with each artifact row's repository taken from `fresh`'s row for
-/// the same platform and coordinate, where it has one. Pins, snapshot
-/// builds and everything else stay `lock`'s.
-fn with_origins_of(lock: &Lockfile, fresh: &Lockfile) -> Lockfile {
+/// Where raeva looked for the version of a JDK that names none.
+fn unnamed_jdk(config: &Config) -> String {
+    match config.host().value(&rv_maven_model::HostInput::JavaHome) {
+        Some(home) => format!(
+            "the JDK at {home} has no release file that names a version, and JAVA_VERSION is unset"
+        ),
+        None => "JAVA_HOME is unset, no java on PATH has a JDK release file beside it, and \
+                 JAVA_VERSION is unset"
+            .to_string(),
+    }
+}
+
+/// Whether the store holds each build extension jar `lock` pins where a
+/// resolution reads it. A restore of the same coordinates as a dependency,
+/// of this project or another sharing the store, may have stored one from
+/// a repository the extension does not resolve from, so a jar counts only
+/// as a plugin repository served it: one the settings' profiles, the POMs
+/// (the super POM's included) or Maven's request declare, each unless an
+/// earlier one has its id, as Maven orders them. A plugin repository only
+/// a remote parent declares is not among them, so its jars resolve again.
+async fn extension_jars_stored(
+    config: &Config,
+    store: &Store,
+    lock: &Lockfile,
+    models: &[ReactorModel],
+) -> Result<bool> {
+    let declared = (config.profile_plugin_repositories().iter())
+        .map(Repository::from)
+        .chain(
+            models
+                .iter()
+                .flat_map(ReactorModel::declared_plugin_repositories),
+        )
+        .chain(config.plugin_repositories().iter().map(Repository::from));
+    let mut plugin_repositories: Vec<Repository> = Vec::new();
+    for repo in declared {
+        if repo.id.is_none() || !(plugin_repositories.iter()).any(|known| known.id == repo.id) {
+            plugin_repositories.push(repo);
+        }
+    }
+    let from_plugin_repository = |served: &[(String, String)]| {
+        (served.iter()).any(|(url, _)| {
+            (plugin_repositories.iter()).any(|known| {
+                plugins::same_repository(url, rv_config::stored_repository(&known.url))
+            })
+        })
+    };
+    for (_, jar) in (lock.platforms.iter()).flat_map(rv_lock::LockPlatform::extension_jars) {
+        let (indexed, served) = store.indexed_and_served(&jar.coord(), &jar.sha256).await?;
+        if !indexed || !from_plugin_repository(&served) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `lock` with each artifact row's and support POM's repository taken from
+/// `fresh`'s for the same platform and coordinate, where it has one, or the
+/// support POMs' alone with `support_poms_only`. Pins, snapshot builds and
+/// everything else stay `lock`'s.
+fn with_origins_of(lock: &Lockfile, fresh: &Lockfile, support_poms_only: bool) -> Lockfile {
     let mut lock = lock.clone();
     for platform in &mut lock.platforms {
         let Some(found) = fresh
@@ -1032,7 +1800,7 @@ fn with_origins_of(lock: &Lockfile, fresh: &Lockfile) -> Lockfile {
         else {
             continue;
         };
-        for artifact in &mut platform.artifacts {
+        for artifact in (platform.artifacts.iter_mut()).filter(|_| !support_poms_only) {
             if let Some(row) = found
                 .artifacts
                 .iter()
@@ -1067,6 +1835,100 @@ fn lock_bytes(path: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Record that raeva.lock passed a full check of `platforms`, which read
+/// it as `checked`, or is what a sync just wrote for them, so a plain sync
+/// keeps its plugin tables without checking them again. A file replaced
+/// since the check is not recorded, and a check of other platforms of the
+/// same bytes stands.
+pub(crate) fn record_checked(
+    config: &Config,
+    client: &RepoClient,
+    platforms: &[Platform],
+    checked: Option<&Lockfile>,
+) {
+    let Some(bytes) = lock_bytes(&config.lock_path) else {
+        return;
+    };
+    if checked.is_some_and(|checked| !reads_as(&bytes, checked)) {
+        return;
+    }
+    let (project, sha256) = (checked_key(config, &bytes), lock_digest(&bytes));
+    let mut covered: Vec<String> = platforms.iter().map(ToString::to_string).collect();
+    if let Some((_, held)) = client
+        .checked_lock(&project)
+        .filter(|(at, _)| *at == sha256)
+    {
+        covered.extend(held.lines().map(str::to_string));
+    }
+    covered.sort();
+    covered.dedup();
+    client.record_checked_lock(&project, &sha256, &covered.join("\n"));
+}
+
+/// Whether the home of `client` wrote or checked raeva.lock as it reads,
+/// for each of `platforms`.
+pub(crate) fn checked_here(config: &Config, client: &RepoClient, platforms: &[Platform]) -> bool {
+    let Some(bytes) = lock_bytes(&config.lock_path) else {
+        return false;
+    };
+    (client.checked_lock(&checked_key(config, &bytes))).is_some_and(|(recorded, covered)| {
+        recorded == lock_digest(&bytes)
+            && (platforms.iter())
+                .all(|platform| covered.lines().any(|line| line == platform.to_string()))
+    })
+}
+
+/// Carry the record of `before`, the raeva.lock a trace started from, to
+/// `written`, the lock the trace wrote from it, while the file reads as it.
+async fn record_traced(config: &Config, before: Option<&[u8]>, written: &Lockfile) {
+    let (Some(before), Some(after)) = (before, lock_bytes(&config.lock_path)) else {
+        return;
+    };
+    if !reads_as(&after, written) {
+        return;
+    }
+    let Ok(client) = RepoClient::new(config).await else {
+        return;
+    };
+    if let Some((_, platforms)) = (client.checked_lock(&checked_key(config, before)))
+        .filter(|(at, _)| *at == lock_digest(before))
+    {
+        let project = checked_key(config, &after);
+        client.record_checked_lock(&project, &lock_digest(&after), &platforms);
+    }
+}
+
+fn reads_as(bytes: &[u8], lock: &Lockfile) -> bool {
+    (std::str::from_utf8(bytes).ok())
+        .and_then(|text| Lockfile::from_toml(text).ok())
+        .as_ref()
+        == Some(lock)
+}
+
+fn lock_digest(bytes: &[u8]) -> String {
+    rv_maven_types::Sha256::from_bytes(bytes).to_string()
+}
+
+/// The project a checked raeva.lock is recorded for: its canonical root,
+/// and the lock hash of `lock`'s inputs with the host's directories as they
+/// are, which the lock's own hash reads as markers.
+fn checked_key(config: &Config, lock: &[u8]) -> String {
+    let raw = (std::str::from_utf8(lock).ok())
+        .and_then(|text| Lockfile::from_toml(text).ok())
+        .and_then(|lock| {
+            resolution_config_hash(&config.with_host_paths(), &recorded_ambient(&lock)).ok()
+        });
+    format!("{}\n{}", project_key(config), raw.unwrap_or_default())
+}
+
+/// The project a SNAPSHOT check is recorded for: its canonical root.
+fn project_key(config: &Config) -> String {
+    let root = &config.project_root;
+    (dunce::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn recorded_platforms(lock: &Lockfile) -> Vec<Platform> {
     (lock.platforms.iter())
         .map(|entry| entry.platform.clone())
@@ -1085,12 +1947,12 @@ fn model_for<'a>(models: &'a [ReactorModel], platform: &Platform) -> &'a Reactor
 /// A lock is never extended to the current platform unasked, so a machine on
 /// another OS checks and rewrites the lock it was given.
 fn resolve_platforms(
-    args: &SyncArgs,
+    requested: &[Platform],
     recorded: &[Platform],
     jdks: &[String],
 ) -> Result<Vec<Platform>> {
-    let requested = if !args.platforms.is_empty() {
-        args.platforms.clone()
+    let requested = if !requested.is_empty() {
+        requested.to_vec()
     } else if !recorded.is_empty() {
         recorded.to_vec()
     } else {

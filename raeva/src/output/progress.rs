@@ -142,7 +142,7 @@ fn retry_note(error: &RepoError, wait: Duration, attempt: usize, attempts: usize
 /// The file name a download URL ends with. `url` arrives redacted; redacting
 /// again keeps the label safe whatever calls it.
 fn progress_label(url: &str) -> String {
-    let redacted = rv_config::redact_url(url);
+    let redacted = super::secrets::redact_secrets(&rv_config::redact_url(url)).into_owned();
     let path = redacted.split(['?', '#']).next().unwrap_or_default();
     let name = path
         .trim_end_matches('/')

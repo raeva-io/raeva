@@ -35,7 +35,6 @@ rv-vuln.workspace = true
 chrono.workspace = true
 clap.workspace = true
 clap_complete = { workspace = true, features = ["unstable-dynamic"] }
-dirs.workspace = true
 dunce.workspace = true
 foldhash.workspace = true
 fs4.workspace = true
@@ -47,6 +46,7 @@ owo-colors.workspace = true
 pathdiff.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -54,7 +54,7 @@ strum.workspace = true
 tabled.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -63,6 +63,7 @@ url.workspace = true
 [dev-dependencies]
 rv-config = { workspace = true, features = ["testing"] }
 rusqlite.workspace = true
+rv-repo = { workspace = true, features = ["testing"] }
 rv-test-support.workspace = true
 jsonschema.workspace = true
 serde_json.workspace = true

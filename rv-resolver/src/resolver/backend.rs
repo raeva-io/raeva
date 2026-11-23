@@ -7,30 +7,36 @@
 
 use bytes::Bytes;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
+use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
+use indexmap::IndexSet;
+use rv_lock::MetadataVersionKind;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use rv_maven_model::{ActivationContext, ModelPolicy, ModelSource, Pom, PomError, Project};
-use rv_maven_types::{ArtifactCoord, Coord, Version, VersionReq};
+use rv_maven_types::{ArtifactCoord, Coord, MavenMode, Version, VersionReq};
 use rv_repo::{
     Admission, ArtifactRequest, Declaration, Metadata, Provenance, RepoError, Repository,
     RepositoryPolicy, SnapshotCandidate,
 };
 use rv_store::BlobId;
 
-use crate::context::{MetadataKey, RepoContext, ResolveContext};
+use crate::context::{IdListings, ListingRead, MetadataKey, RepoContext, ResolveContext};
 use crate::error::{ConflictingPom, DroppedRepo, RepoSearchStatus, ResolveError, Result};
 use crate::graph::{ExactCoord, RepoRef};
 use crate::parent_resolver::LocalParents;
-use crate::solver::{Backend, PathNode, ResolvedProject, ResolvedVersion};
+use crate::solver::{Backend, PathNode, ResolvedProject, ResolvedVersion, is_legacy_core};
 use crate::util::{DynamicVersionToken, lock, parse_dynamic_version_token};
 use crate::workspace::{Workspace, WorkspaceModule};
 
 use super::WorkspaceProgress;
+use super::model_list::{self, Entry, ModelBuild};
 use super::pom_source::PomSource;
 use super::reactor_models::{ContextId, DependencyPom, KeptImports, ReactorModel, ReactorModels};
-use super::scope::ModelScope;
+use super::scope::{KeptImport, ModelScope};
+use super::session_models::ModuleTurn;
 use super::utils::{dummy_coord, filter_repos_for_version, remember_search_error};
 
 pub(super) type WorkspaceSupportPomBuffer = Arc<SupportPoms>;
@@ -153,6 +159,48 @@ impl SupportPomBuffer {
 /// identity a POM pin is keyed by.
 pub(super) type PomGav = (String, String, String);
 
+/// Which of Maven's model caches holds a POM: Maven keeps the parents it
+/// read apart from the BOMs it imported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ModelTag {
+    Parent,
+    Import,
+}
+
+pub(super) type ModelKey = (PomGav, ModelTag);
+
+/// Maven's model cache: what each parent and import key was read as, and
+/// the reactor module version a parent range took.
+#[derive(Clone, Default)]
+pub(super) struct ModelCache {
+    pub(super) poms: HashMap<ModelKey, Arc<SupportPom>>,
+    pub(super) reactor_ranges: HashMap<PomGav, String>,
+    /// In the Maven 3.9 mode, what each BOM the project builds imported
+    /// contributed, by coordinates: Maven 3.9 keeps the first build of a
+    /// BOM for every later import of it in the session, project or
+    /// dependency. See `ModelScope::cached_import`.
+    pub(super) imports: HashMap<PomGav, Arc<KeptImport>>,
+    /// The versions each parent range key of `poms` listed, by the URL of
+    /// the repository whose list named them, as the read that took it saw.
+    pub(super) range_listings: HashMap<PomGav, Arc<RangeListing>>,
+}
+
+/// The versions a range listed, by the URL of the repository whose list
+/// named them.
+pub(super) type RangeListing =
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>;
+
+impl ModelCache {
+    /// The version a parent range `key` names was read as.
+    pub(super) fn range_version(&self, key: &ModelKey) -> Option<String> {
+        (self.poms.get(key).map(|pom| pom.version().to_string()))
+            .or_else(|| self.reactor_ranges.get(&key.0).cloned())
+    }
+}
+
+/// See [`ModelService::read_models`].
+pub(super) type ReadModels = Arc<Mutex<ModelCache>>;
+
 /// Where an artifact's companion POM came from. A SNAPSHOT POM resolves on
 /// its own, so its build may be other than the artifact's, and any POM's
 /// repository may be other than the one that serves the jar.
@@ -165,7 +213,22 @@ pub(super) struct CompanionPomOrigin {
 }
 
 type ModelParentRanges = HashMap<(ExactCoord, RepoContext), Vec<rv_lock::ParentRange>>;
+/// The versions each dependency range listed, by `(group, artifact, range)`
+/// and by the URL of the repository whose list named them.
+pub(super) type RangeListings = std::collections::BTreeMap<
+    (String, String, String),
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+>;
+/// The repositories each read of a dependency range took a list from, by
+/// `(group, artifact, range)`.
+pub(super) type RangeReads = BTreeMap<(String, String, String), BTreeSet<BTreeSet<String>>>;
+type RangeTies = BTreeMap<(String, String), BTreeSet<String>>;
+/// The secret-named inputs and the names that take one.
+type SecretInputs = (Vec<(String, String)>, Vec<(String, String)>);
 type ReleasePomRepos = HashMap<(PomGav, RepoContext), Arc<str>>;
+/// The repository whose metadata named each SNAPSHOT a `LATEST` took, by
+/// `(group, artifact, version)` and repository context.
+type LatestSnapshots = HashMap<(String, String, String, RepoContext), RepoRef>;
 /// A POM's bytes and the repository that served them, if one did.
 pub(super) type ServedPom = (BlobId, Option<Arc<str>>);
 
@@ -178,12 +241,109 @@ pub(super) fn pom_gav(coord: &Coord) -> PomGav {
 }
 
 /// Maven Central under either of its names.
-fn is_central(url: &str) -> bool {
+pub(super) fn is_central(url: &str) -> bool {
     let url = url.trim().trim_end_matches('/').to_ascii_lowercase();
     matches!(
         url.as_str(),
         "https://repo1.maven.org/maven2" | "https://repo.maven.apache.org/maven2"
     )
+}
+
+/// Keep `metadata`, the version listing of `group:artifact` that `repo`, a
+/// repository after mirror selection, served to `read`. URLs compare as
+/// parsed, and Central's two names are one URL.
+pub(super) fn record_listing(
+    listings: &IdListings,
+    repo: &Repository,
+    (group, artifact): (&str, &str),
+    read: ListingRead,
+    metadata: &Metadata,
+) {
+    let Some(id) = repo.id.as_deref().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let url = repo
+        .base_url()
+        .map_or_else(|_| repo.url.clone(), String::from);
+    let url = match is_central(&url) {
+        true => "https://repo1.maven.org/maven2/".to_string(),
+        false => url,
+    };
+    let key = (id.to_string(), group.to_string(), artifact.to_string());
+    let mut listings = lock(listings);
+    let listing = listings.entry(key).or_default();
+    listing.reads.insert(read);
+    let served = listing.by_url.entry(url).or_default();
+    if !served.iter().any(|seen| **seen == *metadata) {
+        served.push(Arc::new(metadata.clone()));
+    }
+}
+
+/// What `read` takes from `metadata`, as the Maven of `mode` reads it.
+type ListingView<'a> = (Vec<&'a str>, [Option<&'a str>; 3]);
+
+fn listing_view(read: ListingRead, mode: MavenMode, metadata: &Metadata) -> ListingView<'_> {
+    let reader = match read {
+        ListingRead::Range => Some(rv_repo::MetadataReader::VersionRange),
+        ListingRead::Marker { .. } => Some(rv_repo::MetadataReader::Version),
+        ListingRead::Plugin { .. } => None,
+    };
+    if mode == MavenMode::Maven310
+        && reader.is_some_and(|reader| metadata.has_invalid_token(reader))
+    {
+        return (Vec::new(), [None; 3]);
+    }
+    let release = (metadata.release.as_deref()).filter(|marker| !marker.is_empty());
+    let latest = (metadata.latest.as_deref()).filter(|marker| !marker.is_empty());
+    // Maven compares `lastUpdated` only to pick a marker, so a listing
+    // without one reads as a 404 does.
+    let stamp =
+        (metadata.last_updated.as_deref()).filter(|_| release.is_some() || latest.is_some());
+    match read {
+        ListingRead::Range => (metadata.listed_versions().collect(), [None; 3]),
+        ListingRead::Marker {
+            latest: reads_latest,
+            among_others,
+        } => {
+            let latest = latest.filter(|_| reads_latest);
+            let stamp = stamp.filter(|_| among_others && (release.is_some() || latest.is_some()));
+            (Vec::new(), [release, latest, stamp])
+        }
+        ListingRead::Plugin { among_others } => {
+            let stamp = stamp.map(str::trim).filter(|stamp| !stamp.is_empty());
+            let stamp = if among_others {
+                stamp
+            } else {
+                stamp.map(|_| "")
+            };
+            let versions = metadata.versions.iter().map(String::as_str).collect();
+            (versions, [release, latest, stamp])
+        }
+    }
+}
+
+/// Maven keeps one version listing per repository id after mirror
+/// selection, `maven-metadata-<id>.xml`: the module that reads it first
+/// fixes it for the later ones, whatever their URL, and under `-T` thread
+/// timing decides which module that is. Refuses the first id, group and
+/// artifact, in sorted order, whose URLs served listings that some read of
+/// it would take differently.
+pub(super) fn refuse_split_listings(listings: &IdListings, mode: MavenMode) -> Result<()> {
+    for ((id, group, artifact), listing) in lock(listings).iter() {
+        let served: Vec<&Arc<Metadata>> = listing.by_url.values().flatten().collect();
+        let differs = |read: &ListingRead| {
+            let first = listing_view(*read, mode, served[0]);
+            (served.iter()).any(|other| listing_view(*read, mode, other) != first)
+        };
+        if listing.by_url.len() > 1 && listing.reads.iter().any(differs) {
+            return Err(ResolveError::SplitListing {
+                id: id.clone(),
+                coord: format!("{group}:{artifact}"),
+                urls: listing.by_url.keys().map(rv_config::redact_url).collect(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The repositories a dependency's effective model adds to the resolution.
@@ -270,14 +430,28 @@ pub(super) struct SupportPom {
     /// The store key of the POM.
     key: ArtifactCoord,
     /// The bare `g:a:v` the provenance is recorded under.
-    name: String,
+    pub(super) name: String,
     provenance: SupportPomProvenance,
     pub(super) bytes: Bytes,
     pub(super) blob: BlobId,
     route: PomRoute,
+    /// What Maven's model cache holds it as; nothing for a relocated
+    /// dependency.
+    pub(super) model: Option<ModelKey>,
 }
 
 impl SupportPom {
+    /// The URL of the declared repository that served it, when a mirror
+    /// served it for that repository.
+    pub(super) fn mirrored_from(&self) -> Option<&str> {
+        (*self.route.repo != *self.route.endpoint).then_some(&*self.route.repo)
+    }
+
+    /// The version of the POM, as its coordinates name it.
+    pub(super) fn version(&self) -> &str {
+        self.name.rsplit(':').next().unwrap_or_default()
+    }
+
     fn new(coord: &Coord, repo: &Repository, endpoint: &str, path: &str, bytes: Bytes) -> Self {
         let file_version = path
             .rsplit('/')
@@ -319,6 +493,7 @@ impl SupportPom {
                 repo: Arc::from(repo.url.as_str()),
                 endpoint: Arc::from(endpoint),
             },
+            model: None,
         }
     }
 }
@@ -362,6 +537,13 @@ pub(super) struct ModelService {
     /// coordinate, `None` when they lacked it, which the lock pins over
     /// what another path's repositories gave.
     winner_poms: Arc<Mutex<HashMap<PomGav, Option<BlobId>>>>,
+    /// The POMs of nodes that lost mediation at the version their
+    /// declaration named, which Maven reads again offline.
+    loser_poms: Arc<Mutex<HashSet<PomGav>>>,
+    /// Maven's model cache: each parent and imported BOM this module read,
+    /// built or reused, which a build that does not find one in its own
+    /// repositories takes.
+    pub(super) read_models: ReadModels,
     /// Provenance for each support POM (parent / imported BOM) fetched during
     /// resolution, keyed by `"g:a:v"`. A support POM can resolve from a
     /// different repository than the child that referenced it; recording the
@@ -393,6 +575,18 @@ pub(super) struct ModelService {
     release_pom_repos: Arc<Mutex<ReleasePomRepos>>,
     /// Trusted reactor models available to parent/BOM/dependency resolution.
     pub(super) workspace: Option<Arc<Workspace>>,
+    /// Whether the reactor's modules stand in for repository artifacts.
+    /// Maven resolves build and core extensions before its reactor reader
+    /// serves them; the reactor's `.mvn/maven.config` still applies.
+    reactor_reader: bool,
+    /// The POM path of the module whose graph this resolves.
+    own_module: Option<String>,
+    /// Each build of the module's own SNAPSHOT whose version names no base,
+    /// such as `1.020240101.010101-1` of `1.0SNAPSHOT`, to that base.
+    own_builds: Arc<Mutex<HashMap<PomGav, Version>>>,
+    /// The first repository failure met on the module's own coordinates,
+    /// which only a request that needs the repository's artifact reports.
+    own_failure: Arc<Mutex<Option<ResolveError>>>,
     /// Parent/BOM bytes collected while the modules build their graphs in
     /// parallel. The driver writes them in discovery order before artifact
     /// population, so the store sees the same writes whatever the timing.
@@ -402,10 +596,35 @@ pub(super) struct ModelService {
     pub(super) workspace_progress: Option<Arc<WorkspaceProgress>>,
     /// Range evidence by model and repository context; only graph winners enter the lock.
     pub(super) parent_ranges: Arc<Mutex<ModelParentRanges>>,
+    /// The versions each dependency range listed, by `(group, artifact,
+    /// range)`; the lock keeps the ranges whose highest version the graph
+    /// does not hold.
+    pub(super) range_listings: Arc<Mutex<RangeListings>>,
+    /// Which of those lists each read of the ranges took.
+    pub(super) range_reads: Arc<Mutex<RangeReads>>,
+    /// The same for the ranges a reactor version satisfies, which Maven
+    /// reads beside the reactor's versions. They take no part in evicted
+    /// ranges: only the version a list gave enters the lock.
+    pub(super) reactor_range_listings: Arc<Mutex<RangeListings>>,
+    /// The `<release>` and `<latest>` each `RELEASE` and `LATEST` took.
+    pub(super) markers: Arc<Mutex<BTreeSet<rv_lock::MetadataVersion>>>,
+    latest_snapshots: Arc<Mutex<LatestSnapshots>>,
+    /// The spellings that compare equal at the top of a range's listing,
+    /// by `(group, artifact)`: which one Maven takes depends on the order of
+    /// the whole listing.
+    pub(super) range_ties: Arc<Mutex<RangeTies>>,
     dependency_activation: Arc<OnceLock<ActivationContext>>,
+    /// [`rv_config::Config::secret_inputs`] of `ctx`, read once: each POM's
+    /// repositories are screened against them.
+    secret_inputs: Arc<OnceLock<SecretInputs>>,
     /// URLs of root-lineage repositories, and of POM repositories whose URL
     /// may hold a credential, already refused and reported.
     refused_lineage_urls: Arc<Mutex<HashSet<String>>>,
+    /// Each support POM an imported BOM's build read, by `g:a:v`, with each
+    /// repository only imported BOMs declare that the read searched. Maven
+    /// searches those for the BOMs' parents and imports alone, so they
+    /// serve those POMs and nothing else.
+    import_repositories: Arc<Mutex<Vec<(String, Repository)>>>,
     /// Dependency POMs read as invalid, reported by
     /// [`Self::report_pom_problem`] once the graph selects them: a range
     /// reads every candidate's POM, and the problem of one it does not
@@ -420,6 +639,12 @@ pub(super) struct ModelService {
     /// Entries of [`Self::repos`] that a parent lookup added, which an
     /// effective model's declaration under the same id replaces.
     lineage_repos: Arc<Mutex<HashSet<RepoKey>>>,
+    /// The URL of each [`Self::lineage_repos`] entry that an effective
+    /// model's declaration under its id replaced on the same mirror, with
+    /// that declaration's URL. A parent lookup reads the declaration as
+    /// written, such as `${repo.url}/releases`, so the parents it served
+    /// are recorded as the effective declaration's.
+    retired_routes: Arc<Mutex<HashMap<String, String>>>,
     /// Ids of refused root-lineage declarations, which no later parent's
     /// declaration takes over.
     held_repo_ids: Arc<Mutex<HashSet<String>>>,
@@ -427,13 +652,34 @@ pub(super) struct ModelService {
     /// root lineage added, which a dependency's POM cannot redeclare.
     root_repo_ids: Arc<Mutex<HashSet<String>>>,
     default_urls: Arc<HashSet<String>>,
+    /// The URLs of Maven's request: the defaults and
+    /// [`rv_config::Config::request_repositories`].
+    request_urls: Arc<HashSet<String>>,
+    /// The URLs of [`rv_config::Config::requested_repositories`]: a POM's
+    /// repository on one is the project's, not a default.
+    requested_urls: Arc<HashSet<String>>,
     /// Imported BOMs built so far, by coordinates and context; see
     /// `ModelScope::reuse_import`.
     pub(super) kept_imports: Arc<KeptImports>,
+    /// Collects a plugin's dependencies, below which Maven's WagonExcluder
+    /// drops the wagon providers of a Maven 2 core artifact.
+    plugin: bool,
     reactor_models: Option<Arc<ReactorModels>>,
+    /// The module's place in the reactor's model cache, for a module graph.
+    module_turn: Option<Arc<ModuleTurn>>,
+    /// The place in the reactor's model cache of the module whose graph
+    /// builds a reactor module's own model, for its imports only.
+    import_turn: Option<Arc<ModuleTurn>>,
+    /// The artifact handlers of the module's build extensions, read when its
+    /// resolution meets a type no core handler defines.
+    pub(super) extension_types: Option<Arc<super::extension_types::ExtensionTypes>>,
     /// The model context of each repository context, and the generation of
     /// the repositories it was read at.
     model_contexts: Arc<Mutex<HashMap<RepoContext, (u64, ContextId)>>>,
+    /// The module whose build extension's realm this collects: a SNAPSHOT
+    /// in it takes the build the module's extensions lines pin, under
+    /// `--frozen` or offline.
+    extension_module: Option<String>,
 }
 
 #[derive(Debug)]
@@ -524,6 +770,16 @@ struct Search {
     last_error: Option<RepoError>,
 }
 
+/// Whether `error` says no repository has the file, rather than that one
+/// failed: not found, uncached offline, or no repository with snapshots.
+fn is_missing(error: &ResolveError) -> bool {
+    match error {
+        ResolveError::ArtifactNotFound { .. } | ResolveError::NoSnapshotRepository { .. } => true,
+        ResolveError::Repo { source, .. } => matches!(**source, RepoError::OfflineNotCached(_)),
+        _ => false,
+    }
+}
+
 impl Search {
     fn snapshot_served(
         &self,
@@ -593,6 +849,11 @@ impl Search {
 }
 
 impl ModelService {
+    /// The Maven line the project resolves as.
+    pub(super) fn mode(&self) -> MavenMode {
+        self.ctx.config.lock.maven.mode
+    }
+
     pub(super) fn new(ctx: &ResolveContext, repos: Vec<Repository>) -> Self {
         let backend = Self {
             ctx: ctx.clone(),
@@ -607,20 +868,35 @@ impl ModelService {
             missing_pom_paths: Arc::default(),
             missing_poms: Arc::default(),
             winner_poms: Arc::default(),
+            loser_poms: Arc::default(),
+            read_models: Arc::default(),
             support_pom_provenance: Arc::new(RwLock::new(HashMap::new())),
             companion_pom_blobs: Arc::new(RwLock::new(HashMap::new())),
             recorded_support_poms: Arc::default(),
             companion_pom_origins: Arc::new(RwLock::new(HashMap::new())),
             release_pom_repos: Arc::default(),
             workspace: None,
+            reactor_reader: true,
+            own_module: None,
+            own_builds: Arc::default(),
+            own_failure: Arc::default(),
             workspace_support_poms: None,
             workspace_progress: None,
             parent_ranges: Arc::default(),
+            range_listings: Arc::default(),
+            range_reads: Arc::default(),
+            reactor_range_listings: Arc::default(),
+            markers: Arc::default(),
+            latest_snapshots: Arc::default(),
+            range_ties: Arc::default(),
             dependency_activation: Arc::new(OnceLock::new()),
+            secret_inputs: Arc::default(),
             refused_lineage_urls: Arc::new(Mutex::new(HashSet::new())),
+            import_repositories: Arc::default(),
             pom_problems: Arc::default(),
             provisional_repos: Arc::new(Mutex::new(HashMap::new())),
             lineage_repos: Arc::default(),
+            retired_routes: Arc::default(),
             held_repo_ids: Arc::default(),
             root_repo_ids: Arc::new(Mutex::new(HashSet::new())),
             default_urls: Arc::new(
@@ -628,8 +904,24 @@ impl ModelService {
                     .map(|repo| Repository::from(repo).url)
                     .collect(),
             ),
+            request_urls: Arc::new(
+                (ctx.config.default_repositories().iter())
+                    .chain(ctx.config.request_repositories())
+                    .map(|repo| Repository::from(repo).url)
+                    .collect(),
+            ),
+            requested_urls: Arc::new(
+                (ctx.config.requested_repositories().iter())
+                    .map(|repo| Repository::from(repo).url)
+                    .collect(),
+            ),
             kept_imports: Arc::default(),
+            plugin: false,
             reactor_models: None,
+            module_turn: None,
+            import_turn: None,
+            extension_types: None,
+            extension_module: None,
         };
         // The starting list is not only the configuration: the driver merges
         // the root project's lineage `<repositories>` into it before the
@@ -638,9 +930,43 @@ impl ModelService {
         backend
     }
 
+    pub(super) fn collecting_plugin(mut self, plugin: bool) -> Self {
+        self.plugin = plugin;
+        self
+    }
+
     pub(super) fn with_workspace(mut self, workspace: Arc<Workspace>) -> Self {
         self.workspace = Some(workspace);
         self
+    }
+
+    pub(super) fn with_own_module(mut self, pom_path: String) -> Self {
+        self.own_module = Some(pom_path);
+        self
+    }
+
+    /// Takes nothing from the reactor's modules, as for an extension.
+    pub(super) fn without_reactor_reader(mut self) -> Self {
+        self.reactor_reader = false;
+        self
+    }
+
+    /// Collects the realm of a build extension of `module`.
+    pub(super) fn in_extension_realm_of(mut self, module: &str) -> Self {
+        self.extension_module = Some(module.to_string());
+        self
+    }
+
+    /// The reactor whose modules stand in for repository artifacts.
+    fn reactor(&self) -> Option<&Workspace> {
+        self.workspace.as_deref().filter(|_| self.reactor_reader)
+    }
+
+    /// The secret-named inputs and the names that take one, as
+    /// [`rv_config::Config::secret_inputs`] gives them.
+    fn secret_inputs(&self) -> &SecretInputs {
+        self.secret_inputs
+            .get_or_init(|| self.ctx.config.secret_inputs())
     }
 
     /// The activation context Maven's `DefaultArtifactDescriptorReader`
@@ -685,6 +1011,46 @@ impl ModelService {
     pub(super) fn with_kept_imports(mut self, imports: Arc<KeptImports>) -> Self {
         self.kept_imports = imports;
         self
+    }
+
+    pub(super) fn with_extension_types(
+        mut self,
+        types: Arc<super::extension_types::ExtensionTypes>,
+    ) -> Self {
+        self.extension_types = Some(types);
+        self
+    }
+
+    pub(super) fn with_module_turn(mut self, turn: Arc<ModuleTurn>) -> Self {
+        self.module_turn = Some(turn);
+        self
+    }
+
+    /// What the reactor's model cache gives `find`, past this module's own.
+    pub(super) async fn session_model<T>(
+        &self,
+        find: impl Fn(&ModelCache) -> Option<T>,
+    ) -> Option<T> {
+        match &self.module_turn {
+            Some(turn) => turn.find(find).await,
+            None => None,
+        }
+    }
+
+    /// What the reactor's project builds imported as `bom`, past this
+    /// module's own; see [`ModelCache::imports`].
+    pub(super) async fn session_import(&self, bom: &PomGav) -> Option<Arc<KeptImport>> {
+        match self.module_turn.as_ref().or(self.import_turn.as_ref()) {
+            Some(turn) => turn.import(bom).await,
+            None => None,
+        }
+    }
+
+    /// The project build's imports start: its lineage is read.
+    pub(super) fn lineage_read(&self) {
+        if let Some(turn) = &self.module_turn {
+            turn.lineage_read(&self.read_models);
+        }
     }
 
     pub(super) fn with_reactor_models(mut self, models: Arc<ReactorModels>) -> Self {
@@ -772,14 +1138,23 @@ impl ModelService {
         own.recorded_support_poms = Arc::clone(&self.recorded_support_poms);
         own.kept_imports = Arc::clone(&self.kept_imports);
         own.reactor_models.clone_from(&self.reactor_models);
+        // Maven takes a reactor dependency's model from the project build,
+        // which imported with the session's model cache.
+        own.import_turn = (self.module_turn.clone()).or_else(|| self.import_turn.clone());
+        lock(&own.read_models).imports = lock(&self.read_models).imports.clone();
         own
     }
 
     pub(super) fn workspace_module_for_coord(&self, coord: &Coord) -> Option<&WorkspaceModule> {
-        self.workspace
-            .as_deref()?
+        self.reactor()?
             .candidates(coord.group_id.as_str(), coord.artifact_id.as_str())
             .find(|module| module.gav().version == coord.version.as_str())
+    }
+
+    /// Whether `coord` names the module whose graph this resolves.
+    fn is_own_module(&self, coord: &Coord) -> bool {
+        (self.workspace_module_for_coord(coord))
+            .is_some_and(|module| self.own_module.as_deref() == Some(module.pom_path.as_str()))
     }
 
     /// [`Workspace::stand_in_pom`] of the reactor module with `coord`'s
@@ -807,7 +1182,7 @@ impl ModelService {
     /// `<relativePath>` [`Self::workspace_pom_for_coord`] made absolute.
     /// A repository POM names none.
     pub(super) fn reactor_parents(&self) -> LocalParents {
-        match self.workspace.as_deref() {
+        match self.reactor() {
             Some(workspace) => {
                 let boundary = workspace.local_parent_boundary();
                 LocalParents::new(boundary.clone(), boundary).cached_in(self.ctx.local_parents())
@@ -816,13 +1191,72 @@ impl ModelService {
         }
     }
 
-    fn workspace_versions(&self, group_id: &str, artifact_id: &str) -> Vec<Version> {
-        self.workspace
-            .as_deref()
-            .into_iter()
-            .flat_map(|workspace| workspace.candidates(group_id, artifact_id))
+    /// The versions of the reactor's modules of an artifact, which Maven puts
+    /// first into its range map. Their order picks only between modules
+    /// whose versions compare equal, which [`Self::refuse_reactor_tie`]
+    /// refuses.
+    /// The module `unbuilt`, which has made nothing yet, is left out.
+    fn workspace_versions(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        unbuilt: Option<&str>,
+    ) -> Vec<Version> {
+        let Some(workspace) = self.reactor() else {
+            return Vec::new();
+        };
+        (workspace.candidates(group_id, artifact_id))
+            .filter(|module| unbuilt != Some(module.pom_path.as_str()))
             .filter_map(|module| Version::parse(&module.gav().version).ok())
             .collect()
+    }
+
+    /// Refuses a range that admits a version two reactor modules of the
+    /// artifact share in value but spell apart, or with `taken` only when it
+    /// takes that version. Maven puts the modules into its range map in the
+    /// order it builds them, known only once every module is built, and that
+    /// order picks the spelling, also of a lower version that mediation
+    /// keeps.
+    fn refuse_reactor_tie(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        range: &VersionReq,
+        taken: Option<&Version>,
+        unbuilt: Option<&str>,
+    ) -> Result<()> {
+        let Some(workspace) = self.reactor() else {
+            return Ok(());
+        };
+        let mode = self.mode();
+        let admitted: Vec<(&WorkspaceModule, Version)> = (workspace
+            .candidates(group_id, artifact_id))
+        .filter(|module| unbuilt != Some(module.pom_path.as_str()))
+        .filter_map(|module| Some((module, Version::parse(&module.gav().version).ok()?)))
+        .filter(|(_, version)| range.matches_in(version, mode))
+        .filter(|(_, version)| taken.is_none_or(|taken| version.cmp_in(taken, mode).is_eq()))
+        .collect();
+        let tied = |(_, version): &&(&WorkspaceModule, Version)| {
+            let mut spellings = (admitted.iter())
+                .filter(|(_, other)| other.cmp_in(version, mode).is_eq())
+                .map(|(module, _)| module.gav().version.as_str());
+            let first = spellings.next();
+            spellings.any(|spelling| Some(spelling) != first)
+        };
+        let modules: Vec<String> = (admitted.iter())
+            .filter(tied)
+            .map(|(module, _)| module.pom_path.clone())
+            .collect();
+        if modules.is_empty() {
+            return Ok(());
+        }
+        Err(ResolveError::ReactorChoice {
+            coord: format!("{group_id}:{artifact_id}"),
+            requested: range.to_string(),
+            modules,
+            reason: "their versions compare equal, and Maven takes the one it builds first"
+                .to_string(),
+        })
     }
 
     /// Every repository admitted so far, in admission order.
@@ -877,11 +1311,32 @@ impl ModelService {
     /// The union of all effective repositories (root plus every admitted
     /// transitive repository across the resolution), used for lockfile trust
     /// recording and export markers.
+    /// Note what an imported BOM's build searched; see
+    /// [`Self::import_repositories`].
+    pub(super) fn note_import_repositories(&self, searched: &[(String, Repository)]) {
+        let mut known = lock(&self.import_repositories);
+        for pair in searched {
+            if !known.contains(pair) {
+                known.push(pair.clone());
+            }
+        }
+    }
+
+    /// What [`Self::note_import_repositories`] noted.
+    pub(super) fn import_repositories(&self) -> Vec<(String, Repository)> {
+        lock(&self.import_repositories).clone()
+    }
+
     pub(super) fn effective_repos_snapshot(&self) -> Vec<Repository> {
         effective(
             &self.repos.read().expect("repos lock poisoned").entries,
             &lock(&self.provisional_repos),
         )
+    }
+
+    /// Whether the POM of `coord` was read as invalid.
+    pub(super) fn pom_invalid(&self, coord: &Coord) -> bool {
+        lock(&self.pom_problems).contains_key(&pom_gav(coord))
     }
 
     /// Warn that the POM of `coord`, which the graph selected, is invalid.
@@ -978,11 +1433,83 @@ impl ModelService {
 
     /// Snapshot the `"g:a:v" -> provenance` records collected for support POMs.
     pub(super) fn support_pom_provenance_snapshot(&self) -> Vec<(String, SupportPomProvenance)> {
+        let retired = lock(&self.retired_routes);
         self.support_pom_provenance
             .read()
             .expect("support_pom_provenance lock poisoned")
             .iter()
-            .map(|(coord, provenance)| (coord.clone(), provenance.clone()))
+            .map(|(coord, provenance)| {
+                let mut provenance = provenance.clone();
+                if let Some(url) = retired.get(&provenance.repo_url) {
+                    provenance.repo_url.clone_from(url);
+                }
+                (coord.clone(), provenance)
+            })
+            .collect()
+    }
+
+    /// Each `group:artifact:version` whose POM this resolution read or
+    /// looked for, losers and range candidates included, and the file of
+    /// each it found none for.
+    pub(super) fn pom_reads(&self) -> rv_lock::PomReads {
+        let mut reads = rv_lock::PomReads::default();
+        let blobs = self
+            .companion_pom_blobs
+            .read()
+            .expect("companion_pom_blobs lock poisoned");
+        for ((group_id, artifact_id, version), served) in blobs.iter() {
+            let pom = served.as_ref().map(|(blob, _)| blob.clone());
+            let gav = rv_maven_types::Gav::new(group_id, artifact_id, version);
+            reads.read.insert(gav, pom);
+        }
+        drop(blobs);
+        for (ExactCoord(coord), _) in lock(&self.missing_poms).iter() {
+            let version = coord.version.to_string();
+            let gav = rv_maven_types::Gav::new(
+                coord.group_id.as_str(),
+                coord.artifact_id.as_str(),
+                &version,
+            );
+            let packaging = coord.packaging.as_deref().unwrap_or("jar");
+            let classifier =
+                (coord.classifier.as_deref()).map_or(String::new(), |c| format!(":{c}"));
+            reads.read.entry(gav.clone()).or_insert(None);
+            (reads.without_pom.entry(gav)).or_insert_with(|| {
+                format!(
+                    "{}:{}:{version}:{packaging}{classifier}",
+                    coord.group_id, coord.artifact_id
+                )
+            });
+        }
+        reads
+    }
+
+    /// The dependency POMs this resolution read from a repository, as support
+    /// POMs, all of them or those of nodes that lost mediation.
+    pub(super) fn read_poms(
+        &self,
+        losers: bool,
+    ) -> Vec<(rv_maven_types::Gav, SupportPomProvenance)> {
+        let loser_poms = lock(&self.loser_poms);
+        (self.companion_pom_blobs.read())
+            .expect("companion_pom_blobs lock poisoned")
+            .iter()
+            .filter(|(gav, _)| !losers || loser_poms.contains(*gav))
+            .filter_map(|((group_id, artifact_id, version), served)| {
+                let (blob, Some(repo_url)) = served.as_ref()? else {
+                    return None;
+                };
+                let provenance = SupportPomProvenance {
+                    repo_id: String::new(),
+                    repo_url: repo_url.to_string(),
+                    snapshot: None,
+                    sha256: blob.to_string(),
+                };
+                Some((
+                    rv_maven_types::Gav::new(group_id, artifact_id, version),
+                    provenance,
+                ))
+            })
             .collect()
     }
 
@@ -1062,10 +1589,19 @@ impl ModelService {
     /// what its provenance allows; without a source nothing is fetched, and
     /// the same repositories are refused.
     fn admission(&self, repos: Vec<Repository>, from: Declaration) -> Admission {
-        match self.ctx.pom_source.as_deref() {
-            Some(source) => source.admit(repos, from),
-            None => RepositoryPolicy::screen(&self.ctx.config, repos, from),
-        }
+        let (secrets, names) = self.secret_inputs();
+        let mut screened =
+            RepositoryPolicy::screen_with(&self.ctx.config, secrets, names, repos, from);
+        let Some(source) = self.ctx.pom_source.as_deref() else {
+            return screened;
+        };
+        // The client's policy reads the settings of every platform a sync
+        // resolves; this platform's decide what its HTTP blocker refuses.
+        let mut admission = source.admit(std::mem::take(&mut screened.admitted), from);
+        admission.dropped.append(&mut screened.dropped);
+        admission.secret_urls.append(&mut screened.secret_urls);
+        admission.blocked_http.append(&mut screened.blocked_http);
+        admission
     }
 
     /// Append the repositories of the root project's lineage to the shared
@@ -1118,7 +1654,24 @@ impl ModelService {
         if !refused.is_empty() {
             self.hold_refused_ids(&refused, declared);
         }
+        let remote = declared != Declared::Provisional
+            && (admitted.iter()).any(|repo| repo.provenance() == Provenance::FetchedPom);
         self.append_repos(admitted, declared);
+        if remote && let Some(observer) = &self.ctx.root_repositories {
+            observer(
+                &self.ctx.platform,
+                &self.root_effective_repos_snapshot(),
+                &[],
+            );
+        }
+    }
+
+    /// Hold the ids of root-lineage declarations that serve nothing, as
+    /// [`Self::extend_root_lineage_repos`] holds a refused one's.
+    pub(super) fn hold_lineage_ids(&self, unserved: &[Repository]) {
+        if !unserved.is_empty() {
+            self.hold_refused_ids(unserved, Declared::Lineage);
+        }
     }
 
     fn hold_refused_ids(&self, refused: &[Repository], declared: Declared) {
@@ -1139,6 +1692,7 @@ impl ModelService {
                 continue;
             };
             if declared == Declared::Effective {
+                let mut retired = false;
                 while let Some(at) = guard[..*project_end].iter().position(|known| {
                     known.id.as_deref() == Some(id) && lineage.contains(&repo_key(known))
                 }) {
@@ -1147,6 +1701,19 @@ impl ModelService {
                     lineage.remove(&removed);
                     seen.remove(&removed);
                     *project_end -= 1;
+                    retired = true;
+                }
+                // Maven's request repository under the id, which a lineage
+                // declaration had replaced, is searched again, last.
+                if retired
+                    && !(guard[..*project_end].iter()).any(|known| known.id.as_deref() == Some(id))
+                    && let Some(default) = (self.ctx.config.default_repositories().iter())
+                        .map(Repository::from)
+                        .find(|default| default.id.as_deref() == Some(id))
+                    && seen.insert(repo_key(&default))
+                {
+                    guard.insert(*project_end, default);
+                    *project_end += 1;
                 }
             }
             root_ids.insert(id.to_string());
@@ -1231,18 +1798,43 @@ impl ModelService {
         if refused.is_empty() {
             return;
         }
-        let secrets = self.ctx.config.secret_named_inputs();
+        let (secrets, names) = self.secret_inputs();
         for repo in refused {
             let refused_urls = Arc::clone(&self.refused_lineage_urls);
             let id = repo.id.as_deref().unwrap_or_default();
             let (url, id) = (
                 repo.url.clone(),
-                rv_config::without_secret_values(id, &secrets).to_string(),
+                rv_repo::shown_id(id, repo.id_reads(), secrets, names),
             );
-            let declared_by = declared_by.map(str::to_string);
-            let Some(refusal) = rv_repo::secret_url_refusal(&url, &secrets) else {
-                continue;
-            };
+            let declared_by = (declared_by.map(str::to_string)).or_else(|| {
+                (repo.provenance() == rv_repo::Provenance::LocalPom)
+                    .then(|| "the project".to_string())
+            });
+            let config = &self.ctx.config;
+            // Only a URL or id that may hold a secret is reported as one, and
+            // a `\`, which no request of Maven's succeeds with, as its own.
+            let secret = |refusal: String| ("REPO_URL_SECRET_REFUSED", refusal);
+            let other = |refusal: String| ("REPOSITORY_IGNORED", refusal);
+            let secret_id =
+                rv_repo::secret_id_refusal(repo.id.as_deref(), repo.id_reads(), secrets, names);
+            let (code, refusal) =
+                match rv_repo::secret_part_refusal(&url, repo.url_reads(), secrets, names) {
+                    Some(refusal) => secret(format!("URL {refusal}")),
+                    None => match (secret_id, rv_config::url_refusal(&url)) {
+                        (Some(refusal), _) => secret(format!("id {refusal}")),
+                        (None, Some(refusal)) if url.contains('\\') => {
+                            ("REPO_URL_BACKSLASH", format!("URL {refusal}"))
+                        }
+                        (None, Some(refusal)) => other(format!("URL {refusal}")),
+                        (None, None) => match rv_repo::expression_id_refusal(config, repo) {
+                            Some(refusal) => other(format!("id {refusal}")),
+                            None => match rv_repo::layout_refusal(config, repo) {
+                                Some(refusal) => other(refusal),
+                                None => continue,
+                            },
+                        },
+                    },
+                };
             rv_maven_model::held::when_shown(move || {
                 if !lock(&refused_urls).insert(url.clone()) {
                     return;
@@ -1250,21 +1842,30 @@ impl ModelService {
                 let id = rv_maven_types::bounded(&id);
                 match declared_by.as_deref().map(rv_maven_types::bounded) {
                     Some(declared_by) => tracing::warn!(
-                        sec_code = "REPO_URL_SECRET_REFUSED",
+                        sec_code = code,
                         repository = %id,
                         declared_by = %declared_by,
-                        "ignoring repository '{id}' that {declared_by} declares because its URL \
+                        "ignoring repository '{id}' that {declared_by} declares because its \
                          {refusal}"
                     ),
                     None => tracing::warn!(
-                        sec_code = "REPO_URL_SECRET_REFUSED",
+                        sec_code = code,
                         repository = %id,
-                        "ignoring repository '{id}' that a fetched POM declares because its URL \
+                        "ignoring repository '{id}' that a fetched POM declares because its \
                          {refusal}"
                     ),
                 }
             });
         }
+    }
+
+    /// Whether `repo` is one of the defaults the project's repositories go
+    /// before: on a default's URL, unless a POM declares it on a request
+    /// repository's.
+    fn is_default(&self, repo: &Repository) -> bool {
+        self.default_urls.contains(&repo.url)
+            && (repo.provenance() == Provenance::Configured
+                || !self.requested_urls.contains(&repo.url))
     }
 
     /// Add admitted repositories to the shared list, deduplicated by id and
@@ -1290,7 +1891,14 @@ impl ModelService {
         let mut lineage = lock(&self.lineage_repos);
         let mut root_ids = lock(&self.root_repo_ids);
         let mut held = lock(&self.held_repo_ids);
-        for repo in repos {
+        // An effective model lists the project's repositories in Maven's
+        // search order, the child's before its parents'.
+        let effective: Vec<RepoKey> = if declared == Declared::Effective {
+            repos.iter().map(repo_key).collect()
+        } else {
+            Vec::new()
+        };
+        for (index, repo) in repos.into_iter().enumerate() {
             let key = repo_key(&repo);
             let id = repo.id.as_deref().filter(|id| !id.is_empty());
             if let Some(id) = id
@@ -1306,8 +1914,8 @@ impl ModelService {
             }
             // Maven aggregates a dependency's repositories under the ones
             // the project already has by id, so one that reuses such an id
-            // on another URL is dropped. Kept, it would receive the
-            // credential configured for that id.
+            // is dropped, its policies too. Kept on another URL, it would
+            // receive the credential configured for that id.
             if matches!(declared, Declared::Fetched | Declared::Reactor)
                 && let Some(id) = id
                 && if declared == Declared::Reactor {
@@ -1317,10 +1925,9 @@ impl ModelService {
                 } else {
                     root_ids.contains(id)
                 }
-                && !seen.contains(&key)
             {
                 tracing::debug!(
-                    url = %rv_config::redact_url(&repo.url),
+                    url = %rv_config::redact_repository_url(&repo.url),
                     id,
                     "ignoring a dependency POM's repository under an id the project already uses"
                 );
@@ -1330,44 +1937,84 @@ impl ModelService {
                 && let Some(id) = id
             {
                 root_ids.insert(id.to_string());
+                // Maven's request repository under the id gives way to the
+                // model's, which is searched before Central.
+                if declared != Declared::Provisional
+                    && repo.provenance() != Provenance::Configured
+                    && let Some(at) = guard[..*project_end].iter().position(|known| {
+                        known.id.as_deref() == Some(id)
+                            && known.provenance() == Provenance::Configured
+                            && self.requested_urls.contains(&known.url)
+                    })
+                {
+                    seen.remove(&repo_key(&guard.remove(at)));
+                    *project_end -= 1;
+                }
             }
-            let default = self.default_urls.contains(&repo.url);
-            // The project's repositories are one per id, as in Maven's model.
-            // One under a default's id replaces that default, as one under
-            // `central` replaces the super POM's. Otherwise an effective
-            // model's declaration replaces one a parent lookup added, and the
-            // first declaration stays.
+            let default = self.is_default(&repo);
+            // The project's repositories are one per id, as in Maven's model:
+            // the first declaration stays, and an effective model's replaces
+            // one a parent lookup added. One under a default's id replaces
+            // that default, as one under `central` replaces the super POM's,
+            // unless a mirror serves one of them and not the other: Maven
+            // compares the ids its mirrors give them, and keeps the default
+            // beside it.
             if !matches!(declared, Declared::Fetched | Declared::Reactor)
                 && let Some(id) = id
             {
                 let listed = |known: &Repository, default_url: bool| {
-                    known.id.as_deref() == Some(id)
-                        && self.default_urls.contains(&known.url) == default_url
+                    known.id.as_deref() == Some(id) && self.is_default(known) == default_url
                 };
-                let replaced = if !default
-                    && declared != Declared::Provisional
-                    && let Some(at) = guard[..*project_end]
-                        .iter()
-                        .position(|known| listed(known, true))
-                {
-                    Some(at)
-                } else if let Some(at) = guard[..*project_end]
+                let mirrored_id =
+                    |repo: &Repository| rv_repo::mirrored_repository(&self.ctx.config, repo).id;
+                let mut retired = false;
+                if let Some(at) = guard[..*project_end]
                     .iter()
                     .position(|known| listed(known, false) && known.url != repo.url)
                 {
                     if declared != Declared::Effective || !lineage.contains(&repo_key(&guard[at])) {
                         continue;
                     }
-                    Some(at)
-                } else {
-                    None
-                };
+                    let old = guard.remove(at);
+                    let route = |repo: &Repository| {
+                        let served = rv_repo::mirrored_repository(&self.ctx.config, repo);
+                        (served.url, served.id)
+                    };
+                    if route(&old) == route(&repo) {
+                        lock(&self.retired_routes).insert(old.url.clone(), repo.url.clone());
+                    }
+                    let removed = repo_key(&old);
+                    provisional.remove(&removed);
+                    lineage.remove(&removed);
+                    seen.remove(&removed);
+                    *project_end -= 1;
+                    retired = true;
+                }
+                let replaced = (!default && declared != Declared::Provisional)
+                    .then(|| {
+                        guard[..*project_end].iter().position(|known| {
+                            listed(known, true) && mirrored_id(known) == mirrored_id(&repo)
+                        })
+                    })
+                    .flatten();
                 if let Some(at) = replaced {
                     let removed = repo_key(&guard.remove(at));
                     provisional.remove(&removed);
                     lineage.remove(&removed);
                     seen.remove(&removed);
                     *project_end -= 1;
+                } else if retired
+                    && !(guard[..*project_end].iter()).any(|known| listed(known, true))
+                    && let Some(default) = (self.ctx.config.default_repositories().iter())
+                        .map(Repository::from)
+                        .find(|default| {
+                            default.id.as_deref() == Some(id)
+                                && mirrored_id(default) != mirrored_id(&repo)
+                        })
+                    && seen.insert(repo_key(&default))
+                {
+                    guard.insert(*project_end, default);
+                    *project_end += 1;
                 }
             }
             if seen.insert(key.clone()) {
@@ -1384,10 +2031,17 @@ impl ModelService {
                 let at = if matches!(declared, Declared::Fetched | Declared::Reactor) {
                     guard.len()
                 } else {
-                    let at = guard[..*project_end]
+                    let defaults = guard[..*project_end]
                         .iter()
-                        .position(|known| !default && self.default_urls.contains(&known.url))
+                        .position(|known| !default && self.is_default(known))
                         .unwrap_or(*project_end);
+                    let later = effective.get(index + 1..).unwrap_or_default();
+                    let at = (guard[..defaults].iter())
+                        .position(|known| {
+                            let known = repo_key(known);
+                            lineage.contains(&known) && later.contains(&known)
+                        })
+                        .unwrap_or(defaults);
                     *project_end += 1;
                     at
                 };
@@ -1515,7 +2169,27 @@ impl ModelService {
         extra: impl IntoIterator<Item = Repository>,
         declared_by: Option<&str>,
     ) -> (Vec<Repository>, Vec<Repository>) {
-        let admission = self.admission(extra.into_iter().collect(), Declaration::Transitive);
+        self.admit_declared(extra, declared_by, Declaration::Transitive)
+    }
+
+    /// [`Self::admit_transitive`] for the parent and imported BOMs of the
+    /// declaring POM's own model, which Maven 3.10 fetches with the
+    /// credentials it keeps from the same repository while it collects
+    /// that POM's dependencies.
+    pub(super) fn admit_transitive_model(
+        &self,
+        extra: impl IntoIterator<Item = Repository>,
+    ) -> (Vec<Repository>, Vec<Repository>) {
+        self.admit_declared(extra, None, Declaration::TransitiveModel)
+    }
+
+    fn admit_declared(
+        &self,
+        extra: impl IntoIterator<Item = Repository>,
+        declared_by: Option<&str>,
+        from: Declaration,
+    ) -> (Vec<Repository>, Vec<Repository>) {
+        let admission = self.admission(extra.into_iter().collect(), from);
         self.warn_secret_urls(&admission.secret_urls, declared_by);
         if let Some(declared_by) = declared_by {
             // A not-found error names these when they could have served the
@@ -1538,7 +2212,7 @@ impl ModelService {
                         // `sec_code` routes warnings into `data.warnings` even when JSON mode suppresses tracing output.
                         tracing::warn!(
                             sec_code = "TRANSITIVE_REPO_DROPPED",
-                            url = %rv_config::redact_url(&repo.url),
+                            url = %rv_config::redact_repository_url(&repo.url),
                             declared_by,
                             "ignoring transitive repository declaration; not on allowlist (see [security] allow_transitive_repositories)"
                         );
@@ -1593,6 +2267,7 @@ impl ModelService {
     /// none, unless `found` already, is an error: the first failure, else
     /// not found. A repository its configuration refuses fails the listing,
     /// as in Maven.
+    #[allow(clippy::too_many_arguments)]
     async fn listed_metadata(
         &self,
         source: &dyn PomSource,
@@ -1601,6 +2276,7 @@ impl ModelService {
         artifact_id: &str,
         with_snapshots: bool,
         found: bool,
+        reader: rv_repo::MetadataReader,
     ) -> Result<Vec<(Repository, Arc<Metadata>)>> {
         let (repos, listings) = Self::version_listings(searched, with_snapshots)?;
         let concurrency = self
@@ -1639,15 +2315,55 @@ impl ModelService {
             .collect()
             .await;
         results.sort_by_key(|(idx, _)| *idx);
+        let answered = (results.iter())
+            .filter(|(_, result)| result.is_ok())
+            .count();
 
         let mut hits = Vec::new();
         let mut searched = Vec::new();
         let mut first_error = None;
         let mut fallback = rv_repo::RepositoryFallback::default();
         let mut skipped = Vec::new();
+        let none_listed = Metadata::default();
         for (idx, result) in results {
             let repo = &repos[idx];
+            // Maven records a 404 under the repository id, and the read of
+            // another URL of the id then finds it, as an empty listing.
+            let listed = match &result {
+                Ok(metadata) => Some(&**metadata),
+                Err(err @ RepoError::NotFound(_)) if !err.is_filtered() => Some(&none_listed),
+                Err(_) => None,
+            };
+            if let Some(metadata) = listed {
+                // A range reads the list; `RELEASE` and `LATEST`, the
+                // markers, `LATEST` with snapshots.
+                let read = match reader {
+                    rv_repo::MetadataReader::VersionRange => ListingRead::Range,
+                    rv_repo::MetadataReader::Version => ListingRead::Marker {
+                        latest: with_snapshots,
+                        among_others: answered > 1,
+                    },
+                };
+                let served = source.effective_repository(repo);
+                let coord = (group_id, artifact_id);
+                record_listing(&self.ctx.id_listings, &served, coord, read, metadata);
+            }
             let err = match result {
+                // Maven 3.10 takes metadata naming a version that is no
+                // coordinate for invalid, and reads it as empty.
+                Ok(metadata)
+                    if self.mode() == MavenMode::Maven310 && metadata.has_invalid_token(reader) =>
+                {
+                    tracing::warn!(
+                        sec_code = "POM_PROBLEM",
+                        repository = %rv_config::redact_repository_url(&repo.url),
+                        "ignoring {group_id}:{artifact_id} metadata with an invalid version token",
+                        group_id = rv_maven_types::bounded(group_id),
+                        artifact_id = rv_maven_types::bounded(artifact_id),
+                    );
+                    hits.push((repo.clone(), Arc::new(Metadata::default())));
+                    continue;
+                }
                 Ok(metadata) => {
                     hits.push((repo.clone(), metadata));
                     continue;
@@ -1663,8 +2379,17 @@ impl ModelService {
                 source.effective_repository(repo)
             }));
             // A listing without a repository that failed a retried request
-            // would differ from one with it.
-            if matches!(err, RepoError::Config(_)) || err.is_transient() {
+            // would differ from one with it. Bytes that fail or lack their
+            // checksum, and a redirect to plain HTTP, stop it as they stop
+            // the search for a file.
+            let refused = matches!(
+                err.cause(),
+                RepoError::ChecksumMismatch { .. }
+                    | RepoError::MissingChecksum(_)
+                    | RepoError::MissingMetadataChecksum(_)
+                    | RepoError::RedirectRejected { .. }
+            ) && !err.moves_to_next_repository();
+            if matches!(err, RepoError::Config(_)) || err.is_transient() || refused {
                 return Err(ResolveError::Repo {
                     coord: Some(format!("{group_id}:{artifact_id}")),
                     source: Box::new(err),
@@ -1701,7 +2426,7 @@ impl ModelService {
                     &repo
                         .id
                         .clone()
-                        .unwrap_or_else(|| rv_config::redact_url(&repo.url)),
+                        .unwrap_or_else(|| rv_config::redact_repository_url(&repo.url)),
                 )
                 .to_string();
                 tracing::warn!(
@@ -1712,6 +2437,10 @@ impl ModelService {
                      '{repository}', which failed: {error}"
                 );
             }
+        }
+        if hits.is_empty() {
+            // For a parent's range, which lists none without an error.
+            (self.ctx).note_listing_miss(group_id, artifact_id, searched.clone().into());
         }
         if hits.is_empty() && !found {
             return Err(match first_error {
@@ -1737,6 +2466,7 @@ impl ModelService {
         artifact_id: &str,
         req: &VersionReq,
         repos: &RepoContext,
+        unbuilt: Option<&str>,
     ) -> Result<Vec<ResolvedVersion>> {
         if let VersionReq::Exact(version) = req
             && let Some(token) = parse_dynamic_version_token(version.as_str())
@@ -1747,35 +2477,61 @@ impl ModelService {
                 .map(|v| vec![v]);
         }
 
-        let workspace_versions = self.workspace_versions(group_id, artifact_id);
+        let workspace_versions = self.workspace_versions(group_id, artifact_id, unbuilt);
         let found = !workspace_versions.is_empty();
         let hits = match self.ctx.pom_source.as_deref() {
             Some(source) => {
                 let searched = self.search_repos(repos);
-                self.listed_metadata(source, searched, group_id, artifact_id, true, found)
-                    .await?
+                self.listed_metadata(
+                    source,
+                    searched,
+                    group_id,
+                    artifact_id,
+                    true,
+                    found,
+                    rv_repo::MetadataReader::VersionRange,
+                )
+                .await?
             }
             None if found => Vec::new(),
             None => return Err(ResolveError::MissingRepoClient),
         };
+        let mode = self.mode();
+        // A reactor module in the range stands in for every list.
+        let in_reactor = (workspace_versions.iter()).any(|version| req.matches_in(version, mode));
+        // Maven's map holds every spelling listed, in the range or not, and
+        // the order they were put in orders the spellings that compare equal.
+        let mut listed: IndexSet<String> = (workspace_versions.iter())
+            .map(|version| version.as_str().to_string())
+            .collect();
         let mut versions: Vec<_> = workspace_versions;
-        for (repo, metadata) in hits {
-            for candidate in &metadata.versions {
+        let mut listed_by: Vec<(&str, &str)> = Vec::new();
+        for (repo, metadata) in &hits {
+            for candidate in metadata.listed_versions() {
                 // Gate each candidate on the repository that listed it, so a
                 // range cannot select a snapshot that only a mirror the
                 // consumer's policy excludes publishes.
-                if repo.allows_listed_version(candidate)
-                    && let Ok(version) = Version::parse(candidate)
+                if !repo.allows_listed_version(candidate) {
+                    continue;
+                }
+                listed.insert(candidate.trim().to_string());
+                let Ok(version) = Version::parse(candidate) else {
+                    continue;
+                };
+                if req.matches_in(&version, mode)
+                    && (self.ctx).admits_listed(group_id, artifact_id, req, &version, mode)
                 {
                     versions.push(version);
+                    listed_by.push((candidate, &repo.url));
                 }
             }
         }
         // Maven lists each spelling once, and two that compare equal both.
-        let mut listed = HashSet::new();
-        versions
-            .retain(|version| listed.insert(version.as_str().to_string()) && req.matches(version));
-        sort_as_maven_lists(&mut versions, listed.len());
+        let mut seen = HashSet::new();
+        versions.retain(|version| {
+            seen.insert(version.as_str().to_string()) && req.matches_in(version, mode)
+        });
+        sort_as_maven_lists(&mut versions, &listed, mode);
         let versions: Vec<_> = versions
             .into_iter()
             .map(|version| ResolvedVersion {
@@ -1788,6 +2544,52 @@ impl ModelService {
                 coord: format!("{group_id}:{artifact_id}"),
                 requirement: req.to_string(),
             });
+        }
+        if matches!(req, VersionReq::Ranges(_)) {
+            self.refuse_reactor_tie(group_id, artifact_id, req, None, unbuilt)?;
+        }
+        if matches!(req, VersionReq::Ranges(_)) {
+            let key = (
+                group_id.to_string(),
+                artifact_id.to_string(),
+                req.to_string(),
+            );
+            let kept: HashSet<&str> = (versions.iter())
+                .map(|listed| listed.version.as_str())
+                .collect();
+            let mut listings = match in_reactor {
+                true => lock(&self.reactor_range_listings),
+                false => lock(&self.range_listings),
+            };
+            let by_origin = listings.entry(key.clone()).or_default();
+            let mut read = BTreeSet::new();
+            for (version, url) in listed_by {
+                if kept.contains(version) {
+                    (by_origin.entry(url.to_string()).or_default()).insert(version.to_string());
+                    read.insert(url.to_string());
+                }
+            }
+            drop(listings);
+            if !in_reactor {
+                lock(&self.range_reads).entry(key).or_default().insert(read);
+            }
+        }
+        if matches!(req, VersionReq::Ranges(_)) && !in_reactor {
+            let top = &versions[versions.len() - 1].version;
+            let tied: BTreeSet<String> = (versions.iter())
+                .filter(|listed| listed.version.cmp_in(top, mode).is_eq())
+                .map(|listed| listed.version.as_str().to_string())
+                .collect();
+            if tied.len() > 1
+                || self
+                    .ctx
+                    .replays_tie(group_id, artifact_id, top, &listed, mode)
+            {
+                (lock(&self.range_ties))
+                    .entry((group_id.to_string(), artifact_id.to_string()))
+                    .or_default()
+                    .extend(tied);
+            }
         }
         Ok(versions)
     }
@@ -1802,10 +2604,10 @@ impl ModelService {
         // A reactor module stands in for the local repository's metadata,
         // which Maven also reads and raeva does not.
         let workspace = self
-            .workspace_versions(group_id, artifact_id)
+            .workspace_versions(group_id, artifact_id, None)
             .into_iter()
             .filter(|version| token.admits(version.as_str()))
-            .max();
+            .max_by(|a, b| a.cmp_in(b, self.mode()));
         let with_snapshots = token == DynamicVersionToken::Integration;
         let hits = match self.ctx.pom_source.as_deref() {
             Some(source) => {
@@ -1816,6 +2618,7 @@ impl ModelService {
                     artifact_id,
                     with_snapshots,
                     workspace.is_some(),
+                    rv_repo::MetadataReader::Version,
                 )
                 .await?
             }
@@ -1824,32 +2627,85 @@ impl ModelService {
         };
         // DefaultVersionResolver takes `<release>`, or for LATEST `<latest>`
         // and else `<release>`, from the metadata with the newest
-        // `<lastUpdated>`, the first on a tie. It never reads `<versions>`.
+        // `<lastUpdated>`, the first on a tie, whatever version it names
+        // and whatever the policy of the repository. It never reads
+        // `<versions>`.
         let newest = |marker: fn(&Metadata) -> Option<&str>| {
-            let mut newest: Option<(&str, &str)> = None;
+            let mut newest: Option<(&Repository, &str, &str)> = None;
             for (repo, metadata) in &hits {
-                // Gate each marker on the repository that wrote it, as for
-                // ranges.
-                let Some(version) = marker(metadata).filter(|version| {
-                    !version.is_empty() && token.admits(version) && repo.allows_version(version)
-                }) else {
+                let Some(version) = marker(metadata).filter(|version| !version.is_empty()) else {
                     continue;
                 };
                 let stamp = metadata.last_updated.as_deref();
-                if newest.is_none_or(|(_, known)| stamp.is_some_and(|stamp| stamp > known)) {
-                    newest = Some((version, stamp.unwrap_or("")));
+                if newest.is_none_or(|(_, _, known)| stamp.is_some_and(|stamp| stamp > known)) {
+                    newest = Some((repo, version, stamp.unwrap_or("")));
                 }
             }
-            newest.and_then(|(version, _)| Version::parse(version).ok())
+            newest.and_then(|(repo, version, _)| Some((repo, Version::parse(version).ok()?)))
         };
-        let release: fn(&Metadata) -> Option<&str> = |metadata| metadata.release.as_deref();
-        let marked = match token {
-            DynamicVersionToken::Release => newest(release),
-            DynamicVersionToken::Integration => {
-                newest(|metadata| metadata.latest.as_deref()).or_else(|| newest(release))
+        let release = || newest(|metadata| metadata.release.as_deref());
+        // The marker is recorded as the one `mvn -o` reads first for the
+        // token: a LATEST that fell back to `<release>` is written as
+        // `<latest>`.
+        let (kind, marked) = match token {
+            DynamicVersionToken::Release => (MetadataVersionKind::Release, release()),
+            DynamicVersionToken::Integration => (
+                MetadataVersionKind::Latest,
+                newest(|metadata| metadata.latest.as_deref()).or_else(release),
+            ),
+        };
+        // A frozen replay keeps the version the lock chose when a newer one,
+        // or another spelling of it, was marked since, and a repository still
+        // lists it: the marker the lock records, which may be a SNAPSHOT,
+        // else the highest version it locks.
+        let listed = |locked: &Version| {
+            (hits.iter()).any(|(repo, metadata)| {
+                (metadata.versions.iter()).any(|version| {
+                    version == locked.as_str() && repo.allows_listed_version(version)
+                })
+            })
+        };
+        let cap = (self.ctx.version_caps.as_deref()).and_then(|caps| {
+            let admits = |locked: &Version| token.admits(locked.as_str()) && listed(locked);
+            (caps.marker(group_id, artifact_id, kind, self.mode(), listed))
+                .or_else(|| caps.cap(group_id, artifact_id, self.mode(), admits))
+        });
+        let marked = match (marked, cap) {
+            (Some((_, marked)), Some(cap))
+                if marked.as_str() != cap.as_str() && marked.cmp_in(cap, self.mode()).is_ge() =>
+            {
+                (self.ctx.version_caps.as_deref()).inspect(|caps| caps.applied());
+                Some((kind, cap.clone()))
             }
+            (marked, _) => marked.map(|(repo, marked)| {
+                // Maven resolves the SNAPSHOT a LATEST took in the
+                // repository whose metadata named it alone.
+                if token == DynamicVersionToken::Integration
+                    && rv_maven_types::resolves_through_snapshot_metadata(marked.as_str())
+                {
+                    lock(&self.latest_snapshots).insert(
+                        (
+                            group_id.to_string(),
+                            artifact_id.to_string(),
+                            marked.as_str().to_string(),
+                            repos.clone(),
+                        ),
+                        RepoRef::of(repo),
+                    );
+                }
+                (kind, marked)
+            }),
         };
+        if let Some((kind, version)) = &marked {
+            lock(&self.markers).insert(rv_lock::MetadataVersion {
+                group: group_id.to_string(),
+                artifact: artifact_id.to_string(),
+                kind: *kind,
+                version: version.as_str().to_string(),
+            });
+        }
         marked
+            .map(|(_, version)| version)
             .or(workspace)
             .map(|version| ResolvedVersion {
                 version,
@@ -1867,12 +2723,60 @@ impl ModelService {
         repos: &RepoContext,
     ) -> Result<ResolvedVersion> {
         if self.workspace_module_for_coord(coord).is_some() {
-            return Ok(ResolvedVersion {
+            let base = ResolvedVersion {
                 version: coord.version.clone(),
+                repo: None,
+            };
+            if !self.is_own_module(coord) {
+                return Ok(base);
+            }
+            // The module being resolved has made nothing yet, so its own
+            // artifact is the newest build a repository has. Without one, or
+            // without a repository to ask, only its POM is served, from the
+            // module, and a request for another artifact fails on the file.
+            // A failing repository fails only such a request.
+            let resolved = match self.resolve_repository_snapshot(coord, repos).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    if !is_missing(&error) {
+                        self.defer_own_failure(error);
+                    }
+                    return Ok(base);
+                }
+            };
+            if rv_maven_types::snapshot_base_version(resolved.version.as_str()).is_none() {
+                let build = Coord {
+                    version: resolved.version.clone(),
+                    ..coord.clone()
+                };
+                lock(&self.own_builds).insert(pom_gav(&build), coord.version.clone());
+            }
+            return Ok(resolved);
+        }
+        // The lock records no repository for a realm's jar, so the pinned
+        // build comes from the first repository that serves it.
+        let gav = rv_maven_types::Gav::new(
+            coord.group_id.as_str(),
+            coord.artifact_id.as_str(),
+            coord.version.as_str(),
+        );
+        let pinned = (self.extension_module.as_deref()).and_then(|module| {
+            (self.ctx.client.as_ref())?.pinned_extension(&self.ctx.platform, module, &gav)
+        });
+        if let Some(build) = pinned {
+            return Ok(ResolvedVersion {
+                version: Version::parse(build)?,
                 repo: None,
             });
         }
+        self.resolve_repository_snapshot(coord, repos).await
+    }
 
+    async fn resolve_repository_snapshot(
+        &self,
+        coord: &Coord,
+        repos: &RepoContext,
+    ) -> Result<ResolvedVersion> {
         let source = self
             .ctx
             .pom_source
@@ -1880,8 +2784,21 @@ impl ModelService {
             .ok_or(ResolveError::MissingRepoClient)?;
 
         let version_str = coord.version.as_str();
+        let latest = lock(&self.latest_snapshots)
+            .get(&(
+                coord.group_id.to_string(),
+                coord.artifact_id.to_string(),
+                version_str.to_string(),
+                repos.clone(),
+            ))
+            .cloned();
         let repos = self.search_repos(repos);
-        let eligible_repos = filter_repos_for_version(&repos, version_str, coord)?;
+        let mut eligible_repos = filter_repos_for_version(&repos, version_str, coord)?;
+        if let Some(latest) = latest
+            && eligible_repos.iter().any(|repo| latest.is(repo))
+        {
+            eligible_repos.retain(|repo| latest.is(repo));
+        }
 
         let mut search = Search::default();
         let (repo, resolution) = match self
@@ -1895,9 +2812,13 @@ impl ModelService {
         // As in Maven, a base version no repository names leaves the file to
         // whichever repository serves it.
         let candidate = resolution.candidate != SnapshotCandidate::Absent;
+        let pinned = resolution.candidate == SnapshotCandidate::Pinned;
         Ok(ResolvedVersion {
             version: Version::parse(&resolution.version)?,
-            repo: candidate.then(|| RepoRef::of(repo)),
+            repo: candidate.then(|| RepoRef {
+                pinned,
+                ..RepoRef::of(repo)
+            }),
         })
     }
 
@@ -1923,7 +2844,6 @@ impl ModelService {
         let mut generic: Option<(&'r Repository, rv_repo::SnapshotResolution)> = None;
         let mut base = None;
         let mut pinned = None;
-        let mut served = Vec::new();
         let first = repos.first().copied();
         // Every repository is read, so all are asked at once.
         self.note_progress();
@@ -1935,14 +2855,9 @@ impl ModelService {
         }))
         .await;
         for (repo, result) in repos.into_iter().zip(results) {
-            if let Ok(resolution) = &result
-                && resolution.candidate != SnapshotCandidate::Absent
-            {
-                served.push((repo, resolution.clone()));
-            }
             match result {
                 Ok(resolution) if resolution.candidate == SnapshotCandidate::Pinned => {
-                    pinned.get_or_insert(resolution.version);
+                    pinned.get_or_insert((repo, resolution));
                 }
                 Ok(resolution) if resolution.candidate == SnapshotCandidate::Absent => {
                     base.get_or_insert((repo, resolution));
@@ -1973,13 +2888,12 @@ impl ModelService {
                 }
             }
         }
-        // The build raeva.lock pins stands over newer ones, from the first
-        // repository that serves it, as when it was locked.
-        if let Some(version) = pinned {
-            return Ok(served
-                .into_iter()
-                .find(|(_, resolution)| resolution.version == version)
-                .expect("the pinned resolution is served"));
+        // The build raeva.lock pins stands over newer ones, from the
+        // repository that holds it as the lock records, as when it was
+        // locked: an earlier one that lists the same build with an older
+        // `updated` lost to it then.
+        if let Some(pinned) = pinned {
+            return Ok(pinned);
         }
         let best = match (specific, generic) {
             (Some(specific), Some(generic))
@@ -2014,7 +2928,17 @@ impl ModelService {
         repos: &RepoContext,
     ) -> Result<ResolvedProject> {
         let version = coord.version.as_str();
-        let result = if (rv_maven_types::resolves_through_snapshot_metadata(version)
+        let own_base = lock(&self.own_builds).get(&pom_gav(coord)).cloned();
+        let result = if let Some(base) = own_base {
+            // A build of the module's own SNAPSHOT that Maven reads as a
+            // release: the repository's file and POM, the module's model.
+            self.pin_own_pom(coord, None, repos).await?;
+            let base = Coord {
+                version: base,
+                ..coord.clone()
+            };
+            self.fetch_project_at_version(&base, None, repos).await?
+        } else if (rv_maven_types::resolves_through_snapshot_metadata(version)
             || (resolve_snapshot_pom && rv_maven_types::snapshot_base_version(version).is_some()))
             && self.workspace_module_for_coord(coord).is_none()
         {
@@ -2028,6 +2952,9 @@ impl ModelService {
             result
         };
         self.record_parent_ranges(coord, repos, &result.project);
+        if let Some(types) = &self.extension_types {
+            types.meet(&result.project).await?;
+        }
         Ok(result)
     }
 
@@ -2064,13 +2991,33 @@ impl ModelService {
             ..coord.clone()
         };
         let resolved = self.resolve_snapshot_version_internal(&pom, repos).await?;
+        let base = pom.clone();
         let pom = Coord {
             version: resolved.version,
             ..pom
         };
-        let project = self
-            .fetch_project_at_version(&pom, resolved.repo.as_ref(), repos)
-            .await?;
+        let (project, pom_repo) = if self.is_own_module(&base) {
+            // The module's own build: the repository's file and POM, the
+            // module's model.
+            let pom_repo = self
+                .pin_own_pom(&pom, resolved.repo.as_ref(), repos)
+                .await?;
+            let project = self.fetch_project_at_version(&base, None, repos).await?;
+            (project, pom_repo)
+        } else {
+            // Maven's version resolver names a repository again only for a
+            // version that still ends in SNAPSHOT: a timestamped POM is
+            // read from the first repository that serves it, not only from
+            // the one whose metadata named the build, which keeps the jar.
+            let build_repo = (resolved.repo.as_ref()).filter(|_| {
+                rv_maven_types::resolves_through_snapshot_metadata(pom.version.as_str())
+            });
+            let project = self
+                .fetch_project_at_version(&pom, build_repo, repos)
+                .await?;
+            let pom_repo = project.repo_url.clone();
+            (project, pom_repo)
+        };
         let recorded = self.companion_pom_blob(&pom_gav(&pom)).ok_or_else(|| {
             ResolveError::InternalError(format!("no companion POM recorded for {pom}"))
         })?;
@@ -2080,7 +3027,7 @@ impl ModelService {
         } else {
             recorded
         };
-        let served = blob.clone().map(|blob| (blob, project.repo_url.clone()));
+        let served = blob.clone().map(|blob| (blob, pom_repo.clone()));
         self.record_companion_pom_blob(pom_gav(coord), served)?;
         if blob.is_none() {
             lock(&self.missing_poms).insert((ExactCoord(coord.clone()), repos.clone()));
@@ -2097,7 +3044,7 @@ impl ModelService {
                 Some(stamp)
                     != rv_maven_types::SnapshotStamp::of_version(coord.version.as_str()).as_ref()
             }),
-            repo_url: project.repo_url.clone(),
+            repo_url: pom_repo,
         };
         self.companion_pom_origins
             .write()
@@ -2106,7 +3053,20 @@ impl ModelService {
         Ok(project)
     }
 
-    async fn fetch_project_at_version(
+    /// [`Self::fetch_project_at`] on the heap. A debug build keeps the
+    /// future of each await on the caller's stack frame, and the callers
+    /// that await it at several points overflowed a 2 MiB test thread on
+    /// Windows.
+    fn fetch_project_at_version<'a>(
+        &'a self,
+        coord: &'a Coord,
+        resolved_repo: Option<&'a RepoRef>,
+        repos: &'a RepoContext,
+    ) -> BoxFuture<'a, Result<ResolvedProject>> {
+        Box::pin(self.fetch_project_at(coord, resolved_repo, repos))
+    }
+
+    async fn fetch_project_at(
         &self,
         coord: &Coord,
         resolved_repo: Option<&RepoRef>,
@@ -2118,6 +3078,17 @@ impl ModelService {
                 .as_deref()
                 .expect("workspace module requires workspace");
             let pom_path = module.pom_path.clone();
+            // The module being resolved takes another artifact of its own
+            // from a repository but its model from here. Its row pins the
+            // repository's POM, as a plugin that reads the file does.
+            if self.own_module.as_deref() == Some(pom_path.as_str()) {
+                // A SNAPSHOT build pins its POM where it resolves.
+                if rv_maven_types::is_snapshot_version(coord.version.as_str()) {
+                    self.record_companion_pom_blob(pom_gav(coord), None)?;
+                } else {
+                    self.pin_own_pom(coord, resolved_repo, repos).await?;
+                }
+            }
             // Maven takes a reactor dependency's model from the reactor, built
             // from the configuration and the module's own POMs, never from
             // the consumer's repositories.
@@ -2179,6 +3150,7 @@ impl ModelService {
                 )));
             }
             let support_poms = scope.into_reads();
+            self.learn_models(&support_poms);
             // Every build starts from the same state, so what it adds to its
             // own repositories does not keep the model from another module.
             if let (Some(models), Some(context)) = (self.reactor_models.as_deref(), context) {
@@ -2262,16 +3234,12 @@ impl ModelService {
                     let endpoint: Arc<str> = Arc::from(effective.url.as_str());
                     search.fallback.served(&effective, &req, path.clone());
                     self.note_progress();
-                    let repository_url = repo.base_url().map_err(|source| ResolveError::Repo {
-                        coord: Some(coord.to_string()),
-                        source: Box::new(source),
-                        searched: std::mem::take(&mut search.searched),
-                    })?;
                     let pom_blob = BlobId::from_bytes(&bytes);
                     let parsed = self.ctx.parsed_poms().parse(&pom_blob, &bytes);
                     let mut support_poms = Vec::new();
                     let mut reads = Arc::default();
                     let mut problem = None;
+                    let mut borrowed = false;
                     let project = match parsed {
                         Ok(pom) => {
                             let mut pom = Arc::unwrap_or_clone(pom);
@@ -2283,6 +3251,7 @@ impl ModelService {
                             let project = build_remote_project(pom, &scope, &activation).await;
                             reads = Arc::new(activation.environment.take_reads());
                             environment.record_reads(&reads);
+                            borrowed = scope.borrowed();
                             support_poms = scope.into_reads();
                             match project? {
                                 Ok(project) => project,
@@ -2300,7 +3269,7 @@ impl ModelService {
                         // drop transitives. Missing parents stay hard errors.
                         Err(err) if err.is_malformed_xml() || err.is_deserialize() => {
                             problem = Some(PomProblem {
-                                repository: Some(rv_config::redact_url(&repository_url)),
+                                repository: Some(rv_config::redact_repository_url(&repo.url)),
                                 error: err.to_string(),
                             });
                             invalid_descriptor(coord)
@@ -2308,7 +3277,7 @@ impl ModelService {
                         Err(err) => {
                             return Err(PomError::InvalidModel(format!(
                                 "{coord} from {}: {err}",
-                                rv_config::redact_url(&repository_url)
+                                rv_config::redact_repository_url(&repo.url)
                             ))
                             .into());
                         }
@@ -2334,18 +3303,22 @@ impl ModelService {
                         repo_url: Arc::from(repo.url.as_str()),
                         endpoint_url: endpoint,
                     };
-                    self.keep_reactor_model(
-                        coord,
-                        repos,
-                        context,
-                        ReactorModel {
-                            project: Arc::clone(&project),
-                            pom: Some(pom.clone()),
-                            support_poms,
-                            reads,
-                            problem: problem.clone(),
-                        },
-                    );
+                    // A model built from what another path read is this
+                    // module's alone.
+                    if !borrowed {
+                        self.keep_reactor_model(
+                            coord,
+                            repos,
+                            context,
+                            ReactorModel {
+                                project: Arc::clone(&project),
+                                pom: Some(pom.clone()),
+                                support_poms,
+                                reads,
+                                problem: problem.clone(),
+                            },
+                        );
+                    }
                     if let Some(problem) = problem {
                         lock(&self.pom_problems).insert(pom_gav(coord), problem);
                     }
@@ -2382,6 +3355,88 @@ impl ModelService {
         }
     }
 
+    /// Pins the repository's POM of the module's own coordinates, from
+    /// `resolved_repo` when version resolution picked one, and returns the
+    /// repository that served it. Maven builds the module's model from the
+    /// module and never reads this POM, so when no repository serves it,
+    /// missing, uncached offline or failing, nothing is pinned.
+    async fn pin_own_pom(
+        &self,
+        coord: &Coord,
+        resolved_repo: Option<&RepoRef>,
+        repos: &RepoContext,
+    ) -> Result<Option<Arc<str>>> {
+        let Some(source) = self.ctx.pom_source.as_deref() else {
+            self.record_companion_pom_blob(pom_gav(coord), None)?;
+            return Ok(None);
+        };
+        let req = ArtifactRequest::from_coord(coord);
+        let search_repos = self.search_repos(repos);
+        let mut eligible = (filter_repos_for_version(&search_repos, coord.version.as_str(), coord))
+            .unwrap_or_default();
+        if let Some(resolved) = resolved_repo {
+            eligible.retain(|repo| resolved.is(repo));
+        }
+        let mut search = Search::default();
+        for repo in eligible {
+            match self.read_pom(source, &search_repos, repo, &req).await {
+                Ok((bytes, _)) => {
+                    let url: Arc<str> = Arc::from(repo.url.as_str());
+                    let route = PomRoute {
+                        key: pom_key(coord),
+                        repo: Arc::clone(&url),
+                        endpoint: Arc::from(source.effective_repository(repo).url.as_str()),
+                    };
+                    let blob = BlobId::from_bytes(&bytes);
+                    self.store_pom_bytes(&pom_key(coord), &bytes, &blob, &route)
+                        .await?;
+                    lock(&self.release_pom_repos)
+                        .insert((pom_gav(coord), repos.clone()), Arc::clone(&url));
+                    self.record_companion_pom_blob(
+                        pom_gav(coord),
+                        Some((blob, Some(Arc::clone(&url)))),
+                    )?;
+                    return Ok(Some(url));
+                }
+                Err(err) => {
+                    if search.failed(source, repo, coord, err).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        self.record_companion_pom_blob(pom_gav(coord), None)?;
+        Ok(None)
+    }
+
+    /// The refusal of a repository of `declared`, which `declared_by`
+    /// declares, that the transitive policy admits and whose id raeva does
+    /// not follow ([`rv_repo::expression_id_refusal`]): Maven reads it, so
+    /// ignoring it would lock what Maven does not.
+    fn unfollowed_id(&self, declared: &[Repository], declared_by: &str) -> Option<ResolveError> {
+        let config = &self.ctx.config;
+        let (secrets, names) = self.secret_inputs();
+        declared.iter().find_map(|repo| {
+            let secret = rv_repo::secret_part_refusal(&repo.url, repo.url_reads(), secrets, names)
+                .is_some()
+                || rv_repo::secret_id_refusal(repo.id.as_deref(), repo.id_reads(), secrets, names)
+                    .is_some();
+            if secret || !config.security.allows_transitive_repo_url(&repo.url) {
+                return None;
+            }
+            let refusal = rv_repo::expression_id_refusal(config, repo)?;
+            Some(ResolveError::RepositoryIdUnfollowed {
+                id: rv_maven_types::bounded(repo.id.as_deref().unwrap_or_default()).to_string(),
+                declared_by: rv_maven_types::bounded(declared_by).to_string(),
+                refusal: refusal.to_string(),
+            })
+        })
+    }
+
+    fn defer_own_failure(&self, error: ResolveError) {
+        lock(&self.own_failure).get_or_insert(error);
+    }
+
     /// Record what reading `coord`'s POM and building `project` from it
     /// adds to this resolution.
     async fn admit_dependency(
@@ -2392,16 +3447,15 @@ impl ModelService {
         pom: &DependencyPom,
     ) -> Result<ResolvedProject> {
         let (pom_blob, repo_url) = (&pom.blob, Arc::clone(&pom.repo_url));
+        let declared_by = format!("{}:{}:{}", coord.group_id, coord.artifact_id, coord.version);
+        let declared: Vec<_> = resolution_repositories(&project.repositories).collect();
+        if let Some(error) = self.unfollowed_id(&declared, &declared_by) {
+            return Err(error);
+        }
         // Record admitted <repositories> declared by this transitive POM in
         // the shared list (for trusted_repositories / checksum policy
         // tightening) and report dropped ones.
-        self.extend_repos(
-            resolution_repositories(&project.repositories),
-            Some(&format!(
-                "{}:{}:{}",
-                coord.group_id, coord.artifact_id, coord.version
-            )),
-        );
+        self.extend_repos(declared, Some(&declared_by));
         // Persist and pin the exact bytes this graph node was
         // parsed from, here, where they are in hand. The download
         // pass would otherwise re-fetch the same URL and index
@@ -2431,7 +3485,8 @@ impl ModelService {
 
     /// Record the support POMs another module's build of a reused model
     /// read, as this module's build would have.
-    async fn record_support_poms(&self, poms: &[Arc<SupportPom>]) -> Result<()> {
+    pub(super) async fn record_support_poms(&self, poms: &[Arc<SupportPom>]) -> Result<()> {
+        self.learn_models(poms);
         for pom in poms {
             if self.recorded(pom) {
                 continue;
@@ -2440,6 +3495,17 @@ impl ModelService {
             self.mark_recorded(Arc::clone(pom));
         }
         Ok(())
+    }
+
+    /// Keep what `poms` were read as in the model cache, as a build of
+    /// their model here would have.
+    pub(super) fn learn_models(&self, poms: &[Arc<SupportPom>]) {
+        let models = &mut lock(&self.read_models).poms;
+        for pom in poms {
+            if let Some(key) = &pom.model {
+                (models.entry(key.clone())).or_insert_with(|| Arc::clone(pom));
+            }
+        }
     }
 
     /// Whether this service recorded `pom` while no coordinate in the
@@ -2472,67 +3538,70 @@ impl ModelService {
         ids
     }
 
-    /// The root list, the path's repository context, and the repositories
-    /// one build's lineage declared. A build's model resolver starts from
-    /// the path's repositories, so a declaration under an id already used on
-    /// another URL is left out.
-    fn parent_search_list(&self, ctx: &RepoContext, build: &[Repository]) -> Vec<Repository> {
-        let mut repos = self.root_repos_snapshot();
-        for repo in self.parent_search_extra(&repos, ctx, build) {
-            if !repos.iter().any(|known| repo_key(known) == repo_key(&repo)) {
-                repos.push(repo);
+    /// The list a build's model resolver searches: the root list and the
+    /// path's repository context, then what `build` declared, as
+    /// [`model_list::replay`] holds it.
+    pub(super) fn model_entries(&self, ctx: &RepoContext, build: &ModelBuild) -> Vec<Entry> {
+        let mut request = self.root_repos_snapshot();
+        let mut seen = HashSet::new();
+        let mut external = Vec::new();
+        if build.project {
+            // The project's request entries the configuration adds, which
+            // its resolver keeps behind the POM's, and every id its own
+            // build declared, the super POM's `central` among them.
+            external = (request.iter())
+                .filter(|repo| self.request_urls.contains(&repo.url))
+                .cloned()
+                .collect();
+            seen.extend(lock(&self.root_repo_ids).iter().cloned().map(Some));
+            seen.insert(Some("central".to_string()));
+        } else {
+            for repo in ctx.as_slice() {
+                if !request
+                    .iter()
+                    .any(|known| repo_key(known) == repo_key(repo))
+                {
+                    request.push(repo.clone());
+                }
             }
         }
-        repos
+        let start = model_list::Start {
+            request,
+            external,
+            seen,
+        };
+        model_list::replay(&self.ctx.config, self.mode(), start, build)
     }
 
-    /// The [`RepoContext`] representing the non-root repositories that
-    /// [`Self::parent_search_list`] searches for `(ctx, build)`.
+    /// The repositories of [`Self::model_entries`] raeva reads, in order.
+    pub(super) fn parent_search_list(
+        &self,
+        ctx: &RepoContext,
+        build: &ModelBuild,
+    ) -> Vec<Repository> {
+        (self.model_entries(ctx, build).into_iter())
+            .filter(|entry| entry.reach == model_list::Reach::Read)
+            .map(|entry| entry.repo)
+            .collect()
+    }
+
+    /// The [`RepoContext`] that keys what [`Self::parent_search_list`]
+    /// searches for `(ctx, build)`: `ctx` while the build changed nothing.
     pub(super) fn parent_search_context(
         &self,
         ctx: &RepoContext,
-        build: &[Repository],
+        build: &ModelBuild,
     ) -> RepoContext {
-        if build.is_empty() {
+        if build.added.is_empty() {
             return ctx.clone();
         }
-        let extra = self.parent_search_extra(&self.root_repos_snapshot(), ctx, build);
-        if extra.as_slice() == ctx.as_slice() {
+        let unchanged = self.parent_search_list(ctx, &ModelBuild::default());
+        let searched = self.parent_search_list(ctx, build);
+        if searched == unchanged {
             ctx.clone()
         } else {
-            RepoContext::from_repos(extra)
+            RepoContext::from_repos(searched)
         }
-    }
-
-    /// `ctx`, then each of `build` that neither `root` nor an earlier entry
-    /// holds, unless its id is a root id or one `ctx` uses on another URL.
-    fn parent_search_extra(
-        &self,
-        root: &[Repository],
-        ctx: &RepoContext,
-        build: &[Repository],
-    ) -> Vec<Repository> {
-        let root_ids = lock(&self.root_repo_ids);
-        let mut extra = ctx.as_slice().to_vec();
-        for repo in build {
-            let id = repo.id.as_deref().filter(|id| !id.is_empty());
-            let blocked_id = id.is_some_and(|id| {
-                root_ids.contains(id)
-                    || ctx
-                        .as_slice()
-                        .iter()
-                        .any(|r| r.id.as_deref() == Some(id) && r.url != repo.url)
-            });
-            if !blocked_id
-                && !root
-                    .iter()
-                    .chain(&extra)
-                    .any(|known| repo_key(known) == repo_key(repo))
-            {
-                extra.push(repo.clone());
-            }
-        }
-        extra
     }
 
     /// Highest version in `range` for a parent lookup: reactor modules when
@@ -2544,43 +3613,95 @@ impl ModelService {
         artifact_id: &str,
         range: &VersionReq,
         ctx: &RepoContext,
-        build: &[Repository],
+        build: &ModelBuild,
         reactor: bool,
-    ) -> Result<Option<Version>> {
-        let mut best = if reactor {
-            self.workspace_versions(group_id, artifact_id)
-                .into_iter()
-                .filter(|version| range.matches(version))
-                .max()
-        } else {
-            None
+    ) -> Result<(Option<Version>, RangeListing)> {
+        let mode = self.mode();
+        let mut versions = match reactor {
+            true => self.workspace_versions(group_id, artifact_id, None),
+            false => Vec::new(),
+        };
+        // Maven's map holds every spelling listed, in the range or not, and
+        // takes the last of the spellings that compare equal.
+        let mut listed: IndexSet<String> = (versions.iter())
+            .map(|version| version.as_str().to_string())
+            .collect();
+        versions.retain(|version| range.matches_in(version, mode));
+        let highest = |mut versions: Vec<Version>, listed: &IndexSet<String>| -> Result<_> {
+            sort_as_maven_lists(&mut versions, listed, mode);
+            (self.ctx).order_parent_taken((group_id, artifact_id), &mut versions, mode);
+            let taken = versions.pop();
+            if let Some(taken) = taken.as_ref().filter(|_| reactor) {
+                self.refuse_reactor_tie(group_id, artifact_id, range, Some(taken), None)?;
+            }
+            Ok(taken)
         };
         let Some(source) = self.ctx.pom_source.as_deref() else {
-            return Ok(best);
+            return Ok((highest(versions, &listed)?, RangeListing::new()));
         };
         // Maven lists a parent's versions in the repositories it would
         // fetch the parent from, the model's own among them.
         let searched = self.parent_search_list(ctx, build);
         let hits = match self
-            .listed_metadata(source, searched, group_id, artifact_id, true, true)
+            .listed_metadata(
+                source,
+                searched,
+                group_id,
+                artifact_id,
+                true,
+                true,
+                rv_repo::MetadataReader::VersionRange,
+            )
             .await
         {
             Ok(hits) => hits,
             Err(ResolveError::ArtifactNotFound { .. }) => Vec::new(),
             Err(error) => return Err(error),
         };
+        let mut listing = RangeListing::new();
         for (repo, metadata) in hits {
-            for candidate in &metadata.versions {
-                if repo.allows_listed_version(candidate)
-                    && let Ok(version) = Version::parse(candidate)
-                    && range.matches(&version)
-                    && best.as_ref().is_none_or(|current| *current < version)
+            for candidate in metadata.listed_versions() {
+                if !repo.allows_listed_version(candidate) {
+                    continue;
+                }
+                let first = listed.insert(candidate.trim().to_string());
+                if let Ok(version) = Version::parse(candidate)
+                    && range.matches_in(&version, mode)
+                    && (self.ctx).admits_listed(group_id, artifact_id, range, &version, mode)
                 {
-                    best = Some(version);
+                    (listing.entry(repo.url.to_string()).or_default())
+                        .insert(candidate.trim().to_string());
+                    if first {
+                        versions.push(version);
+                    }
                 }
             }
         }
-        Ok(best)
+        Ok((highest(versions, &listed)?, listing))
+    }
+
+    /// The prefetcher, and the request and store key of the artifact of
+    /// `coord`, unless it has none to download: a pom-packaged artifact is
+    /// the POM the model was read from, and the reactor builds a module's.
+    fn artifact_hint(
+        &self,
+        coord: &Coord,
+    ) -> Option<(&super::prefetch::Prefetcher, ArtifactRequest, ArtifactCoord)> {
+        let prefetcher = self.ctx.prefetcher.as_deref()?;
+        let request = ArtifactRequest::from_coord(coord);
+        let model =
+            request.packaging == "pom" && request.classifier.as_deref().is_none_or(str::is_empty);
+        if model || self.workspace_module_for_coord(coord).is_some() {
+            return None;
+        }
+        let key = ArtifactCoord::new(
+            request.group_id.as_str(),
+            request.artifact_id.as_str(),
+            request.version.as_str(),
+            request.packaging.as_str(),
+            request.classifier.as_deref(),
+        );
+        Some((prefetcher, request, key))
     }
 
     /// Start fetching the POM of `coord` from the repositories a read of it
@@ -2589,21 +3710,18 @@ impl ModelService {
     /// declared so far, as for [`Self::fetch_pom_bytes`]; `None` marks a
     /// dependency's POM, which is searched only in the effective
     /// repositories. A `range` version is read for certain. Reactor
-    /// modules, snapshots and POMs this resolution has already read are left
-    /// alone.
+    /// modules and POMs this resolution has already read are left alone.
     pub(super) fn prefetch_pom(
         &self,
         coord: &Coord,
         ctx: &RepoContext,
-        build: Option<&[Repository]>,
+        build: Option<&ModelBuild>,
         range: bool,
     ) {
         let Some(prefetcher) = self.ctx.prefetcher.as_deref() else {
             return;
         };
-        let version = coord.version.to_string();
-        if rv_maven_types::is_snapshot_version(&version)
-            || self.workspace_module_for_coord(coord).is_some()
+        if self.workspace_module_for_coord(coord).is_some()
             || (build.is_none() && self.ctx.has_project(coord, ctx))
         {
             return;
@@ -2612,10 +3730,7 @@ impl ModelService {
             Some(build) => self.parent_search_list(ctx, build),
             None => self.search_repos(ctx),
         };
-        if let Ok(eligible) = filter_repos_for_version(&repos, &version, coord) {
-            let eligible = eligible.into_iter().cloned().collect();
-            prefetcher.hint(eligible, ArtifactRequest::from_coord(coord), range);
-        }
+        prefetcher.hint(repos, ArtifactRequest::from_coord(coord), range);
     }
 
     /// [`PomSource::pom`], with the parent and imported BOMs of a POM it
@@ -2638,11 +3753,24 @@ impl ModelService {
     /// that serves them, persisted and pinned as a support POM. `build`
     /// holds the repositories the model being built declared so far; they
     /// are searched after the shared ones.
+    #[cfg(test)]
     pub(super) async fn fetch_pom_bytes(
         &self,
         coord: &Coord,
         ctx: &RepoContext,
-        build: &[Repository],
+        build: &ModelBuild,
+        model: Option<ModelKey>,
+    ) -> Result<Arc<SupportPom>> {
+        let repos = self.parent_search_list(ctx, build);
+        self.fetch_pom_bytes_from(coord, repos, model).await
+    }
+
+    /// [`Self::fetch_pom_bytes`] from `repos`, in order.
+    pub(super) async fn fetch_pom_bytes_from(
+        &self,
+        coord: &Coord,
+        repos: Vec<Repository>,
+        model: Option<ModelKey>,
     ) -> Result<Arc<SupportPom>> {
         let source = self
             .ctx
@@ -2652,7 +3780,6 @@ impl ModelService {
         let mut req = ArtifactRequest::from_coord(coord);
 
         let version_str = coord.version.to_string();
-        let repos = self.parent_search_list(ctx, build);
         let mut eligible_repos = filter_repos_for_version(&repos, &version_str, coord)?;
         let mut search = Search::default();
         // A SNAPSHOT parent or BOM is the newest build across the
@@ -2697,7 +3824,10 @@ impl ModelService {
             match self.read_pom(source, &repos, repo, &req).await {
                 Ok((bytes, path)) => {
                     let endpoint = source.effective_repository(repo).url;
-                    let pom = SupportPom::new(coord, repo, &endpoint, &path, bytes);
+                    let pom = SupportPom {
+                        model,
+                        ..SupportPom::new(coord, repo, &endpoint, &path, bytes)
+                    };
                     search
                         .fallback
                         .served(&source.effective_repository(repo), &req, path);
@@ -2733,6 +3863,7 @@ impl ModelService {
     /// this module had read them. Other bytes for one this module read are
     /// a conflict, as a fetch of them would be.
     pub(super) fn record_kept_support_poms(&self, poms: &[Arc<SupportPom>]) -> Result<()> {
+        self.learn_models(poms);
         for pom in poms {
             if self.recorded(pom) {
                 continue;
@@ -2819,17 +3950,59 @@ impl ModelService {
 }
 
 impl Backend for ModelService {
+    fn maven_mode(&self) -> MavenMode {
+        self.mode()
+    }
+
+    fn order_taken(&self, coordinate: (&str, &str), versions: &mut [ResolvedVersion], first: bool) {
+        let mode = self.mode();
+        (self.ctx).order_taken(coordinate, versions, |listed| &listed.version, mode, first);
+    }
+
+    fn artifact_types(&self) -> rv_maven_model::ArtifactTypes {
+        match &self.extension_types {
+            Some(types) => types.types(),
+            None => rv_maven_model::ArtifactTypes::core(self.mode()),
+        }
+    }
+
+    fn pom_read(&self, coord: &Coord, repos: &RepoContext) -> Option<Option<BlobId>> {
+        if lock(&self.missing_poms).contains(&(ExactCoord(coord.clone()), repos.clone())) {
+            return Some(None);
+        }
+        self.companion_pom_blob(&pom_gav(coord))
+    }
+
     fn workspace_module(&self, coord: &Coord) -> Option<String> {
         self.workspace_module_for_coord(coord)
             .map(|module| module.pom_path.clone())
+    }
+
+    fn take_own_failure(&self) -> Option<ResolveError> {
+        lock(&self.own_failure).take()
+    }
+
+    fn drops_wagons_below(&self, coord: &Coord) -> bool {
+        self.plugin && is_legacy_core(coord)
     }
 
     fn note_transitive_selection(&self) {
         self.ctx.note_reactor_through_dependencies();
     }
 
+    fn workspace_packaging(&self, coord: &Coord) -> Option<String> {
+        let module = self.workspace_module_for_coord(coord)?;
+        Some(
+            module
+                .pom()
+                .packaging
+                .clone()
+                .unwrap_or_else(|| "jar".to_string()),
+        )
+    }
+
     fn is_reactor_module(&self, group: &str, artifact: &str, version: &str) -> bool {
-        (self.workspace.as_deref()).is_some_and(|workspace| {
+        self.reactor().is_some_and(|workspace| {
             (workspace.candidates(group, artifact)).any(|module| module.gav().version == version)
         })
     }
@@ -2843,7 +4016,7 @@ impl Backend for ModelService {
     ) -> crate::solver::BoxFuture<'b, Result<ResolvedVersion>> {
         Box::pin(async move {
             let mut versions = self
-                .resolve_versions_internal(group_id, artifact_id, req, repos)
+                .resolve_versions_internal(group_id, artifact_id, req, repos, None)
                 .await?;
             versions.pop().ok_or_else(|| ResolveError::VersionNotFound {
                 coord: format!("{group_id}:{artifact_id}"),
@@ -2859,7 +4032,18 @@ impl Backend for ModelService {
         req: &'b VersionReq,
         repos: &'b RepoContext,
     ) -> crate::solver::BoxFuture<'b, Result<Vec<ResolvedVersion>>> {
-        Box::pin(self.resolve_versions_internal(group_id, artifact_id, req, repos))
+        Box::pin(self.resolve_versions_internal(group_id, artifact_id, req, repos, None))
+    }
+
+    fn resolve_versions_unbuilt<'b>(
+        &'b self,
+        group_id: &'b str,
+        artifact_id: &'b str,
+        req: &'b VersionReq,
+        repos: &'b RepoContext,
+        unbuilt: &'b str,
+    ) -> crate::solver::BoxFuture<'b, Result<Vec<ResolvedVersion>>> {
+        Box::pin(self.resolve_versions_internal(group_id, artifact_id, req, repos, Some(unbuilt)))
     }
 
     fn resolve_snapshot_version<'b>(
@@ -2877,6 +4061,10 @@ impl Backend for ModelService {
         searched: &[RepoSearchStatus],
     ) -> Vec<DroppedRepo> {
         self.collect_dropped_repos(path, version, searched)
+    }
+
+    fn note_loser(&self, coord: &Coord) {
+        lock(&self.loser_poms).insert(pom_gav(coord));
     }
 
     /// One POM pin serves every classifier of a coordinate, so winners
@@ -3012,11 +4200,23 @@ impl Backend for ModelService {
                     .map(|listing| lister.metadata(listing, &dummy));
                 let listed = futures::future::join_all(listed).await;
                 service.ctx.prefetcher = weak.upgrade();
+                let valid = |metadata: &Metadata| {
+                    service.mode() != MavenMode::Maven310
+                        || !metadata.has_invalid_token(rv_repo::MetadataReader::VersionRange)
+                };
                 for (repo, metadata) in search_repos.iter().zip(listed) {
+                    let metadata = metadata.filter(valid);
                     for listed in metadata.iter().flat_map(|metadata| &metadata.versions) {
                         if repo.allows_listed_version(listed)
                             && let Ok(version) = Version::parse(listed)
-                            && req.matches(&version)
+                            && req.matches_in(&version, service.mode())
+                            && service.ctx.admits_listed(
+                                &dummy.group_id,
+                                &dummy.artifact_id,
+                                &req,
+                                &version,
+                                service.mode(),
+                            )
                         {
                             let coord = Coord {
                                 version,
@@ -3030,55 +4230,58 @@ impl Backend for ModelService {
         });
     }
 
-    fn prefetch_artifact(&self, coord: &Coord, repo_url: Option<&str>, repos: &RepoContext) {
-        let Some(prefetcher) = self.ctx.prefetcher.as_deref() else {
+    fn prefetch_artifact(
+        &self,
+        coord: &Coord,
+        build_repo: Option<&RepoRef>,
+        repo_url: Option<&str>,
+        repos: &RepoContext,
+    ) {
+        let Some((prefetcher, request, key)) = self.artifact_hint(coord) else {
             return;
         };
-        let request = ArtifactRequest::from_coord(coord);
-        // A pom-packaged artifact is the POM the model was read from.
-        let model =
-            request.packaging == "pom" && request.classifier.as_deref().is_none_or(str::is_empty);
-        if model || request.is_snapshot() || self.workspace_module_for_coord(coord).is_some() {
-            return;
-        }
-        // The repository the artifact pass tries first: the one that served
-        // the POM, else the first that may serve this version.
+        // The repository the artifact pass tries first: the one whose
+        // metadata named the build, else the one that served the POM, else
+        // the first that may serve this version.
         let repos = self.search_repos(repos);
         let Ok(eligible) = filter_repos_for_version(&repos, &request.version, coord) else {
             return;
         };
-        let repo = repo_url
-            .and_then(|url| eligible.iter().find(|repo| repo.url == url))
-            .or_else(|| eligible.first());
+        let repo = match build_repo {
+            Some(build) => eligible.iter().find(|repo| build.is(repo)),
+            None => (repo_url.and_then(|url| eligible.iter().find(|repo| repo.url == url)))
+                .or_else(|| eligible.first()),
+        };
         if let Some(repo) = repo {
-            let key = ArtifactCoord::new(
-                request.group_id.as_str(),
-                request.artifact_id.as_str(),
-                request.version.as_str(),
-                request.packaging.as_str(),
-                request.classifier.as_deref(),
-            );
             prefetcher.hint_artifact(repo, request, key);
         }
     }
+
+    fn prefetch_kept_artifact(&self, coord: &Coord, repos: &RepoContext) {
+        let Some((prefetcher, request, key)) = self.artifact_hint(coord) else {
+            return;
+        };
+        prefetcher.hint_artifact_after_pom(self.search_repos(repos), request, key);
+    }
 }
 
-/// Sort a range's versions, `listed` spellings in all, as Maven does: it
-/// gathers them, in the order the repositories list them, in a
-/// `java.util.HashMap` and sorts its entries stably, so the spellings that
-/// compare equal follow the map's buckets.
-fn sort_as_maven_lists(versions: &mut Vec<Version>, listed: usize) {
-    let mut capacity = 16;
-    while listed * 4 > capacity * 3 {
-        capacity *= 2;
+/// Sort a range's versions as Maven does: it puts every spelling `listed`,
+/// in this order, in a `java.util.HashMap` and sorts the map's entries
+/// stably, so the spellings that compare equal keep the map's order.
+fn sort_as_maven_lists(versions: &mut Vec<Version>, listed: &IndexSet<String>, mode: MavenMode) {
+    let mut rank = vec![0; listed.len()];
+    for (at, index) in hash_map::iteration_order(listed.iter().map(String::as_str))
+        .into_iter()
+        .enumerate()
+    {
+        rank[index] = at;
     }
     versions.sort_by_cached_key(|version| {
-        let hash = (version.as_str().encode_utf16()).fold(0u32, |hash, unit| {
-            hash.wrapping_mul(31).wrapping_add(unit.into())
-        });
-        (hash ^ (hash >> 16)) as usize & (capacity - 1)
+        listed
+            .get_index_of(version.as_str())
+            .map(|index| rank[index])
     });
-    Version::sort_by_key(versions, |version| version);
+    Version::sort_by_key_in(versions, mode, |version| version);
 }
 
 /// Build the effective model of a dependency POM fetched from a repository.
@@ -3086,9 +4289,9 @@ fn sort_as_maven_lists(versions: &mut Vec<Version>, listed: usize) {
 /// Maven's descriptor reader tells an unresolvable model from an invalid one.
 /// A parent or imported BOM that no repository could serve, or that failed to
 /// transfer, fails the build. A model that is invalid, such as a parent or BOM
-/// that does not parse or a system dependency without `<systemPath>`, only
-/// costs the artifact its transitive dependencies, with a warning. Reactor
-/// POMs fail in both cases. The invalid descriptor is discarded without
+/// that does not parse, a system dependency without `<systemPath>` or a
+/// property cycle, only costs the artifact its transitive dependencies,
+/// with a warning. Reactor POMs fail in both cases. The invalid descriptor is discarded without
 /// repeating inheritance.
 /// A dependency POM's effective model, or the model problem for which Maven
 /// takes it as invalid and drops its dependencies.
@@ -3105,6 +4308,7 @@ async fn build_remote_project<S: ModelSource<Error = ResolveError>>(
                     | PomError::InvalidSystemPath(_)
                     | PomError::InvalidModel(_)
                     | PomError::MissingField(_)
+                    | PomError::PropertyCycle(_)
             ) =>
         {
             Ok(Err(error))
@@ -3148,5 +4352,6 @@ pub(super) fn model_parent_ranges(model: &str, project: &Project) -> Vec<rv_lock
         .collect()
 }
 
+mod hash_map;
 #[cfg(test)]
 mod tests;

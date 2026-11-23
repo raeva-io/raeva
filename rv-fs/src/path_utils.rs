@@ -3,11 +3,13 @@
 //! These utilities deal with resolving user-supplied paths to absolute,
 //! symlink-aware locations without requiring the path to exist yet.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Resolve `path` to an absolute, symlink-resolved form even when the path
 /// does not (yet) exist on disk. The deepest existing ancestor is
-/// canonicalized; any remaining components are appended lexically.
+/// canonicalized, a dangling symlink followed to where it points; the
+/// remaining components are appended lexically, a `..` among them taking
+/// off the last.
 ///
 /// This is the building block for containment checks: callers can compare
 /// a not-yet-created destination against an existing root while still
@@ -18,23 +20,45 @@ use std::path::{Path, PathBuf};
 /// Returns an error only if the path is relative and the current working
 /// directory cannot be read.
 pub fn canonicalize_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    resolve_existing_prefix(path, 0)
+}
+
+/// [`canonicalize_existing_prefix`] after following `links` dangling
+/// symlinks, up to the 40 Linux follows before `ELOOP`.
+fn resolve_existing_prefix(path: &Path, links: usize) -> std::io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let mut existing = absolute.as_path();
-    let mut remainder = Vec::new();
-    while !existing.exists() {
-        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
-            return Ok(absolute);
-        };
-        remainder.push(name);
-        existing = parent;
+    let components: Vec<Component<'_>> = absolute.components().collect();
+    // A symlink counts as existing, dangling or not.
+    let Some(end) = (1..=components.len()).rev().find(|&end| {
+        let prefix: PathBuf = components[..end].iter().collect();
+        std::fs::symlink_metadata(prefix).is_ok()
+    }) else {
+        return Ok(absolute);
+    };
+    let existing: PathBuf = components[..end].iter().collect();
+    let mut result = match canonicalize_plain(&existing) {
+        Ok(canonical) => canonical,
+        Err(_) => match std::fs::read_link(&existing) {
+            Ok(target) if links < 40 => {
+                let parent = existing.parent().unwrap_or(&existing);
+                resolve_existing_prefix(&parent.join(target), links + 1)?
+            }
+            _ => strip_verbatim_disk(existing),
+        },
+    };
+    for component in &components[end..] {
+        match component {
+            Component::ParentDir => {
+                result.pop();
+            }
+            Component::CurDir => {}
+            component => result.push(component),
+        }
     }
-    let mut result = canonicalize_plain(existing)
-        .unwrap_or_else(|_| strip_verbatim_disk(existing.to_path_buf()));
-    result.extend(remainder.into_iter().rev());
     Ok(result)
 }
 
@@ -59,7 +83,7 @@ fn canonicalize_plain(path: &Path) -> std::io::Result<PathBuf> {
 pub fn plain_path(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
-        use std::path::{Component, Prefix};
+        use std::path::Prefix;
         let mut components = path.components();
         let verbatim_disk = matches!(
             components.next(),
@@ -274,7 +298,7 @@ fn win32_entry(entry: &str) -> String {
 /// drives in every case.
 #[cfg(windows)]
 fn strip_verbatim_disk(path: PathBuf) -> PathBuf {
-    use std::path::{Component, Prefix};
+    use std::path::Prefix;
     let Some(Component::Prefix(prefix)) = path.components().next() else {
         return path;
     };
@@ -327,6 +351,41 @@ mod tests {
                 std::fs::canonicalize(&deep).unwrap().join("child")
             );
         }
+    }
+
+    /// A symlink leads a path where the filesystem would take it, with a
+    /// `..` after it and when it dangles.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_leads_where_it_points_with_a_parent_step_or_dangling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let real = std::fs::canonicalize(outside.path()).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        assert_eq!(
+            canonicalize_existing_prefix(&link.join("nonexistent/..")).unwrap(),
+            real
+        );
+        assert_eq!(
+            canonicalize_existing_prefix(&link.join("a/../b")).unwrap(),
+            real.join("b")
+        );
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(real.join("marker"), &dangling).unwrap();
+        assert_eq!(
+            canonicalize_existing_prefix(&dangling).unwrap(),
+            real.join("marker")
+        );
+        let relative = dir.path().join("relative");
+        std::os::unix::fs::symlink("link/marker", &relative).unwrap();
+        assert_eq!(
+            canonicalize_existing_prefix(&relative.join("child")).unwrap(),
+            real.join("marker/child")
+        );
+        let looped = dir.path().join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        assert!(canonicalize_existing_prefix(&looped).is_ok());
     }
 
     #[test]

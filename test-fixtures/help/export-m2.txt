@@ -10,7 +10,7 @@ Options:
           Overwrite existing files in the target repository
 
       --link <STRATEGY>
-          How to place each file: copy, hardlink, or symlink. A link shares the file in raeva's store, so a Maven write to it corrupts the store
+          How to place each file: copy, hardlink, or symlink. A link shares the file in raeva's store, so a Maven write to it corrupts the store. A hard link that cannot be made is a copy. Maven 3.10 by default reads no symbolic link below its repository, so a Maven 3.10 lock refuses symlink
           
           [default: copy]
 
@@ -22,6 +22,9 @@ Options:
 
       --with-javadocs
           Also fetch/export -javadoc classifier JARs
+
+      --plan-json
+          Print what an export into an empty repository writes, as JSON, and write nothing
 
   -h, --help
           Print help (see a summary with '-h')
@@ -53,14 +56,17 @@ Global Options:
   -D, --define <NAME=VALUE>
           Set a Maven user property, as mvn -D does (repeatable)
 
-Copies the locked dependencies, their POMs, parents and imported BOMs from raeva's store into a Maven local repository, so `mvn -o` finds them.
+Copies the locked dependencies and plugins, their POMs, parents and imported BOMs from raeva's store into a Maven local repository, so `mvn -o` finds them.
 
 The destination is --m2-path, else -Dmaven.repo.local given to raeva, else local_repository in the user config.toml, else <localRepository> in ~/.m2/settings.xml, else ~/.m2/repository. local_repository in raeva.toml and -Dmaven.repo.local in .mvn/maven.config are ignored here, with a warning. ${user.home} and ${env.NAME} in a configured path are expanded, and a relative path is resolved against the current directory, as Maven does.
 
 For a locked offline build, export to an empty directory of its own outside the project, as `raeva --help` shows. Its version lists then name only the locked versions, so `mvn -o` resolves what raeva.lock pins, also with a -Dmaven.repo.local.tail. Into the local repository other builds share, it adds the locked versions, removes nothing, and warns that `mvn -o` there is not a locked build.
 
-Build plugins and extensions are not exported: fill another repository with one online Maven run and pass it as the tail. Reactor modules are not exported either: run `mvn -o` at the reactor root, or with -pl <module> -am.
+Build plugins and extensions are exported only when [plugins] lock = true in raeva.toml locks them, and what they download while they run only when [plugins] trace pins it. Otherwise fill another repository with one online Maven run and pass it as the tail. Reactor modules are not exported either: run `mvn -o` at the reactor root, or with -pl <module> -am.
+
+--plan-json prints what an export into an empty directory writes, as JSON, and writes nothing: each file a repository serves, with its SHA-256 and the URL of the repository raeva.lock records for it, not a mirror's, and the text of each file the export writes itself. It covers every platform in raeva.lock and takes the digests from raeva's store, so run raeva sync first. The format is unstable.
 
 Examples:
   raeva export-m2 --m2-path "$(mktemp -d)/deps" # Export to a new repository of its own
   raeva export-m2 --dry-run           # Show what would be exported
+  raeva export-m2 --plan-json > plan.json # Describe the repository for another tool to build

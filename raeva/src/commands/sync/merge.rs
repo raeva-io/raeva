@@ -4,7 +4,7 @@ use foldhash::{HashMap, HashSet};
 
 use rv_config::Config;
 use rv_lock::drift::ResolutionDrift;
-use rv_lock::merge::{Candidate, DropReason};
+use rv_lock::merge::DropReason;
 use rv_lock::{AmbientInput, Lockfile, ModelInputs, Platform};
 use rv_maven_model::HostInput;
 use rv_repo::Repository;
@@ -17,10 +17,13 @@ use crate::commands::lock_inputs::{
 use crate::error::{CliError, Result};
 use crate::output::command_line;
 
+/// `plugins` is `previous` with its plugin tables, when a platform is kept
+/// only with tables that hold.
 pub(super) fn merge_previous(
     config: &Config,
     lock: &mut Lockfile,
     previous: Option<&Lockfile>,
+    plugins: Option<&Lockfile>,
     models: &[ReactorModel],
     reads: &PlatformReads,
     trusted_repositories: &[Repository],
@@ -37,13 +40,15 @@ pub(super) fn merge_previous(
     let mut ambient = BTreeSet::new();
     if let Some(previous) = previous {
         let previous_ambient = recorded_ambient(previous);
+        let config_hash = resolution_config_hash(config, &previous_ambient)?;
         preserve_platforms(
             config,
             lock,
             previous,
+            plugins,
             models,
             trusted_repositories,
-            &resolution_config_hash(config, &previous_ambient)?,
+            &config_hash,
         )?;
         // A kept platform's graphs read what the previous lock lists, and a
         // property name stays while a kept graph lists it.
@@ -62,6 +67,7 @@ pub(super) fn merge_previous(
     // platforms carried forward with their own lists.
     ambient.retain(AmbientInput::is_property_name);
     ambient.extend(lock.resolution.ambient_inputs.iter().cloned());
+    crate::commands::lock_inputs::refuse_unnamed_jdk_reads(config, &ambient)?;
     lock.config_hash = Some(resolution_config_hash(config, &ambient)?);
     lock.resolution.command_line = command_line_names(config, &ambient);
     lock.resolution.ambient_inputs = ambient;
@@ -174,20 +180,20 @@ fn bind_module_reads(
 /// sync each platform from its own runner).
 ///
 /// `config_hash` is this run's, which `lock` was just resolved under.
+/// `plugins` is `previous` with its plugin tables, when they must hold.
 pub(super) fn preserve_platforms(
     config: &Config,
     lock: &mut Lockfile,
     previous: &Lockfile,
+    plugins: Option<&Lockfile>,
     models: &[ReactorModel],
     trusted_repositories: &[Repository],
     config_hash: &str,
 ) -> Result<()> {
     let mut kept = Vec::new();
     let mut preserved_models = Vec::new();
-    for Candidate {
-        platform, dropped, ..
-    } in rv_lock::merge::preservation(lock, previous, config_hash)
-    {
+    for candidate in rv_lock::merge::preservation(lock, previous, config_hash) {
+        let platform = candidate.platform.clone();
         let current_jdk = match platform.jdk() {
             None => config.lock.jdks.is_empty(),
             Some(jdk) => config.lock.jdks.iter().any(|configured| configured == jdk),
@@ -200,33 +206,45 @@ pub(super) fn preserve_platforms(
         {
             continue;
         }
-        let system_drift = previous
-            .platforms
-            .iter()
-            .find(|entry| entry.platform == platform)
-            .and_then(|entry| entry.system_file_drift(&config.project_root));
-        let reason = match (dropped, system_drift) {
-            (Some(reason), _) => reason,
-            (None, Some(ResolutionDrift::SystemFile { path })) => {
-                DropReason::SystemFileChanged { path }
+        let plugins_hold = match plugins {
+            Some(plugins) => super::plugins::kept(config, plugins, &platform)?,
+            None => true,
+        };
+        let verdict = candidate.keep(|platform| {
+            if !plugins_hold {
+                return Some(DropReason::PluginsChanged);
             }
-            (None, _) => match discover_reactor_model(config, &platform) {
+            let system_drift = previous
+                .platforms
+                .iter()
+                .find(|entry| entry.platform == *platform)
+                .and_then(|entry| entry.system_file_drift(&config.project_root));
+            if let Some(ResolutionDrift::SystemFile { path }) = system_drift {
+                return Some(DropReason::SystemFileChanged { path });
+            }
+            match discover_reactor_model(config, platform) {
                 Ok(model)
                     if previous
                         .platforms
                         .iter()
-                        .any(|entry| entry.platform == platform)
+                        .any(|entry| entry.platform == *platform)
                         && model.matches(previous) =>
                 {
-                    kept.push(platform);
                     preserved_models.push(model);
-                    continue;
+                    None
                 }
-                Ok(_) => DropReason::ModelChanged,
-                Err(err) => DropReason::ModelUnavailable {
+                Ok(_) => Some(DropReason::ModelChanged),
+                Err(err) => Some(DropReason::ModelUnavailable {
                     error: err.to_string(),
-                },
-            },
+                }),
+            }
+        });
+        let reason = match verdict {
+            Ok(candidate) => {
+                kept.push(candidate);
+                continue;
+            }
+            Err((_, reason)) => reason,
         };
         // A JSON consumer loses the platform's pins too, so this is a
         // warning with a code, not only a log line.
@@ -261,9 +279,10 @@ pub(super) fn check_support_companion_agreement(lock: &Lockfile) -> Result<()> {
         return Ok(());
     };
     Err(CliError::Message(format!(
-        "resolution pinned two different POMs for {coord}: it was resolved both as a \
-         parent/imported BOM and as a dependency, and Maven has one local-repository path per \
-         coordinate. Re-run `{sync}` after clearing raeva.lock, or report this if it persists",
+        "resolution pinned two different POMs for {coord}: one as a support POM (a parent, an \
+         imported BOM or a losing version's) and one as a dependency's, and Maven has one \
+         local-repository path per coordinate. Re-run `{sync}` after clearing raeva.lock, or \
+         report this if it persists",
         sync = command_line("sync")
     )))
 }

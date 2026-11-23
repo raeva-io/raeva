@@ -5,12 +5,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 
 use rv_test_support::http::{Response, StubServer};
 use tempfile::TempDir;
 
-use crate::common::{assert_status, assert_success, run_raeva, with_sha256, write_repo_toml};
+use crate::common::{
+    assert_status, assert_success, run_raeva, stderr, with_sha256, write_repo_toml,
+};
 
 const LIB_POM: &[u8] = br#"<project>
   <modelVersion>4.0.0</modelVersion>
@@ -18,10 +19,6 @@ const LIB_POM: &[u8] = br#"<project>
 </project>"#;
 const LIB_JAR: &[u8] = b"lib artifact bytes";
 const LIB_SOURCES: &[u8] = b"lib sources bytes";
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
 
 /// A repository that serves `org.test:lib:1.0` sources and records every
 /// request, standing in for an origin the project never declared.
@@ -338,20 +335,59 @@ fn a_linked_project_repository_is_recorded_in_the_project() {
     assert_eq!(lock.platforms[0].artifacts[0].repo_url, "./repository/");
 }
 
-/// A repository only the POM declares, outside the project and spelled with
-/// a `localhost` host, keeps its id: a frozen sync accepts the lock after a
-/// harmless edit, and export labels its files with that id even when the
-/// lock spells the origin as declared.
+/// A link inside a `file:` repository to another of its files is followed,
+/// as Maven follows it. One that leads out of the repository fails the sync
+/// as a repository failure, not a store error.
+#[cfg(unix)]
+#[test]
+fn a_link_inside_a_file_repository_is_followed() {
+    let base = TempDir::new().expect("base");
+    let project = base.path().join("project");
+    let (stub, _server) = empty_repository();
+    write_project(&project, &stub, &pom("", ""));
+    let dir = project.join("repository/org/test/lib/1.0");
+    fs::create_dir(dir.join("real")).expect("create real");
+    fs::rename(dir.join("lib-1.0.jar"), dir.join("real/lib.jar")).expect("move jar");
+    std::os::unix::fs::symlink("real/lib.jar", dir.join("lib-1.0.jar")).expect("link");
+    let home = TempDir::new().expect("home");
+    assert_success(&run_raeva(&project, home.path(), &["sync"]), "sync");
+    let lock = fs::read_to_string(project.join("raeva.lock")).expect("lock");
+    let digest = rv_maven_types::Digest::of_bytes(rv_maven_types::HashAlgorithm::Sha256, LIB_JAR);
+    assert!(lock.contains(digest.hex()), "{lock}");
+
+    fs::remove_file(project.join("raeva.lock")).expect("remove lock");
+    fs::write(project.join("outside.jar"), LIB_JAR).expect("write outside");
+    fs::remove_file(dir.join("lib-1.0.jar")).expect("remove link");
+    std::os::unix::fs::symlink("../../../../../outside.jar", dir.join("lib-1.0.jar"))
+        .expect("link out");
+    let home = TempDir::new().expect("home");
+    let output = run_raeva(&project, home.path(), &["sync"]);
+    assert_status(&output, 5, "a link out of the repository");
+    assert!(
+        stderr(&output).contains("leads out of the repository"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A repository only the POM declares, beside the project and spelled with
+/// a `localhost` host, is recorded relative to the project and keeps its id:
+/// a frozen sync accepts the lock after a harmless edit, and export labels
+/// its files with that id.
 #[test]
 fn a_pom_file_repository_keeps_its_id_however_it_is_spelled() {
     let base = TempDir::new().expect("base");
-    let outside = base.path().join("corp");
+    // A temporary directory on macOS is spelled through a link, which a
+    // literal URL would keep: it shares no named directory with the real
+    // path raeva reads the project at.
+    let base_path = dunce::canonicalize(base.path()).expect("canonical base");
+    let outside = base_path.join("corp");
     publish_lib(&outside);
     let corp = url::Url::from_directory_path(&outside)
         .unwrap()
         .to_string()
         .replacen("file:///", "file://localhost/", 1);
-    let project = base.path().join("project");
+    let project = base_path.join("project");
     let (stub, _server) = empty_repository();
     let pom_text = format!(
         "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
@@ -365,13 +401,9 @@ fn a_pom_file_repository_keeps_its_id_however_it_is_spelled() {
     assert_success(&run_raeva(&project, home.path(), &["sync"]), "sync");
 
     let lock_path = project.join("raeva.lock");
-    let written = fs::read_to_string(&lock_path).expect("read lock");
-    let mut lock = rv_lock::Lockfile::read(&lock_path).expect("lock");
-    let id = lock.repo_ids.pop_first().expect("corp id").1;
-    assert_eq!(id, ["corp".to_string()].into());
-    lock.repo_ids.insert(corp.clone(), id);
-    fs::write(&lock_path, lock.to_toml().unwrap()).expect("write lock");
-    let m2 = base.path().join("m2");
+    let lock = rv_lock::Lockfile::read(&lock_path).expect("lock");
+    assert_eq!(lock.repo_ids["../corp/"], ["corp".to_string()].into());
+    let m2 = base_path.join("m2");
     let export = run_raeva(
         &project,
         home.path(),
@@ -382,7 +414,6 @@ fn a_pom_file_repository_keeps_its_id_however_it_is_spelled() {
         fs::read_to_string(lib_dir(&m2).join("_remote.repositories")).expect("read markers");
     assert!(markers.contains("lib-1.0.jar>corp="), "{markers}");
 
-    fs::write(&lock_path, written).expect("restore lock");
     fs::write(
         project.join("pom.xml"),
         pom_text.replace("</project>", "<!-- edit --></project>"),
@@ -543,6 +574,10 @@ fn an_undeclared_symlink_token_grants_nothing() {
         verify_output.contains("untrusted origin ./link/"),
         "{verify_output}"
     );
+    assert!(
+        verify_output.contains("FROZEN_RESOLUTION_FAILED"),
+        "{verify_output}"
+    );
     let cold = TempDir::new().expect("cold home");
     let verify = run_raeva(
         &project,
@@ -601,5 +636,202 @@ fn a_malformed_origin_is_not_repeated_in_errors() {
             stderr(&sync)
         );
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), original, "{label}");
+    }
+}
+
+fn lib_pom_with(repository: &str) -> String {
+    format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>root</artifactId><version>1</version><repositories><repository>\
+         <id>shared</id><url>{repository}</url></repository></repositories><dependencies>\
+         <dependency><groupId>org.test</groupId><artifactId>lib</artifactId>\
+         <version>1.0</version></dependency></dependencies></project>"
+    )
+}
+
+fn copy_dir(source: &Path, target: &Path) {
+    rv_test_support::fixtures::copy_tree_skipping(source, target, |_| false);
+}
+
+/// A `file:` repository outside the project that shares a directory with it
+/// is recorded relative to the project, with `../` segments, so the same
+/// tree moved deeper passes `--frozen`, restores a seed saved before the
+/// move, and exports. A directory name holding `\` or `%` is escaped.
+#[test]
+fn a_repository_beside_the_project_moves_with_the_tree() {
+    let mut cases = vec![
+        (
+            "proj",
+            "shared",
+            "file://${project.basedir}/../shared/",
+            "../shared/",
+            false,
+        ),
+        ("proj", "shared", "file:../shared/", "../shared/", false),
+        (
+            "proj",
+            "shared",
+            "file://${maven.multiModuleProjectDirectory}/shared/",
+            "../shared/",
+            true,
+        ),
+        (
+            "apps/web",
+            "libs/shared",
+            "file://${project.basedir}/../../libs/shared/",
+            "../../libs/shared/",
+            false,
+        ),
+        (
+            "proj",
+            "a%b",
+            "file://${project.basedir}/../a%25b/",
+            "../a%25b/",
+            false,
+        ),
+        (
+            "proj",
+            "my repo#1",
+            "file://${project.basedir}/../my%20repo%231/",
+            "../my%20repo%231/",
+            false,
+        ),
+        (
+            "proj",
+            "proj/in%b",
+            "file://${project.basedir}/in%25b/",
+            "./in%25b/",
+            false,
+        ),
+    ];
+    if cfg!(unix) {
+        cases.push((
+            "proj",
+            "a\\b?",
+            "file://${project.basedir}/../a%5Cb%3F/",
+            "../a%5Cb%3F/",
+            false,
+        ));
+    }
+    let (stub, _server) = empty_repository();
+    for (project_dir, repository_dir, url, token, launcher) in cases {
+        let case = format!("{url} from {project_dir}");
+        let base = TempDir::new().expect("base");
+        let tree = base.path().join("tree");
+        let project = tree.join(project_dir);
+        fs::create_dir_all(&project).expect("create project");
+        if launcher {
+            fs::create_dir(tree.join(".mvn")).expect("create .mvn");
+        }
+        publish_lib(&tree.join(repository_dir));
+        write_repo_toml(&project, "stub", &stub);
+        fs::write(project.join("pom.xml"), lib_pom_with(url)).expect("write pom.xml");
+        let home = TempDir::new().expect("home");
+        assert_success(&run_raeva(&project, home.path(), &["sync"]), &case);
+        let lock = rv_lock::Lockfile::read(&project.join("raeva.lock")).expect("lock");
+        assert_eq!(lock.platforms[0].artifacts[0].repo_url, token, "{case}");
+        let seed = base.path().join("seed");
+        let seed = seed.to_str().unwrap();
+        assert_success(
+            &run_raeva(&project, home.path(), &["seed", "save", seed]),
+            &format!("{case} seed save"),
+        );
+
+        let moved = base.path().join("moved/deeper/tree");
+        copy_dir(&tree, &moved);
+        let project = moved.join(project_dir);
+        let fresh = TempDir::new().expect("home");
+        let output = run_raeva(&project, fresh.path(), &["sync", "--frozen"]);
+        assert_success(&output, &format!("{case} frozen after the move"));
+        let restored = TempDir::new().expect("home");
+        let output = run_raeva(&project, restored.path(), &["seed", "restore", seed]);
+        assert_success(&output, &format!("{case} seed restore after the move"));
+        let output = run_raeva(
+            &project,
+            restored.path(),
+            &["--offline", "sync", "--frozen"],
+        );
+        assert_success(&output, &format!("{case} offline frozen from the seed"));
+        let m2 = base.path().join("m2");
+        let output = run_raeva(
+            &project,
+            fresh.path(),
+            &["export-m2", "--m2-path", m2.to_str().unwrap()],
+        );
+        assert_success(&output, &format!("{case} export"));
+        assert_eq!(
+            fs::read(lib_dir(&m2).join("lib-1.0.jar")).expect("exported jar"),
+            LIB_JAR,
+            "{case}"
+        );
+        // Each plan URL is relative to the directory of raeva.lock.
+        let output = run_raeva(&project, fresh.path(), &["export-m2", "--plan-json"]);
+        assert_success(&output, &format!("{case} plan"));
+        let plan: serde_json::Value = serde_json::from_slice(&output.stdout).expect("plan");
+        let base = url::Url::from_directory_path(&project).unwrap();
+        for file in plan["files"].as_array().expect("files") {
+            let url = base.join(file["url"].as_str().expect("url")).unwrap();
+            let bytes = fs::read(url.to_file_path().unwrap()).expect("the file the url names");
+            assert_eq!(
+                crate::common::sha256_hex(&bytes),
+                file["sha256"],
+                "{case}: {url}"
+            );
+        }
+    }
+}
+
+/// A project moved without the repository beside it does not pass
+/// `--frozen`: a URL that still names the repository where it was records
+/// another relative origin from the new place, and one written relative to
+/// the project names a directory there that is missing or holds other files.
+#[test]
+fn a_project_moved_without_the_repository_beside_it_does_not_pass() {
+    let (stub, _server) = empty_repository();
+    let base = TempDir::new().expect("base");
+    let base = dunce::canonicalize(base.path()).expect("canonical base");
+    let tree = base.join("tree");
+    publish_lib(&tree.join("shared"));
+    let absolute = url::Url::from_directory_path(tree.join("shared"))
+        .unwrap()
+        .to_string();
+    let other = base.join("other");
+    for (url, elsewhere, code) in [
+        (absolute.as_str(), None, 7),
+        ("file://${project.basedir}/../shared/", None, 5),
+        (
+            "file://${project.basedir}/../shared/",
+            Some(b"other bytes".as_slice()),
+            7,
+        ),
+    ] {
+        let case = format!("{url} with {elsewhere:?} beside the moved project");
+        let project = tree.join("proj");
+        fs::create_dir_all(&project).expect("create project");
+        write_repo_toml(&project, "stub", &stub);
+        fs::write(project.join("pom.xml"), lib_pom_with(url)).expect("write pom.xml");
+        let _ = fs::remove_file(project.join("raeva.lock"));
+        let home = TempDir::new().expect("home");
+        assert_success(&run_raeva(&project, home.path(), &["sync"]), &case);
+        let lock = rv_lock::Lockfile::read(&project.join("raeva.lock")).expect("lock");
+        assert_eq!(
+            lock.platforms[0].artifacts[0].repo_url, "../shared/",
+            "{case}"
+        );
+
+        if other.exists() {
+            fs::remove_dir_all(&other).expect("clear the other place");
+        }
+        let moved = other.join("proj");
+        copy_dir(&project, &moved);
+        if let Some(bytes) = elsewhere {
+            publish_lib(&other.join("shared"));
+            fs::write(other.join("shared/org/test/lib/1.0/lib-1.0.jar"), bytes).expect("jar");
+        }
+        let fresh = TempDir::new().expect("home");
+        for (what, home) in [("fresh", fresh.path()), ("warm", home.path())] {
+            let output = run_raeva(&moved, home, &["sync", "--frozen"]);
+            assert_status(&output, code, &format!("{case}, {what} home"));
+        }
     }
 }

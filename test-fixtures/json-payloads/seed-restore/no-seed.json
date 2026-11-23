@@ -1,0 +1,15 @@
+{
+  "exit_code": 7,
+  "stdout": {
+    "code": "LOCKFILE_MISMATCH",
+    "data": {
+      "warnings": []
+    },
+    "error": "<tmp>/empty holds no seed this raeva reads (seed.json is missing or of another format)",
+    "exit_code": 7,
+    "hints": [
+      "Save a seed with 'raeva seed save' after 'raeva sync --frozen'"
+    ],
+    "success": false
+  }
+}

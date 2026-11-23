@@ -1,5 +1,11 @@
 use crate::Scope;
-use rv_maven_types::{bounded, quoted};
+use rv_maven_types::{MavenMode, bounded, quoted};
+
+use crate::ArtifactTypes;
+
+/// The core artifact handlers of Maven 3.9.
+static CORE_39: std::sync::LazyLock<ArtifactTypes> =
+    std::sync::LazyLock::new(|| ArtifactTypes::core(MavenMode::Maven39));
 
 /// A dependency exclusion pattern (groupId:artifactId).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -45,6 +51,50 @@ pub struct Dependency {
     pub exclusions: Vec<Exclusion>,
     /// The `<systemPath>` of a `system`-scoped dependency.
     pub system_path: Option<String>,
+    /// Whether `system_path` was written to start at a directory of the
+    /// project. Equality ignores it.
+    #[serde(skip)]
+    pub system_path_from_project: ProjectDirectory,
+    /// For a project's managed entry, and a dependency whose version one
+    /// supplied, where the version comes from. Equality ignores it.
+    #[serde(skip)]
+    pub origin: ManagedOrigin,
+}
+
+/// Whether a [`Dependency`]'s `<systemPath>` was written to start at a
+/// directory of the project, such as `${project.basedir}`, which Maven
+/// holds as an absolute path on every OS. A path that merely reads the
+/// same was written for one OS. Set when the dependency is interpolated,
+/// and never part of its equality.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProjectDirectory(pub bool);
+
+impl PartialEq for ProjectDirectory {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ProjectDirectory {}
+
+/// Where a managed version comes from, carried with a [`Dependency`] but
+/// never part of its equality: two declarations alike are alike wherever
+/// management declares them.
+#[derive(Clone, Default)]
+pub struct ManagedOrigin(pub Option<std::sync::Arc<rv_maven_types::ManagedSource>>);
+
+impl PartialEq for ManagedOrigin {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ManagedOrigin {}
+
+impl std::fmt::Debug for ManagedOrigin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
 }
 
 /// The `<dependencyManagement>` section of a POM, providing version and scope defaults.
@@ -121,53 +171,60 @@ element_list!(fn deserialize_exclusions, "exclusion", Exclusion);
 element_list!(pub(crate) fn deserialize_dependencies, "dependency", Dependency);
 
 impl Dependency {
-    /// The parsed `<scope>`: [`Scope::Compile`] when absent or blank, and
-    /// compile with a warning when unknown (see [`Scope::parse`]).
+    /// The parsed `<scope>`: [`Scope::Compile`] when absent or empty. Maven
+    /// keeps a scope it does not know, such as an unresolved property, a
+    /// case other than lowercase, the `optional` some POMs write or
+    /// `foo:bar`, and so does this ([`Scope::Other`]), also when raeva.lock
+    /// cannot record it ([`Scope::recordable`]). The reader trimmed the
+    /// POM's text, and Maven trims no interpolated value, so ` compile `
+    /// from a property is a scope Maven does not know.
     pub fn effective_scope(&self) -> Scope {
-        match self.scope.as_deref().map(str::trim) {
+        match self.scope.as_deref() {
             None | Some("") => Scope::default(),
-            Some(s) => Scope::parse(s),
+            Some(text) => Scope::declared(text),
         }
     }
 
     /// Whether `<scope>` is `system` as Maven's validator compares it, case
     /// included.
-    fn declares_system_scope(&self) -> bool {
-        self.scope.as_deref().map(str::trim) == Some("system")
+    pub fn declares_system_scope(&self) -> bool {
+        self.scope.as_deref() == Some("system")
     }
 
     pub(crate) fn is_import_scope(&self) -> bool {
-        self.scope.as_deref().map(str::trim) == Some("import")
+        self.scope.as_deref() == Some("import")
     }
 
     /// The file extension of the artifact `<type>` names, from Maven 3.9's
-    /// artifact handlers: `ejb`, `ejb-client`, `test-jar`, `maven-plugin`,
-    /// `java-source` and `javadoc` are jars. Any other type is its own
-    /// extension.
+    /// core artifact handlers: `ejb`, `ejb-client`, `test-jar`,
+    /// `maven-plugin`, `java-source` and `javadoc` are jars. Any other type
+    /// is its own extension.
     pub fn effective_type(&self) -> &str {
+        self.effective_type_in(&CORE_39)
+    }
+
+    /// [`Self::effective_type`] with the artifact handlers `types` holds:
+    /// Maven 3.10's `fatjar` is a jar, and a build extension defines its own.
+    pub fn effective_type_in<'a>(&'a self, types: &'a ArtifactTypes) -> &'a str {
         match self.type_.as_deref() {
-            Some(
-                "test-jar" | "maven-plugin" | "ejb" | "ejb-client" | "java-source" | "javadoc",
-            ) => "jar",
-            Some(value) if !value.is_empty() => value,
+            Some(value) if !value.is_empty() => types.extension(value),
             _ => "jar",
         }
     }
 
-    /// The declared classifier, or the one Maven's artifact handler for the
-    /// `<type>` implies.
+    /// The declared classifier, or the one Maven 3.9's core artifact
+    /// handler for the `<type>` implies when none is declared: an empty one
+    /// names the main artifact, as in Aether's `DefaultArtifact`.
     pub fn effective_classifier(&self) -> Option<&str> {
-        if let Some(ref classifier) = self.classifier
-            && !classifier.is_empty()
-        {
-            return Some(classifier.as_str());
-        }
-        match self.type_.as_deref() {
-            Some("test-jar") => Some("tests"),
-            Some("ejb-client") => Some("client"),
-            Some("java-source") => Some("sources"),
-            Some("javadoc") => Some("javadoc"),
-            _ => None,
+        self.effective_classifier_in(&CORE_39)
+    }
+
+    /// [`Self::effective_classifier`] with the artifact handlers `types`
+    /// holds.
+    pub fn effective_classifier_in<'a>(&'a self, types: &'a ArtifactTypes) -> Option<&'a str> {
+        match self.classifier.as_deref() {
+            Some(classifier) => (!classifier.is_empty()).then_some(classifier),
+            None => types.classifier(self.type_.as_deref()?),
         }
     }
 
@@ -183,6 +240,19 @@ impl Dependency {
         (&self.group_id, &self.artifact_id, type_, classifier)
     }
 
+    /// The key Maven merges, imports and injects managed entries by: unlike
+    /// [`Self::management_key`], an empty `<classifier>` is apart from none.
+    pub(crate) fn maven_key(&self) -> (&str, &str, &str, Option<&str>) {
+        let (group_id, artifact_id, type_, _) = self.management_key();
+        (group_id, artifact_id, type_, self.classifier.as_deref())
+    }
+
+    /// [`Self::maven_key`] with owned strings.
+    pub(crate) fn raw_key(&self) -> (String, String, String, Option<String>) {
+        let (group_id, artifact_id, type_, _) = self.owned_management_key();
+        (group_id, artifact_id, type_, self.classifier.clone())
+    }
+
     /// [`Self::management_key`] with owned strings, for merge maps that need
     /// owned keys.
     pub(crate) fn owned_management_key(&self) -> (String, String, String, Option<String>) {
@@ -196,9 +266,12 @@ impl Dependency {
     }
 
     /// Whether the artifact bundles its own dependencies, so Maven does not
-    /// collect them: the `war`, `ear` and `rar` handlers say so.
-    pub fn includes_dependencies(&self) -> bool {
-        matches!(self.type_.as_deref(), Some("war" | "ear" | "rar"))
+    /// collect them: the `war`, `ear` and `rar` handlers say so, Maven
+    /// 3.10's `fatjar` too, and a build extension's handler may.
+    pub fn includes_dependencies_in(&self, types: &ArtifactTypes) -> bool {
+        self.type_
+            .as_deref()
+            .is_some_and(|type_| types.includes_dependencies(type_))
     }
 
     /// Whether `<optional>` is `true` in any case. Anything else, including
@@ -268,18 +341,66 @@ impl Dependency {
         self.invalid(managed, field, "is missing")
     }
 
+    /// Maven's message for a missing `field` of this dependency, a full
+    /// path such as a plugin dependency's.
+    pub(crate) fn missing_message(&self, field: &str) -> String {
+        self.problem(field, "is missing")
+    }
+
     fn invalid(&self, managed: bool, field: &str, problem: &str) -> crate::PomError {
+        let prefix = if managed { "dependencyManagement." } else { "" };
+        crate::PomError::InvalidModel(
+            self.problem(&format!("{prefix}dependencies.dependency.{field}"), problem),
+        )
+    }
+
+    /// Maven's problem with the `<systemPath>` of this effective plugin
+    /// dependency, `prefix` the path of its fields. A path raeva could not
+    /// fully interpolate is not judged, as Maven may expand it to another
+    /// or to none.
+    pub(crate) fn plugin_system_path_problem(
+        &self,
+        prefix: &str,
+        environment: &crate::ModelEnvironment,
+    ) -> Option<String> {
+        let field = format!("{prefix}.systemPath");
+        let path = self.system_path.as_deref().filter(|path| !path.is_empty());
+        match (self.declares_system_scope(), path) {
+            (true, None) => Some(self.problem(&field, "is missing")),
+            (true, Some(path))
+                if !path.contains("${") && !self.absolute_system_path(path, environment) =>
+            {
+                let mut message = self.problem(
+                    &field,
+                    &format!("must specify an absolute path but is {path}"),
+                );
+                // Maven ends this one without a period.
+                message.pop();
+                Some(message + &on_platform(environment))
+            }
+            (false, Some(path)) if !path.contains("${") => Some(self.problem(
+                &field,
+                "must be omitted. This field may only be specified for a dependency with \
+                 system scope",
+            )),
+            _ => None,
+        }
+    }
+
+    /// Maven's message for a `problem` with `field` of this dependency, a
+    /// full path.
+    pub(crate) fn problem(&self, field: &str, problem: &str) -> String {
         let (group_id, artifact_id, type_, classifier) = self.management_key();
         let classifier = classifier
             .map(|c| format!(":{}", bounded(c)))
             .unwrap_or_default();
-        crate::PomError::InvalidModel(format!(
-            "'{}dependencies.dependency.{field}' for {}:{}:{}{classifier} {problem}.",
-            if managed { "dependencyManagement." } else { "" },
+        format!(
+            "'{}' for {}:{}:{}{classifier} {problem}.",
+            bounded(field),
             bounded(group_id),
             bounded(artifact_id),
             bounded(type_),
-        ))
+        )
     }
 
     /// Validates a `system`-scoped dependency.
@@ -293,11 +414,15 @@ impl Dependency {
     /// `system`. For system-scoped deps the function returns:
     /// - `Err` describing "missing systemPath" when `system_path` is absent or
     ///   blank.
-    /// - `Err` describing "non-absolute systemPath" when the path does not
-    ///   start with `/` (POSIX) or a drive letter (Windows). A path that
-    ///   still names a `java.*`, `user.*` or `env.*` value after
-    ///   interpolation is accepted: Maven has a value for it.
-    pub(crate) fn validate_system_scope(&self) -> Result<(), crate::PomError> {
+    /// - `Err` describing "non-absolute systemPath" when `java.io.File`
+    ///   does not take the path for absolute on the platform of
+    ///   `environment`. A path that still names a `java.*`, `user.*` or
+    ///   `env.*` value after interpolation is accepted: Maven has a value
+    ///   for it.
+    pub(crate) fn validate_system_scope(
+        &self,
+        environment: &crate::ModelEnvironment,
+    ) -> Result<(), crate::PomError> {
         if !self.declares_system_scope() {
             return Ok(());
         }
@@ -320,6 +445,7 @@ impl Dependency {
         if path.contains("${")
             && path.split("${").skip(1).all(|rest| {
                 rest.split_once('}').is_some_and(|(name, _)| {
+                    let name = rv_maven_types::expression_key(name);
                     ["java.", "user.", "env."]
                         .iter()
                         .any(|prefix| name.starts_with(prefix))
@@ -329,55 +455,62 @@ impl Dependency {
             return Ok(());
         }
 
-        if !is_absolute_path(path) {
+        if !self.absolute_system_path(path, environment) {
             return Err(crate::PomError::InvalidSystemPath(format!(
                 "system-scoped dependency {}:{} requires an absolute <systemPath> \
-                 (got {})",
+                 (got {}){}",
                 bounded(&self.group_id),
                 bounded(&self.artifact_id),
-                quoted(path)
+                quoted(path),
+                on_platform(environment)
             )));
         }
 
         Ok(())
     }
+
+    /// Whether Maven takes `path`, this dependency's interpolated
+    /// `<systemPath>`, for absolute on the platform `environment` locks. A
+    /// path written to start at a directory of the project, such as
+    /// `${project.basedir}/lib/x.jar`, is: raeva expands it to the host's
+    /// directory, and Maven to its own, absolute on every OS. Any other
+    /// path is judged by [`absolute_on`], also when it reads as a path in
+    /// the project on the host, since it was then written for the host's
+    /// OS.
+    fn absolute_system_path(&self, path: &str, environment: &crate::ModelEnvironment) -> bool {
+        self.system_path_from_project.0 || absolute_on(path, environment)
+    }
 }
 
-fn is_absolute_path(path: &str) -> bool {
-    // A leading `/` only denotes an absolute path on Unix; on Windows
-    // it's just a slash that the shell would resolve against the current
-    // drive's root. Guard the rule behind cfg(unix) so a `/opt/libs/x.jar`
-    // value in a POM authored on Linux is not silently accepted as
-    // "absolute" by a Windows build, and conversely so a Windows-only POM
-    // is not rejected on Linux just for using backslashes.
-    #[cfg(unix)]
-    {
-        if path.starts_with('/') {
-            return true;
-        }
+/// Whether Maven takes `path` for absolute as `java.io.File` does on the
+/// OS of the platform `environment` locks: on Windows by [`windows_absolute`],
+/// elsewhere by a leading `/`. Without a platform, either rule will do.
+fn absolute_on(path: &str, environment: &crate::ModelEnvironment) -> bool {
+    match environment.platform() {
+        Some(("windows", _)) => windows_absolute(path),
+        Some(_) => path.starts_with('/'),
+        None => windows_absolute(path) || path.starts_with('/'),
     }
-    // Windows drive letter (e.g. `C:\path` or `C:/path`). Recognized on
-    // every platform because POMs frequently ship paths in this form even
-    // when consumed cross-platform; a Linux runner refusing the form would
-    // simply mis-diagnose a Windows-authored POM, and the downstream code
-    // resolves the path against a Windows local repo anyway.
+}
+
+/// `, for the locked platform os-arch`, or nothing without a platform.
+fn on_platform(environment: &crate::ModelEnvironment) -> String {
+    (environment.platform())
+        .map(|(os, arch)| format!(", for the locked platform {os}-{arch}"))
+        .unwrap_or_default()
+}
+
+/// `java.io.File.isAbsolute` on Windows (WinNTFileSystem): slashes before a
+/// drive go, two or more lead a UNC path, and a drive is absolute only with
+/// a slash after it.
+fn windows_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
-    if bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-    {
-        return true;
+    let slash = |byte: &u8| matches!(byte, b'/' | b'\\');
+    let slashes = bytes.iter().take_while(|byte| slash(byte)).count();
+    match &bytes[slashes..] {
+        [drive, b':', rest @ ..] if drive.is_ascii_alphabetic() => rest.first().is_some_and(slash),
+        _ => slashes >= 2,
     }
-    // UNC paths: `\\server\share\path` (or the forward-slash form
-    // `//server/share/path`). These are absolute on Windows and we accept
-    // them on every platform for the same cross-platform reasons.
-    if bytes.len() >= 2
-        && ((bytes[0] == b'\\' && bytes[1] == b'\\') || (bytes[0] == b'/' && bytes[1] == b'/'))
-    {
-        return true;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -390,6 +523,29 @@ mod tests {
              {fields}</dependency>"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn an_unknown_scope_is_kept() {
+        for (scope, effective) in [
+            ("", Scope::Compile),
+            // The reader trims the POM's text; a value interpolated into it
+            // keeps its spaces, as in Maven.
+            (" runtime ", Scope::Other(" runtime ")),
+            ("weird", Scope::Other("weird")),
+            ("compile-only", Scope::CompileOnly),
+            // Maven compares scopes with their case, so `SYSTEM` is unknown.
+            ("SYSTEM", Scope::Other("SYSTEM")),
+            // Some POMs write the invalid <scope>optional</scope>.
+            ("optional", Scope::Other("optional")),
+            // Kept, though raeva.lock cannot record it.
+            ("two words", Scope::Other("two words")),
+            ("foo:bar", Scope::Other("foo:bar")),
+            ("\u{a0}runtime", Scope::Other("\u{a0}runtime")),
+        ] {
+            let dep = dependency(&format!("<scope>{scope}</scope>"));
+            assert_eq!(dep.effective_scope(), effective, "{scope:?}");
+        }
     }
 
     #[test]
@@ -467,7 +623,7 @@ mod tests {
             assert_eq!(dep.effective_type(), extension, "{type_}{classifier}");
             assert_eq!(dep.effective_classifier(), effective, "{type_}{classifier}");
             assert_eq!(
-                dep.includes_dependencies(),
+                dep.includes_dependencies_in(&ArtifactTypes::core(MavenMode::Maven39)),
                 includes_dependencies,
                 "{type_}"
             );
@@ -475,11 +631,12 @@ mod tests {
     }
 
     /// A system dependency needs an absolute path: a drive or UNC path in
-    /// either slash form, or a `/` path on Unix only, where it would
-    /// otherwise resolve against the current drive. A path may keep a JDK,
-    /// user or environment value raeva does not know, and nothing else.
+    /// either slash form on Windows, a `/` path elsewhere, and either
+    /// without a platform. A path may keep a JDK, user or environment value
+    /// raeva does not know, and nothing else.
     #[test]
     fn a_system_dependency_needs_an_absolute_path() {
+        let unknown = crate::ModelEnvironment::builder().build();
         for (path, error) in [
             ("", Some("non-empty")),
             ("<systemPath>   </systemPath>", Some("non-empty")),
@@ -505,7 +662,7 @@ mod tests {
             ),
         ] {
             let dep = dependency(&format!("<scope>system</scope>{path}"));
-            match (dep.validate_system_scope(), error) {
+            match (dep.validate_system_scope(&unknown), error) {
                 (Ok(()), None) => {}
                 (Err(crate::PomError::InvalidSystemPath(message)), Some(expected)) => {
                     assert!(message.contains(expected), "{path}: {message}");
@@ -513,7 +670,41 @@ mod tests {
                 (result, _) => panic!("{path}: {result:?}"),
             }
         }
-        dependency("").validate_system_scope().unwrap();
-        assert_eq!(is_absolute_path("/opt/lib/tools.jar"), cfg!(unix));
+        dependency("").validate_system_scope(&unknown).unwrap();
+        for (os, path, absolute) in [
+            ("windows", "C:/lib/x.jar", true),
+            ("windows", "/opt/x.jar", false),
+            ("linux", "/opt/x.jar", true),
+            ("linux", "C:/lib/x.jar", false),
+            ("linux", "\\\\server\\share\\x.jar", false),
+            ("macos", "/opt/x.jar", true),
+            ("macos", "C:\\lib\\x.jar", false),
+        ] {
+            let environment = crate::ModelEnvironment::builder()
+                .platform(os, "x86_64")
+                .build();
+            let dep = dependency(&format!(
+                "<scope>system</scope><systemPath>{path}</systemPath>"
+            ));
+            let result = dep.validate_system_scope(&environment);
+            assert_eq!(result.is_ok(), absolute, "{os} {path}");
+            if let Err(error) = result {
+                let platform = format!("for the locked platform {os}-x86_64");
+                assert!(error.to_string().contains(&platform), "{error}");
+            }
+        }
+        for (path, absolute) in [
+            ("C:\\lib\\x.jar", true),
+            ("C:/lib/x.jar", true),
+            ("/C:/lib/x.jar", true),
+            ("C:lib/x.jar", false),
+            ("//C:lib/x.jar", false),
+            ("\\\\server\\share\\x.jar", true),
+            ("///server/share/x.jar", true),
+            ("/opt/x.jar", false),
+            ("lib/x.jar", false),
+        ] {
+            assert_eq!(windows_absolute(path), absolute, "{path}");
+        }
     }
 }

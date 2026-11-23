@@ -14,6 +14,9 @@ use rv_maven_types::{ArtifactCoord, Digest};
 use rv_repo::{IntegritySource, RepoError};
 use rv_store::{PinCheck, Store};
 
+use crate::commands::lock_inputs::{
+    check_recorded_freshness, discover_reactor_models, frozen_models_match,
+};
 use crate::commands::module_selector::ModuleSelector;
 use crate::commands::{path_to_forward_slashes, read_lockfile};
 use crate::error::{CliError, Result};
@@ -48,11 +51,12 @@ pub(crate) enum LockCommand {
 #[derive(Debug, Args)]
 #[command(after_long_help = crate::commands::util::help_examples(&[
     ("lock verify", "Check the store against every pin"),
-    ("lock verify --download", "Download missing or corrupt files again"),
+    ("lock verify --download", "Download what the store lacks and an offline sync --frozen reads"),
     ("lock verify --module app/pom.xml", "Check one module"),
 ]))]
 pub(crate) struct LockVerifyArgs {
-    /// Download missing or corrupt artifacts again
+    /// Download missing or corrupt artifacts again, and, unless --module
+    /// narrows the check, what an offline `sync --frozen` reads
     #[arg(long)]
     pub download: bool,
 
@@ -121,7 +125,6 @@ fn lock_info(session: &Session) -> Result<Report> {
         path: path_to_forward_slashes(&config.lock_path),
         display_path: config.lock_path.display().to_string(),
         schema_version: LOCKFILE_SCHEMA_VERSION,
-        latest_schema_version: LOCKFILE_SCHEMA_VERSION,
         last_modified,
         platform_count: platforms.len(),
         total_packages: platforms.iter().map(|platform| platform.packages).sum(),
@@ -136,7 +139,6 @@ struct LockInfoReport {
     #[serde(skip)]
     display_path: String,
     schema_version: u32,
-    latest_schema_version: u32,
     last_modified: String,
     platform_count: usize,
     total_packages: usize,
@@ -166,10 +168,6 @@ impl CommandOutput for LockInfoReport {
         let mut table = Table::new(["Property", "Value"]);
         table.add_row(["Path", &self.display_path]);
         table.add_row(["Schema version", &self.schema_version.to_string()]);
-        table.add_row([
-            "Latest schema version",
-            &self.latest_schema_version.to_string(),
-        ]);
         table.add_row(["Last modified", &self.last_modified]);
         table.add_row(["Platforms", &self.platform_count.to_string()]);
         table.add_row([
@@ -227,7 +225,17 @@ async fn verify_inner(
     offline: bool,
     output: &Output,
 ) -> Result<LockVerifyReport> {
-    let lock = read_lockfile(config)?;
+    // The plugin tables' files are hashed as the dependencies' are; their
+    // repair is the resolution `--download` runs as `sync --frozen` does,
+    // which knows the repositories they come from.
+    let mut lock = read_lockfile(config)?;
+    let written = crate::commands::util::check_written(&lock, &config.lock_path);
+    let held = (lock.platforms.iter())
+        .any(|entry| entry.plugins.is_some())
+        .then(|| lock.clone());
+    lock.platforms
+        .iter_mut()
+        .for_each(rv_lock::LockPlatform::remove_plugins);
     // Open the store once into an Arc and share that single Arc
     // through both the verification fan-out and the optional download
     // fan-out. Re-cloning the underlying `Store` into two distinct
@@ -250,67 +258,86 @@ async fn verify_inner(
     // the WEAK_HASH_FALLBACK warning), so a lockfile produced against a
     // SHA-1-only repository legitimately carries SHA-1 pins. Verify must
     // accept the same set or it falsely rejects those lockfiles.
-    let (targets, no_checksum, workspace_skipped) = prepare_targets(&lock, &args.module)?;
-
-    // In lock order, so the error reported is the first in lock order, here
-    // and for the downloads below, while a large file holds only its own
-    // slot.
-    let mut results: Vec<(usize, Result<(PreparedTarget, PinCheck)>)> =
-        stream::iter(targets.into_iter().enumerate())
-            .map(|(index, target)| {
-                let store = Arc::clone(&store);
-                async move {
-                    let result = async {
-                        // The store is SHA-256 keyed, so another pin names its blob
-                        // through the artifact-key index; none means this package was
-                        // never synced into this store.
-                        let blob = match &target.expected {
-                            Digest::Sha256(id) => Some(id.clone()),
-                            Digest::Sha1(_) | Digest::Md5(_) => {
-                                store.lookup_artifact(&target.key).await?
-                            }
-                        };
-                        let Some(blob) = blob else {
-                            return Ok((target, PinCheck::Missing));
-                        };
-                        let expected = target.expected.clone();
-                        let status =
-                            tokio::task::spawn_blocking(move || store.check_pin(&blob, &expected))
-                                .await
-                                .map_err(|e| CliError::task_failed("verify", e))??;
-                        Ok((target, status))
-                    };
-                    (index, result.await)
-                }
-            })
-            .buffer_unordered(parallelism)
-            .collect()
-            .await;
-    results.sort_unstable_by_key(|(index, _)| *index);
+    let (targets, no_checksum, workspace_skipped) =
+        prepare_targets(held.as_ref().unwrap_or(&lock), &args.module)?;
 
     let mut verified = 0usize;
     let mut missing = Vec::new();
     let mut corrupt = Vec::new();
-    for (_, entry) in results {
-        let (target, status) = entry?;
-        match status {
-            PinCheck::Match => verified += 1,
-            PinCheck::Missing => missing.push(VerifyTarget {
-                target,
-                actual: None,
-            }),
-            PinCheck::Mismatch { actual } => corrupt.push(VerifyTarget {
-                target,
-                actual: Some(actual),
-            }),
+    let checked = check_pins(&store, targets, parallelism).await?;
+    verified += sort_checks(checked, &mut missing, &mut corrupt);
+
+    let mut downloaded = 0usize;
+    // An offline `sync --frozen` resolves again, which reads more than the
+    // pinned files: version listings, the POMs of versions the lock does not
+    // pin, and the answers of repositories that lack a file. The same
+    // resolution online caches all of it, and downloads the pinned files it
+    // reaches as it goes.
+    // Only the resolution of the plugin tables, which a frozen sync runs,
+    // fetches a plugin file or build extension jar again from the plugin
+    // repositories, so a module's repair runs it for one.
+    let platforms = &held.as_ref().unwrap_or(&lock).platforms;
+    let plugin_files: BTreeSet<ArtifactCoord> = (platforms.iter())
+        .filter_map(rv_lock::LockPlatform::plugin_files)
+        .flat_map(|files| {
+            files
+                .pinned_files()
+                .map(|file| file.key)
+                .collect::<Vec<_>>()
+        })
+        .chain(
+            (platforms
+                .iter()
+                .flat_map(rv_lock::LockPlatform::extension_jars))
+            .map(|(_, jar)| jar.coord()),
+        )
+        .collect();
+    let repairs_plugins =
+        (missing.iter().chain(&corrupt)).any(|finding| plugin_files.contains(&finding.target.key));
+    // The files only the plugin tables pin, which the dependencies' repair
+    // and trust never vouch for.
+    let dependency_files: BTreeSet<ArtifactCoord> = (lock.platforms.iter())
+        .flat_map(|platform| platform.pinned_files().map(|file| file.key))
+        .collect();
+    let plugin_only =
+        |key: &ArtifactCoord| plugin_files.contains(key) && !dependency_files.contains(key);
+    if args.download
+        && !offline
+        && (args.module.is_all() || repairs_plugins)
+        && config.project_root.join("pom.xml").is_file()
+    {
+        match resolve_frozen(config, Arc::clone(&store), &lock, held.as_ref(), output).await {
+            // The lock is the resolution's result, so each file it stored
+            // came from where the lock's model allows.
+            Ok(()) => {
+                let again: Vec<_> = (missing.drain(..).chain(corrupt.drain(..)))
+                    .map(|finding| finding.target)
+                    .collect();
+                let checked = check_pins(&store, again, parallelism).await?;
+                downloaded = sort_checks(checked, &mut missing, &mut corrupt);
+                verified += downloaded;
+            }
+            Err(err) => {
+                let reason = err.to_string();
+                let reason = (reason.lines().next().unwrap_or_default()).trim_end_matches(':');
+                output.warn(crate::output::Warning::new(
+                    crate::output::WarningCode::FrozenResolutionFailed,
+                    format!(
+                        "raeva.lock did not resolve again as 'raeva sync --frozen' resolves \
+                         it: {reason}; 'raeva --offline sync --frozen' fails until it does"
+                    ),
+                ));
+            }
         }
     }
 
-    let mut downloaded = 0usize;
     let mut untrusted_origin: Vec<VerifyTarget> = Vec::new();
     let mut pin_mismatch: Vec<VerifyTarget> = Vec::new();
     if args.download && (!missing.is_empty() || !corrupt.is_empty()) {
         let mut targets = Vec::new();
+        let was_corrupt: HashSet<ArtifactCoord> = (corrupt.iter())
+            .map(|finding| finding.target.key.clone())
+            .collect();
         targets.append(&mut missing);
         targets.append(&mut corrupt);
 
@@ -326,12 +353,10 @@ async fn verify_inner(
             }
             let mut context = crate::commands::sync::LockDownloadContext::new(
                 config,
-                &lock,
+                held.as_ref().unwrap_or(&lock),
                 &entry.platform,
                 output,
-                offline,
-                false,
-                false,
+                &crate::commands::sync::Mode::check(offline),
             )
             .await?;
             // Trust discovery must inspect only repairs: a verified row's
@@ -343,12 +368,18 @@ async fn verify_inner(
             let repair = &mut repairs.platforms[0];
             repair.artifacts.clear();
             repair.support_poms.clear();
-            for origin in mine() {
+            // The dependencies' trust never vouches for a plugin file.
+            let dependencies = (targets.iter())
+                .filter(|target| !plugin_only(&target.target.key))
+                .flat_map(|target| &target.target.origins)
+                .filter(|origin| *origin.platform() == entry.platform);
+            for origin in dependencies {
                 match origin {
                     Origin::Row(artifact, _) => repair.artifacts.push(artifact.clone()),
                     Origin::Support(coord, pin, _) => {
                         repair.support_poms.insert(coord.clone(), pin.clone());
                     }
+                    Origin::Extension(..) => {}
                 }
             }
             let resolved =
@@ -372,7 +403,7 @@ async fn verify_inner(
         // retry does not verify keeps its first finding.
         let failed = |outcome: &Result<Downloaded>| !matches!(outcome, Ok(Downloaded::Verified));
         let owners: HashSet<Platform> = (download_results.iter())
-            .filter(|(outcome, _)| failed(outcome))
+            .filter(|(outcome, target)| failed(outcome) && !plugin_only(&target.target.key))
             .flat_map(|(_, target)| &target.target.origins)
             .map(|origin| origin.platform().clone())
             .collect();
@@ -406,9 +437,20 @@ async fn verify_inner(
                 },
             ));
         }
+        let mut repaired = 0;
         for (outcome, target) in download_results {
             match outcome? {
-                Downloaded::Verified => downloaded += 1,
+                Downloaded::Verified => repaired += 1,
+                // This repair knows only the dependencies' repositories; a
+                // plugin file is the frozen resolution's to repair.
+                Downloaded::Untrusted
+                    if plugin_only(&target.target.key) || target.target.extension_only() =>
+                {
+                    match was_corrupt.contains(&target.target.key) {
+                        true => corrupt.push(target),
+                        false => missing.push(target),
+                    }
+                }
                 Downloaded::Untrusted => untrusted_origin.push(target),
                 Downloaded::Mismatch(actual) => pin_mismatch.push(VerifyTarget {
                     target: target.target,
@@ -416,7 +458,8 @@ async fn verify_inner(
                 }),
             }
         }
-        verified += downloaded;
+        downloaded += repaired;
+        verified += repaired;
     }
 
     // The fan-outs above finish in any order; reports list findings by
@@ -429,6 +472,7 @@ async fn verify_inner(
     ] {
         findings.sort_by_cached_key(|finding| finding.target.key.to_string());
     }
+    crate::commands::util::not_written(written)?;
 
     Ok(LockVerifyReport {
         verified,
@@ -441,6 +485,135 @@ async fn verify_inner(
         workspace_skipped,
         list_workspace: false,
     })
+}
+
+/// [`Store::check_pin`] for every target, `parallelism` at a time, in lock
+/// order, so the error reported is the first in lock order, while a large
+/// file holds only its own slot.
+async fn check_pins(
+    store: &Arc<Store>,
+    targets: Vec<PreparedTarget>,
+    parallelism: usize,
+) -> Result<Vec<(PreparedTarget, PinCheck)>> {
+    let mut results: Vec<(usize, Result<(PreparedTarget, PinCheck)>)> =
+        stream::iter(targets.into_iter().enumerate())
+            .map(|(index, target)| {
+                let store = Arc::clone(store);
+                async move {
+                    let result = async {
+                        // The store is SHA-256 keyed, so another pin names its blob
+                        // through the artifact-key index; none means this package was
+                        // never synced into this store.
+                        let blob = match &target.expected {
+                            Digest::Sha256(id) => Some(id.clone()),
+                            Digest::Sha1(_) | Digest::Md5(_) => {
+                                store.lookup_artifact(&target.key).await?
+                            }
+                        };
+                        let Some(blob) = blob else {
+                            return Ok((target, PinCheck::Missing));
+                        };
+                        let digests = target.digests();
+                        let status = tokio::task::spawn_blocking(move || {
+                            for digest in &digests {
+                                match store.check_pin(&blob, digest)? {
+                                    PinCheck::Match => {}
+                                    other => return Ok(other),
+                                }
+                            }
+                            Ok::<_, rv_store::StoreError>(PinCheck::Match)
+                        })
+                        .await
+                        .map_err(|e| CliError::task_failed("verify", e))??;
+                        Ok((target, status))
+                    };
+                    (index, result.await)
+                }
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Sort pin checks into `missing` and `corrupt`, returning how many matched.
+fn sort_checks(
+    checked: Vec<(PreparedTarget, PinCheck)>,
+    missing: &mut Vec<VerifyTarget>,
+    corrupt: &mut Vec<VerifyTarget>,
+) -> usize {
+    let mut matched = 0;
+    for (target, status) in checked {
+        match status {
+            PinCheck::Match => matched += 1,
+            PinCheck::Missing => missing.push(VerifyTarget {
+                target,
+                actual: None,
+            }),
+            PinCheck::Mismatch { actual } => corrupt.push(VerifyTarget {
+                target,
+                actual: Some(actual),
+            }),
+        }
+    }
+    matched
+}
+
+/// Resolve every platform `lock` records, online, as `sync --frozen` does,
+/// with the plugins of `held`, the lock with its plugin tables, and fail
+/// where it would.
+async fn resolve_frozen(
+    config: &Config,
+    store: Arc<Store>,
+    lock: &Lockfile,
+    held: Option<&Lockfile>,
+    output: &Output,
+) -> Result<()> {
+    let platforms: Vec<Platform> = (lock.platforms.iter())
+        .map(|entry| entry.platform.clone())
+        .collect();
+    let config = config.for_platforms(
+        (platforms.iter()).map(|platform| (platform.os(), platform.arch(), platform.jdk())),
+    );
+    config.settings_activation()?;
+    let models = discover_reactor_models(&config, &platforms)?;
+    let models_match = frozen_models_match(lock, &models);
+    check_recorded_freshness(
+        &config,
+        lock,
+        &models,
+        models_match,
+        true,
+        "raeva.lock has no config_hash, so --frozen cannot check it against the configuration",
+    )?;
+    let client = (crate::commands::sync::Mode::check(false).client(&config))
+        .await?
+        .with_progress(output.progress())
+        .with_lock_pins(lock);
+    output.step("Resolving dependencies...");
+    crate::commands::sync::validate_frozen_resolution(
+        &config,
+        Arc::clone(&store),
+        client.clone(),
+        lock,
+        &models,
+        models_match,
+        output,
+    )
+    .await?;
+    crate::commands::sync::check_frozen_plugins(
+        &config,
+        store,
+        client.clone(),
+        held,
+        &models,
+        &platforms,
+    )
+    .await?;
+    let checked = held.unwrap_or(lock);
+    crate::commands::sync::record_checked(&config, &client, &platforms, Some(checked));
+    Ok(())
 }
 
 /// What `raeva lock verify` found. Any finding fails the command with
@@ -664,6 +837,17 @@ fn prepare_targets(
                     .insert(module.path.clone());
             }
         }
+        // A plugin table's files are those of the modules that build with
+        // them; a set that names none, as a trace, is the whole build's.
+        for set in platform.plugins.iter().flat_map(|tables| &tables.sets) {
+            for module in (selection.modules().iter())
+                .filter(|module| set.modules.is_empty() || set.modules.contains(&module.path))
+            {
+                for coordinate in &set.artifacts {
+                    (reachable.entry(coordinate.clone()).or_default()).insert(module.path.clone());
+                }
+            }
+        }
 
         for artifact in &platform.artifacts {
             let Some(modules) = reachable.get(&artifact.coordinate) else {
@@ -692,6 +876,23 @@ fn prepare_targets(
             }
         }
 
+        // A build extension's jar records no repository, so only the
+        // resolution fetches it again.
+        for module in selection.modules() {
+            let jars = (module.extensions.iter()).filter(|jar| {
+                !rv_maven_types::resolves_through_snapshot_metadata(jar.gav.version())
+            });
+            for jar in jars {
+                let key = jar.coord();
+                let (origins, owners) = artifacts.entry(key).or_default();
+                origins.push(Origin::Extension(
+                    jar.sha256.clone(),
+                    platform.platform.clone(),
+                ));
+                owners.insert(module.path.clone());
+            }
+        }
+
         // Export needs the parent POMs and imported BOMs the lock pins. They
         // are attributed to no module, so every selection checks them.
         for (coord, pin) in &platform.support_poms {
@@ -714,6 +915,7 @@ fn prepare_targets(
         let expected = match &origins[0] {
             Origin::Row(artifact, _) => artifact.pin().cloned(),
             Origin::Support(_, pin, _) => Some(Digest::Sha256(pin.sha256.clone())),
+            Origin::Extension(sha256, _) => Some(Digest::Sha256(sha256.clone())),
         };
         let Some(expected) = expected else {
             no_checksum.push(UnpinnedTarget { key, modules });
@@ -806,6 +1008,7 @@ async fn download_from_owners(
                         Origin::Row(artifact, _) => {
                             rv_repo::index_restored(store, lock, owner, artifact).await
                         }
+                        Origin::Extension(..) => Ok(()),
                     };
                 }
                 return Ok(Downloaded::Verified);
@@ -848,6 +1051,7 @@ async fn download_and_verify(
             )
             .await
         }
+        Origin::Extension(..) => return Ok(Downloaded::Untrusted),
     };
     match fetched {
         Ok(()) => {
@@ -856,13 +1060,18 @@ async fn download_and_verify(
                 _ => store.lookup_artifact(&target.key).await?,
             };
             let Some(blob) = blob else {
-                return Err(RepoError::NotFound(target.key.to_string()).into());
+                return Err(RepoError::NotFound(target.key.to_string().into()).into());
             };
-            match store.check_pin_async(&blob, &target.expected).await? {
-                PinCheck::Match => Ok(Downloaded::Verified),
-                PinCheck::Mismatch { actual } => Ok(Downloaded::Mismatch(Some(actual))),
-                PinCheck::Missing => Err(RepoError::NotFound(target.key.to_string()).into()),
+            for digest in target.digests() {
+                match store.check_pin_async(&blob, &digest).await? {
+                    PinCheck::Match => {}
+                    PinCheck::Mismatch { actual } => return Ok(Downloaded::Mismatch(Some(actual))),
+                    PinCheck::Missing => {
+                        return Err(RepoError::NotFound(target.key.to_string().into()).into());
+                    }
+                }
             }
+            Ok(Downloaded::Verified)
         }
         Err(RepoError::ChecksumMismatch {
             check: IntegritySource::LockPin,
@@ -885,26 +1094,56 @@ struct PreparedTarget {
 }
 
 impl PreparedTarget {
-    fn repo_url(&self) -> &str {
-        match &self.origins[0] {
-            Origin::Row(artifact, _) => &artifact.repo_url,
-            Origin::Support(_, pin, _) => &pin.repo_url,
+    /// The pin, then each other digest a row records, which must name the
+    /// file too.
+    fn digests(&self) -> Vec<Digest> {
+        let mut digests = vec![self.expected.clone()];
+        for origin in &self.origins {
+            let Origin::Row(artifact, _) = origin else {
+                continue;
+            };
+            for digest in &artifact.checksums {
+                if !digests.contains(digest) {
+                    digests.push(digest.clone());
+                }
+            }
         }
+        digests
+    }
+
+    fn repo_url(&self) -> &str {
+        (self.origins.iter())
+            .find_map(|origin| match origin {
+                Origin::Row(artifact, _) => Some(artifact.repo_url.as_str()),
+                Origin::Support(_, pin, _) => Some(pin.repo_url.as_str()),
+                Origin::Extension(..) => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether only build extensions pin the file, which records no origin
+    /// a download could take.
+    fn extension_only(&self) -> bool {
+        (self.origins.iter()).all(|origin| matches!(origin, Origin::Extension(..)))
     }
 }
 
-/// Where a file comes from: an artifact row (or its companion POM), or a
-/// support POM with its coordinate, on the platform that records it.
+/// Where a file comes from: an artifact row (or its companion POM), a
+/// support POM with its coordinate, or a build extension jar with its pin,
+/// on the platform that records it.
 #[derive(Debug)]
 enum Origin {
     Row(LockArtifact, Platform),
     Support(String, SupportPom, Platform),
+    Extension(rv_maven_types::Sha256, Platform),
 }
 
 impl Origin {
     fn platform(&self) -> &Platform {
         match self {
-            Self::Row(_, platform) | Self::Support(_, _, platform) => platform,
+            Self::Row(_, platform)
+            | Self::Support(_, _, platform)
+            | Self::Extension(_, platform) => platform,
         }
     }
 }
@@ -1093,7 +1332,7 @@ mod tests {
         row.pom_sha256 = Some(rv_maven_types::BlobId::from_bytes(b"pom"));
         publish(repo.path(), &row.coord(), b"jar");
         let lock = lock_with_packages(vec![row]);
-        lock.write_atomic(&config.lock_path).unwrap();
+        write_lock(lock, &config);
         let store = Store::open(&config.paths.store_dir).unwrap();
         store.put_bytes(b"pom").await.unwrap();
         let blob = store.put_bytes(b"jar").await.unwrap();
@@ -1149,9 +1388,7 @@ mod tests {
             );
             verified.repo_url = "https://transitive.example/m2/".to_string();
             verified.pom_sha256 = row.pom_sha256.clone();
-            lock_with_packages(vec![row, verified])
-                .write_atomic(&config.lock_path)
-                .unwrap();
+            write_lock(lock_with_packages(vec![row, verified]), &config);
             let store = Store::open(&config.paths.store_dir).unwrap();
             store.put_bytes(b"pom").await.unwrap();
             store.put_bytes(b"verified").await.unwrap();
@@ -1188,7 +1425,7 @@ mod tests {
                     b"jar",
                 )];
             }
-            lock.write_atomic(&config.lock_path).unwrap();
+            let lock = write_lock(lock, &config);
             let store = Store::open(&config.paths.store_dir).unwrap();
             let (targets, _, _) = prepare_targets(&lock, &ModuleSelector::default()).unwrap();
             for (target, bytes) in targets.iter().zip([b"jar".as_slice(), b"pom", b"parent"]) {
@@ -1239,6 +1476,26 @@ mod tests {
         }
     }
 
+    /// A download that matches the pin but not a row's other digest does
+    /// not count as a repair.
+    #[tokio::test]
+    async fn download_checks_every_digest_a_row_records() {
+        let repo = TempDir::new().unwrap();
+        let url = url::Url::from_directory_path(repo.path()).unwrap();
+        let (_temp, config) = config_with_repo(url.as_str());
+        let mut lock = repair_lock(url.as_str());
+        let sha1 = Digest::of_bytes(rv_maven_types::HashAlgorithm::Sha1, b"other");
+        lock.platforms[0].artifacts[0].checksums.push(sha1);
+        let lock = write_lock(lock, &config);
+        let (targets, _, _) = prepare_targets(&lock, &ModuleSelector::default()).unwrap();
+        for (target, bytes) in targets.iter().zip([b"jar".as_slice(), b"pom", b"parent"]) {
+            publish(repo.path(), &target.key, bytes);
+        }
+        let report = repair(&config).await;
+        assert!(report.has_findings(), "{}", report.summary());
+        assert_eq!(report.downloaded, 2, "{}", report.summary());
+    }
+
     #[tokio::test]
     async fn download_uses_foreign_platform_settings_for_rows_and_support_poms() {
         let project = TempDir::new().unwrap();
@@ -1277,7 +1534,7 @@ mod tests {
             "jar",
             Vec::new(),
         ));
-        lock.write_atomic(&config.lock_path).unwrap();
+        let lock = write_lock(lock, &config);
         let (targets, _, _) = prepare_targets(&lock, &ModuleSelector::default()).unwrap();
         for (target, bytes) in targets.iter().zip([b"jar".as_slice(), b"pom", b"parent"]) {
             publish(repo.path(), &target.key, bytes);
@@ -1309,6 +1566,28 @@ mod tests {
     }
 
     const SHA256_A: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+
+    /// A row's SHA-1 beside its SHA-256 must name the file too.
+    #[tokio::test]
+    async fn every_digest_a_row_records_is_checked() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let blob = store.put_bytes(b"jar").await.unwrap();
+        for (bytes, matched) in [(b"jar".as_slice(), true), (b"other", false)] {
+            let mut row = lock_package("demo", "jar", Some(Digest::Sha256(blob.clone())));
+            let sha1 = Digest::of_bytes(rv_maven_types::HashAlgorithm::Sha1, bytes);
+            row.checksums.push(sha1);
+            let lock = lock_with_packages(vec![row]);
+            let (targets, _, _) = prepare_targets(&lock, &ModuleSelector::default()).unwrap();
+            let checked = check_pins(&store, targets, 1).await.unwrap();
+            assert_eq!(
+                checked[0].1 == PinCheck::Match,
+                matched,
+                "{:?}",
+                checked[0].1
+            );
+        }
+    }
 
     #[test]
     fn snapshot_pom_verification_uses_its_own_build() {
@@ -1381,6 +1660,15 @@ mod tests {
             "the unpinned POM row is a finding, the system-path package is not: {unpinned:?}"
         );
         assert!(unpinned[0].contains("pom-no-pin"));
+    }
+
+    /// Write `lock` with its origins as a sync of `config`'s project records
+    /// them.
+    fn write_lock(mut lock: Lockfile, config: &Config) -> Lockfile {
+        let origins = rv_lock::LockOrigins::for_root(&config.project_root);
+        lock.relativize_origins(&origins).unwrap();
+        lock.write_atomic(&config.lock_path).unwrap();
+        lock
     }
 
     fn config_with_repo(url: &str) -> (TempDir, Config) {

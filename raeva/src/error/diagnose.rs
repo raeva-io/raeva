@@ -23,6 +23,12 @@ pub(crate) struct HintEnv {
     /// The proxies config.toml and settings.xml name, as `host:port`. The
     /// proxy variables are not read while there are any.
     pub(crate) file_proxies: Vec<String>,
+    /// Maven 3.10's credential scope, and the ids whose username and
+    /// password come from settings.xml, which it binds.
+    pub(crate) credential_scope: Option<(rv_config::CredentialScope, Vec<String>)>,
+    /// The ids of the settings.xml servers whose encrypted password raeva
+    /// could not decrypt, which give no credential.
+    pub(crate) dropped_passwords: Vec<String>,
 }
 
 impl HintEnv {
@@ -34,6 +40,8 @@ impl HintEnv {
             settings_file: None,
             env_proxies: Vec::new(),
             file_proxies: Vec::new(),
+            credential_scope: None,
+            dropped_passwords: Vec::new(),
         }
     }
 
@@ -44,8 +52,28 @@ impl HintEnv {
             settings_file: config.settings_path.clone(),
             env_proxies,
             file_proxies,
+            credential_scope: (config.credential_scope())
+                .map(|scope| (scope.clone(), settings_password_ids(config))),
+            dropped_passwords: (config.auth_layers().settings().iter())
+                .filter(|entry| entry.password_dropped)
+                .filter_map(|entry| entry.id.clone())
+                .collect(),
             ..Self::from_paths(Some(&config.paths))
         }
+    }
+
+    /// Whether sync keeps the settings.xml username and password of `id`
+    /// from `url` in the Maven 3.10 mode, as Maven's credential scope does.
+    pub(crate) fn scope_withholds(&self, id: &str, url: &str) -> bool {
+        (self.credential_scope.as_ref()).is_some_and(|(scope, ids)| {
+            ids.iter().any(|known| known == id) && !scope.sends(id, url)
+        })
+    }
+
+    /// Whether the settings.xml server `id` gave no credential because its
+    /// password could not be decrypted.
+    pub(crate) fn password_dropped(&self, id: &str) -> bool {
+        self.dropped_passwords.iter().any(|dropped| dropped == id)
     }
 
     /// The labels of `config`'s proxies, for [`Self::env_proxies`] and
@@ -222,9 +250,22 @@ impl CliError {
                     ..cause
                 };
             }
+            CliError::OfflinePlugins(cause) => {
+                let mut cause = cause.diagnose(env);
+                if cause.code == "OFFLINE_NOT_CACHED" {
+                    cause.hints = vec![format!(
+                        "Run '{}' online once, or restore a seed, to make this home ready \
+                         offline: a plain 'raeva sync' does not download what the plugin check \
+                         reads",
+                        crate::output::command_line("sync --frozen")
+                    )];
+                }
+                return cause;
+            }
             CliError::Config(_) | CliError::Platform(_) => (S::Config, "CONFIG"),
             CliError::Lock(err) => match err {
                 rv_lock::LockError::Io { .. } => (S::Failure, "IO"),
+                rv_lock::LockError::UnrecordableOrigin(_) => (S::Config, "REPOSITORY_CONFIG"),
                 _ => (S::Config, "LOCKFILE_INVALID"),
             },
             CliError::InvalidProjectInput { .. } => (S::Config, "INVALID_PROJECT_INPUT"),
@@ -255,15 +296,27 @@ impl CliError {
                 return Diagnostic::new(S::Config, "LOCKFILE_MISSING", rendered);
             }
             CliError::LockfileNotAFile { .. } => (S::Config, "LOCKFILE_NOT_A_FILE"),
-            CliError::LockfileIncompatible { regenerable, .. } => {
+            CliError::LockfileIncompatible { regenerate, .. } => {
                 let mut rendered = Rendered::plain(self.to_string());
-                rendered.hints.push(if *regenerable {
-                    "Run 'raeva sync' without --frozen to regenerate it".to_string()
-                } else {
-                    "Delete raeva.lock and run 'raeva sync', which cannot read this one to \
-                     keep the platforms it names"
-                        .to_string()
-                });
+                rendered.hints.push(
+                    match regenerate {
+                        Some(true) => "Run 'raeva sync' without --frozen to regenerate it",
+                        Some(false) => {
+                            "Run 'raeva sync --update' to regenerate it without its pins, which a \
+                         plain sync cannot keep, or delete raeva.lock"
+                        }
+                        None => {
+                            "Delete raeva.lock and run 'raeva sync', which cannot read this one to \
+                         keep the platforms it names"
+                        }
+                    }
+                    .to_string(),
+                );
+                return Diagnostic::new(S::Config, "LOCKFILE_INVALID", rendered);
+            }
+            CliError::LockfileUnreplaced { hint, .. } => {
+                let mut rendered = Rendered::plain(self.to_string());
+                rendered.hints.push(hint.clone());
                 return Diagnostic::new(S::Config, "LOCKFILE_INVALID", rendered);
             }
             CliError::LockfileDefect { .. } => (S::Config, "LOCKFILE_INVALID"),
@@ -306,6 +359,15 @@ impl CliError {
                 }
                 return Diagnostic::new(S::Config, "PLATFORM_MISSING", rendered);
             }
+            CliError::OtherPlatformOrigin { .. } => {
+                let mut rendered = Rendered::plain(self.to_string());
+                rendered.hints.push(
+                    "Run 'raeva sync --frozen', or 'raeva sync', without --platforms: it \
+                     resolves every platform, through the repositories each one's build declares"
+                        .to_string(),
+                );
+                return Diagnostic::new(S::Config, "OTHER_PLATFORM_ORIGIN", rendered);
+            }
             CliError::LockfileMismatch { details, hint } => {
                 let mut rendered = Rendered::plain(details.clone());
                 rendered.hints.push(
@@ -343,7 +405,21 @@ impl CliError {
 /// service's own.
 fn vuln_class(err: &rv_vuln::VulnError) -> (ExitStatus, &'static str) {
     use rv_vuln::VulnError;
+    // A proxy's refusal, of the tunnel or of a plain request, as a download
+    // classes it.
+    let proxy = || {
+        (
+            ErrorClass::ProxyAuth.exit_status(),
+            class_code(ErrorClass::ProxyAuth),
+        )
+    };
     match err {
+        VulnError::Http(source) if rv_http::transient::tunnel_refusal(source).is_some() => proxy(),
+        VulnError::HttpStatus { status, .. }
+            if *status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED =>
+        {
+            proxy()
+        }
         VulnError::Http(source)
             if rv_http::tls_cause(source).is_some_and(rv_http::tls_failure_is_permanent) =>
         {
@@ -352,7 +428,9 @@ fn vuln_class(err: &rv_vuln::VulnError) -> (ExitStatus, &'static str) {
         VulnError::Http(source) if rv_http::transient::transport_is_transient(source) => {
             (ExitStatus::Network, "NETWORK")
         }
-        VulnError::RateLimited { .. } => (ExitStatus::Network, "NETWORK"),
+        VulnError::RateLimited { .. } | VulnError::Truncated { .. } => {
+            (ExitStatus::Network, "NETWORK")
+        }
         VulnError::HttpStatus { status, .. }
             if rv_http::transient::status_is_transient(*status) =>
         {
@@ -388,6 +466,7 @@ pub(crate) fn class_code(class: ErrorClass) -> &'static str {
         ErrorClass::Store => "STORE",
         ErrorClass::Offline => "OFFLINE_NOT_CACHED",
         ErrorClass::Lockfile => "LOCKFILE_INVALID",
+        ErrorClass::Internal => "INTERNAL",
         ErrorClass::Other => "REPOSITORY",
     }
 }
@@ -414,6 +493,12 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
         ResolveError::Store(source) => {
             Diagnostic::new(S::Failure, "STORE", report::render_store_error(source, env))
         }
+        ResolveError::FilteredModel { error, searched } => {
+            let mut diagnostic = diagnose_resolve(error, env);
+            report::append_searched_section(&mut diagnostic.message, Some(searched));
+            diagnostic.hints.insert(0, report::FILTERED_HINT.to_string());
+            diagnostic
+        }
         ResolveError::MultipleArtifactErrors { first, rest } => {
             let first_diagnostic = diagnose_resolve(first, env);
             Diagnostic {
@@ -424,6 +509,31 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
                     report::render_multiple_artifact_errors(first, rest, env),
                 )
             }
+        }
+        ResolveError::Plugin {
+            plugin,
+            searched,
+            error,
+        } => {
+            let mut diagnostic = diagnose_resolve(error, env);
+            diagnostic.message = format!(
+                "While resolving the {}:\n\n{}",
+                crate::output::inline_text(plugin),
+                diagnostic.message
+            );
+            if let ResolveError::Pom(rv_maven_model::PomError::ParentNotFound(..)) = error.cause()
+                && !searched.is_empty()
+                && !names_filtered_model(error)
+            {
+                diagnostic.message.push_str(
+                    "\n  None of the repositories the plugin pass searched for this plugin has it:\n",
+                );
+                for url in searched {
+                    let url = rv_config::redact_url(url);
+                    diagnostic.message.push_str(&format!("    - {url}\n"));
+                }
+            }
+            diagnostic
         }
         ResolveError::Declared { module, via, error } => {
             let mut diagnostic = diagnose_resolve(error, env);
@@ -478,8 +588,15 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
             "VERSION_CONFLICT",
             report::render_version_conflict(coord, requested, selected),
         ),
+        ResolveError::Pom(source @ rv_maven_model::PomError::SecretCoordinate { .. }) => {
+            Diagnostic::plain(S::Config, "INVALID_POM", source.to_string())
+        }
+        // Maven builds a model raeva cannot lock the same way: a refusal.
         ResolveError::Pom(source) => Diagnostic::new(
-            S::Resolution,
+            match source {
+                rv_maven_model::PomError::Unlockable(_) => S::Config,
+                _ => S::Resolution,
+            },
             "INVALID_POM",
             report::render_pom_error(source),
         ),
@@ -489,6 +606,9 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
             report::render_local_pom_error(path, source),
         ),
         ResolveError::Config(_) => Diagnostic::plain(S::Config, "CONFIG", err.to_string()),
+        ResolveError::UnrecordableScope { .. } => {
+            Diagnostic::plain(S::Config, "INVALID_POM", err.to_string())
+        }
         ResolveError::Io(_) => Diagnostic::plain(S::Failure, "IO", err.to_string()),
         ResolveError::InternalError(_) | ResolveError::MissingRepoClient => {
             Diagnostic::plain(S::Failure, "INTERNAL", err.to_string())
@@ -508,21 +628,96 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
                 ],
             },
         ),
-        ResolveError::UndefinedProperty { property, .. } => Diagnostic::new(
+        ResolveError::UndefinedProperty { property, .. } => {
+            let unread = rv_config::unread_jvm_option(property);
+            let is_unread = unread.is_some();
+            let (severity, code) = match rv_maven_model::jvm_owned(property) || unread.is_some() {
+                true => (S::Config, "INVALID_POM"),
+                false => (S::Resolution, "RESOLUTION"),
+            };
+            Diagnostic::new(
+            severity,
+            code,
+            Rendered {
+                message: err.to_string(),
+                hints: vec![match property.as_str() {
+                    property if is_unread => format!(
+                        "mvn's JVM may take {property} from its options, where {}, which \
+                         raeva cannot read exactly; write that option plainly, or define \
+                         {property} on the command line of both raeva and mvn: \
+                         -D{property}=<value>",
+                        unread.as_deref().unwrap_or_default()
+                    ),
+                    property if rv_maven_model::jvm_owned(property) => format!(
+                        "Maven takes {property} from the JVM, which raeva does not read from \
+                         the host or which differs across the hosts the lock covers, so a lock \
+                         cannot follow it. Define it in .mvn/maven.config or on the command \
+                         line: raeva sync -D{property}=<value>"
+                    ),
+                    _ => format!(
+                        "Define it in .mvn/maven.config or on the command line: raeva sync \
+                         -D{}=<value>. In a Maven build a build extension or plugin that raeva \
+                         does not run may set it. raeva resolves every reactor module, so one \
+                         a build skips with -pl can still fail the sync",
+                        rv_maven_types::bounded(property)
+                    ),
+                }],
+            },
+        )
+        }
+        ResolveError::ReadsNoPom { .. } => Diagnostic::new(
             S::Resolution,
             "RESOLUTION",
             Rendered {
                 message: err.to_string(),
-                hints: vec![format!(
-                    "Define it in .mvn/maven.config or on the command line: raeva sync \
-                     -D{}=<value>. In a Maven build a build extension or plugin that raeva \
-                     does not run may set it. raeva resolves every reactor module, so one a \
-                     build skips with -pl can still fail the sync",
-                    rv_maven_types::bounded(property)
-                )],
+                hints: vec![
+                    "Declare a repository that serves this POM, as a <pluginRepository> for a \
+                     plugin, or resolve as Maven 3.10 does, which reads each module's and \
+                     plugin's POMs apart, with maven = \"3.10\" under [lock] in raeva.toml"
+                        .to_string(),
+                ],
             },
         ),
-        ResolveError::ConflictingCompanionPomBytes(_) => Diagnostic::new(
+        ResolveError::OnePomPerVersion { .. } => Diagnostic::new(
+            S::Resolution,
+            "RESOLUTION",
+            Rendered {
+                message: err.to_string(),
+                hints: vec![
+                    "Declare one repository that serves this POM for every module and plugin \
+                     that reads it"
+                        .to_string(),
+                ],
+            },
+        ),
+        ResolveError::ReactorModuleUnordered { .. } => Diagnostic::new(
+            S::Resolution,
+            "RESOLUTION",
+            Rendered {
+                message: err.to_string(),
+                hints: vec![
+                    "Declare the reactor module as a <dependency> of the plugin in the POM \
+                     that uses it, which makes Maven build it first"
+                        .to_string(),
+                ],
+            },
+        ),
+        ResolveError::SharedDescriptorDiffers { .. } => Diagnostic::new(
+            S::Resolution,
+            "RESOLUTION",
+            Rendered {
+                message: err.to_string(),
+                hints: vec![
+                    "Declare the repository that serves this POM for every module and plugin \
+                     that reads it, as a <pluginRepository> for a plugin. Where one finds no \
+                     POM, resolving as Maven 3.10 does, with maven = \"3.10\" under [lock] in \
+                     raeva.toml, also locks it"
+                        .to_string(),
+                ],
+            },
+        ),
+        ResolveError::ConflictingCompanionPomBytes(_)
+        | ResolveError::ConflictingSupportCompanionPom { .. } => Diagnostic::new(
             S::Resolution,
             "RESOLUTION",
             Rendered {
@@ -545,9 +740,75 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
                 hints: vec!["Re-run 'raeva sync --update'".to_string()],
             },
         ),
-        ResolveError::NoSnapshotRepository { .. } => Diagnostic::new(
+        ResolveError::ParentBehindWrittenMirror { mirror, .. } => Diagnostic::new(
             S::Resolution,
-            "RESOLUTION",
+            "INVALID_POM",
+            Rendered {
+                message: err.to_string(),
+                hints: vec![format!(
+                    "If mirror '{mirror}' holds the parent, add its URL as a repository in \
+                     raeva.toml"
+                )],
+            },
+        ),
+        ResolveError::MirroredImportRepository { id, .. } => Diagnostic::new(
+            S::Config,
+            "REPOSITORY_CONFIG",
+            Rendered {
+                message: err.to_string(),
+                hints: vec![format!(
+                    "Declare repository '{id}' in the project POM or a settings profile, so \
+                     the mirror serves it for the project"
+                )],
+            },
+        ),
+        ResolveError::RedeclaredRepository { .. } => Diagnostic::new(
+            S::Config,
+            "REPOSITORY_CONFIG",
+            Rendered {
+                message: err.to_string(),
+                hints: vec!["Allow the redeclared URL with [security] \
+                     transitive_repository_allowlist in config.toml, or give the project a \
+                     mirror that serves both URLs"
+                    .to_string()],
+            },
+        ),
+        ResolveError::UnreadRepositoryAhead { id, .. } => Diagnostic::new(
+            S::Config,
+            "REPOSITORY_CONFIG",
+            Rendered {
+                message: err.to_string(),
+                hints: vec![format!(
+                    "Allow repository '{id}' with [security] transitive_repository_allowlist \
+                     in config.toml, or declare it in the project POM"
+                )],
+            },
+        ),
+        ResolveError::RepositoryIdUnfollowed { .. } => Diagnostic::new(
+            S::Config,
+            "REPOSITORY_CONFIG",
+            Rendered {
+                message: err.to_string(),
+                hints: vec!["Write the id out in that POM, or name its value in the \
+                     <mirrorOf> of the mirror that should serve it"
+                    .to_string()],
+            },
+        ),
+        ResolveError::MirrorRouteSplit { .. } => Diagnostic::new(
+            S::Config,
+            "REPOSITORY_CONFIG",
+            Rendered {
+                message: err.to_string(),
+                hints: vec![
+                    "Give the URL without an expression, or name the repository's id in the \
+                     <mirrorOf> of the mirror that should serve it, or exclude it with !id"
+                        .to_string(),
+                ],
+            },
+        ),
+        ResolveError::NoSnapshotRepository { .. } => Diagnostic::new(
+            S::Config,
+            "REPOSITORY_CONFIG",
             Rendered {
                 message: err.to_string(),
                 hints: vec![
@@ -560,6 +821,8 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
         ),
         ResolveError::RelocationCycle(_)
         | ResolveError::WorkspaceDependencyCycle { .. }
+        | ResolveError::ReactorChoice { .. }
+        | ResolveError::SplitListing { .. }
         | ResolveError::ConflictingArtifactBytes { .. }
         | ResolveError::ConflictingSupportPomBytes(_)
         | ResolveError::ConflictingResolvedPomBytes(_)
@@ -569,9 +832,24 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
         | ResolveError::GraphLimitExceeded { .. }
         | ResolveError::MediationDiverged { .. }
         | ResolveError::UnrecordableSnapshotBuild { .. }
+        | ResolveError::PluginSnapshot { .. }
+        | ResolveError::UnorderedTestClasspath { .. }
+        | ResolveError::ConflictingPluginBytes { .. }
+        | ResolveError::UnrecordablePluginPom { .. }
+        | ResolveError::UnreadableJar { .. }
         | ResolveError::Version(_) => {
             Diagnostic::plain(S::Resolution, "RESOLUTION", err.to_string())
         }
+    }
+}
+
+/// Whether `err` lists how the repositories answered for the parent or BOM
+/// it misses.
+fn names_filtered_model(err: &ResolveError) -> bool {
+    match err {
+        ResolveError::FilteredModel { .. } => true,
+        ResolveError::Declared { error, .. } => names_filtered_model(error),
+        _ => false,
     }
 }
 
@@ -616,6 +894,14 @@ fn diagnose_export(err: &ExportError, env: &HintEnv) -> Diagnostic {
                 "Run '{sync}' with network access to restore the locked POMs, then retry the export"
             )),
         ),
+        ExportError::NotStored(_) => (
+            S::LockMismatch,
+            "LOCKFILE_MISMATCH",
+            Some(format!(
+                "Run '{sync}' with network access to download and check every locked file of \
+                 every platform, then retry"
+            )),
+        ),
         ExportError::UnpinnedPom { .. } => (
             S::Config,
             "LOCKFILE_INVALID",
@@ -628,7 +914,25 @@ fn diagnose_export(err: &ExportError, env: &HintEnv) -> Diagnostic {
             "LOCKFILE_INVALID",
             Some(format!("Run '{sync}' to rewrite raeva.lock")),
         ),
+        ExportError::EqualSpellings { coordinate, .. } => (
+            S::Config,
+            "LOCKFILE_INVALID",
+            Some(format!(
+                "Give {coordinate} one version in the project, such as in \
+                 <dependencyManagement>, so that no range chooses between them"
+            )),
+        ),
+        ExportError::UnversionedPlugin { .. } => (
+            S::Config,
+            "LOCKFILE_INVALID",
+            Some(format!(
+                "Set [plugins] lock = true in raeva.toml and run '{sync}', or give the plugin \
+                 a version in the POM"
+            )),
+        ),
         ExportError::UnsupportedChecksum { .. }
+        | ExportError::ConflictingMarkers { .. }
+        | ExportError::SecretOrigin { .. }
         | ExportError::InvalidCoordinate(_)
         | ExportError::WindowsUnsafeName { .. }
         | ExportError::ShortNameAlias { .. } => (S::Config, "LOCKFILE_INVALID", None),
@@ -646,22 +950,30 @@ fn diagnose_export(err: &ExportError, env: &HintEnv) -> Diagnostic {
                     .to_string(),
             ),
         ),
-        ExportError::CaseCollision { path, .. } => {
+        ExportError::CaseCollision { path, .. } | ExportError::PlanCaseCollision { path, .. } => {
             let metadata = path.file_name().is_some_and(|name| {
                 let name = name.to_string_lossy();
                 name.starts_with("maven-metadata-")
                     && (name.ends_with(".xml") || name.contains(".xml."))
             });
-            let hint = if metadata {
-                "Rename the repositories so that their ids differ in more than letter case or \
-                 Unicode normalization, or export with --m2-path to a volume that keeps the \
-                 names apart"
-            } else {
-                "Export with --m2-path to a volume that keeps the names apart: a case-sensitive \
-                 one, though APFS treats names that differ only in Unicode normalization as one \
-                 either way"
+            let export = match err {
+                ExportError::PlanCaseCollision { .. } => "--m2-path in place of --plan-json",
+                _ => "--m2-path",
             };
-            (S::Config, "LOCAL_REPOSITORY", Some(hint.to_string()))
+            let hint = if metadata {
+                format!(
+                    "Rename the repositories so that their ids differ in more than letter case \
+                     or Unicode normalization, or export with {export} to a volume that keeps \
+                     the names apart"
+                )
+            } else {
+                format!(
+                    "Export with {export} to a volume that keeps the names apart: a \
+                     case-sensitive one, though APFS treats names that differ only in Unicode \
+                     normalization as one either way"
+                )
+            };
+            (S::Config, "LOCAL_REPOSITORY", Some(hint))
         }
         ExportError::DestinationMismatch { .. } => (
             S::Failure,
@@ -679,6 +991,38 @@ fn diagnose_export(err: &ExportError, env: &HintEnv) -> Diagnostic {
     Diagnostic::new(status, code, rendered)
 }
 
+/// The ids whose credential sync takes from a settings.xml username and
+/// password, as `AuthStore::lookup_auth` picks it: the first entry of a file
+/// for the id decides, unless it has none of the fields raeva reads, when
+/// the next file does.
+fn settings_password_ids(config: &rv_config::Config) -> Vec<String> {
+    let layers = config.auth_layers();
+    let mut ids: Vec<String> = Vec::new();
+    for id in layers
+        .settings()
+        .iter()
+        .filter_map(|entry| entry.id.as_deref())
+    {
+        let picked = [layers.project(), layers.user(), layers.settings()]
+            .into_iter()
+            .enumerate()
+            .filter_map(|(file, entries)| {
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.id.as_deref() == Some(id))?;
+                (entry.token.is_some() || entry.username.is_some() || entry.password.is_some())
+                    .then_some((file == 2, entry))
+            })
+            .next();
+        if matches!(picked, Some((true, entry)) if entry.token.is_none())
+            && !ids.iter().any(|known| known == id)
+        {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CliError, ExitStatus, HintEnv};
@@ -693,6 +1037,8 @@ mod tests {
             settings_file: None,
             env_proxies: Vec::new(),
             file_proxies: Vec::new(),
+            credential_scope: None,
+            dropped_passwords: Vec::new(),
         }
     }
 
@@ -811,6 +1157,7 @@ mod tests {
             ErrorClass::Store,
             ErrorClass::Offline,
             ErrorClass::Lockfile,
+            ErrorClass::Internal,
             ErrorClass::Other,
         ];
         for class in classes {
@@ -826,6 +1173,7 @@ mod tests {
                 | ErrorClass::Store
                 | ErrorClass::Offline
                 | ErrorClass::Lockfile
+                | ErrorClass::Internal
                 | ErrorClass::Other => {}
             }
             given.push((class_code(class).to_string(), class.exit_status()));
@@ -1092,6 +1440,18 @@ mod tests {
                 source: io(ErrorKind::PermissionDenied),
             },
             ResolveError::InternalError(s("x")).into(),
+            ResolveError::Plugin {
+                plugin: s("plugin t:p:1-SNAPSHOT"),
+                searched: Vec::new(),
+                error: Box::new(ResolveError::PluginSnapshot {
+                    coord: s("t:p:1-SNAPSHOT:jar"),
+                }),
+            }
+            .into(),
+            ResolveError::ConflictingPluginBytes {
+                coord: s("t:p:1:jar"),
+            }
+            .into(),
             ResolveError::WorkspaceStalled {
                 modules: s("app"),
                 stalled_for_secs: 9,
@@ -1132,6 +1492,12 @@ mod tests {
                 path: "x".into(),
             }
             .into(),
+            Export::PlanCaseCollision {
+                first: s("A"),
+                second: s("a"),
+                path: "x".into(),
+            }
+            .into(),
             Export::DestinationMismatch {
                 key: s("k"),
                 path: "x".into(),
@@ -1146,7 +1512,7 @@ mod tests {
             })),
             CliError::Download {
                 failures: vec![s("g:a:1: gone")],
-                first: RepoError::NotFound(s("a")),
+                first: RepoError::NotFound(s("a").into()),
             },
             CliError::Download {
                 failures: (0..12).map(|n| format!("g:a{n}:1: refused")).collect(),
@@ -1162,9 +1528,14 @@ mod tests {
                 recorded: vec![s("macos-aarch64"), s("windows-x86_64")],
                 frozen: true,
             },
+            CliError::OtherPlatformOrigin {
+                file: s("org.test:s:1:jar"),
+                repo: s("https://repo-b.example/"),
+                platforms: vec![s("windows-x86_64")],
+            },
             CliError::LockfileTooNew {
-                found: 9,
-                expected: 8,
+                found: 10,
+                expected: 9,
             },
             CliError::LockfileMissing {
                 path: "/p/raeva.lock".into(),

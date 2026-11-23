@@ -65,6 +65,11 @@ pub(crate) enum CliError {
     #[error("vulnerability scan failed: {0}")]
     VulnerabilityScan(Box<CliError>),
 
+    /// The plugin check of an offline `sync --frozen` failed. The cause gives
+    /// the message and status.
+    #[error("{0}")]
+    OfflinePlugins(Box<CliError>),
+
     /// OSV named vulnerability records that could not be fetched, so the
     /// scan is incomplete. The status follows the fetch errors.
     #[error("OSV named {} vulnerability record(s) that could not be fetched", failures.len())]
@@ -118,7 +123,8 @@ pub(crate) enum CliError {
     )]
     LockfileMissing {
         path: PathBuf,
-        /// The project's own raeva.lock, which `raeva sync` creates.
+        /// The project's own raeva.lock beside its pom.xml, which `raeva
+        /// sync` creates.
         sync_creates: bool,
         reactor: Option<PathBuf>,
     },
@@ -128,11 +134,21 @@ pub(crate) enum CliError {
     )]
     LockfileNotAFile { path: PathBuf },
 
-    /// raeva.lock is not a lockfile this raeva can use. `regenerable` when
-    /// a plain sync reads enough of it to replace it, which it cannot for a
-    /// file too large or not UTF-8.
+    /// raeva.lock is not a lockfile this raeva can use. `regenerate` when a
+    /// sync reads enough of it to replace it, which it cannot for a file too
+    /// large or not UTF-8: whether a plain sync keeps its pins, or only
+    /// `--update` replaces it.
     #[error("raeva.lock cannot be used: {reason}")]
-    LockfileIncompatible { reason: String, regenerable: bool },
+    LockfileIncompatible {
+        reason: String,
+        regenerate: Option<bool>,
+    },
+
+    /// raeva.lock is not a lockfile this raeva can use, and a plain sync
+    /// cannot replace it: it cannot read it whole, or keep its pins. `hint`
+    /// says what replaces it.
+    #[error("raeva.lock cannot be used: {reason}")]
+    LockfileUnreplaced { reason: String, hint: String },
 
     /// raeva.lock has a schema a later raeva wrote. A sync with this one
     /// would rewrite it in the older schema, so nothing regenerates it.
@@ -180,6 +196,17 @@ pub(crate) enum CliError {
         /// Raised by `sync --frozen`, which can check the recorded
         /// platforms instead.
         frozen: bool,
+    },
+
+    #[error(
+        "raeva.lock pins a file of {file} from repository '{repo}', which only the build of {0} declares, \
+         so a run without {0} cannot trust it",
+        platforms.join(", ")
+    )]
+    OtherPlatformOrigin {
+        file: String,
+        repo: String,
+        platforms: Vec<String>,
     },
 
     #[error(

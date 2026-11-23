@@ -100,7 +100,7 @@ impl RepositoryFallback {
 /// such as an uppercase host or the default port compare equal.
 fn endpoint(repo: &Repository) -> String {
     repo.base_url().map_or_else(
-        |_| rv_config::redact_url(&repo.url),
+        |_| rv_config::redact_repository_url(&repo.url),
         |url| rv_config::redacted_url(&url).to_string(),
     )
 }
@@ -122,7 +122,7 @@ fn same_endpoint(a: &Repository, b: &Repository) -> bool {
 fn repository_name(repo: &Repository) -> String {
     repo.id
         .clone()
-        .unwrap_or_else(|| rv_config::redact_url(&repo.url))
+        .unwrap_or_else(|| rv_config::redact_repository_url(&repo.url))
 }
 
 #[cfg(test)]
@@ -132,8 +132,7 @@ mod tests {
     #[test]
     fn mirrors_that_differ_in_a_masked_token_stay_apart() {
         for token in ["tokA-71", "tokB-72"] {
-            let url = format!("https://m.example/{token}/m2/");
-            rv_config::register_masked_url(&url, "https://m.example/***/m2/");
+            rv_config::register_secret(token);
         }
         let a = Repository::new(
             Some("a".into()),
@@ -148,7 +147,10 @@ mod tests {
             false,
         );
         let a_again = Repository::new(None, "https://user@M.example:443/tokA-71/m2/", true, false);
-        assert_eq!(endpoint(&a), endpoint(&b));
+        assert_eq!(
+            rv_config::redact_secrets(&endpoint(&a)),
+            rv_config::redact_secrets(&endpoint(&b))
+        );
         assert!(!same_endpoint(&a, &b));
         assert!(same_endpoint(&a, &a_again));
     }

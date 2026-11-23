@@ -6,7 +6,6 @@
 use std::collections::{HashMap, HashSet};
 
 use rv_lock::LockEdge;
-use rv_maven_model::Scope;
 use rv_maven_types::{ArtifactCoord, BlobId, Coord, SnapshotStamp, Version};
 use rv_repo::{ArtifactRequest, RepoError, Repository};
 
@@ -59,13 +58,16 @@ pub(super) async fn fetch_artifact_from_repos(
     let mut last_error: Option<RepoError> = None;
     let mut searched: Vec<RepoSearchStatus> = Vec::with_capacity(repos.len());
 
-    let renew =
-        rv_maven_types::resolves_through_snapshot_metadata(key.version()) && client.updates();
-    for (pos, repo) in repos.iter().enumerate() {
-        // Once the repositories before it missed, a remote repository
-        // answers with the intact bytes it served before, as the caller's
-        // store lookup does for the first one. A `file:` repository is read.
-        if pos > 0 && !renew && !client.effective_repository(repo).is_local() {
+    let renew = client.renews(key);
+    for repo in repos {
+        // As Maven's artifact resolver does, a repository whose policy
+        // refuses the version is not asked.
+        if !repo.allows_version(key.version()) {
+            continue;
+        }
+        // A remote repository answers with the intact bytes it served
+        // before, offline too. A `file:` repository is read.
+        if !renew && !client.effective_repository(repo).is_local() {
             let served = served_before(client, store, repo, key)
                 .await
                 .map_err(|err| FetchError::Failed {
@@ -122,6 +124,42 @@ pub(super) async fn fetch_artifact_from_repos(
     }
 }
 
+/// The intact blob the store holds for `key` from the first of `repos`
+/// whose policy takes its version, and that repository's URL, as the
+/// resolver's lookup for a graph node finds one: bytes it served, or bytes
+/// raeva.lock pins. An offline run reads a plugin jar an earlier run
+/// fetched.
+pub(super) async fn stored_in_first(
+    client: &rv_repo::RepoClient,
+    store: &rv_store::Store,
+    key: &ArtifactCoord,
+    repos: &[Repository],
+) -> std::result::Result<Option<(BlobId, String)>, rv_store::StoreError> {
+    // A non-unique build's POM is read first, as Maven reads it before the
+    // jar, so a POM fetched again renews the stored jar with it.
+    if rv_maven_types::resolves_through_snapshot_metadata(key.version()) {
+        let pom = ArtifactRequest::from(key);
+        for repo in repos
+            .iter()
+            .filter(|repo| repo.allows_version(key.version()))
+        {
+            if client.fetch_pom(repo, &pom).await.is_ok() {
+                break;
+            }
+        }
+    }
+    let renew = client.renews(key);
+    let first = repos.iter().find(|repo| repo.allows_version(key.version()));
+    let Some(repo) = first.filter(|_| !renew) else {
+        return Ok(None);
+    };
+    let Some(blob) = client.stored_artifact(store, repo, key).await? else {
+        return Ok(None);
+    };
+    let intact = store.verify_blobs(std::slice::from_ref(&blob), 1).await?;
+    Ok(intact.contains(&blob).then(|| (blob, repo.url.clone())))
+}
+
 /// The intact blob the store holds for `key` as `repo` served it, with its
 /// origin, when the run's checksum policy accepts it.
 async fn served_before(
@@ -158,17 +196,6 @@ pub(super) fn dummy_coord(group_id: &str, artifact_id: &str) -> Result<Coord> {
         packaging: None,
         classifier: None,
     })
-}
-
-fn lock_scope(scope: Scope) -> rv_lock::Scope {
-    match scope {
-        Scope::Compile => rv_lock::Scope::Compile,
-        Scope::Provided => rv_lock::Scope::Provided,
-        Scope::Runtime => rv_lock::Scope::Runtime,
-        Scope::Test => rv_lock::Scope::Test,
-        Scope::System => rv_lock::Scope::System,
-        Scope::Import => rv_lock::Scope::Import,
-    }
 }
 
 /// The lock rows of every package reachable from the root, in coordinate
@@ -215,15 +242,21 @@ pub(super) fn build_lock_data(
             continue;
         }
 
-        if let (Some(&from_idx), Some(&to_idx), Some(parent)) =
-            (index_map.get(&from), index_map.get(&to), graph.node(from))
-        {
-            edges.push(LockEdge::new(
-                from_idx,
-                to_idx,
-                Some(lock_scope(weight.scope_below(parent.scope))),
-                weight.optional,
-            ));
+        if let (Some(&from_idx), Some(&to_idx), Some(parent), Some(child)) = (
+            index_map.get(&from),
+            index_map.get(&to),
+            graph.node(from),
+            graph.node(to),
+        ) {
+            let scope = weight.scope_below(parent.scope);
+            if !scope.recordable() {
+                return Err(ResolveError::UnrecordableScope {
+                    dependency: child.coord.to_string(),
+                    parent: parent.coord.to_string(),
+                    scope: scope.as_str().to_string(),
+                });
+            }
+            edges.push(LockEdge::new(from_idx, to_idx, scope, weight.optional));
         }
     }
 
@@ -246,8 +279,18 @@ pub(super) fn build_lock_data(
             node.coord.packaging.as_deref().unwrap_or("jar"),
             node.coord.classifier.as_deref(),
         );
-        let direct_scope = direct_edges.get(idx).map(|edge| lock_scope(edge.scope));
-        let scope = lock_scope(node.scope);
+        let direct_scope = direct_edges.get(idx).map(|edge| edge.scope);
+        let scope = node.scope;
+        if let Some(unrecordable) =
+            (direct_scope.into_iter().chain([scope])).find(|scope| !scope.recordable())
+        {
+            return Err(ResolveError::UnrecordableScope {
+                dependency: node.coord.to_string(),
+                parent: (graph.node(graph.root()))
+                    .map_or_else(String::new, |root| root.coord.to_string()),
+                scope: unrecordable.as_str().to_string(),
+            });
+        }
         // System-scoped dependencies use local paths, no remote fetch.
         if node.local || node.workspace_module.is_some() {
             packages.push(ResolvedPackage {
@@ -256,6 +299,7 @@ pub(super) fn build_lock_data(
                 scope,
                 workspace_module: node.workspace_module.clone(),
                 system_path: node.system_path.clone(),
+                managed: node.version_origin.0.clone(),
                 artifact: None,
             });
             continue;
@@ -297,6 +341,7 @@ pub(super) fn build_lock_data(
             scope,
             workspace_module: None,
             system_path: None,
+            managed: node.version_origin.0.clone(),
             artifact: Some(ResolvedArtifact {
                 version,
                 snapshot,
@@ -426,6 +471,25 @@ pub(crate) fn filter_repos_for_version<'a>(
     Ok(eligible_repos)
 }
 
+/// [`merge_repos`] of the configured repositories and those the project's
+/// POMs declare, less each of Maven's request repositories after Central
+/// ([`rv_config::Config::requested_repositories`]) whose id a POM declares:
+/// Maven keeps the model's, before Central.
+pub(crate) fn merge_project_repos(
+    config: &rv_config::Config,
+    mut base: Vec<Repository>,
+    declared: Vec<Repository>,
+) -> Vec<Repository> {
+    let requested: Vec<Repository> = (config.requested_repositories().iter())
+        .map(Repository::from)
+        .collect();
+    base.retain(|repo| {
+        let request = (requested.iter()).any(|other| other.url == repo.url && other.id == repo.id);
+        !request || !declared.iter().any(|other| other.id == repo.id)
+    });
+    merge_repos(base, declared)
+}
+
 /// `base` then the repositories of `extra` it does not list yet. One URL
 /// stays listed under each of its ids, as each id has its own policies,
 /// mirror and credential; the ids themselves are deduplicated when the list
@@ -478,7 +542,7 @@ mod tests {
             for error in errors {
                 remember_search_error(&mut last, error);
             }
-            remember_search_error(&mut last, RepoError::NotFound("missing".to_string()));
+            remember_search_error(&mut last, RepoError::NotFound("missing".into()));
             assert_eq!(last.unwrap().status_code(), Some(502));
         }
     }
@@ -517,6 +581,7 @@ mod tests {
             local: false,
             system_path: None,
             winner_parent: None,
+            version_origin: Default::default(),
         }
     }
 
@@ -574,12 +639,12 @@ mod tests {
         for (from, to) in [(root, a), (t, x), (a, b), (b, x), (x, y)] {
             graph.add_edge(from, to, compile_edge());
         }
-        graph.select_scopes().unwrap();
+        graph.node_mut(t).unwrap().scope = Scope::Test;
         let (packages, edges) = build_lock_data(&graph, any_pom).unwrap();
         let name = |index: usize| packages[index].coordinate.artifact_id().to_string();
         let edges: Vec<String> = edges
             .iter()
-            .map(|e| format!("{}>{}@{}", name(e.from), name(e.to), e.scope.unwrap()))
+            .map(|e| format!("{}>{}@{}", name(e.from), name(e.to), e.scope))
             .collect();
         assert_eq!(
             edges,

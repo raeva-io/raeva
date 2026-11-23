@@ -15,10 +15,14 @@ mod coord;
 mod digest;
 mod error;
 mod id;
+mod java;
 pub mod layout;
+mod managed;
+mod mode;
 mod par;
 mod purl;
 mod range;
+mod scope;
 mod snapshot;
 mod text;
 mod version;
@@ -31,11 +35,16 @@ pub use coord::{ArtifactCoord, Coord, Gav, PartialCoord};
 pub use digest::{BlobId, Digest, DigestError, HashAlgorithm, Md5, Sha1, Sha256};
 pub use error::VersionError;
 pub use id::{ArtifactId, GroupId};
+pub use java::{java_set_order, java_string_hash};
+pub use managed::{ManagedKind, ManagedSource, expression_key, single_property};
+pub use mode::MavenMode;
 pub use par::par_map;
 pub use purl::{
-    PurlError, canonicalize_purl, maven_purl, maven_purl_name_version, maven_purl_with_qualifiers,
+    PurlError, canonicalize_purl, maven_purl, maven_purl_coordinate, maven_purl_name_version,
+    maven_purl_with_qualifiers,
 };
 pub use range::{VersionRange, VersionReq};
+pub use scope::{InvalidScope, Scope};
 pub use snapshot::{
     SnapshotStamp, TimestampedSnapshot, is_listed_snapshot_version, is_snapshot_timestamp,
     is_snapshot_version, resolves_through_snapshot_metadata, snapshot_base_version,

@@ -33,6 +33,21 @@ pub struct Repository {
     pub releases_checksum_policy: Option<String>,
     /// Raw `<snapshots><checksumPolicy>` token, as written.
     pub snapshots_checksum_policy: Option<String>,
+    /// The URL as interpolated, when `url` is the `file:` URL of the
+    /// directory Maven reads for it: mirror patterns and repository filters
+    /// read this one.
+    pub declared_url: Option<String>,
+    /// Each name the model looked up to interpolate the URL, through other
+    /// properties too, so a consumer can refuse one named like a secret
+    /// whatever its value and wherever it lands in the URL.
+    pub url_reads: Vec<String>,
+    /// [`Self::url_reads`] for the id.
+    pub id_reads: Vec<String>,
+    /// The `<layout>`, trimmed and once interpolated; `None` when absent,
+    /// which Maven reads as `default`.
+    pub layout: Option<String>,
+    /// [`Self::layout`] as written.
+    pub written_layout: Option<String>,
 }
 
 impl Repository {
@@ -53,7 +68,33 @@ impl Repository {
             snapshots_update_policy: None,
             releases_checksum_policy: None,
             snapshots_checksum_policy: None,
+            declared_url: None,
+            url_reads: Vec::new(),
+            id_reads: Vec::new(),
+            layout: None,
+            written_layout: None,
         }
+    }
+
+    /// Why the `<layout>` keeps raeva from reading the repository as Maven
+    /// does, or `None` for an absent or `default` one: Maven reaches no
+    /// other layout but through a mirror. The layout is the declaration's
+    /// as it stands, as written while the parents are looked up.
+    pub fn layout_refusal(&self) -> Option<String> {
+        let layout = self
+            .layout
+            .as_deref()
+            .filter(|layout| *layout != "default")?;
+        // The value an expression took may be a secret.
+        Some(
+            match (self.written_layout.as_deref()).filter(|written| *written != layout) {
+                Some(written) => format!(
+                    "takes '{}', which is not 'default' once interpolated",
+                    rv_maven_types::bounded(written)
+                ),
+                None => format!("is '{}'", rv_maven_types::bounded(layout)),
+            },
+        )
     }
 
     /// Whether the URL or a policy still holds a `${...}` that the model
@@ -93,6 +134,7 @@ impl Repository {
         mut interpolate: impl FnMut(&str) -> Result<String, E>,
     ) -> Result<(), E> {
         for policy in [
+            &mut self.layout,
             &mut self.releases_update_policy,
             &mut self.snapshots_update_policy,
             &mut self.releases_checksum_policy,
@@ -141,6 +183,7 @@ impl<'de> Deserialize<'de> for Repository {
         struct RepositoryXml {
             id: Option<String>,
             url: Option<String>,
+            layout: Option<String>,
             releases: Option<PolicyXml>,
             snapshots: Option<PolicyXml>,
         }
@@ -192,6 +235,11 @@ impl<'de> Deserialize<'de> for Repository {
             snapshots_update_policy,
             releases_checksum_policy: xml.releases.and_then(|p| p.checksum_policy),
             snapshots_checksum_policy: xml.snapshots.and_then(|p| p.checksum_policy),
+            declared_url: None,
+            url_reads: Vec::new(),
+            id_reads: Vec::new(),
+            layout: xml.layout.as_deref().map(str::trim).map(str::to_string),
+            written_layout: xml.layout.map(|layout| layout.trim().to_string()),
         })
     }
 }

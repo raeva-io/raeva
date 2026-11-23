@@ -4,7 +4,6 @@ mod tests;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -201,21 +200,19 @@ impl ClientSet {
             .as_deref()
             .is_some_and(|origin| self.trusted_origins.contains(origin));
         // Refuse an IP literal outside the public internet when the origin
-        // is not exempt.
+        // is not exempt. A proxy resolves a name itself, out of the
+        // resolver's reach, so it carries no name of such an origin, as it
+        // carries no redirect to one.
         if self.screen_literals && !trusted {
-            // A proxy resolves a name itself, out of the resolver's reach, so
-            // a `localhost` name (RFC 6761) it carries is screened here too.
-            let loopback = self.proxies.carries(url)
-                && url.host_str().is_some_and(|host| {
-                    let host = host.trim_end_matches('.').to_ascii_lowercase();
-                    host == "localhost" || host.ends_with(".localhost")
-                });
-            match ip_literal(url).or(loopback.then_some(IpAddr::V4(Ipv4Addr::LOCALHOST))) {
+            match ip_literal(url) {
                 Some(addr) if !is_globally_routable(addr) => {
                     return Err(RepoError::NonGlobalAddress {
                         url: redact_url(url),
                         addr,
                     });
+                }
+                None if self.proxies.carries(url) => {
+                    return Err(RepoError::ProxiedUntrustedHost(redact_url(url)));
                 }
                 _ => {}
             }

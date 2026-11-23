@@ -9,12 +9,8 @@ const KEY_MATCHES: &str = "group_id = ?1 AND artifact_id = ?2 AND version = ?3
 pub(crate) fn init_db(conn: &Connection) -> Result<()> {
     let path = std::path::Path::new(conn.path().unwrap_or_default());
     let tx = crate::sqlite::write_transaction(conn, path, crate::store::INDEX.generation)?;
-    let upgraded = crate::sqlite::has_table(&tx, "artifact_origins_v2")?;
-    // Legacy origins could precede a rejected lock pin. Keep served evidence
-    // for pinned restores, but retire the trust used by unpinned resolution.
     tx.execute_batch(
-        "DROP TABLE IF EXISTS artifact_origins_v2;
-        CREATE TABLE IF NOT EXISTS artifacts (
+        "CREATE TABLE IF NOT EXISTS artifacts (
             group_id   TEXT NOT NULL,
             artifact_id TEXT NOT NULL,
             version    TEXT NOT NULL,
@@ -61,9 +57,6 @@ pub(crate) fn init_db(conn: &Connection) -> Result<()> {
     }
     tx.commit()
         .db_context(|| "failed to initialize artifacts table")?;
-    if upgraded {
-        crate::sqlite::warn_upgraded(path, "its record of which repository served each file");
-    }
     Ok(())
 }
 
@@ -140,14 +133,18 @@ pub(crate) fn add_origin(
     id: &BlobId,
     origin: &crate::Origin,
 ) -> Result<()> {
+    let (repo_url, endpoint_url) = (
+        rv_config::stored_urls(rv_config::stored_repository(&origin.repo_url)),
+        rv_config::stored_urls(&origin.endpoint_url),
+    );
     let row = params![
         key.group_id(),
         key.artifact_id(),
         key.version(),
         key.extension(),
         key.classifier_key(),
-        origin.repo_url,
-        origin.endpoint_url,
+        repo_url,
+        endpoint_url,
         id.as_str(),
         origin.checksum_verified
     ];
@@ -167,7 +164,9 @@ pub(crate) fn add_origin(
 }
 
 /// Keep as evidence that `endpoint_url` served `id` for `key` under
-/// `repo_url`.
+/// `repo_url`. Each URL is kept as [`rv_config::stored_urls`] names it, so
+/// the index holds no token a mirror URL takes, and a repository URL as
+/// [`rv_config::stored_repository`] does.
 pub(crate) fn add_served(
     conn: &Connection,
     key: &ArtifactCoord,
@@ -187,8 +186,8 @@ pub(crate) fn add_served(
             key.version(),
             key.extension(),
             key.classifier_key(),
-            repo_url,
-            endpoint_url,
+            rv_config::stored_urls(rv_config::stored_repository(repo_url)),
+            rv_config::stored_urls(endpoint_url),
             id.as_str(),
         ])
     })
@@ -215,7 +214,15 @@ pub(crate) fn served_by(
             id.as_str()
         ];
         statement
-            .query_map(columns, |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(columns, |row| {
+                let url = |at: usize| -> rusqlite::Result<String> {
+                    let url: String = row.get(at)?;
+                    Ok(rv_config::restored_urls(&url).into_owned())
+                };
+                // A row an earlier raeva wrote may hold the text.
+                let repo = rv_config::stored_repository(&url(0)?).to_string();
+                Ok((repo, url(1)?))
+            })?
             .collect()
     })
     .db_context(|| format!("failed to look up the origins of artifact {key}"))
@@ -249,8 +256,8 @@ pub(crate) fn lookup_origin(
                 key.version(),
                 key.extension(),
                 key.classifier_key(),
-                repo_url,
-                endpoint_url,
+                rv_config::stored_urls(rv_config::stored_repository(repo_url)),
+                rv_config::stored_urls(endpoint_url),
                 allow_unverified,
                 allow_recorded
             ];

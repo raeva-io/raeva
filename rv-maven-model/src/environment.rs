@@ -16,7 +16,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 pub enum HostInput {
     /// The JDK's `java.version`.
     JavaVersion,
-    /// The JDK's `java.home`, from `JAVA_HOME`.
+    /// The JDK's `java.home`, from `JAVA_HOME` or the `java` on `PATH`.
     JavaHome,
     /// The environment variable of this name.
     Env(String),
@@ -54,8 +54,13 @@ pub enum HostInput {
     /// A property defined by a `settings.xml` profile that a project-lineage
     /// build read in a way that can change resolution.
     SettingsProperty(String),
-    /// A user-property lookup, including an absent `-D` override.
+    /// A user-property lookup, including an absent `-D` override, which a
+    /// system property answers where no user property does.
     UserProperty(String),
+    /// A user-property lookup of a name the model defines itself, which
+    /// only a `-D` user property overrides: a system property, such as a
+    /// JVM option's, ranks below the model's own value.
+    UserOverride(String),
     /// An activation lookup whose name contains external values. Only the
     /// authored expression and the POM properties it reads are retained.
     UserPropertyLookup {
@@ -94,6 +99,7 @@ impl HostInput {
         !matches!(
             self,
             Self::UserProperty(_)
+                | Self::UserOverride(_)
                 | Self::UserPropertyLookup {
                     from_host: false,
                     ..
@@ -108,7 +114,10 @@ impl HostInput {
     pub(crate) fn is_java_version(&self) -> bool {
         match self {
             Self::JavaVersion | Self::Jdk(_) => true,
-            Self::Property { name, .. } => crate::activation::negation(name).1 == "java.version",
+            Self::Property { name, .. } => matches!(
+                crate::activation::negation(name).1,
+                "java.version" | "java.specification.version"
+            ),
             _ => false,
         }
     }
@@ -235,9 +244,9 @@ impl Eq for Consulted {}
 /// The host inputs `raeva` reads once per run, before any POM is read.
 ///
 /// [`HostSnapshot::capture`] is the only place that reads the process
-/// environment for model building: `JAVA_HOME` and its `release` file,
-/// `JAVA_VERSION`, the variables named in the `${env.*}` allowlist, and on
-/// Linux the os-release file.
+/// environment for model building: the JDK from `JAVA_HOME` or `PATH` and
+/// its `release` file, `JAVA_VERSION`, the variables named in the `${env.*}`
+/// allowlist, and on Linux the os-release file.
 /// Everything a model build needs from the host comes from a snapshot
 /// through [`HostSnapshot::environment`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -248,49 +257,158 @@ impl HostSnapshot {
     /// A variable that is unset or not Unicode is left out.
     ///
     /// This reads the process environment on purpose, and is the one place
-    /// model building does: `JAVA_HOME`, the `JAVA_VERSION=` line of
-    /// `$JAVA_HOME/release`, the `JAVA_VERSION` variable when that file
-    /// gives no version, and each variable named in `allowlist`. No other
-    /// variable is read, so a POM cannot reach one outside the allowlist.
+    /// model building does: the JDK Maven's launcher runs, from `JAVA_HOME`
+    /// or else the `java` on `PATH`, the `JAVA_VERSION=` line of
+    /// that JDK's `release` file, the `JAVA_VERSION` variable when that file
+    /// gives no version, and each variable named in `allowlist`, without
+    /// the mavenrc files ([`Self::capture_after`]). No other variable is
+    /// read, so a POM cannot reach one outside the allowlist.
     /// Without a JDK version, builds see `java.version` 17. On Linux it
-    /// also reads the os-release file os-maven-plugin reads.
+    /// also reads the os-release file os-maven-plugin reads, and it reads
+    /// the working directory, whose drive `java.io.File` gives a Windows
+    /// path that starts at a root without one.
     pub fn capture(allowlist: &[String]) -> Self {
-        let java_home = std::env::var("JAVA_HOME").ok();
+        Self::capture_after(&crate::mavenrc::Shell::process(), allowlist)
+    }
+
+    /// [`Self::capture`], with the variables as `mvn` holds them once it
+    /// has sourced the mavenrc files of `shell`: the JDK from the
+    /// `JAVA_HOME` or `PATH` they leave in its shell, and `${env.*}` from
+    /// what they export.
+    pub fn capture_after(shell: &crate::mavenrc::Shell, allowlist: &[String]) -> Self {
+        let launcher_var = |name: &str| shell.shell_value(name).map(crate::mavenrc::os_string);
+        let env_home = launcher_var("JAVA_HOME").filter(|home| !home.is_empty());
+        let (java_home, jdk_release) = match env_home {
+            Some(home) => {
+                let release = JdkRelease::read(Path::new(&home));
+                (Some(PathBuf::from(home)), release)
+            }
+            None => launcher_java_home(launcher_var("PATH")).unzip(),
+        };
         let not_blank = |version: &String| !version.trim().is_empty();
-        let java_version = java_home
-            .as_deref()
-            .and_then(|home| parse_java_release(Path::new(home)))
-            .filter(not_blank)
+        let release = jdk_release
+            .as_ref()
+            .and_then(|release| release.version.clone());
+        let java_version = (release.filter(not_blank))
             .or_else(|| std::env::var("JAVA_VERSION").ok().filter(not_blank));
-        let host_env: BTreeMap<String, String> = std::env::vars_os()
-            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        let java_home =
+            (java_home.map(runtime_home)).and_then(|home| home.into_os_string().into_string().ok());
+        let text = |(name, value): (&std::ffi::OsStr, &std::ffi::OsStr)| {
+            Some((name.to_str()?.to_string(), value.to_str()?.to_string()))
+        };
+        let host_env: BTreeMap<String, String> = shell.exported_env().filter_map(text).collect();
+        let unexported: BTreeMap<String, String> = (shell.unexported())
+            .filter_map(|(name, value)| Some((name.to_string(), value.to_str()?.to_string())))
             .collect();
         let allowed: BTreeSet<String> = allowlist.iter().cloned().collect();
         let env = allowed
             .iter()
-            .filter_map(|name| Some((name.clone(), host_env.get(name)?.clone())))
+            .filter_map(|name| {
+                let (_, value) = maven_env_entry(&host_env, name, cfg!(windows))?;
+                Some((name.clone(), value.clone()))
+            })
             .collect();
         Self(EnvironmentInner {
             platform: None,
             java_version,
+            jdk_release,
             target_jdk: false,
             java_home,
             system_properties: HashMap::new(),
+            unread_system_properties: BTreeSet::new(),
             env,
             host_env: HostEnv(Arc::new(host_env)),
+            unexported: HostEnv(Arc::new(unexported)),
             allowed,
             allow_all_env: false,
             linux_release: LinuxRelease::host(),
             classifier_likes: None,
+            maven_mode: rv_maven_types::MavenMode::default(),
+            reactor_root: None,
+            launcher_root: None,
+            root_directory: None,
+            project_directory: None,
+            working_directory: std::env::current_dir().ok(),
+            restricted: false,
             consulted: Consulted::default(),
             defaulted_java: Warned::default(),
+            sole_locked_jdk: None,
+            secret_names: BTreeMap::new(),
+            windows_os_name: None,
         })
+    }
+
+    /// This snapshot for a lock that lists the JDKs `jdks` in `[lock] jdks`.
+    #[must_use]
+    pub fn with_locked_jdks(mut self, jdks: &[String]) -> Self {
+        self.0.sole_locked_jdk = match jdks {
+            [jdk] => Some(jdk.clone()),
+            _ => None,
+        };
+        self
+    }
+
+    /// This snapshot for builds as `mode` builds models.
+    #[must_use]
+    pub fn with_maven_mode(mut self, mode: rv_maven_types::MavenMode) -> Self {
+        self.0.maven_mode = mode;
+        self
+    }
+
+    /// This snapshot with `names`, the names a model may read a host input
+    /// named like a secret under, each with how a message names the input.
+    /// A dependency coordinate that reads one is refused
+    /// ([`crate::PomError::SecretCoordinate`]): raeva.lock, the store and
+    /// a repository request would take its value.
+    pub fn with_secret_names(mut self, names: BTreeMap<String, String>) -> Self {
+        self.0.secret_names = names;
+        self
+    }
+
+    /// This snapshot for a project in `reactor_root`, the directory raeva
+    /// runs in, canonical. `MavenCli` searches for `session.rootDirectory`
+    /// from there; the launcher's search is [`Self::with_project_directory`]'s,
+    /// from `reactor_root` until that names the directory as given.
+    #[must_use]
+    pub fn with_reactor_root(mut self, reactor_root: &Path) -> Self {
+        let maven_basedir = self.launcher_variable("MAVEN_BASEDIR");
+        let launcher_root = launcher_root(reactor_root, maven_basedir, None, None);
+        self.0.launcher_root = Some(launcher_root);
+        self.0.root_directory = (reactor_root.ancestors())
+            .find(|dir| dir.join(".mvn").is_dir())
+            .map(Path::to_path_buf);
+        self.0.reactor_root = Some(reactor_root.to_path_buf());
+        self
+    }
+
+    /// This snapshot for a project in `directory`, absolute, as raeva was
+    /// given it: `mvn` searches for `.mvn` from there as the shell names it.
+    #[must_use]
+    pub fn with_project_directory(mut self, directory: &Path) -> Self {
+        let (pwd, working_directory) = (
+            self.launcher_variable("PWD"),
+            self.0.working_directory.as_deref(),
+        );
+        let named = shell_path(directory, pwd, working_directory);
+        let maven_basedir = self.launcher_variable("MAVEN_BASEDIR");
+        let launcher_root = launcher_root(directory, maven_basedir, pwd, working_directory);
+        self.0.launcher_root = Some(launcher_root);
+        self.0.project_directory = Some(named);
+        self
     }
 
     /// This snapshot with the JVM properties supplied by the project's launcher options.
     #[must_use]
     pub fn with_system_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.0.system_properties = properties;
+        self
+    }
+
+    /// This snapshot with the names a JVM option may set in a way raeva
+    /// does not read, which [`crate::host_property`] answers as unread.
+    #[must_use]
+    pub fn with_unread_system_properties(mut self, names: Vec<String>) -> Self {
+        self.0.unread_system_properties = names.into_iter().collect();
         self
     }
 
@@ -302,6 +420,7 @@ impl HostSnapshot {
         Self(EnvironmentInner {
             java_home: None,
             java_version: None,
+            jdk_release: None,
             linux_release: None,
             ..Self::capture(allowlist).0
         })
@@ -313,6 +432,14 @@ impl HostSnapshot {
     #[must_use]
     pub fn with_os_release(mut self, os_release: &str) -> Self {
         self.0.linux_release = LinuxRelease::parse(os_release);
+        self
+    }
+
+    /// This snapshot with `directory` as the working directory.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn with_working_directory(mut self, directory: &Path) -> Self {
+        self.0.working_directory = Some(directory.to_path_buf());
         self
     }
 
@@ -361,7 +488,9 @@ impl HostSnapshot {
             .filter(|input| {
                 !matches!(
                     input,
-                    HostInput::UserProperty(_) | HostInput::FileLookup { .. }
+                    HostInput::UserProperty(_)
+                        | HostInput::UserOverride(_)
+                        | HostInput::FileLookup { .. }
                 )
             })
             .collect()
@@ -375,6 +504,19 @@ impl HostSnapshot {
             .into_iter()
             .filter_map(|input| match input {
                 HostInput::UserProperty(name) => Some(name),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The names of [`HostInput::UserOverride`] lookups models made.
+    pub fn consulted_user_overrides(&self) -> BTreeSet<String> {
+        self.0
+            .consulted
+            .snapshot()
+            .into_iter()
+            .filter_map(|input| match input {
+                HostInput::UserOverride(name) => Some(name),
                 _ => None,
             })
             .collect()
@@ -401,6 +543,7 @@ impl HostSnapshot {
             | HostInput::FileLookup { .. }
             | HostInput::SettingsProperty(_)
             | HostInput::UserProperty(_)
+            | HostInput::UserOverride(_)
             | HostInput::UserPropertyLookup { .. }
             | HostInput::InterpolationLookup { .. } => None,
             HostInput::JavaVersion => Some(
@@ -434,7 +577,18 @@ impl HostSnapshot {
             HostInput::Property { name, value } => {
                 let actual = match crate::activation::negation(name).1 {
                     "java.version" => self.value(&HostInput::JavaVersion),
-                    "java.home" => self.value(&HostInput::JavaHome),
+                    "java.specification.version" => {
+                        self.value(&HostInput::JavaVersion).map(|version| {
+                            crate::activation::java_specification_version(&version).to_string()
+                        })
+                    }
+                    // Every JVM sets it, so a presence test holds without a JDK too.
+                    "java.home" => (self.value(&HostInput::JavaHome)).or_else(|| {
+                        value
+                            .as_deref()
+                            .is_none_or(str::is_empty)
+                            .then(|| "set".to_string())
+                    }),
                     other => other
                         .strip_prefix("env.")
                         .and_then(|variable| self.value(&HostInput::Env(variable.to_string()))),
@@ -453,6 +607,7 @@ impl HostSnapshot {
             | HostInput::FileLookup { .. }
             | HostInput::SettingsProperty(_)
             | HostInput::UserProperty(_)
+            | HostInput::UserOverride(_)
             | HostInput::UserPropertyLookup { .. }
             | HostInput::InterpolationLookup { .. } => None,
         }
@@ -465,13 +620,8 @@ impl HostSnapshot {
         if let HostInput::Property { name, value } = input
             && let Some(variable) = crate::activation::negation(name).1.strip_prefix("env.")
         {
-            let actual = self
-                .0
-                .host_env
-                .0
-                .get(variable)
-                .or_else(|| self.0.env.get(variable))
-                .map(String::as_str);
+            let actual = (self.0.maven_env(variable))
+                .or_else(|| self.0.env.get(variable).map(String::as_str));
             return Some(crate::activation::property_matches(
                 name,
                 value.as_deref(),
@@ -491,13 +641,53 @@ impl HostSnapshot {
         &self.0.allowed
     }
 
-    /// The host's `java.version`: from `$JAVA_HOME/release`, else
-    /// `JAVA_VERSION`, else `17`.
+    /// The host's `java.version`: from the `release` file of the JDK Maven
+    /// runs, else `JAVA_VERSION`, else `17`.
     pub fn java_version(&self) -> &str {
         self.0
             .java_version
             .as_deref()
             .unwrap_or(DEFAULT_JAVA_VERSION)
+    }
+
+    /// The host's `java.version` when a JDK `release` file or `JAVA_VERSION`
+    /// names one, `None` where [`Self::java_version`] takes the stand-in.
+    pub fn named_java_version(&self) -> Option<&str> {
+        self.0.java_version.as_deref()
+    }
+
+    /// The `release` file of the JDK Maven's launcher runs, from `JAVA_HOME`
+    /// or else `PATH`, when it has one. `JAVA_VERSION` plays no part.
+    pub fn jdk_release(&self) -> Option<&JdkRelease> {
+        self.0.jdk_release.as_ref()
+    }
+
+    /// The `java.home` of the JDK [`Self::jdk_release`] describes.
+    pub fn java_home(&self) -> Option<&str> {
+        self.0.java_home.as_deref()
+    }
+
+    /// The variable `name` as `mvn` holds it once it has sourced the
+    /// mavenrc files, such as `MAVEN_OPTS`, whether or not its JVM sees it.
+    pub fn launcher_variable(&self, name: &str) -> Option<&str> {
+        (self.0.unexported.0.get(name))
+            .or_else(|| self.0.host_env.0.get(name))
+            .map(String::as_str)
+    }
+
+    /// The variable `name` in the environment of the JVM `mvn` starts.
+    pub fn launcher_env(&self, name: &str) -> Option<&str> {
+        self.0.host_env.0.get(name).map(String::as_str)
+    }
+
+    /// The allowlisted variable `name` as a model build reads it.
+    pub fn env_value(&self, name: &str) -> Option<&str> {
+        self.0.env.get(name).map(String::as_str)
+    }
+
+    /// [`ModelEnvironment::jvm_env`].
+    pub fn jvm_env(&self, name: &str) -> Option<&str> {
+        self.0.jvm_env(name)
     }
 
     /// The environment of a build for the host platform.
@@ -528,6 +718,15 @@ impl HostSnapshot {
         let mut inner = self.0.clone();
         inner.platform = Some((os.to_string(), arch.to_string()));
         if let Some(jdk) = jdk {
+            // The host JDK's `java.home` is the target's only where the
+            // lock covers that JDK alone and `mvn` runs it.
+            let host_only = self.0.sole_locked_jdk.as_deref() == Some(jdk)
+                && (self.0.java_version.as_deref())
+                    .and_then(|host| host.trim().strip_prefix(jdk))
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '_', '-']));
+            if !host_only {
+                inner.java_home = None;
+            }
             inner.java_version = Some(jdk.to_string());
             inner.target_jdk = true;
         }
@@ -536,7 +735,7 @@ impl HostSnapshot {
 }
 
 /// Everything outside the POMs that can change an effective model, fixed
-/// for one build: the target platform, the JDK version, `JAVA_HOME`, and the
+/// for one build: the target platform, the JDK version, `java.home`, and the
 /// allowlisted environment variables with their values.
 ///
 /// Cloning is cheap; clones share one value. [`ModelEnvironment::default`]
@@ -554,18 +753,51 @@ pub struct ModelEnvironment {
 struct EnvironmentInner {
     platform: Option<(String, String)>,
     java_version: Option<String>,
+    /// The host JDK's `release` file, which `java_version` may name.
+    jdk_release: Option<JdkRelease>,
     target_jdk: bool,
     java_home: Option<String>,
     system_properties: HashMap<String, String>,
+    /// The names a JVM option may set in a way raeva does not read.
+    unread_system_properties: BTreeSet<String>,
     env: BTreeMap<String, String>,
     host_env: HostEnv,
+    /// The variables a mavenrc file sets in `mvn`'s shell without exporting
+    /// them to its JVM.
+    unexported: HostEnv,
     allowed: BTreeSet<String>,
     allow_all_env: bool,
     linux_release: Option<LinuxRelease>,
     /// os-maven-plugin's `os.detection.classifierWithLikes` for the build.
     classifier_likes: Option<ClassifierLikes>,
+    maven_mode: rv_maven_types::MavenMode,
+    /// The directory raeva runs in, Maven's `maven.multiModuleProjectDirectory`.
+    reactor_root: Option<PathBuf>,
+    /// The `maven.multiModuleProjectDirectory` `mvn` sets; see
+    /// [`launcher_root`].
+    launcher_root: Option<String>,
+    /// `session.rootDirectory`: the nearest directory from `reactor_root`
+    /// up that holds a `.mvn` directory.
+    root_directory: Option<PathBuf>,
+    /// The project directory as the shell names it, where `mvn` starts its
+    /// search for `.mvn`.
+    project_directory: Option<PathBuf>,
+    /// The directory raeva was started in, as found, which Maven's
+    /// `user.dir` is.
+    working_directory: Option<PathBuf>,
+    /// Interpolation of a model Maven 3.10 reads from a repository.
+    restricted: bool,
     consulted: Consulted,
     defaulted_java: Warned,
+    /// The one `[lock] jdks` entry, when the lock lists exactly one.
+    sole_locked_jdk: Option<String>,
+    /// The names a model may read a host input named like a secret under,
+    /// each with how a message names that input, which no coordinate may
+    /// take ([`HostSnapshot::with_secret_names`]).
+    secret_names: BTreeMap<String, String>,
+    /// The `os.name` a Windows JVM reports, as one of the editions profile
+    /// activation is tested on.
+    windows_os_name: Option<&'static str>,
 }
 
 /// os-maven-plugin's `os.detection.classifierWithLikes` for a build, with a
@@ -613,6 +845,111 @@ impl Eq for ClassifierLikes {}
 #[derive(Debug, Clone, Default)]
 struct Warned(Arc<AtomicBool>);
 
+/// A variable `mvn` sets in its JVM's environment itself, whatever the
+/// shell passes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LauncherSet<'a> {
+    Value(&'a str),
+    /// Set to a value raeva does not know, such as `mvn`'s own arguments.
+    Unknown,
+    /// Removed, as `mvn.cmd` removes `FILE_ARG`.
+    Unset,
+}
+
+/// The class `mvn` and `mvn.cmd` start.
+const CLASSWORLDS_LAUNCHER: &str = "org.codehaus.plexus.classworlds.launcher.Launcher";
+
+impl EnvironmentInner {
+    /// The variable `name` in the environment of the JVM `mvn` starts, as
+    /// settings.xml interpolation reads `${env.name}`: by the name as set,
+    /// or as `env.name` reads it ([`Self::maven_env`]).
+    fn jvm_env(&self, name: &str) -> Option<&str> {
+        match self.launcher_set(name) {
+            Some(LauncherSet::Value(value)) => Some(value),
+            Some(_) => None,
+            None => (self.host_env.0.get(name))
+                .or_else(|| Some(maven_env_entry(&self.host_env.0, name, cfg!(windows))?.1))
+                .map(String::as_str),
+        }
+    }
+
+    /// The variable Maven's JVM holds as its system property `env.name`,
+    /// which a model and profile activation read: on Windows
+    /// `EnvironmentUtils` names each in upper case, so `Path` is `env.PATH`
+    /// and `env.Path` is unset.
+    fn maven_env(&self, name: &str) -> Option<&str> {
+        if cfg!(windows) && name.to_uppercase() != name {
+            return None;
+        }
+        match self.launcher_set(name) {
+            Some(LauncherSet::Value(value)) => Some(value),
+            Some(_) => None,
+            None => Some(
+                maven_env_entry(&self.host_env.0, name, cfg!(windows))?
+                    .1
+                    .as_str(),
+            ),
+        }
+    }
+
+    /// What `mvn` (Maven 3.9.12 and 3.10.0's `bin/mvn`, or on Windows
+    /// `mvn.cmd`) sets the variable `name` to before it starts Java, as
+    /// measured: `bin/mvn` exports `MAVEN_PROJECTBASEDIR` and
+    /// `MAVEN_CMD_LINE_ARGS`, and a variable it assigns reaches Java with
+    /// that value when the shell exported it; every variable `mvn.cmd` sets
+    /// reaches Java.
+    fn launcher_set(&self, name: &str) -> Option<LauncherSet<'_>> {
+        use LauncherSet::{Unknown, Unset, Value};
+        let maven_310 = self.maven_mode == rv_maven_types::MavenMode::Maven310;
+        let root = || (self.launcher_root.as_deref()).map_or(Unknown, Value);
+        if cfg!(windows) {
+            return Some(match name.to_uppercase().as_str() {
+                "MAVEN_PROJECTBASEDIR" => root(),
+                "CLASSWORLDS_LAUNCHER" => Value(CLASSWORLDS_LAUNCHER),
+                "ERROR_CODE" => Value("0"),
+                "FILE_ARG" => Unset,
+                "JVMCONFIG" if !maven_310 => Value("\\.mvn\\jvm.config"),
+                "JVM_CONFIG_MAVEN_PROPS" if !maven_310 => Unknown,
+                "JVM_CONFIG_MAVEN_OPTS" if maven_310 => Unknown,
+                "CLASSWORLDS_JAR"
+                | "EXEC_DIR"
+                | "INTERNAL_MAVEN_OPTS"
+                | "JAVACMD"
+                | "MAVEN_CMD_LINE_ARGS"
+                | "MAVEN_HOME"
+                | "WDIR" => Unknown,
+                _ => return None,
+            });
+        }
+        let exported = self.host_env.0.contains_key(name);
+        Some(match name {
+            "MAVEN_PROJECTBASEDIR" => root(),
+            // `$MAVEN_CONFIG $@`, with the goals raeva is not given.
+            "MAVEN_CMD_LINE_ARGS" => Unknown,
+            _ if !exported => return None,
+            "CLASSWORLDS_LAUNCHER" => Value(CLASSWORLDS_LAUNCHER),
+            "cygwin" | "mingw" => Value("false"),
+            "JLINE_NATIVE_PATH" if !maven_310 => return None,
+            "MAVEN_OPTS" | "MAVEN_HOME" | "JAVACMD" | "CLASSWORLDS_JAR" | "JLINE_NATIVE_PATH"
+            | "PRG" | "saveddir" => Unknown,
+            _ => return None,
+        })
+    }
+}
+
+/// The entry of `env` Maven's JVM holds as `env.name`: on Windows the
+/// variable whose name in upper case is `name`.
+fn maven_env_entry<'a>(
+    env: &'a BTreeMap<String, String>,
+    name: &str,
+    windows: bool,
+) -> Option<(&'a String, &'a String)> {
+    match windows {
+        true => env.iter().find(|(key, _)| key.to_uppercase() == name),
+        false => env.get_key_value(name),
+    }
+}
+
 impl PartialEq for Warned {
     fn eq(&self, _other: &Self) -> bool {
         true
@@ -625,8 +962,8 @@ impl Eq for Warned {}
 /// per run.
 static HIDDEN_ENV_WARNED: LazyLock<Mutex<BTreeSet<String>>> = LazyLock::new(Mutex::default);
 
-/// Warn once per snapshot that a read of `java.version` that counts, by
-/// `pom` when known, saw the stand-in because no JDK is named.
+/// Warn once per snapshot, naming `pom` when known, where a read of
+/// `java.version` saw the stand-in because no JDK is named.
 fn warn_defaulted_java(inner: &EnvironmentInner, pom: Option<&str>) {
     if inner.java_version.is_some() || inner.defaulted_java.0.load(Ordering::Relaxed) {
         return;
@@ -642,9 +979,10 @@ fn warn_defaulted_java(inner: &EnvironmentInner, pom: Option<&str>) {
             tracing::warn!(
                 sec_code = "JAVA_VERSION_DEFAULTED",
                 pom = pom.as_deref(),
-                "{reader} reads java.version, and neither JAVA_HOME nor JAVA_VERSION names a \
-                 JDK, so raeva used {DEFAULT_JAVA_VERSION}; set JAVA_HOME to the JDK the build \
-                 uses, or list the JDKs in [lock] jdks in raeva.toml"
+                "{reader} reads java.version, and neither the release file of the JDK from \
+                 JAVA_HOME or PATH nor JAVA_VERSION names a version, so raeva used \
+                 {DEFAULT_JAVA_VERSION}; set JAVA_HOME to the JDK the build uses, or list the \
+                 JDKs in [lock] jdks in raeva.toml"
             );
         }
     });
@@ -771,6 +1109,7 @@ impl std::fmt::Debug for EnvironmentInner {
             .debug_struct("ModelEnvironment")
             .field("platform", &self.platform)
             .field("java_version", &self.java_version)
+            .field("jdk_release", &self.jdk_release)
             .field("java_home", &self.java_home)
             .field("env", &EnvNames(&self.env))
             .field("allowed", &self.allowed)
@@ -826,13 +1165,21 @@ impl ModelEnvironmentBuilder {
         self
     }
 
+    /// Set the variable `name` to `value` on the host without allowing POMs
+    /// to read it.
+    #[cfg(test)]
+    pub(crate) fn hidden_env(mut self, name: &str, value: &str) -> Self {
+        Arc::make_mut(&mut self.inner.host_env.0).insert(name.to_string(), value.to_string());
+        self
+    }
+
     /// The environment with the inputs set so far.
     pub fn build(self) -> ModelEnvironment {
         ModelEnvironment::new(self.inner)
     }
 }
 
-/// `java.version` when neither `JAVA_HOME` nor `JAVA_VERSION` names a JDK.
+/// `java.version` when no JDK `release` file nor `JAVA_VERSION` names one.
 /// `raeva` runs no JVM, so this is a stand-in rather than a detected version.
 const DEFAULT_JAVA_VERSION: &str = "17";
 
@@ -852,6 +1199,11 @@ impl ModelEnvironment {
     /// The JVM properties supplied by the project's launcher options.
     pub fn system_properties(&self) -> &HashMap<String, String> {
         &self.inner.system_properties
+    }
+
+    /// Whether a JVM option may set `name` in a way raeva does not read.
+    pub fn unread_system_property(&self, name: &str) -> bool {
+        self.inner.unread_system_properties.contains(name)
     }
 
     /// This environment for another target platform.
@@ -880,6 +1232,86 @@ impl ModelEnvironment {
             }),
             consulted: self.consulted.clone(),
         }
+    }
+
+    /// How a message names the host input named like a secret that the
+    /// first of `names` a model read takes.
+    pub(crate) fn secret_input<'a>(
+        &self,
+        names: impl IntoIterator<Item = &'a String>,
+    ) -> Option<String> {
+        let secrets = &self.inner.secret_names;
+        (names.into_iter()).find_map(|name| secrets.get(name).cloned())
+    }
+
+    /// Whether a model may read a host input named like a secret.
+    pub(crate) fn reads_secrets(&self) -> bool {
+        !self.inner.secret_names.is_empty()
+    }
+
+    /// This environment for a build as `mode` builds models.
+    #[must_use]
+    pub fn with_maven_mode(&self, mode: rv_maven_types::MavenMode) -> Self {
+        Self {
+            inner: Arc::new(EnvironmentInner {
+                maven_mode: mode,
+                ..EnvironmentInner::clone(&self.inner)
+            }),
+            consulted: self.consulted.clone(),
+        }
+    }
+
+    /// The Maven line models are built as.
+    pub fn maven_mode(&self) -> rv_maven_types::MavenMode {
+        self.inner.maven_mode
+    }
+
+    /// The directory raeva runs in, when the configuration names it.
+    pub fn reactor_root(&self) -> Option<&Path> {
+        self.inner.reactor_root.as_deref()
+    }
+
+    /// The directory raeva was started in, unless the environment was
+    /// made without a host snapshot.
+    pub fn working_directory(&self) -> Option<&Path> {
+        self.inner.working_directory.as_deref()
+    }
+
+    /// The launcher's `maven.multiModuleProjectDirectory`.
+    pub fn launcher_root(&self) -> Option<&str> {
+        self.inner.launcher_root.as_deref()
+    }
+
+    /// `MavenCli`'s `session.rootDirectory`, `None` where no directory from
+    /// the reactor root up holds a `.mvn` directory, which fails Maven's
+    /// build on a read of it.
+    pub fn root_directory(&self) -> Option<&Path> {
+        self.inner.root_directory.as_deref()
+    }
+
+    /// The project directory as the shell names it, when the configuration
+    /// names it.
+    pub fn project_directory(&self) -> Option<&Path> {
+        self.inner.project_directory.as_deref()
+    }
+
+    /// This environment for the interpolation of a model Maven 3.10 reads
+    /// from a repository, which reads only the system properties
+    /// [`crate::activation::is_safe_external_property`] names and no
+    /// environment variable.
+    pub(crate) fn restricted(&self) -> Self {
+        Self {
+            inner: Arc::new(EnvironmentInner {
+                restricted: true,
+                ..EnvironmentInner::clone(&self.inner)
+            }),
+            consulted: self.consulted.clone(),
+        }
+    }
+
+    /// Whether this is a [`Self::restricted`] environment.
+    pub(crate) fn is_restricted(&self) -> bool {
+        self.inner.restricted
     }
 
     /// The entries of [`Self::with_classifier_likes`], trimmed, without
@@ -945,8 +1377,27 @@ impl ModelEnvironment {
     }
 
     pub(crate) fn os_name(&self) -> Option<&str> {
-        self.platform()
-            .map(|(os, _)| crate::activation::jvm_os_name(os))
+        (self.inner.windows_os_name).or_else(|| {
+            self.platform()
+                .map(|(os, _)| crate::activation::jvm_os_name(os))
+        })
+    }
+
+    /// The Windows edition's `os.name` this environment was given, if any.
+    pub(crate) fn windows_os_name(&self) -> Option<&'static str> {
+        self.inner.windows_os_name
+    }
+
+    /// This environment with the `os.name` a Windows JVM reports on one
+    /// edition.
+    pub(crate) fn with_windows_os_name(&self, name: &'static str) -> Self {
+        Self {
+            inner: Arc::new(EnvironmentInner {
+                windows_os_name: Some(name),
+                ..EnvironmentInner::clone(&self.inner)
+            }),
+            consulted: self.consulted.clone(),
+        }
     }
 
     pub(crate) fn os_arch(&self) -> Option<&str> {
@@ -995,6 +1446,14 @@ impl ModelEnvironment {
         self.inner.java_home.as_deref()
     }
 
+    /// `env.JAVA_HOME` of Maven's JVM: the variable `mvn` picks the JDK of
+    /// [`Self::host_java_home`] by, unless a `[lock] jdks` JDK other than
+    /// the host's leaves that home unknown.
+    pub(crate) fn host_java_home_env(&self) -> Option<&str> {
+        self.inner.java_home.as_ref()?;
+        self.inner.maven_env("JAVA_HOME")
+    }
+
     /// The build machine's Linux release, which os-maven-plugin reads when
     /// it detects Linux.
     pub(crate) fn linux_release(&self) -> Option<&LinuxRelease> {
@@ -1005,6 +1464,12 @@ impl ModelEnvironment {
     /// Record a user-property lookup without retaining its value.
     pub fn record_user_property(&self, name: &str) {
         self.record(HostInput::UserProperty(name.to_string()));
+    }
+
+    /// Record a lookup of `name`, which the model defines, that only a user
+    /// property can override.
+    pub fn record_user_override(&self, name: &str) {
+        self.record(HostInput::UserOverride(name.to_string()));
     }
 
     /// Record a read of the settings.xml profile property `name`.
@@ -1117,6 +1582,7 @@ impl ModelEnvironment {
             inner: Arc::new(EnvironmentInner {
                 java_version: Some(jdk.to_string()),
                 target_jdk: true,
+                java_home: target.inner.java_home.clone(),
                 ..EnvironmentInner::clone(&self.inner)
             }),
             consulted: self.consulted.clone(),
@@ -1136,8 +1602,37 @@ impl ModelEnvironment {
         }
     }
 
+    /// Whether a POM reads the variable `name` from the host, which no
+    /// allowlist gives one `mvn` sets itself.
     pub(crate) fn allows_env(&self, name: &str) -> bool {
-        self.inner.allow_all_env || self.inner.allowed.contains(name)
+        self.inner.launcher_set(name).is_none()
+            && (self.inner.allow_all_env || self.inner.allowed.contains(name))
+    }
+
+    /// What `mvn` sets the variable `name` to itself.
+    pub(crate) fn launcher_set(&self, name: &str) -> Option<LauncherSet<'_>> {
+        self.inner.launcher_set(name)
+    }
+
+    /// Whether the variable `name` is set where Maven reads its value but a
+    /// POM reads it as unset here: set outside the allowlist, or set by
+    /// `mvn` to a value raeva does not know.
+    pub fn hides_env(&self, name: &str) -> bool {
+        match self.inner.launcher_set(name) {
+            Some(set) => set == LauncherSet::Unknown,
+            None => {
+                !self.allows_env(name)
+                    && maven_env_entry(&self.inner.host_env.0, name, cfg!(windows)).is_some()
+            }
+        }
+    }
+
+    /// The value Maven reads for the variable `name` that [`Self::hides_env`]
+    /// hides, unless `mvn` sets it itself.
+    pub(crate) fn hidden_env_value(&self, name: &str) -> Option<&str> {
+        (self.hides_env(name) && self.inner.launcher_set(name).is_none())
+            .then(|| self.inner.maven_env(name))
+            .flatten()
     }
 
     /// Report, once per run, that a POM read the variable `name`, which is
@@ -1155,7 +1650,8 @@ impl ModelEnvironment {
         // machine.
         if !plain
             || matches!(name, "JAVA_HOME" | "PWD")
-            || !self.inner.host_env.0.contains_key(name)
+            || !self.hides_env(name)
+            || self.launcher_set(name).is_some()
         {
             return;
         }
@@ -1169,14 +1665,17 @@ impl ModelEnvironment {
                     sec_code = "ENV_VAR_HIDDEN",
                     variable = name,
                     "a POM reads the environment variable {name}, which is set here, but raeva \
-                     treats it as unset where Maven reads its value; if the value may be \
-                     public, add \"{name}\" to [security] allow_env_substitution in config.toml"
+                     treats it as unset where Maven reads its value; {}",
+                    allow_env_fix(&name)
                 );
             }
         });
     }
 
     pub(crate) fn env_var(&self, name: &str) -> Option<&str> {
+        if self.inner.launcher_set(name).is_some() {
+            return self.inner.maven_env(name);
+        }
         if !self.inner.allowed.contains(name) {
             return None;
         }
@@ -1184,30 +1683,190 @@ impl ModelEnvironment {
         self.inner.env.get(name).map(String::as_str)
     }
 
+    /// The variable `name`, whatever the allowlist, in the environment of
+    /// the JVM `mvn` starts, as the mavenrc files leave it. A value that is
+    /// not Unicode reads as unset.
+    pub fn jvm_env(&self, name: &str) -> Option<&str> {
+        self.inner.jvm_env(name)
+    }
+
     /// [`Self::env_var`] for a reader that records what it tested itself.
     pub(crate) fn host_env_var(&self, name: &str) -> Option<&str> {
+        if self.inner.launcher_set(name).is_some() {
+            return self.inner.maven_env(name);
+        }
         if !self.allows_env(name) {
             return None;
         }
         if self.inner.allow_all_env {
-            return self
-                .inner
-                .host_env
-                .0
-                .get(name)
-                .or_else(|| self.inner.env.get(name))
-                .map(String::as_str);
+            return (self.inner.maven_env(name))
+                .or_else(|| self.inner.env.get(name).map(String::as_str));
         }
         self.inner.env.get(name).map(String::as_str)
     }
 }
 
-fn parse_java_release(java_home: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(java_home.join("release")).ok()?;
-    contents.lines().find_map(|line| {
-        let value = line.trim().strip_prefix("JAVA_VERSION=")?;
-        Some(strip_quotes(value.trim()))
-    })
+/// How a refusal or warning over the hidden variable `name` tells the user
+/// to let raeva read it.
+pub(crate) fn allow_env_fix(name: &str) -> String {
+    format!(
+        "if the value may be public, add \"{name}\" to [security] allow_env_substitution in \
+         config.toml; this is part of raeva.lock's configuration, so set it on every machine \
+         that syncs, or on none"
+    )
+}
+
+/// Test hook: in a build with the `testing` feature, when set, the
+/// directories searched for the `java` Maven's launcher runs when
+/// `JAVA_HOME` is unset, in place of `PATH`. Tests set it so they do not
+/// depend on the JDKs of the machine that runs them. Unset, `PATH` is
+/// searched, so a `cargo test` binary writes the lock a release build does.
+#[cfg(any(test, feature = "testing"))]
+pub const JAVA_PATH_TEST_ENV: &str = "RAEVA_TEST_JAVA_PATH";
+
+/// Test hook: in a build with the `testing` feature, `1` or `0` in place
+/// of what [`avx512_vbmi_cpu`] detects.
+#[cfg(any(test, feature = "testing"))]
+pub const AVX512_VBMI_TEST_ENV: &str = "RAEVA_TEST_AVX512_VBMI";
+
+/// Whether this is an x86-64 CPU, with the operating system's support, that
+/// has avx512f, avx512bw, avx512vbmi and bmi2: the instructions of
+/// HotSpot's Base64 decoder intrinsic that CVE-2026-114938 is in.
+pub fn avx512_vbmi_cpu() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(set) = std::env::var_os(AVX512_VBMI_TEST_ENV) {
+        return set == "1";
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+            && std::arch::is_x86_feature_detected!("bmi2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
+}
+
+/// The home of the JDK Maven's launcher runs when `JAVA_HOME` is unset, as
+/// the JVM finds it, and the version its `release` file names: the first
+/// `java` on `PATH` (`java.exe` on Windows, as `mvn.cmd` looks it up) with
+/// its links resolved, whose `bin` directory's parent is the home. macOS's
+/// `/usr/bin/java` is a stub that runs the JDK `/usr/libexec/java_home`
+/// names. Without a `release` file, as beside a version manager's shim, the
+/// home is no JDK's, so there is none.
+fn launcher_java_home(path: Option<std::ffi::OsString>) -> Option<(PathBuf, JdkRelease)> {
+    #[cfg(any(test, feature = "testing"))]
+    let path = std::env::var_os(JAVA_PATH_TEST_ENV).or(path);
+    let path = path?;
+    let name = if cfg!(windows) { "java.exe" } else { "java" };
+    let java = std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(name))
+        .find(|java| is_executable(java))?;
+    let java = std::fs::canonicalize(java).ok()?;
+    let home = if cfg!(target_os = "macos") && java == Path::new("/usr/bin/java") {
+        stub_java_home(Path::new("/usr/libexec/java_home"))?
+    } else {
+        rv_fs::plain_path(java.parent()?.parent()?)
+    };
+    let release = JdkRelease::read(&home).filter(|release| release.version.is_some())?;
+    Some((home, release))
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    path.is_file()
+}
+
+/// The JDK home `java_home`, macOS's `/usr/libexec/java_home`, prints: the
+/// one the `/usr/bin/java` stub runs.
+fn stub_java_home(java_home: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new(java_home)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let home = String::from_utf8(output.stdout).ok()?;
+    Some(PathBuf::from(home.trim_end_matches(['\n', '\r']))).filter(|home| home.is_absolute())
+}
+
+/// The `java.home` of the JDK at `home`: a JDK 8 runs from the JRE inside
+/// it, as its `jre/lib` shows, and later ones from `home` itself.
+fn runtime_home(home: PathBuf) -> PathBuf {
+    let jre = home.join("jre");
+    match jre.join("lib").is_dir() {
+        true => jre,
+        false => home,
+    }
+}
+
+/// What a JDK's `release` file says of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JdkRelease {
+    /// `JAVA_VERSION`, such as `21.0.4` or `1.8.0_442`, maybe blank.
+    pub version: Option<String>,
+    /// `JAVA_VERSION_DATE`, the version's release date, as written.
+    pub version_date: Option<String>,
+    /// Whether the file names OpenJ9, as an OpenJ9 JDK's `JVM_VARIANT`
+    /// does: its JVM is not HotSpot.
+    pub openj9: bool,
+}
+
+impl JdkRelease {
+    /// The `release` file of the JDK at `java_home`. A JDK 8 `java` runs
+    /// from `jre/bin`, below the file.
+    fn read(java_home: &Path) -> Option<Self> {
+        let contents = std::fs::read_to_string(java_home.join("release"))
+            .ok()
+            .or_else(|| {
+                let jdk = java_home.parent().filter(|_| java_home.ends_with("jre"))?;
+                std::fs::read_to_string(jdk.join("release")).ok()
+            })?;
+        Some(Self::parse(&contents))
+    }
+
+    /// The `JAVA_VERSION=` and `JAVA_VERSION_DATE=` lines of a `release`
+    /// file's `contents`.
+    pub fn parse(contents: &str) -> Self {
+        let value = |key: &str| {
+            contents.lines().find_map(|line| {
+                let value = line.trim().strip_prefix(key)?.strip_prefix('=')?;
+                Some(strip_quotes(value.trim()))
+            })
+        };
+        Self {
+            version: value("JAVA_VERSION"),
+            version_date: value("JAVA_VERSION_DATE"),
+            openj9: contents.to_ascii_lowercase().contains("openj9"),
+        }
+    }
+
+    /// The numbers of the version, the feature release first: `1.8.0_442`
+    /// reads as 8, 0, 442, and `17.0.6+10` or `21-ea` as 17, 0, 6 or 21.
+    /// `None` for a version that is not numbers so.
+    pub fn version_numbers(&self) -> Option<Vec<u32>> {
+        let version = self.version.as_deref()?.trim();
+        let version = version.split(['-', '+']).next()?;
+        let mut numbers = (version.split(['.', '_']))
+            .map(|part| {
+                (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| part.parse::<u32>().ok())
+                    .flatten()
+            })
+            .collect::<Option<Vec<u32>>>()?;
+        if numbers.len() > 1 && numbers[0] == 1 {
+            numbers.remove(0);
+        }
+        Some(numbers)
+    }
 }
 
 fn strip_quotes(value: &str) -> String {
@@ -1223,14 +1882,159 @@ fn strip_quotes(value: &str) -> String {
     trimmed.to_string()
 }
 
+/// The `maven.multiModuleProjectDirectory` `mvn` and `mvn.cmd` pass for a
+/// build started in `directory`: `maven_basedir` (`MAVEN_BASEDIR`) when set,
+/// else the nearest directory that holds `.mvn`, searched up from
+/// `directory` as the shell names it, else that directory. On unix the
+/// shell names the working directory as `pwd` does, by `PWD` where that
+/// names it, and walks up by name, so a `.mvn` beside a symbolic link
+/// counts; `mvn.cmd` takes any `.mvn`, a file too.
+pub fn launcher_root(
+    directory: &Path,
+    maven_basedir: Option<&str>,
+    pwd: Option<&str>,
+    working_directory: Option<&Path>,
+) -> String {
+    if let Some(set) = maven_basedir.filter(|dir| !dir.is_empty()) {
+        return set.to_string();
+    }
+    let start = shell_path(directory, pwd, working_directory);
+    let holds = |dir: &Path| match cfg!(windows) {
+        true => dir.join(".mvn").exists(),
+        false => dir.join(".mvn").is_dir(),
+    };
+    (start.ancestors().find(|dir| holds(dir)))
+        .unwrap_or(&start)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `directory`, absolute, as a shell names it after `cd` there: under the
+/// working directory as `pwd` names it, its `.` and `..` steps taken by name.
+fn shell_path(directory: &Path, pwd: Option<&str>, working_directory: Option<&Path>) -> PathBuf {
+    let logical = |cwd: &Path| -> Option<PathBuf> {
+        let pwd = Path::new(pwd?);
+        (cfg!(unix) && pwd.is_absolute() && same_directory(pwd, cwd)).then(|| pwd.to_path_buf())
+    };
+    let named = match working_directory {
+        Some(cwd) => match (logical(cwd), directory.strip_prefix(cwd)) {
+            (Some(pwd), Ok(rest)) => pwd.join(rest),
+            _ => directory.to_path_buf(),
+        },
+        None => directory.to_path_buf(),
+    };
+    let mut path = PathBuf::new();
+    for component in named.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                path.pop();
+            }
+            other => path.push(other),
+        }
+    }
+    path
+}
+
+fn same_directory(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        a == b
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `MAVEN_BASEDIR` wins; else the search goes up from the directory as
+    /// the shell names it, by `PWD` where `PWD` names the working directory,
+    /// and takes a `.mvn` file as `mvn.cmd` does on Windows only.
+    #[test]
+    fn the_launcher_root_is_found_as_mvn_finds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(real.join("t/proj")).unwrap();
+        std::fs::write(real.join("t/.mvn"), "").unwrap();
+        let proj = real.join("t/proj");
+        let found = |dir: &Path| launcher_root(dir, None, None, None);
+        let expected = match cfg!(windows) {
+            true => real.join("t"),
+            false => proj.clone(),
+        };
+        assert_eq!(found(&proj), expected.to_string_lossy());
+        assert_eq!(
+            launcher_root(&proj, Some("/basedir"), None, None),
+            "/basedir"
+        );
+        assert_eq!(
+            launcher_root(&proj, Some(""), None, None),
+            expected.to_string_lossy()
+        );
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(dir.path().join("a")).unwrap();
+            std::fs::create_dir(dir.path().join("a/.mvn")).unwrap();
+            std::os::unix::fs::symlink(&proj, dir.path().join("a/proj")).unwrap();
+            let pwd = dir.path().join("a/proj");
+            let pwd = pwd.to_str();
+            assert_eq!(
+                launcher_root(&proj, None, pwd, Some(&proj)),
+                dir.path().join("a").to_string_lossy()
+            );
+            assert_eq!(
+                launcher_root(&proj.join("x/.."), None, pwd, Some(&proj)),
+                dir.path().join("a").to_string_lossy()
+            );
+            // A `PWD` that names another directory is stale.
+            assert_eq!(
+                launcher_root(&proj, None, Some("/"), Some(&proj)),
+                proj.to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_file_gives_the_version_and_its_date() {
+        let release = JdkRelease::parse(
+            "IMPLEMENTOR=\"x\"\nJAVA_VERSION_DATE=\"2026-10-21\"\nJAVA_VERSION=\"21.0.9\"\n",
+        );
+        assert_eq!(release.version.as_deref(), Some("21.0.9"));
+        assert_eq!(release.version_date.as_deref(), Some("2026-10-21"));
+        assert!(!release.openj9);
+        assert_eq!(JdkRelease::parse("JAVA_VERSION=\"8\"\n").version_date, None);
+        assert!(JdkRelease::parse("JAVA_VERSION=\"21\"\nJVM_VARIANT=\"Openj9\"\n").openj9);
+        for (version, numbers) in [
+            ("1.8.0_442", Some(vec![8, 0, 442])),
+            ("11", Some(vec![11])),
+            ("17.0.6+10", Some(vec![17, 0, 6])),
+            ("21-ea", Some(vec![21])),
+            ("27.0.1.0.3", Some(vec![27, 0, 1, 0, 3])),
+            ("", None),
+            ("17.x", None),
+            ("17..1", None),
+        ] {
+            let release = JdkRelease {
+                version: Some(version.to_string()),
+                ..JdkRelease::default()
+            };
+            assert_eq!(release.version_numbers(), numbers, "{version}");
+        }
+    }
 
     #[test]
     fn release_file_wins_over_a_blank_or_other_variable() {
         let home = tempfile::tempdir().unwrap();
         let release = home.path().join("release");
+        let no_jdk = home.path().join("no-jdk");
         for (contents, java_home, variable, expected) in [
             (
                 "IMPLEMENTOR=\"x\"\nJAVA_VERSION=\"27\"\n",
@@ -1247,12 +2051,140 @@ mod tests {
             let vars = [
                 ("JAVA_HOME", java_home),
                 ("JAVA_VERSION", Some(std::ffi::OsStr::new(variable))),
+                (JAVA_PATH_TEST_ENV, Some(no_jdk.as_os_str())),
             ];
             temp_env::with_vars(vars, || {
                 let env = HostSnapshot::capture(&[]).host_environment();
                 assert_eq!(env.java_version(), expected, "{contents:?} {variable:?}");
             });
         }
+    }
+
+    /// Without `JAVA_HOME`, the JDK is that of the first executable `java`
+    /// on the path, its links resolved, as Maven's launcher runs it.
+    #[test]
+    fn the_java_on_the_path_names_the_jdk() {
+        let dir = tempfile::tempdir().unwrap();
+        let java = if cfg!(windows) { "java.exe" } else { "java" };
+        let jdk = |bin: &str, release: Option<&str>| {
+            let bin = dir.path().join(bin);
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join(java), "").unwrap();
+            executable(&bin.join(java), true);
+            let home = bin.parent().unwrap();
+            if let Some(release) = release {
+                let jdk = if home.ends_with("jre") {
+                    home.parent().unwrap()
+                } else {
+                    home
+                };
+                std::fs::write(jdk.join("release"), release).unwrap();
+            }
+            bin
+        };
+        let jdk27 = jdk("jdk-27/bin", Some("JAVA_VERSION=\"27\"\n"));
+        let jdk21 = jdk("jdk-21/bin", Some("JAVA_VERSION=\"21.0.4\"\n"));
+        let jre8 = jdk("jdk8/jre/bin", Some("JAVA_VERSION=\"1.8.0_442\"\n"));
+        // A JDK 8 whose own `bin/java` runs the JRE inside it.
+        let jdk8 = jdk("jdk8b/bin", Some("JAVA_VERSION=\"1.8.0_442\"\n"));
+        std::fs::create_dir_all(dir.path().join("jdk8b/jre/lib")).unwrap();
+        let jdk8_home = dir.path().join("jdk8b");
+        let jdk8_runtime = |home: &Path| {
+            let runtime = rv_fs::plain_path(&std::fs::canonicalize(home).unwrap()).join("jre");
+            Some(runtime.to_str().unwrap().to_string())
+        };
+        let bare = jdk("bare/bin", None);
+        // A link to the JDK's `java`, after a `java` that is not executable.
+        #[cfg(unix)]
+        let first: PathBuf = {
+            let (links, plain) = (dir.path().join("links"), dir.path().join("plain"));
+            std::fs::create_dir(&links).unwrap();
+            std::os::unix::fs::symlink(jdk27.join(java), links.join("java")).unwrap();
+            std::fs::create_dir(&plain).unwrap();
+            std::fs::write(plain.join(java), "").unwrap();
+            executable(&plain.join(java), false);
+            std::env::join_paths([plain, links]).unwrap().into()
+        };
+        #[cfg(not(unix))]
+        let first = jdk27.clone();
+        let home = |bin: &Path| {
+            let home = std::fs::canonicalize(bin.parent().unwrap()).unwrap();
+            Some(rv_fs::plain_path(&home).to_str().unwrap().to_string())
+        };
+        let jdk21_home = jdk21.parent().unwrap().to_str().unwrap();
+        for (path, java_home, variable, version, expected_home) in [
+            (&first, None, Some("11"), "27", home(&jdk27)),
+            (&first, Some(""), None, "27", home(&jdk27)),
+            (
+                &first,
+                Some(jdk21_home),
+                None,
+                "21.0.4",
+                Some(jdk21_home.into()),
+            ),
+            (&jre8, None, None, "1.8.0_442", home(&jre8)),
+            (&jdk8, None, None, "1.8.0_442", jdk8_runtime(&jdk8_home)),
+            (
+                &bare,
+                jdk8_home.to_str(),
+                None,
+                "1.8.0_442",
+                Some(jdk8_home.join("jre").to_str().unwrap().to_string()),
+            ),
+            // A `java` without a release file, as a shim is, names no JDK.
+            (&bare, None, Some("11"), "11", None),
+            (&bare, None, None, "17", None),
+        ] {
+            let vars = [
+                (JAVA_PATH_TEST_ENV, Some(path.as_os_str())),
+                ("JAVA_HOME", java_home.map(std::ffi::OsStr::new)),
+                ("JAVA_VERSION", variable.map(std::ffi::OsStr::new)),
+            ];
+            temp_env::with_vars(vars, || {
+                let host = HostSnapshot::capture(&[]);
+                assert_eq!(host.java_version(), version, "{path:?} {java_home:?}");
+                assert_eq!(host.value(&HostInput::JavaHome), expected_home);
+            });
+        }
+    }
+
+    fn executable(path: &Path, on: bool) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if on { 0o755 } else { 0o644 };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let _ = (path, on);
+    }
+
+    /// macOS's `/usr/bin/java` runs the JDK `/usr/libexec/java_home` prints,
+    /// and none when it fails, as it does without a JDK.
+    #[cfg(unix)]
+    #[test]
+    fn the_macos_stub_runs_the_jdk_java_home_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            executable(&path, true);
+            path
+        };
+        let found = script(
+            "found",
+            "echo /Library/Java/JavaVirtualMachines/jdk-27.jdk/Contents/Home",
+        );
+        assert_eq!(
+            stub_java_home(&found).as_deref(),
+            Some(Path::new(
+                "/Library/Java/JavaVirtualMachines/jdk-27.jdk/Contents/Home"
+            ))
+        );
+        let missing = script(
+            "missing",
+            "echo 'Unable to locate a Java Runtime.' >&2; exit 1",
+        );
+        assert_eq!(stub_java_home(&missing), None);
     }
 
     #[test]
@@ -1269,6 +2201,52 @@ mod tests {
             assert!(debug.contains("RAEVA_TOKEN"), "{debug}");
             assert!(!debug.contains("s3cr3t-value"), "{debug}");
         }
+    }
+
+    /// Maven 3.9.12 and 3.10.0 on Windows read the variable `Path` as
+    /// `env.PATH` in a model and in profile activation, and `env.Path` as
+    /// unset, as measured; elsewhere a name reads as set.
+    #[test]
+    fn windows_names_read_in_upper_case() {
+        let env = BTreeMap::from([("Path".to_string(), "C:\\w".to_string())]);
+        let read = |name: &str, windows: bool| {
+            maven_env_entry(&env, name, windows).map(|(key, _)| key.as_str())
+        };
+        assert_eq!(read("PATH", true), Some("Path"));
+        assert_eq!(read("Path", true), None);
+        assert_eq!(read("PATH", false), None);
+        assert_eq!(read("Path", false), Some("Path"));
+    }
+
+    /// `bin/mvn` exports its project directory and its arguments, and a
+    /// variable it assigns that the shell exported, as measured with Maven
+    /// 3.9.12 and 3.10.0.
+    #[cfg(not(windows))]
+    #[test]
+    fn mvn_sets_its_own_variables() {
+        let inner = EnvironmentInner {
+            launcher_root: Some("/p".to_string()),
+            host_env: HostEnv(Arc::new(BTreeMap::from([
+                ("MAVEN_OPTS".to_string(), "-Dx=1".to_string()),
+                ("CLASSWORLDS_LAUNCHER".to_string(), "x".to_string()),
+                ("RAEVA_SET".to_string(), "on".to_string()),
+            ]))),
+            allowed: BTreeSet::from(["MAVEN_OPTS".to_string(), "RAEVA_SET".to_string()]),
+            ..EnvironmentInner::default()
+        };
+        let environment = HostSnapshot(inner).host_environment();
+        assert_eq!(environment.host_env_var("MAVEN_PROJECTBASEDIR"), Some("/p"));
+        assert_eq!(
+            environment.host_env_var("CLASSWORLDS_LAUNCHER"),
+            Some(CLASSWORLDS_LAUNCHER)
+        );
+        for unknown in ["MAVEN_CMD_LINE_ARGS", "MAVEN_OPTS"] {
+            assert_eq!(environment.host_env_var(unknown), None, "{unknown}");
+            assert!(environment.hides_env(unknown), "{unknown}");
+            assert!(!environment.allows_env(unknown), "{unknown}");
+        }
+        assert_eq!(environment.launcher_set("MAVEN_HOME"), None);
+        assert!(environment.allows_env("RAEVA_SET"));
     }
 
     #[test]
@@ -1473,19 +2451,19 @@ mod tests {
     }
 
     /// A POM activation reads the settings.xml properties its interpolation
-    /// looks up, through a `project.properties.` prefix or a nested name,
+    /// looks up, through a `project.properties.` prefix or a POM property,
     /// and no other, without copying the settings for each one: many large
     /// unused properties stay cheap.
     #[test]
     fn activation_records_the_settings_properties_interpolation_reads() {
         let mut pom = crate::Pom::parse(
             "<project><groupId>g</groupId><artifactId>a</artifactId><version>1</version>\
-             <properties><selector>p2</selector><p3>own</p3></properties><profiles>\
+             <properties><selector>${p2}</selector><p3>own</p3></properties><profiles>\
              <profile><id>direct</id><activation><property><name>flag</name>\
              <value>${p0}</value></property></activation></profile>\
              <profile><id>prefixed</id><activation><jdk>${project.properties.p1}</jdk>\
              </activation></profile>\
-             <profile><id>nested</id><activation><os><name>${${selector}}</name></os>\
+             <profile><id>indirect</id><activation><os><name>${selector}</name></os>\
              </activation></profile>\
              <profile><id>shadowed</id><activation><jdk>${p3}</jdk></activation></profile>\
              </profiles></project>",
@@ -1596,12 +2574,12 @@ mod tests {
     }
 
     #[test]
-    fn user_property_reads_cover_nested_names_and_dependency_models() {
+    fn user_property_reads_cover_indirect_names_and_dependency_models() {
         for policy in [crate::ModelPolicy::PROJECT, crate::ModelPolicy::DEPENDENCY] {
             let pom = crate::Pom::parse("<project><groupId>g</groupId><artifactId>root</artifactId><version>1</version>\
-                <properties><selector>lib.version</selector><lib.version>1</lib.version></properties>\
+                <properties><selector>${lib.version}</selector><lib.version>1</lib.version></properties>\
                 <dependencies><dependency><groupId>g</groupId><artifactId>lib</artifactId>\
-                <version>${project.properties.${selector}}</version></dependency>\
+                <version>${project.properties.selector}</version></dependency>\
                 <dependency><groupId>g</groupId><artifactId>tests</artifactId><version>${excluded.version}</version><scope>test</scope></dependency></dependencies>\
                 <profiles><profile><id>extra</id><activation><property><name>enable.extra</name></property></activation>\
                 <dependencies><dependency><groupId>g</groupId><artifactId>extra</artifactId><version>1</version></dependency></dependencies>\
@@ -1619,12 +2597,24 @@ mod tests {
                 &ctx,
             ))
             .unwrap();
-            let names = host.consulted_user_properties();
-            for name in ["selector", "lib.version", "enable.extra"] {
-                assert!(names.contains(name), "{policy:?}: {names:?}");
+            // The model or a `-D` defines these, so a JVM option's value
+            // cannot decide them.
+            let overrides = host.consulted_user_overrides();
+            for name in ["selector", "lib.version"] {
+                assert!(overrides.contains(name), "{policy:?}: {overrides:?}");
             }
-            assert!(!names.contains("unused"), "{policy:?}: {names:?}");
-            assert_eq!(names.contains("excluded.version"), policy.root, "{names:?}");
+            assert_eq!(
+                overrides.contains("excluded.version"),
+                policy.root,
+                "{overrides:?}"
+            );
+            let names = host.consulted_user_properties();
+            assert_eq!(
+                names,
+                BTreeSet::from(["enable.extra".to_string()]),
+                "{policy:?}"
+            );
+            assert!(!overrides.contains("unused"), "{policy:?}: {overrides:?}");
         }
     }
 
@@ -1679,9 +2669,9 @@ mod tests {
     }
 
     /// A target JDK fixes `java.version` for that build: `<jdk>`,
-    /// `<property>` on `java.version` and `${java.version}` read the target
-    /// JDK and record no JDK host input, while `java.home` stays the host's
-    /// and `-Djava.version` still overrides the target.
+    /// `<property>` on `java.version` and `${java.specification.version}`
+    /// read the target JDK and record no JDK host input, while `java.home`
+    /// stays the host's and `-Djava.version` still overrides the target.
     #[test]
     fn target_jdk_evaluates_jdk_without_recording_jdk_host_reads() {
         let pom = crate::Pom::parse(
@@ -1689,7 +2679,7 @@ mod tests {
              <profiles>\
              <profile><id>jdk21</id><activation><jdk>[21,)</jdk></activation>\
              <dependencies><dependency><groupId>g</groupId><artifactId>d</artifactId>\
-             <version>${java.version}</version><scope>system</scope>\
+             <version>${java.specification.version}</version><scope>system</scope>\
              <systemPath>${java.home}/lib/d.jar</systemPath></dependency></dependencies>\
              </profile>\
              <profile><id>prop21</id><activation><property><name>java.version</name>\

@@ -58,7 +58,7 @@ impl Workspace {
             platform.jdk(),
         ));
         let (properties, expanded) = self.root_user_properties(&activation);
-        activation.system_properties.extend(properties);
+        activation.define_system_properties(properties);
         activation.expanded_properties = expanded;
         let boundary = self.local_parent_boundary();
         EffectiveMetadata::build(

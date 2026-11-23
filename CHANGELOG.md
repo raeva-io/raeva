@@ -5,7 +5,157 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-23
+
+`raeva.lock` is now a lock you can review, build from, and not get past by
+editing it. This is how it works now.
+
+- `raeva sync --frozen` resolves the project again on every run and fails
+  when the result differs from the lock, so a pull request that edits only
+  pins, versions or edges no longer passes. While the inputs match, a
+  range, `RELEASE`, SNAPSHOT or plugin without a version takes no version
+  newer than the locked one
+  ([Frozen checks](docs/offline-builds.md#frozen-checks)).
+- `raeva lock diff` names the parent, imported BOM or property whose change
+  moved the packages. `raeva.lock` is schema 9 and records where each
+  managed version came from; a plain sync rewrites a schema 8 lock, and
+  `--frozen` refuses one
+  ([Review lock changes](docs/ci.md#review-lock-changes-in-pull-requests)).
+- With `[plugins] lock = true`, the lock also pins build plugins, their
+  dependencies and build extensions, and `[plugins] trace` runs the build
+  once to pin what plugins fetch while they run, so `mvn -o` builds from
+  one `raeva export-m2`. Plugin locking is off by default
+  ([Locked plugins](docs/offline-builds.md#locked-plugins)).
+- `[lock] maven = "3.10"`, or a Maven Wrapper for 3.10, resolves as Maven
+  3.10.0 does. The lock records the line, and `--frozen` refuses a lock
+  resolved under the other one
+  ([Maven line](docs/configuration.md#maven-line)).
+- raeva reads Maven's options as `mvn` does: it sources the mavenrc files
+  with `/bin/sh` (`cmd` on Windows), then reads `MAVEN_ARGS`,
+  `.mvn/maven.config` (`-D`, `-P` and `-s`), `.mvn/jvm.config`, and the
+  `-D` options and argument files of `MAVEN_OPTS` and the JVM option
+  variables. Values that decide the lock are lock inputs
+  ([Maven options](docs/configuration.md#maven-options)).
+- Where raeva cannot tell what Maven resolves, the sync fails with an error
+  that names the cause and the fix, instead of writing a lock that may
+  differ ([Where raeva refuses](docs/project-fit.md#where-raeva-refuses-and-maven-builds)).
+- A cold `raeva sync` takes about as long as fetching the same files with
+  curl, 8 at a time: 1.03 to 1.16 times that on guava,
+  jhipster-sample-app, maven-resolver and dubbo against a replay of
+  Central with 35 ms of latency (medians of 5 runs). spring-petclinic
+  takes 1.27 times that, because raeva first resolves the dependencies of
+  its build extension, native-maven-plugin, to read their artifact
+  handlers.
+- A warm `raeva sync` with an unchanged lock is slower than in 0.5.3:
+  0.33 s on guava and 0.565 s on spring-petclinic, about 1.6 to 2.9 times
+  0.5.3, and more on projects with build extensions. It is still 2 to 6
+  times faster than Maven.
+
+### Added
+
+- `raeva seed key`, `seed save` and `seed restore` carry the locked files
+  and cached metadata between CI jobs
+  ([Seed the store](docs/ci.md#seed-the-store-and-the-maven-repository)).
+- `raeva doctor` checks the project from local files: the wrapper and
+  Maven line, build extensions, plugin locking, the lock's platforms, and
+  whether CI runs `sync --frozen`.
+- For CVE-2026-114938 (Java4Shell), `raeva doctor` warns of a JDK and CPU
+  that may be exposed, and the build `[plugins] trace` runs gets
+  `-XX:-UseBASE64Intrinsics` where its JDK's `release` file names 11 or
+  later and not OpenJ9 ([Java4Shell](docs/ci.md#java4shell)).
+- `raeva export-m2 --plan-json` lists what an export writes, for builds
+  without raeva. The format is unstable.
+- Maven's remote repository filters
+  ([Remote repository filters](docs/configuration.md#remote-repository-filters)).
+- `raeva tree` and `raeva why` take `--platform` and `--jdk`, and
+  [CI](docs/ci.md#relock-dependency-bot-pull-requests) has recipes for
+  Dependabot and Renovate.
+
+### Changed
+
+- raeva takes `~/.m2/settings.xml` and `${user.home}` from the JVM's
+  `user.home`, as Maven does, instead of `HOME`; set
+  `MAVEN_OPTS=-Duser.home=...` to point both at another home. A
+  `user.home` raeva cannot look into holds no settings, as for Maven.
+- Without `JAVA_HOME`, POMs see the version in the `release` file of the
+  JDK behind the `java` on `PATH`, instead of 17
+  ([The JDK version](docs/configuration.md#the-jdk-version)).
+- A sync stops (exit 5) where Maven's answer depends on build order: one
+  repository id that lists different versions at two URLs, or two modules
+  that read different bytes for one POM
+  ([Repository ids](docs/offline-builds.md#repository-ids)).
+- Behind a proxy, a repository that only a fetched POM declares is skipped
+  unless your configuration or the transitive allowlist names it
+  ([Repositories and mirrors](docs/configuration.md#repositories-and-mirrors)).
+- A home 0.5.3 used keeps its store, but 0.6 reads none of the metadata
+  0.5.3 cached, since 0.6 decides a `daily` check when it reads it, in the
+  zone of the run that reads. The first sync after the upgrade fetches
+  that metadata again, so it needs the network, as on a new home: before
+  it, `--offline` fails naming the file. Behind a mirror whose URL holds a secret-named
+  `${...}`, it downloads the locked files again too, as 0.6 records that
+  mirror as `mirror:<id>/`.
+- The library crates changed; see docs.rs.
+
+### Fixed
+
+- A `<server>` with a username whose encrypted password cannot be
+  decrypted, as when `settings-security.xml` is missing or unreadable, no
+  longer stops the sync: unless it has a bearer token, which is still
+  sent, it gives no credential for its id, so a repository that allows
+  anonymous reads serves it, as it serves Maven.
+- Resolution follows Maven more closely: the reactor's shared model cache,
+  depth-first collection in the 3.9 line, repository order by effective
+  id, unknown scopes kept as Maven keeps them, leading-dot expressions,
+  `${project.reporting.outputDirectory}` and other model fields, and
+  settings.xml profile conditions recorded as lock inputs.
+- `export-m2` lists only the versions ranges, `RELEASE`, `LATEST` and
+  plugins without a version took, so `mvn -o` takes the version Maven took
+  online, and picks a `file:` repository's mirror as Maven does.
+- A `file:` repository beside the project is recorded relative to it, so
+  `--frozen`, seeds and `export-m2` work after the tree moves, and a
+  symbolic link inside it is followed.
+- `--platforms`, offline `--frozen`, seeds and locks with merge conflict
+  markers handle the cases they failed on, with the exit codes
+  [JSON output](docs/json-output.md) documents.
+- `--frozen` refuses a property name added by hand under `[resolution]
+  ambient_inputs` that no target lists as read.
+- Artifact handlers of a build extension are read from every jar of its
+  realm, as Maven loads them, and from a handler class that implements
+  `ArtifactHandler` itself, such as `nbm-maven-plugin`'s; one raeva cannot
+  read, or that reads a class two of those jars hold differently, fails the
+  sync (exit 3), as does a type Maven's core defines that the realm defines
+  otherwise.
+- A SNAPSHOT jar of a build extension's realm is pinned at its build, as
+  is each SNAPSHOT parent and BOM the realm's resolution read, so a seed
+  carries them and `--frozen` keeps them after a newer deploy. With
+  `[plugins] lock`, the plugin tables refuse such a jar (exit 5), as they
+  pin no SNAPSHOT build.
+
+### Security
+
+- What raeva prints and logs shows `***` for settings.xml passwords,
+  passphrases and private keys, decrypted ones included, and for the
+  value of each secret-named input, from settings, `-D` options, JVM
+  option variables or the mavenrc files, unless it is shorter than 4
+  characters or reads as a version or a word such as `true`
+  ([Repositories and mirrors](docs/configuration.md#repositories-and-mirrors)).
+- A repository URL or id that takes a secret-named input, directly or
+  through a settings profile property, fails the sync (exit 3) instead of
+  reaching `raeva.lock`, the store or a seed.
+- `sbom`, `export-m2` and `seed save` read only regular files from the
+  store, so a FIFO or link put there reads as missing.
+- A settings file that `-s` in `.mvn/maven.config` names is the project's:
+  an `[[auth]]` entry without an id does not go to its repositories and
+  mirrors, and `export-m2` does not write to its `<localRepository>`.
+- raeva does not show or keep the output of the build `[plugins] trace`
+  runs. A failed trace names the exit status, and the plugin, goal and
+  module only as `raeva.lock` and the reactor name them; run the build to
+  see its output ([Locked plugins](docs/offline-builds.md#locked-plugins)).
+- A traced build fails (exit 3) before it starts where the mavenrc files
+  give a value anew each time they run, so it would not run with the
+  values raeva resolved with. A token they fetch anew, in a variable named
+  like a secret, which no POM reads, is allowed, outside Windows
+  ([Java4Shell](docs/ci.md#java4shell)).
 
 ## [0.5.3] - 2026-11-05
 
@@ -557,7 +707,7 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
-[Unreleased]: https://github.com/raeva-io/raeva/compare/v0.5.3...HEAD
+[0.6.0]: https://github.com/raeva-io/raeva/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/raeva-io/raeva/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/raeva-io/raeva/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/raeva-io/raeva/compare/v0.5.0...v0.5.1

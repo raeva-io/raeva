@@ -92,10 +92,14 @@ pub trait ModelSource: Sync {
     fn observe_repositories(&self, _repositories: &[Repository]) {}
 
     /// The interpolated repositories of an effective model; see the
-    /// observation order above. The default passes them to
-    /// [`ModelSource::observe_repositories`].
-    fn observe_effective_repositories(&self, repositories: &[Repository]) {
+    /// observation order above. A source may refuse the build here. The
+    /// default passes them to [`ModelSource::observe_repositories`].
+    fn observe_effective_repositories(
+        &self,
+        repositories: &[Repository],
+    ) -> Result<(), Self::Error> {
         self.observe_repositories(repositories);
+        Ok(())
     }
 
     /// The imports [`ModelSource::import`] is about to be asked for, in
@@ -125,15 +129,31 @@ pub trait ModelSource: Sync {
     /// builder then uses it instead of building the BOM again; `usable`
     /// refuses one whose build's activation inputs differ or which would
     /// fail to build again. The source is asked nothing else about the BOM,
-    /// so one that records lookups must have recorded that build's. The
-    /// default keeps nothing.
+    /// so one that records lookups must have recorded that build's. A source
+    /// may wait for a build of the BOM under way elsewhere to end, one for
+    /// an importer whose activation context `importer` has the same
+    /// properties. The default keeps nothing.
     fn reuse_import(
         &self,
         _bom: ImportCoord<'_>,
         _policy: ModelPolicy,
-        _usable: &dyn Fn(&ImportedBom) -> bool,
-    ) -> Option<Arc<ImportedBom>> {
-        None
+        _importer: &crate::ActivationContext,
+        _usable: &(dyn Fn(&ImportedBom) -> bool + Sync),
+    ) -> impl Future<Output = Option<Arc<ImportedBom>>> + Send {
+        std::future::ready(None)
+    }
+
+    /// What Maven 3.9's session model cache holds for `bom`: the
+    /// contribution of the first build of its coordinates, whatever the
+    /// importer and its context, if `fits` accepts it. The builder takes it
+    /// before [`ModelSource::reuse_import`], as that would; `fits` refuses
+    /// one that would nest too deep. The default holds nothing.
+    fn cached_import(
+        &self,
+        _bom: ImportCoord<'_>,
+        _fits: &(dyn Fn(&ImportedBom) -> bool + Sync),
+    ) -> impl Future<Output = Option<Arc<ImportedBom>>> + Send {
+        std::future::ready(None)
     }
 
     /// What holds the log of a model's BOM imports, so that a source can
@@ -196,6 +216,10 @@ pub struct ModelPolicy {
     /// repositories are marked as declared by the user, and Maven's project
     /// validation, such as unique profile ids, applies to it.
     pub root: bool,
+    /// Whether to read and merge the lineage's plugin sections for
+    /// [`crate::Project::plugins`]; only with `root`. A build that needs no
+    /// plugin model leaves it off and skips their parse.
+    pub plugins: PluginModel,
     /// What to do when the source has no POM for a `<parent>`.
     pub missing_parent: MissingParent,
 }
@@ -204,14 +228,53 @@ impl ModelPolicy {
     /// A project build: a missing parent fails it.
     pub const PROJECT: Self = Self {
         root: true,
+        plugins: PluginModel::Off,
         missing_parent: MissingParent::Fail,
+    };
+
+    /// A project build that keeps its plugin model.
+    pub const PROJECT_PLUGINS: Self = Self {
+        plugins: PluginModel::All,
+        ..Self::PROJECT
+    };
+
+    /// A project build that keeps its plugin model for its build
+    /// extensions.
+    pub const PROJECT_EXTENSIONS: Self = Self {
+        plugins: PluginModel::Extensions,
+        ..Self::PROJECT
     };
 
     /// A dependency's model: a missing parent fails it.
     pub const DEPENDENCY: Self = Self {
         root: false,
+        plugins: PluginModel::Off,
         missing_parent: MissingParent::Fail,
     };
+}
+
+/// Whether a project build keeps its plugin model, and which profiles that
+/// change it are inputs of the build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PluginModel {
+    /// No plugin model.
+    Off,
+    /// A profile that changes what the build's plugins resolve is an input.
+    All,
+    /// Only a profile that changes the build extensions is an input, as
+    /// their handlers can change the dependency graph.
+    Extensions,
+    /// No plugin model, only the `<pluginRepositories>`, the super POM's
+    /// included, which a check that runs without resolution trusts as it
+    /// trusts `<repositories>`.
+    Repositories,
+}
+
+impl PluginModel {
+    /// Whether the build reads the plugin sections.
+    pub(crate) fn reads_plugins(self) -> bool {
+        matches!(self, Self::All | Self::Extensions)
+    }
 }
 
 /// What a build does when the source has no POM for a `<parent>`.
@@ -431,8 +494,12 @@ mod memory {
             self.observe("observe", repositories);
         }
 
-        fn observe_effective_repositories(&self, repositories: &[Repository]) {
+        fn observe_effective_repositories(
+            &self,
+            repositories: &[Repository],
+        ) -> Result<(), Self::Error> {
             self.observe("effective", repositories);
+            Ok(())
         }
 
         fn prefetch_imports(&self, imports: &[ImportCoord<'_>]) {
@@ -580,6 +647,18 @@ mod tests {
 
     #[test]
     fn imports_nest_only_to_the_limit() {
+        // raeva resolves on threads with an 8 MiB stack (raeva/src/main.rs);
+        // fifty nested imports in a debug build pass the test thread's 2 MiB
+        // on Windows.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(imports_nest_only_to_the_limit_on_raevas_stack)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn imports_nest_only_to_the_limit_on_raevas_stack() {
         // A chain of `levels` BOMs where the last one imports nothing.
         let chain = |levels: usize| {
             let mut source = MemorySource::new();

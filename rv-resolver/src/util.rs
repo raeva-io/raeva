@@ -1,6 +1,7 @@
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rv_maven_model::{Parent, Pom};
+use rv_maven_types::MavenMode;
 
 /// Maven's dynamic version tokens: the exact words `RELEASE` and `LATEST`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,7 +73,7 @@ pub(crate) fn pom_matches_parent(pom: &Pom, parent: &Parent) -> bool {
         && pom.artifact_id.as_deref() == Some(parent.artifact_id.as_str())
         && version.is_none_or(|version| {
             version == parent.version
-                || (rv_maven_model::parent_version_range(parent).is_some()
+                || (rv_maven_model::parent_version_range(parent, MavenMode::Maven39).is_some()
                     && rv_maven_model::local_parent_in_range(version, &parent.version))
         })
 }

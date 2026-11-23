@@ -532,6 +532,28 @@ mod tests {
         assert_eq!(store.check_pin(&blob, &pin).unwrap(), PinCheck::Match);
     }
 
+    /// A link or a FIFO in a blob's place reads as no blob, and the FIFO,
+    /// which has no writer, does not block the read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_blob_read_opens_neither_a_link_nor_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let blob = store.put_bytes(b"hello").await.unwrap();
+        assert_eq!(store.read_blob(&blob).unwrap().unwrap(), b"hello");
+        let path = store.get_path(&blob);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(store.read_blob_async(&blob).await.unwrap().is_none());
+        std::fs::remove_file(&path).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        if !made.is_ok_and(|status| status.success()) {
+            return;
+        }
+        assert!(store.open_blob(&blob).unwrap().is_none());
+        assert!(store.read_blob(&blob).unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn queued_checks_share_one_sync_before_their_stamps() {
         let dir = tempfile::tempdir().unwrap();

@@ -4,7 +4,7 @@ Usage: raeva sync [OPTIONS]
 
 Options:
   -f, --frozen
-          Fail if raeva.lock would change, using the locked SNAPSHOT builds (CI mode)
+          Resolve again and fail if the result differs from raeva.lock, keeping the locked SNAPSHOT builds (CI mode)
 
   -u, --update
           Re-resolve all dependencies, taking newer SNAPSHOT builds, and update raeva.lock
@@ -47,7 +47,7 @@ Global Options:
 
 Examples:
   raeva sync                          # Resolve and lock dependencies
-  raeva sync --frozen                 # CI mode: fail if lockfile would change
+  raeva sync --frozen                 # CI mode: resolve again and fail on any difference
   raeva sync --update                 # Force fresh resolution
   raeva sync --offline                # Use cached data and file repositories
   raeva sync --platforms linux-x86_64,macos-aarch64

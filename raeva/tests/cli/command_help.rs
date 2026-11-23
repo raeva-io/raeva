@@ -1,7 +1,8 @@
 use rv_test_support::{fixtures, golden};
 
 use crate::common::{
-    assert_status, assert_success, cli_command_dirs, cli_global_flags, raeva_command, temp_project,
+    assert_status, assert_success, cli_command_dirs, cli_global_flags, raeva_command, run_raeva,
+    temp_project,
 };
 
 #[test]
@@ -25,7 +26,7 @@ fn help_keeps_its_quick_start() {
         .expect("quick start in help");
     let readme = fixtures::workspace_file("README.md");
     let mut commands = Vec::new();
-    // The offline recipe is the README's, which keeps plugins apart.
+    // The offline recipes are the README's.
     for section in ["## Quick start", "## Offline builds"] {
         let before = commands.len();
         for line in fixtures::markdown_fenced_lines(fixtures::markdown_section(&readme, section)) {
@@ -81,10 +82,7 @@ fn offline_is_global_and_refused_where_the_network_is_the_point() {
             ["--offline", command.as_str()],
             [command.as_str(), "--offline"],
         ] {
-            let output = raeva_command(project.path(), home.path())
-                .args(args)
-                .output()
-                .expect("run raeva");
+            let output = run_raeva(project.path(), home.path(), &args);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert_status(&output, 2, &format!("{args:?}"));
             assert!(
@@ -107,20 +105,26 @@ fn offline_is_global_and_refused_where_the_network_is_the_point() {
     );
 }
 
-/// `COMPLETE` in the host shell must not turn `--help` into a completion
-/// script. [`crate::common::raeva_command`] strips it from the child.
+/// `COMPLETE` prints the completion script for a bare `raeva` only, and
+/// never takes over a command.
 #[test]
 fn complete_from_the_host_does_not_take_over_the_command() {
     let (project, home) = temp_project();
-    temp_env::with_var("COMPLETE", Some("bash"), || {
-        let output = raeva_command(project.path(), home.path())
-            .arg("--help")
-            .output()
-            .expect("run raeva --help");
-        assert_success(&output, "help with COMPLETE from the host");
-        let help = String::from_utf8(output.stdout).expect("UTF-8 help");
-        assert!(help.contains("Usage: raeva [OPTIONS] <COMMAND>"), "{help}");
-    });
+    let output = raeva_command(project.path(), home.path())
+        .env("COMPLETE", "bash")
+        .arg("--help")
+        .output()
+        .expect("run raeva --help");
+    assert_success(&output, "help with COMPLETE from the host");
+    let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(help.contains("Usage: raeva [OPTIONS] <COMMAND>"), "{help}");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_raeva"))
+        .env("COMPLETE", "bash")
+        .output()
+        .expect("run raeva");
+    assert_success(&output, "COMPLETE=bash raeva");
+    let script = String::from_utf8(output.stdout).expect("UTF-8 script");
+    assert!(script.contains("-F _clap_complete_raeva raeva"), "{script}");
 }
 
 /// Adding a command must fail here until the README Commands table names it.
@@ -166,7 +170,7 @@ fn the_readme_links_every_doc() {
     let files: Vec<&str> = mentioned.iter().map(String::as_str).collect();
     fixtures::assert_children(
         &fixtures::workspace_root().join("docs"),
-        &["assets"],
+        &["assets", "design"],
         &files,
     );
 }
@@ -445,6 +449,7 @@ fn help_matches_the_snapshots() {
         ("sbom", &["sbom", "--help"]),
         ("vuln", &["vuln", "--help"]),
         ("vuln-triage", &["vuln", "triage", "--help"]),
+        ("seed-restore", &["seed", "restore", "--help"]),
     ] {
         let output = raeva_command(project.path(), home.path())
             .args(args)

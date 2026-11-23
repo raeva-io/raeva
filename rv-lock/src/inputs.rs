@@ -11,10 +11,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
+use rv_maven_types::MavenMode;
 use sha2::{Digest, Sha256};
 
 use crate::ambient::AmbientInput;
-use crate::lock::Lockfile;
+use crate::lock::{LockModule, LockModulePackage, Lockfile};
 use crate::lock_origin::normalize_repo_url;
 use crate::platform::Platform;
 
@@ -39,6 +40,11 @@ pub struct ResolutionInputs {
     pub inactive_profiles: Vec<String>,
     /// Configured repositories in precedence order.
     pub repositories: Vec<RepositoryInputs>,
+    /// The settings.xml plugin repositories of the active profiles, then
+    /// those of Maven's request, which serve the build extensions that map
+    /// a dependency's type. Hashed only when not empty, so a configuration
+    /// without them keeps its hash.
+    pub plugin_repositories: Vec<RepositoryInputs>,
     /// `[security] allow_transitive_repositories`.
     pub allow_transitive_repositories: bool,
     /// `[security] allow_env_substitution`.
@@ -48,17 +54,29 @@ pub struct ResolutionInputs {
     /// `[lock] jdks`, in configured order. Hashed only when not empty, so a
     /// configuration without it keeps its hash.
     pub jdks: Vec<String>,
+    /// The Maven line resolution follows. Hashed only when not 3.9, so a
+    /// configuration that selects none keeps its hash.
+    pub maven: MavenMode,
     /// The settings.xml profiles whose activation depends on a condition,
     /// in settings order. Which of them apply is decided per target
     /// platform, so their content, not the outcome on this host, is the
     /// input. Hashed only when not empty, so a configuration without such
     /// profiles keeps its hash.
     pub settings_profiles: Vec<SettingsProfileInput>,
+    /// The settings.xml profile repositories a project's model fills in, as
+    /// written, of every profile in settings order. Hashed only when not
+    /// empty, so a configuration without them keeps its hash.
+    pub settings_model_repositories: Vec<String>,
     /// The host and user-property inputs consulted, each with its current
     /// value (`None` when unset). Hashed by name and value only when not
     /// empty. The names are what raeva.lock records in
     /// `[resolution] ambient_inputs`.
     pub ambient: BTreeMap<AmbientInput, Option<String>>,
+    /// Maven's remote repository filters: the digests of their rule files
+    /// and the values of the properties `ambient` cannot name, as the
+    /// caller writes them. Hashed only when set, so a configuration without
+    /// filters keeps its hash.
+    pub repository_filters: Option<String>,
 }
 
 /// One conditionally activated settings.xml profile as `config_hash` covers
@@ -105,18 +123,21 @@ pub struct RepositoryInputs {
 /// 1. effective `-P` selections from both option sources, in target order;
 /// 2. resolved active and inactive configuration profile ids;
 /// 3. configured repositories in precedence order: id, URL, release and
-///    snapshot flags, update policies, and checksum policies;
+///    snapshot flags, update policies, and checksum policies, then, when
+///    there are any, the settings.xml plugin repositories the same way;
 /// 4. the `[security]` settings, which decide what a POM may read from the
 ///    environment and which transitive repositories are searched;
-/// 5. when there are any, the conditionally activated settings profiles in
+/// 5. the Maven mode, when it is not 3.9;
+/// 6. when there are any, the conditionally activated settings profiles in
 ///    settings order, each framed with its id and content;
-/// 6. when there are any, the consulted host values in name order, each
+/// 7. when there are any, the consulted host values in name order, each
 ///    framed with its name and its value or an unset marker, except an unset
 ///    one that [`AmbientInput::is_property_name`]: each graph that read
 ///    such a name lists it in its module record, which a lock must list
 ///    too, so it needs no marker, and a branch that only consults another
 ///    unset name leaves the hash, and every graph digest bound to it,
-///    unchanged.
+///    unchanged;
+/// 8. when set, the remote repository filter text.
 pub fn config_hash(inputs: &ResolutionInputs) -> String {
     let mut hasher = Sha256::new();
     hash_str(&mut hasher, "rv-config-hash-v7");
@@ -131,17 +152,13 @@ pub fn config_hash(inputs: &ResolutionInputs) -> String {
     hash_sorted_strings(&mut hasher, "active_profiles", &inputs.active_profiles);
     hash_sorted_strings(&mut hasher, "inactive_profiles", &inputs.inactive_profiles);
 
-    let repos = &inputs.repositories;
-    hasher.update(b"repositories:");
-    hasher.update((repos.len() as u64).to_le_bytes());
-    for repo in repos {
-        hash_str(&mut hasher, repo.id.as_deref().unwrap_or(""));
-        hash_str(&mut hasher, &normalize_repo_url(&repo.url));
-        hasher.update([tristate(repo.releases), tristate(repo.snapshots)]);
-        hash_str(&mut hasher, &repo.snapshots_update_policy);
-        hash_str(&mut hasher, &repo.releases_update_policy);
-        hash_str(&mut hasher, &repo.releases_checksum_policy);
-        hash_str(&mut hasher, &repo.snapshots_checksum_policy);
+    hash_repositories(&mut hasher, "repositories:", &inputs.repositories);
+    if !inputs.plugin_repositories.is_empty() {
+        hash_repositories(
+            &mut hasher,
+            "plugin_repositories:",
+            &inputs.plugin_repositories,
+        );
     }
 
     hasher.update(b"security:");
@@ -165,12 +182,24 @@ pub fn config_hash(inputs: &ResolutionInputs) -> String {
         }
     }
 
+    if inputs.maven != MavenMode::Maven39 {
+        hasher.update(b"maven:");
+        hash_str(&mut hasher, inputs.maven.as_str());
+    }
+
     if !inputs.settings_profiles.is_empty() {
         hasher.update(b"settings_profiles:");
         hasher.update((inputs.settings_profiles.len() as u64).to_le_bytes());
         for profile in &inputs.settings_profiles {
             hash_str(&mut hasher, &profile.id);
             hash_str(&mut hasher, &profile.content);
+        }
+    }
+    if !inputs.settings_model_repositories.is_empty() {
+        hasher.update(b"settings_model_repositories:");
+        hasher.update((inputs.settings_model_repositories.len() as u64).to_le_bytes());
+        for repository in &inputs.settings_model_repositories {
+            hash_str(&mut hasher, repository);
         }
     }
     let counted: Vec<_> = (inputs.ambient.iter())
@@ -188,8 +217,26 @@ pub fn config_hash(inputs: &ResolutionInputs) -> String {
             }
         }
     }
+    if let Some(filters) = &inputs.repository_filters {
+        hasher.update(b"repository_filters:");
+        hash_str(&mut hasher, filters);
+    }
 
     hex::encode(hasher.finalize())
+}
+
+fn hash_repositories(hasher: &mut Sha256, label: &str, repos: &[RepositoryInputs]) {
+    hasher.update(label.as_bytes());
+    hasher.update((repos.len() as u64).to_le_bytes());
+    for repo in repos {
+        hash_str(hasher, repo.id.as_deref().unwrap_or(""));
+        hash_str(hasher, &normalize_repo_url(&repo.url));
+        hasher.update([tristate(repo.releases), tristate(repo.snapshots)]);
+        hash_str(hasher, &repo.snapshots_update_policy);
+        hash_str(hasher, &repo.releases_update_policy);
+        hash_str(hasher, &repo.releases_checksum_policy);
+        hash_str(hasher, &repo.snapshots_checksum_policy);
+    }
 }
 
 /// Everything `model_hash` covers for one platform's reactor.
@@ -351,35 +398,24 @@ pub fn model_records_hash(
     hex::encode(hasher.finalize())
 }
 
-/// Each module's graph digest in `platform`, stored as
-/// [`crate::ModelInputs::graphs`]: the lock's `config_hash`, the module's
-/// input record in `inputs`, its row, the property and variable names it
-/// and every graph of the platform read, the repository ids and the
-/// conditions and host values the platform read (`reads`), the pin of each support POM it
-/// read and the POM pin of each external package, and every module's
-/// coordinates. A branch
-/// that resolves upstream data again changes the digest of each graph it
-/// changes, as an edit to the module's POM does, so merging the two
-/// conflicts in Git, and a lock whose rows and records come from different
-/// resolutions fails [`crate::LockPlatform::graphs_match`].
-pub fn graph_digests(
-    platform: &crate::lock::LockPlatform,
+/// What every graph of a target shares: the lock's `config_hash`, the Maven
+/// mode, the property and variable names every graph of the target read,
+/// and the repository ids and the conditions and host values it read
+/// (`reads`).
+fn target_context(
     inputs: &crate::ModelInputs,
     config_hash: Option<&str>,
+    maven: MavenMode,
     reads: &crate::TargetReads,
-) -> BTreeMap<String, rv_maven_types::Sha256> {
-    let names = |names: &BTreeSet<crate::AmbientInput>| {
-        let mut hasher = Sha256::new();
-        hasher.update((names.len() as u64).to_le_bytes());
-        for name in names {
-            hash_str(&mut hasher, &name.to_string());
-        }
-        hex::encode(hasher.finalize())
-    };
-    let shared = names(&inputs.ambient_inputs);
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_str(&mut hasher, "target-context");
+    hash_str(&mut hasher, config_hash.unwrap_or(""));
+    hash_str(&mut hasher, maven.as_str());
+    hash_str(&mut hasher, "ambient_inputs");
+    hash_str(&mut hasher, &read_names_digest(&inputs.ambient_inputs));
     // What the platform read, so a merge or an edit that changes the
     // repository ids or conditions without the graphs fails.
-    let mut hasher = Sha256::new();
     hash_str(&mut hasher, "repo_ids");
     hasher.update((reads.repo_ids.len() as u64).to_le_bytes());
     for (origin, ids) in &reads.repo_ids {
@@ -390,38 +426,107 @@ pub fn graph_digests(
         }
     }
     hash_str(&mut hasher, "host_inputs");
-    hash_str(&mut hasher, &names(&reads.host_inputs));
-    let reads = hex::encode(hasher.finalize());
-    let empty = BTreeSet::new();
-    let modules: BTreeMap<&str, String> = (platform.modules.iter())
-        .map(|module| (module.path.as_str(), module.gav.to_string()))
-        .collect();
-    let mut reactor = Sha256::new();
-    for (path, gav) in modules {
-        hash_str(&mut reactor, path);
-        hash_str(&mut reactor, &gav);
+    hash_str(&mut hasher, &read_names_digest(&reads.host_inputs));
+    hex::encode(hasher.finalize())
+}
+
+fn read_names_digest(names: &BTreeSet<crate::AmbientInput>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((names.len() as u64).to_le_bytes());
+    for name in names {
+        hash_str(&mut hasher, &name.to_string());
     }
-    let reactor = hex::encode(reactor.finalize());
+    hex::encode(hasher.finalize())
+}
+
+/// Each module's graph digest in `platform`, stored as
+/// [`crate::ModelInputs::graphs`]: what every graph of the target shares
+/// (the lock's `config_hash`, the Maven mode `maven`, the names every graph
+/// read and what the target read, `reads`), the module's input record in
+/// `inputs`, its path, coordinates and row, the names it read, the pin of
+/// each support POM it read and the POM pin of each external package, and
+/// the path and version of each reactor module whose `group:artifact` the
+/// module itself, a package, a support POM or a parent range of its row
+/// names, and the rows of each reactor module the graph depends on. Other
+/// modules are left out, so adding a module that no graph names leaves the
+/// other graph digests as they are.
+///
+/// A branch that resolves upstream data again changes the digest of each
+/// graph it changes, as an edit to the module's POM does, so merging the two
+/// conflicts in Git, and a lock whose rows and records come from different
+/// resolutions fails [`crate::LockPlatform::graphs_match`]: a graph that
+/// names a `group:artifact` the other branch made a reactor module, or
+/// whose version that branch changed, does not match.
+pub fn graph_digests(
+    platform: &crate::lock::LockPlatform,
+    inputs: &crate::ModelInputs,
+    config_hash: Option<&str>,
+    maven: MavenMode,
+    reads: &crate::TargetReads,
+) -> BTreeMap<String, rv_maven_types::Sha256> {
+    let context = target_context(inputs, config_hash, maven, reads);
+    let empty = BTreeSet::new();
+    let mut reactor: HashMap<(&str, &str), Vec<(&str, &str)>> = HashMap::new();
+    for module in &platform.modules {
+        reactor
+            .entry((module.gav.group.as_str(), module.gav.artifact.as_str()))
+            .or_default()
+            .push((module.path.as_str(), module.gav.version()));
+    }
+    for modules in reactor.values_mut() {
+        modules.sort_unstable();
+    }
     let pins: HashMap<_, _> = (platform.artifacts.iter())
         .map(|artifact| (&artifact.coordinate, artifact.pom_sha256.as_ref()))
         .collect();
-    let digest = |module: &crate::lock::LockModule| {
-        let row = if crate::lock::is_canonical_module(module) {
-            Cow::Borrowed(module)
-        } else {
+    // A canonical copy when the row needs one, its packages, edges and
+    // managed sources, and their digest.
+    type Encoded = (Option<LockModule>, String, String, String, [u8; 32]);
+    // One pass canonicalizes a row that needs it and encodes it.
+    let encoded = rv_maven_types::par_map(&platform.modules, |module| -> Encoded {
+        let canonical = (!crate::lock::is_canonical_module(module)).then(|| {
             let mut row = module.clone();
             crate::lock::canonicalize_module(&mut row);
-            Cow::Owned(row)
-        };
+            row
+        });
+        let row = canonical.as_ref().unwrap_or(module);
+        let packages = crate::codec::encode_packages(row);
+        let edges = crate::codec::encode_edges(row);
+        let managed = crate::codec::encode_managed(row);
+        let mut hasher = Sha256::new();
+        hash_str(&mut hasher, &packages);
+        hash_str(&mut hasher, &edges);
+        // Left out when empty, so a module whose versions management did
+        // not supply keeps its digest.
+        if !managed.is_empty() {
+            hash_str(&mut hasher, &managed);
+        }
+        let digest: [u8; 32] = hasher.finalize().into();
+        (canonical, packages, edges, managed, digest)
+    });
+    let rows: Vec<&LockModule> = (platform.modules.iter())
+        .zip(&encoded)
+        .map(|(module, (row, ..))| row.as_ref().unwrap_or(module))
+        .collect();
+    let row_digests: HashMap<&str, &[u8; 32]> = (rows.iter())
+        .zip(&encoded)
+        .map(|(row, (.., digest))| (row.path.as_str(), digest))
+        .collect();
+    let digest = |&(row, (_, packages, edges, managed, _)): &(&LockModule, &Encoded)| {
         let mut hasher = Sha256::new();
         hash_str(&mut hasher, "graph");
-        hash_str(&mut hasher, config_hash.unwrap_or(""));
+        hash_str(&mut hasher, &context);
         let record = inputs.pom_hashes.get(&row.path);
         hash_str(&mut hasher, record.map_or("", AsRef::as_ref));
-        hash_str(&mut hasher, &reactor);
+        hash_str(&mut hasher, &row.path);
+        hash_str(&mut hasher, &row.gav.to_string());
         hash_str(&mut hasher, &row.packaging);
-        hash_str(&mut hasher, &crate::codec::encode_packages(&row));
-        hash_str(&mut hasher, &crate::codec::encode_edges(&row));
+        hash_str(&mut hasher, packages);
+        hash_str(&mut hasher, edges);
+        if !managed.is_empty() {
+            hash_str(&mut hasher, "managed");
+            hash_str(&mut hasher, managed);
+        }
         for range in &row.parent_ranges {
             hash_str(&mut hasher, &range.model);
             hash_str(&mut hasher, &range.parent);
@@ -432,37 +537,106 @@ pub fn graph_digests(
             let pin = platform.support_poms.get(coord);
             hash_str(&mut hasher, pin.map_or("", |pin| pin.sha256.as_ref()));
         }
-        // Framed even when empty: a digest from before graphs recorded
-        // their reads then fails, as such a graph proves nothing about them.
+        if !row.extensions.is_empty() {
+            hash_str(&mut hasher, "extensions");
+            hash_str(&mut hasher, &crate::codec::encode_extensions(row));
+        }
+        if !row.parents.is_empty() {
+            hash_str(&mut hasher, "parents");
+            hash_str(&mut hasher, &row.parents.join("\n"));
+        }
+        if !row.evicted_ranges.is_empty() {
+            hash_str(&mut hasher, "evicted_ranges");
+            hash_str(&mut hasher, &crate::codec::encode_evicted_ranges(row));
+        }
+        if !row.metadata_versions.is_empty() {
+            hash_str(&mut hasher, "metadata_versions");
+            hash_str(
+                &mut hasher,
+                &crate::codec::encode_metadata_versions(&row.metadata_versions),
+            );
+        }
         hash_str(&mut hasher, "ambient_inputs");
-        hash_str(&mut hasher, &shared);
         hash_str(
             &mut hasher,
-            &names(
+            &read_names_digest(
                 inputs
                     .module_ambient_inputs
                     .get(&row.path)
                     .unwrap_or(&empty),
             ),
         );
-        hash_str(&mut hasher, &reads);
+        for coordinate in row
+            .packages
+            .iter()
+            .filter_map(LockModulePackage::repository_file)
+        {
+            let pin = pins.get(coordinate).copied().flatten();
+            hash_str(&mut hasher, pin.map_or("", AsRef::as_ref));
+        }
+        // The reactor modules this graph can name: a reactor module with a
+        // named `group:artifact` would have been a candidate for it.
+        let mut named: BTreeSet<(&str, &str)> = BTreeSet::new();
+        named.insert((row.gav.group.as_str(), row.gav.artifact.as_str()));
         for package in &row.packages {
-            if package.workspace_module.is_none() && package.system_sha256.is_none() {
-                let pin = pins.get(&package.coordinate).copied().flatten();
-                hash_str(&mut hasher, pin.map_or("", AsRef::as_ref));
+            let gav = &package.coordinate.gav;
+            named.insert((gav.group.as_str(), gav.artifact.as_str()));
+        }
+        for range in &row.evicted_ranges {
+            named.insert((range.group.as_str(), range.artifact.as_str()));
+        }
+        for marker in &row.metadata_versions {
+            named.insert((marker.group.as_str(), marker.artifact.as_str()));
+        }
+        let coords = (row.support_poms.iter().map(String::as_str)).chain(
+            row.parent_ranges.iter().flat_map(|range| {
+                [
+                    range.model.as_str(),
+                    range.parent.as_str(),
+                    range.selected.as_str(),
+                ]
+            }),
+        );
+        for coord in coords {
+            if let Some((group, artifact, _)) = crate::lock::split_reactor_gav(coord) {
+                named.insert((group, artifact));
+            }
+        }
+        hash_str(&mut hasher, "reactor");
+        for ga in named {
+            let Some(modules) = reactor.get(&ga) else {
+                continue;
+            };
+            hash_str(&mut hasher, ga.0);
+            hash_str(&mut hasher, ga.1);
+            hasher.update((modules.len() as u64).to_le_bytes());
+            for (path, version) in modules {
+                hash_str(&mut hasher, path);
+                hash_str(&mut hasher, version);
+            }
+        }
+        // A reactor dependency's resolution reaches this graph without its
+        // POM changing, as after `--update`.
+        hash_str(&mut hasher, "workspace");
+        for package in &row.packages {
+            if let Some(path) =
+                (package.workspace_module.as_deref()).filter(|path| *path != row.path)
+            {
+                hash_str(&mut hasher, path);
+                hasher.update(row_digests.get(path).map_or(&[0; 32], |digest| *digest));
             }
         }
         hex::encode(hasher.finalize()).parse().expect("SHA-256 hex")
     };
-    let digests = rv_maven_types::par_map(&platform.modules, digest);
+    let rows: Vec<_> = rows.into_iter().zip(&encoded).collect();
+    let digests = rv_maven_types::par_map(&rows, digest);
     (platform.modules.iter().map(|module| module.path.clone()))
         .zip(digests)
         .collect()
 }
 
-/// SHA-256 of POM bytes with CRLF line endings turned into LF.
-/// Contextual model records also include the POM's role and module identity.
-pub fn pom_sha256(bytes: &[u8]) -> rv_maven_types::Sha256 {
+/// SHA-256 of a project text file with CRLF line endings turned into LF.
+pub fn text_sha256(bytes: &[u8]) -> rv_maven_types::Sha256 {
     rv_maven_types::Sha256::from_bytes(&lf_line_endings(bytes))
 }
 

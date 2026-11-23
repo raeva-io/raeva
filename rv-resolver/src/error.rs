@@ -119,6 +119,8 @@ pub enum RepoStatus {
     Io,
     /// A failure that fits none of the other kinds.
     Other,
+    /// A remote repository filter kept the request from the repository.
+    Filtered,
 }
 
 impl std::fmt::Display for RepoStatus {
@@ -133,12 +135,16 @@ impl std::fmt::Display for RepoStatus {
             Self::InvalidMetadata => f.write_str("invalid metadata"),
             Self::Io => f.write_str("I/O error"),
             Self::Other => f.write_str("error"),
+            Self::Filtered => f.write_str("not allowed by the remote repository filters"),
         }
     }
 }
 
 impl RepoStatus {
     pub(crate) fn from_repo_error(err: &rv_repo::RepoError) -> Self {
+        if err.is_filtered() {
+            return RepoStatus::Filtered;
+        }
         if let Some(code) = err.status_code() {
             return RepoStatus::Http(code);
         }
@@ -209,13 +215,53 @@ pub enum ResolveError {
     /// on the chain. Holds the chain, coordinates joined by ` -> `.
     #[error("relocation cycle detected: {0}")]
     RelocationCycle(String),
-    /// A reactor module depends, directly or transitively, on a module that
-    /// depends back on it.
+    /// A reactor module links, directly or transitively, to a module that
+    /// links back to it: through a dependency, a parent, or in the 3.10 mode
+    /// an import, as Maven's `ProjectSorter` links them, also when a build
+    /// plugin or extension link it added first is on the cycle.
     #[error("workspace dependency cycle detected: {cycle}")]
     WorkspaceDependencyCycle {
         /// `group:artifact` of each module on the cycle, joined by ` -> `,
         /// ending where it starts.
         cycle: String,
+    },
+    /// A range that Maven resolves among reactor modules by what raeva does
+    /// not know while it collects: the order the reactor builds them in, or
+    /// what a module's build has attached.
+    #[error(
+        "{} {} resolves among reactor modules {}, and raeva cannot match \
+         Maven's choice here: {reason}",
+        bounded(coord),
+        bounded(requested),
+        modules.join(", ")
+    )]
+    ReactorChoice {
+        /// The `group:artifact` requested.
+        coord: String,
+        /// The range as requested.
+        requested: String,
+        /// The POM path of each module Maven may choose.
+        modules: Vec<String>,
+        /// Why Maven's choice depends on that.
+        reason: String,
+    },
+    /// One repository id, after mirror selection, listed different versions
+    /// of one `group:artifact` at two URLs. Maven keeps one listing per id.
+    #[error(
+        "repository id {} lists different versions of {} at {}: Maven keeps one version \
+         list per repository id, taken from the URL of the module that reads it first, so \
+         raeva cannot lock its choice; give the repositories distinct ids, or use one URL",
+        bounded(id),
+        bounded(coord),
+        urls.join(" and ")
+    )]
+    SplitListing {
+        /// The repository id.
+        id: String,
+        /// The `group:artifact` listed.
+        coord: String,
+        /// The URLs, sorted, with credentials redacted.
+        urls: Vec<String>,
     },
     /// Two modules of one platform resolved different bytes for one artifact
     /// coordinate; a platform's artifact rows are shared, so raeva.lock cannot
@@ -244,6 +290,39 @@ pub enum ResolveError {
         .0.coord, .0.first_origin, .0.first_sha256, .0.second_origin, .0.second_sha256
     )]
     ConflictingSupportPomBytes(Box<ConflictingPom>),
+    /// In the Maven 3.9 mode, two modules read different POMs for one
+    /// artifact, or one read none and the other one that is not empty, or a
+    /// module and a plugin set, or two plugin sets, read it in any two ways:
+    /// Maven 3.9 reuses one reading for all, depending on the build's order.
+    /// Returned by [`crate::lock::assemble`] for two modules.
+    #[error(
+        "{coord} has a different POM, or none, for {first} than for {second}; Maven 3.9 \
+         reuses the reading of whichever resolves it first, so the order of the build, -T \
+         and -pl decide what both get"
+    )]
+    SharedDescriptorDiffers {
+        /// The artifact read both ways.
+        coord: String,
+        /// The module or plugin set that read it first in order.
+        first: String,
+        /// The other one.
+        second: String,
+    },
+    /// One module read a POM as a support POM, a parent, an imported BOM
+    /// or a losing version's, and another resolved the same file as an
+    /// artifact's with other bytes. Returned by [`crate::lock::assemble`].
+    #[error(
+        "{coord} has one POM for {support_module} and another for {row_module}; Maven has one \
+         local-repository path per coordinate, so one lockfile cannot pin both"
+    )]
+    ConflictingSupportCompanionPom {
+        /// The POM's bare `g:a:v`.
+        coord: String,
+        /// The module that read it as a support POM.
+        support_module: String,
+        /// The module whose dependency rows pin the other bytes.
+        row_module: String,
+    },
     /// Two modules, possibly on different platforms, parsed different
     /// companion `.pom` bytes for one `g:a:v`, each origin with the
     /// repository that served it. Returned by [`crate::lock::assemble`].
@@ -407,6 +486,24 @@ pub enum ResolveError {
         /// The resolved snapshot coordinate.
         coord: String,
     },
+    /// A dependency has a scope Maven keeps as written and raeva.lock
+    /// cannot record, such as one with a space.
+    #[error(
+        "{}, a dependency of {}, has the scope {}, which Maven keeps as written and \
+         raeva.lock cannot record: a scope Maven does not know must be 1 to 255 characters without \
+         whitespace, control or invisible characters",
+        bounded(dependency),
+        bounded(parent),
+        rv_maven_types::quoted(scope)
+    )]
+    UnrecordableScope {
+        /// The dependency's coordinate.
+        dependency: String,
+        /// The coordinate of the node it is a dependency of.
+        parent: String,
+        /// The scope, as declared.
+        scope: String,
+    },
     /// Configuration could not be used, including a root `pom.xml` over the
     /// project input size limit.
     #[error("config error: {0}")]
@@ -475,6 +572,16 @@ pub enum ResolveError {
     /// resolution task. Holds the description.
     #[error("internal error: {0}")]
     InternalError(String),
+    /// A parent or imported BOM that no repository served, where a remote
+    /// repository filter kept one of them out: `searched` says how each
+    /// answered.
+    #[error("{error}")]
+    FilteredModel {
+        /// The parent or BOM not found.
+        error: Box<ResolveError>,
+        /// Each repository searched for it, in order.
+        searched: Vec<RepoSearchStatus>,
+    },
     /// A failure that concerns one declared dependency, with where it is
     /// declared.
     #[error("{error}")]
@@ -486,6 +593,197 @@ pub enum ResolveError {
         /// dependency down to the one that declares the failed dependency.
         /// Empty when the module declares it.
         via: Vec<String>,
+        /// The failure itself.
+        error: Box<ResolveError>,
+    },
+    /// A plugin set's class path holds a SNAPSHOT build, which the plugin
+    /// tables do not pin.
+    #[error("{coord} is a SNAPSHOT build, which plugin locking does not pin")]
+    PluginSnapshot {
+        /// The coordinate of the build.
+        coord: String,
+    },
+    /// The test class path holds versions of an artifact whose order,
+    /// which decides Surefire's test framework provider, the order of a POM
+    /// below a direct dependency gives, which raeva.lock does not keep.
+    #[error(
+        "the test class path holds versions {versions} of {coord}: Surefire picks its test \
+         framework provider by the one Maven lists last, which the order of a POM below a \
+         direct dependency decides and raeva cannot tell; declare the artifacts of {coord} \
+         as direct dependencies, in the order the build needs"
+    )]
+    UnorderedTestClasspath {
+        /// The `groupId:artifactId` of the artifact.
+        coord: String,
+        /// Its versions, comma-separated.
+        versions: String,
+    },
+    /// Two plugin sets read other bytes for one file, which `mvn -o` finds
+    /// at one path.
+    #[error("two plugin sets read different bytes for {coord}")]
+    ConflictingPluginBytes {
+        /// The coordinate of the file.
+        coord: String,
+    },
+    /// Plugins read a file the modules read too, with or without its POM,
+    /// where raeva.lock cannot record which builds read the POM.
+    #[error(
+        "plugins read the POM of {coord} from other repositories than the modules do, which raeva.lock cannot record for each build that reads it, so mvn -o would read the POM where Maven does not or miss it where Maven reads it"
+    )]
+    UnrecordablePluginPom {
+        /// The coordinate of the file.
+        coord: String,
+    },
+    /// A repository a model build may read a parent or an imported BOM
+    /// through goes to another mirror as written than interpolated. Maven
+    /// keeps the mirror of the URL as written for those reads, and the
+    /// dependencies use the interpolated URL's route.
+    #[error(
+        "the URL of repository '{id}' goes to mirror '{written}' as written and to {} once interpolated; Maven reads parents and imported BOMs through the mirror of the URL as written, which raeva does not follow",
+        match interpolated { Some(mirror) => format!("mirror '{mirror}'"), None => "no mirror".to_string() }
+    )]
+    MirrorRouteSplit {
+        /// The repository's id, as [`rv_maven_types::bounded`] shows it.
+        id: String,
+        /// The id of the mirror the URL as written goes to.
+        written: String,
+        /// The id of the mirror the interpolated URL goes to, if any.
+        interpolated: Option<String>,
+    },
+    /// A dependency's parent that no repository raeva searches holds. Maven
+    /// also looks it up through the mirror a repository of the dependency's
+    /// POMs reaches as written, which raeva does not search.
+    #[error(
+        "Parent POM not found: {parent}; Maven also looks it up through mirror '{mirror}', where the URL of repository '{id}' as written goes, and raeva does not search that mirror for the parent of a dependency"
+    )]
+    ParentBehindWrittenMirror {
+        /// The parent's coordinates, bounded.
+        parent: String,
+        /// The id of the repository, bounded.
+        id: String,
+        /// The id of the mirror its URL as written goes to, bounded.
+        mirror: String,
+    },
+    /// An imported BOM's build read a POM through a mirror of a repository
+    /// only imported BOMs declare, which a sync cannot fetch again.
+    #[error(
+        "{pom} comes from repository '{id}', which only the imported BOM {bom} declares, \
+         through mirror '{mirror}'; raeva.lock would record that repository, which the project \
+         does not declare, so a sync could not fetch the POM again"
+    )]
+    MirroredImportRepository {
+        /// The POM's `g:a:v`.
+        pom: String,
+        /// The `g:a:v` of the BOM that declares the repository.
+        bom: String,
+        /// The repository's id, bounded.
+        id: String,
+        /// The mirror's id, bounded.
+        mirror: String,
+    },
+    /// A POM of a build redeclares a repository id the build searches, at
+    /// another URL, and imports a BOM after it: Maven reads that import
+    /// through the redeclared repository, which raeva does not read.
+    #[error(
+        "a POM redeclares repository '{id}' at a URL raeva does not read, and {maven} reads \
+         the BOMs imported after it from that URL in place of the one raeva searches"
+    )]
+    RedeclaredRepository {
+        /// The repository's id, bounded.
+        id: String,
+        /// The Maven releases that read it so.
+        maven: &'static str,
+    },
+    /// A build reads a POM none of the repositories Maven searches before
+    /// one raeva does not read holds, so Maven may read it from that one.
+    #[error(
+        "{pom} is in none of the repositories {maven} searches before repository '{id}', which \
+         raeva does not read"
+    )]
+    UnreadRepositoryAhead {
+        /// The POM's coordinates, bounded.
+        pom: String,
+        /// The repository's id, bounded.
+        id: String,
+        /// The Maven release that searches so.
+        maven: &'static str,
+    },
+    /// A fetched POM whose repositories the build reads declares one raeva
+    /// cannot read as Maven does: its `<id>` takes a `${...}` that decides
+    /// its route ([`rv_repo::expression_id_refusal`]).
+    #[error("the <id> of repository '{id}', which {declared_by} declares, {refusal}")]
+    RepositoryIdUnfollowed {
+        /// The repository's id once interpolated, bounded.
+        id: String,
+        /// The POM that declares it, as "a fetched parent of the project"
+        /// or its coordinates.
+        declared_by: String,
+        /// Why, from [`rv_repo::expression_id_refusal`].
+        refusal: String,
+    },
+    /// A jar whose descriptors raeva reads, an extension's or a plugin's,
+    /// does not read, or one of its entries does not.
+    #[error(
+        "raeva cannot read the jar of {coord}{}: {reason}",
+        .entry.as_deref().map(|entry| format!(", entry {}", bounded(entry))).unwrap_or_default()
+    )]
+    UnreadableJar {
+        /// The coordinate of the jar.
+        coord: String,
+        /// The entry that does not read, `None` for the jar itself.
+        entry: Option<String>,
+        /// Why it does not read.
+        reason: String,
+    },
+    /// In the Maven 3.9 mode with plugins locked, a module, plugin, build
+    /// extension, processor path or test provider read a file without a
+    /// POM, as a winner, a losing version, a range's candidate or a
+    /// relocation's target: Maven 3.9 keeps that reading for the session
+    /// and hands it to whichever module or plugin reads the file later.
+    #[error(
+        "{reader} reads {coord} from repositories that serve no POM for it; Maven 3.9 keeps that reading for the whole build and gives it to every module and plugin that reads it after {reader}, in an order raeva.lock does not record"
+    )]
+    ReadsNoPom {
+        /// The file read without a POM.
+        coord: String,
+        /// The module, or the role and coordinates of the set.
+        reader: String,
+    },
+    /// Outside the Maven 3.9 mode, or against a core extension, two readers
+    /// read two POMs for one `group:artifact:version`, or a POM for one
+    /// file and none for another: Maven reads each, but a local repository
+    /// holds one POM per version.
+    #[error(
+        "{coord} has one POM for {first} and another, or none, for {second}; Maven reads each, but a local repository holds one POM per version, so raeva.lock cannot record both and mvn -o would give both the same one"
+    )]
+    OnePomPerVersion {
+        /// The file's coordinate, or `group:artifact:version`.
+        coord: String,
+        /// One reader.
+        first: String,
+        /// The other.
+        second: String,
+    },
+    /// In the Maven 3.9 mode, a plugin reaches a reactor module through
+    /// an artifact from a repository, which Maven 3.9 does not order the
+    /// reactor by.
+    #[error(
+        "{set} reaches the reactor module {coord} through an artifact from a repository; Maven 3.9 does not build that module before the plugin runs, so the plugin may read its POM from the reactor and its jar from a repository"
+    )]
+    ReactorModuleUnordered {
+        /// The reactor module's file.
+        coord: String,
+        /// The role and coordinates of the set.
+        set: String,
+    },
+    /// A plugin, extension or processor path of a module's build did not
+    /// resolve.
+    #[error("{plugin}: {error}")]
+    Plugin {
+        /// The role and coordinates of the set.
+        plugin: String,
+        /// The URLs of the set's repositories, before mirrors. Not redacted.
+        searched: Vec<String>,
         /// The failure itself.
         error: Box<ResolveError>,
     },
@@ -504,7 +802,7 @@ impl ResolveError {
     /// The failure without the [`ResolveError::Declared`] context around it.
     pub fn cause(&self) -> &ResolveError {
         match self {
-            Self::Declared { error, .. } => error.cause(),
+            Self::Declared { error, .. } | Self::FilteredModel { error, .. } => error.cause(),
             other => other,
         }
     }
@@ -543,6 +841,47 @@ impl ResolveError {
     /// This failure, raised while resolving the graph of the module at
     /// `module`. Failures that name their file or concern no dependency
     /// stay as they are.
+    /// This failure with how the repositories answered for a parent or
+    /// imported BOM it misses, when `search` holds a filter refusal for it.
+    pub(crate) fn naming_filtered_models(
+        self,
+        search: &impl Fn((&str, &str, &str)) -> Option<std::sync::Arc<[RepoSearchStatus]>>,
+    ) -> Self {
+        match self {
+            Self::Declared { module, via, error } => Self::Declared {
+                module,
+                via,
+                error: Box::new(error.naming_filtered_models(search)),
+            },
+            Self::Plugin {
+                plugin,
+                searched,
+                error,
+            } => Self::Plugin {
+                plugin,
+                searched,
+                error: Box::new(error.naming_filtered_models(search)),
+            },
+            Self::MultipleArtifactErrors { first, rest } => Self::MultipleArtifactErrors {
+                first: Box::new(first.naming_filtered_models(search)),
+                rest: (rest.into_iter())
+                    .map(|error| error.naming_filtered_models(search))
+                    .collect(),
+            },
+            Self::Pom(
+                rv_maven_model::PomError::ParentNotFound(ref group, ref artifact, ref version)
+                | rv_maven_model::PomError::ImportNotFound(ref group, ref artifact, ref version),
+            ) => match search((group, artifact, version)) {
+                Some(searched) => Self::FilteredModel {
+                    error: Box::new(self),
+                    searched: searched.to_vec(),
+                },
+                None => self,
+            },
+            other => other,
+        }
+    }
+
     pub(crate) fn in_module(self, module: &str) -> Self {
         match self {
             Self::Declared {
@@ -585,19 +924,29 @@ fn served_by(sha256: &str, repo: &str) -> String {
     }
 }
 
-/// The first `${name}` left in `text`, the name of a property nothing
-/// defined.
+/// The first `${name}` left in the coordinate `text`, the name of a
+/// property nothing defined. Each part is interpolated alone, so an
+/// expression ends in its own part.
 pub(crate) fn undefined_property(text: &str) -> Option<&str> {
-    let first = text.find("${")?;
-    let end = first + text[first..].find('}')?;
-    // The innermost of `${outer.${inner}}`, which left the outer one unread.
-    let start = text[..end].rfind("${")? + 2;
-    Some(&text[start..end])
+    text.split(':').find_map(|part| {
+        let start = part.find("${")? + 2;
+        Some(&part[start..start + part[start..].find('}')?])
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::ResolveError;
+
+    #[test]
+    fn an_undefined_property_ends_in_its_part() {
+        assert_eq!(
+            super::undefined_property("com.${foo:bar:${ver}"),
+            Some("ver")
+        );
+        assert_eq!(super::undefined_property("g:a:${a.${b}}"), Some("a.${b"));
+        assert_eq!(super::undefined_property("g:a:1"), None);
+    }
 
     #[test]
     fn multiple_artifact_errors_shows_count_and_first_error() {

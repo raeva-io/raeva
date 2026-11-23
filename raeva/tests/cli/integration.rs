@@ -10,6 +10,7 @@ use rv_lock::{Lockfile, LockfileGuard, Platform};
 
 use crate::common::{
     assert_status, assert_success, raeva_command, run_raeva, temp_project, write_empty_pom,
+    write_with_sha256,
 };
 
 fn collect_output(mut child: Child, status: ExitStatus) -> Output {
@@ -262,9 +263,8 @@ fn sigterm_stops_a_sync_like_ctrl_c() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("Terminated."));
 }
 
-/// The headline compares the lockfile's bytes, so a sync that leaves them as
-/// they were reports raeva.lock as up to date even when it had to replace
-/// the file, as it does a symlink.
+/// A sync that leaves the lockfile's bytes as they were reports raeva.lock
+/// as up to date, also through a symlink, which it keeps.
 #[cfg(unix)]
 #[test]
 fn identical_bytes_written_through_a_symlink_are_up_to_date() {
@@ -284,6 +284,7 @@ fn identical_bytes_written_through_a_symlink_are_up_to_date() {
     let text = String::from_utf8_lossy(&output.stdout).into_owned()
         + &String::from_utf8_lossy(&output.stderr);
     assert!(text.contains("raeva.lock is up to date"), "{text}");
+    assert!(fs::symlink_metadata(&lock_path).unwrap().is_symlink());
 }
 
 /// A version changed in the POM is resolved, recorded and stored by the next
@@ -302,12 +303,7 @@ fn a_version_changed_in_the_pom_is_downloaded_and_locked() {
         ("lib-2.0.jar", b"lib 2.0 jar bytes"),
     ];
     for (name, bytes) in files {
-        fs::write(dir.join(name), bytes).expect("write file");
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .expect("write sidecar");
+        write_with_sha256(&dir.join(name), bytes);
     }
     let pom = project.root().join("pom.xml");
     let text = fs::read_to_string(&pom).expect("read pom.xml");

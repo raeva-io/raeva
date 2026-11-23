@@ -15,6 +15,53 @@ fn fresh() -> Lockfile {
     linux_lock("1", '1')
 }
 
+/// The platforms of `previous` that `preservation` keeps for `fresh`.
+fn kept(fresh: &Lockfile, previous: &Lockfile) -> Vec<Kept> {
+    (preservation(fresh, previous, &"c".repeat(64)).into_iter())
+        .filter_map(|candidate| candidate.keep(|_| None).ok())
+        .collect()
+}
+
+/// Only a platform `preservation` keeps reaches `carry_forward`: one it
+/// drops, here for a changed configuration, cannot be named.
+#[test]
+fn a_dropped_platform_cannot_be_carried_forward() {
+    let previous = lock(vec![locked_platform("macos-aarch64", Vec::new(), '7')]);
+    let candidates = preservation(&fresh(), &previous, &"d".repeat(64));
+    let dropped = candidates[0].clone().keep(|_| None).unwrap_err();
+    assert_eq!(
+        dropped,
+        (platform("macos-aarch64"), DropReason::Reconfigured)
+    );
+    // Agreeing pins keep a platform only when the caller's check does too.
+    let agreeing = preservation(&fresh(), &previous, &"c".repeat(64));
+    assert_eq!(
+        agreeing[0].clone().keep(|_| Some(DropReason::ModelChanged)),
+        Err((platform("macos-aarch64"), DropReason::ModelChanged))
+    );
+    let mut fresh = fresh();
+    let kept = kept(&fresh, &previous);
+    assert_eq!(kept.len(), 1);
+    // A platform kept twice, or already resolved, is carried once.
+    let twice = [kept[0].clone(), kept[0].clone()];
+    carry_forward(&mut fresh, &previous, &twice).unwrap();
+    carry_forward(&mut fresh, &previous, &twice).unwrap();
+    assert_eq!(fresh.platforms.len(), 2);
+}
+
+/// One entry of reads per platform, or an error, not a panic.
+#[test]
+fn target_reads_for_other_platforms_are_refused() {
+    let mut lock = fresh();
+    let reads = lock.target_reads();
+    lock.set_target_reads(&reads).unwrap();
+    let err = lock.set_target_reads(&[]).unwrap_err();
+    assert!(
+        err.to_string().contains("0 target reads for 1 platforms"),
+        "{err}"
+    );
+}
+
 #[test]
 fn an_agreeing_platform_is_a_candidate_and_a_resolved_one_is_not_listed() {
     let previous = lock(vec![
@@ -65,6 +112,24 @@ fn every_drop_reason_is_reported_in_previous_order() {
         Some(
             "it pins different bytes or another snapshot build of com.example:a:1:jar than this \
              run resolved, and Maven has one local-repository path per coordinate"
+        )
+    );
+
+    // A build extension jar is one file too.
+    let jar = |digest: char| crate::lock::ExtensionJar {
+        gav: Gav::new("t", "ext", "1"),
+        classifier: None,
+        sha256: digest.to_string().repeat(64).parse().unwrap(),
+    };
+    let mut fresh_jar = fresh();
+    fresh_jar.platforms[0].modules[0].extensions = vec![jar('e')];
+    let mut other_jar = lock(vec![macos('7')]);
+    other_jar.platforms[0].modules[0].extensions = vec![jar('f')];
+    assert_eq!(
+        verdicts(&fresh_jar, &other_jar)[0].1.as_deref(),
+        Some(
+            "it pins different bytes or another snapshot build of t:ext:1 than this run \
+             resolved, and Maven has one local-repository path per coordinate"
         )
     );
 
@@ -191,8 +256,10 @@ fn another_companion_pom_build_drops_the_platform() {
     }
 }
 
-/// A row without a POM pin names the same `.pom` path as one with a pin,
-/// or as a support POM, so the two sides cannot both be kept.
+/// A kept row without a POM pin names the same `.pom` path as a fresh one
+/// with a pin, or as a support POM, so the two sides cannot both be kept:
+/// the repository that lacked it may serve it now. A fresh row without one
+/// takes the POM the kept platform read, as one resolution of both would.
 #[test]
 fn a_pom_pin_one_side_lacks_drops_the_platform() {
     let other_pom = "it pins a different POM for com.example:a:1 than this run resolved, and \
@@ -213,11 +280,19 @@ fn a_pom_pin_one_side_lacks_drops_the_platform() {
     set_support_pom(&mut fresh_support, "com.example:a:1", '7');
     for (fresh, previous) in [
         (pinned("linux-x86_64"), unpinned("macos-aarch64")),
-        (unpinned("linux-x86_64"), pinned("macos-aarch64")),
         (fresh_support, unpinned("macos-aarch64")),
     ] {
         assert_eq!(verdicts(&fresh, &previous)[0].1.as_deref(), Some(other_pom));
     }
+    let (mut fresh, previous) = (unpinned("linux-x86_64"), pinned("macos-aarch64"));
+    let kept = kept(&fresh, &previous);
+    assert_eq!(kept.len(), 1);
+    carry_forward(&mut fresh, &previous, &kept).unwrap();
+    let pins: Vec<_> = (fresh.platforms.iter())
+        .map(|platform| platform.artifacts[0].pom_sha256.clone())
+        .collect();
+    let read = &previous.platforms[0].artifacts[0].pom_sha256;
+    assert_eq!(pins, [read.clone(), read.clone()]);
 }
 
 /// Kept platforms bring their own support POMs and the repository ids, with
@@ -253,10 +328,14 @@ fn carry_forward_keeps_the_named_platforms_sorted_with_their_provenance() {
 
     let mut alone = fresh.clone();
     carry_forward(&mut alone, &previous, &[]).unwrap();
+    let kept = kept(&fresh, &previous);
     assert_eq!((alone.platforms.len(), alone.repo_ids.len()), (1, 1));
     assert!(alone.support_poms().is_empty());
 
-    carry_forward(&mut fresh, &previous, &[platform("linux-x86_64")]).unwrap();
+    let linux: Vec<_> = (kept.into_iter())
+        .filter(|kept| kept.platform() == &platform("linux-x86_64"))
+        .collect();
+    carry_forward(&mut fresh, &previous, &linux).unwrap();
     let names: Vec<String> = fresh
         .platforms
         .iter()
@@ -302,12 +381,8 @@ fn carry_forward_orders_jdk_targets_as_written() {
     };
     let previous = lock(vec![target("17")]);
     let mut fresh = lock(vec![target("21")]);
-    carry_forward(
-        &mut fresh,
-        &previous,
-        &[platform("linux-x86_64").with_jdk("17")],
-    )
-    .unwrap();
+    let kept = kept(&fresh, &previous);
+    carry_forward(&mut fresh, &previous, &kept).unwrap();
     let names: Vec<String> = (fresh.platforms.iter())
         .map(|entry| entry.platform.to_string())
         .collect();
@@ -323,5 +398,109 @@ fn a_support_pom_and_a_companion_pom_must_agree() {
     assert_eq!(
         agreeing.support_companion_conflict().as_deref(),
         Some("com.example:a:1")
+    );
+}
+
+/// Within one resolution, a row read from a repository that lacks the POM
+/// pins none and agrees with the support POM another repository served,
+/// which is the one file the local repository holds. Across runs a kept
+/// row agrees only where the previous lock pinned that support POM too, on
+/// its own platform or another: a platform whose row read no POM is dropped
+/// beside a new support POM, which a repository it reads may now serve. A
+/// fresh row without a POM agrees with a kept support POM.
+#[test]
+fn a_row_without_a_pom_agrees_with_its_own_support_pom() {
+    let unpinned = |platform: &str, support: bool| {
+        let mut entry = locked_platform(platform, vec![package("a", "1", '1')], '7');
+        entry.artifacts[0].pom_sha256 = None;
+        let mut lock = lock(vec![entry]);
+        if support {
+            set_support_pom(&mut lock, "com.example:a:1", '8');
+        }
+        lock
+    };
+    assert_eq!(
+        unpinned("linux-x86_64", true).support_companion_conflict(),
+        None
+    );
+    let other_pom = "it pins a different POM for com.example:a:1 than this run resolved, and \
+                     Maven has one local-repository path per coordinate";
+    let mut fresh_support = lock(vec![locked_platform("linux-x86_64", Vec::new(), '7')]);
+    set_support_pom(&mut fresh_support, "com.example:a:1", '8');
+    for (fresh, previous, verdict) in [
+        (
+            unpinned("linux-x86_64", true),
+            unpinned("macos-aarch64", true),
+            None,
+        ),
+        (fresh_support.clone(), unpinned("macos-aarch64", true), None),
+        (
+            fresh_support.clone(),
+            unpinned("macos-aarch64", false),
+            Some(other_pom),
+        ),
+        (
+            unpinned("linux-x86_64", false),
+            unpinned("macos-aarch64", true),
+            None,
+        ),
+    ] {
+        assert_eq!(verdicts(&fresh, &previous)[0].1.as_deref(), verdict);
+    }
+    let mut beside = unpinned("macos-aarch64", false);
+    let mut windows = locked_platform("windows-x86_64", Vec::new(), '7');
+    windows.support_poms = fresh_support.platforms[0].support_poms.clone();
+    beside.platforms.push(windows);
+    assert_eq!(
+        verdicts(&fresh_support, &beside),
+        [
+            ("macos-aarch64".to_string(), None),
+            ("windows-x86_64".to_string(), None)
+        ]
+    );
+}
+
+/// Codex's counterexamples: a kept row without a POM agrees with a fresh
+/// support POM only where the previous lock pinned it from the same
+/// repository, and never with a fresh row that pins it, since its own
+/// repository may serve the POM now.
+#[test]
+fn a_kept_row_without_a_pom_needs_the_same_support_pom_provenance() {
+    let sha = |c: char| -> Sha256 { c.to_string().repeat(64).parse().unwrap() };
+    let unpinned = |platform: &str| {
+        let mut entry = locked_platform(platform, vec![package("a", "1", '1')], '7');
+        entry.artifacts[0].pom_sha256 = None;
+        entry
+    };
+    let support = |platform: &str, url: &str| {
+        let mut entry = locked_platform(platform, Vec::new(), '7');
+        (entry.support_poms).insert(
+            "com.example:a:1".to_string(),
+            SupportPom::new(url, sha('8')),
+        );
+        entry
+    };
+    let previous = lock(vec![
+        unpinned("linux-x86_64"),
+        support("windows-x86_64", "https://b.example/"),
+    ]);
+    let same = lock(vec![support("windows-x86_64", "https://b.example/")]);
+    assert_eq!(
+        verdicts(&same, &previous)[0],
+        ("linux-x86_64".to_string(), None)
+    );
+    let moved = lock(vec![support("windows-x86_64", "https://a.example/")]);
+    assert!(verdicts(&moved, &previous)[0].1.is_some());
+    let mut own = unpinned("macos-aarch64");
+    (own.support_poms).insert(
+        "com.example:a:1".to_string(),
+        SupportPom::new("https://b.example/", sha('8')),
+    );
+    let mut fresh = locked_platform("linux-x86_64", vec![package("a", "1", '1')], '7');
+    fresh.artifacts[0].pom_sha256 = Some(sha('8'));
+    assert!(
+        verdicts(&lock(vec![fresh]), &lock(vec![own]))[0]
+            .1
+            .is_some()
     );
 }

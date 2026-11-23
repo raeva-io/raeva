@@ -15,7 +15,17 @@ fn is_bidi_control(c: char) -> bool {
     )
 }
 
+/// `text` with the value of each secret the configuration took hidden
+/// ([`super::secrets::redact_secrets`]), before escaping, truncation or wrapping
+/// can split or respell it, and then the characters `escape` picks escaped.
 fn escape_where(text: &str, escape: impl Fn(char) -> bool) -> Cow<'_, str> {
+    match super::secrets::redact_secrets(text) {
+        Cow::Borrowed(text) => escape_chars(text, escape),
+        Cow::Owned(text) => Cow::Owned(escape_chars(&text, escape).into_owned()),
+    }
+}
+
+fn escape_chars(text: &str, escape: impl Fn(char) -> bool) -> Cow<'_, str> {
     if !text.chars().any(&escape) {
         return Cow::Borrowed(text);
     }
@@ -50,7 +60,15 @@ pub(crate) fn inline_text(text: &str) -> Cow<'_, str> {
 /// U+001F itself, and outside strings JSON holds only ASCII, so every
 /// character replaced here sits inside a string and the document parses to
 /// the same value.
+///
+/// The value of each secret the configuration took is hidden first
+/// ([`super::secrets::redact_secrets_in_json`]).
 pub(crate) fn json_document(json: String) -> String {
+    let redacted = match super::secrets::redact_secrets_in_json(&json) {
+        Cow::Owned(redacted) => Some(redacted),
+        Cow::Borrowed(_) => None,
+    };
+    let json = redacted.unwrap_or(json);
     let escape = |c: char| ('\u{7F}'..='\u{9F}').contains(&c) || is_bidi_control(c);
     if !json.chars().any(escape) {
         return json;
@@ -69,6 +87,28 @@ pub(crate) fn json_document(json: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::{inline_text, json_document, terminal_text};
+
+    /// A secret is hidden before escaping or wrapping could respell or
+    /// split it: one with a control character, and one of words a table
+    /// would wrap.
+    #[test]
+    fn a_secret_is_hidden_before_it_is_escaped_or_wrapped() {
+        super::super::secrets::register_secret("zqCTL\rzq");
+        super::super::secrets::register_secret("zqwrap one two three four five six seven eight zq");
+        assert_eq!(terminal_text("a zqCTL\rzq b"), "a *** b");
+        assert_eq!(inline_text("a zqCTL\rzq b"), "a *** b");
+        let mut table = crate::output::Table::new(["store", "path"]);
+        table.add_row([
+            "home",
+            "/srv/zqwrap one two three four five six seven eight zq/store",
+        ]);
+        let rendered = table.render_to_width(30);
+        assert!(
+            !rendered.contains("zqwrap") && !rendered.contains("eight"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("***"), "{rendered}");
+    }
 
     #[test]
     fn terminal_text_keeps_layout_and_escapes_controls() {

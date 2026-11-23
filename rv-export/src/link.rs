@@ -13,7 +13,8 @@ use super::error::LinkError;
 #[strum(serialize_all = "lowercase")]
 pub enum LinkStrategy {
     /// A hard link to the store's file, which shares its inode and its
-    /// read-only mode. Falls back to a symbolic link, then a copy.
+    /// read-only mode. Falls back to a copy, never to a symbolic link,
+    /// which Maven 3.10 does not read from a local repository.
     Hardlink,
     /// A symbolic link to the store's file, relative where a relative path
     /// can be computed, otherwise to the store path as given. Falls back to
@@ -42,12 +43,12 @@ fn symlink(src: &Path, dest: &Path) -> io::Result<()> {
     return std::os::windows::fs::symlink_file(target, dest);
 }
 
-fn copy(src: &Path, dest: &Path) -> io::Result<()> {
+fn copy(src: &Path, dest: &Path) -> io::Result<fs::File> {
     // Bytes only: `fs::copy` also copies the store blob's read-only mode and
     // fails where a mode change is refused, such as on a CIFS or
     // root-squashed NFS mount. A new file is writable by its owner; the
     // exporter sets the mode and warns when it cannot.
-    let mut from = fs::File::open(src)?;
+    let mut from = crate::export::open_store_file(src)?;
     let mut to = fs::File::create(dest)?;
     io::copy(&mut from, &mut to)?;
     // Maven keys some freshness checks off the mtime. The data is not
@@ -59,16 +60,16 @@ fn copy(src: &Path, dest: &Path) -> io::Result<()> {
     {
         debug!(error = %err, dest = %dest.display(), "copy keeps its own modification time");
     }
-    Ok(())
+    Ok(from)
 }
 
 /// Puts `src` at `dest` with `strategy` or the next one down, and returns
-/// the strategy that worked.
+/// the strategy that worked and, for a copy, the file it read.
 pub(super) fn link_with_fallback(
     src: &Path,
     dest: &Path,
     strategy: LinkStrategy,
-) -> Result<LinkStrategy, LinkError> {
+) -> Result<(LinkStrategy, Option<fs::File>), LinkError> {
     let io_error = |strategy, source| LinkError::IoError {
         strategy,
         src: src.to_path_buf(),
@@ -87,23 +88,19 @@ pub(super) fn link_with_fallback(
         Ok(_) => {}
     }
     let order: &[LinkStrategy] = match strategy {
-        LinkStrategy::Hardlink => &[
-            LinkStrategy::Hardlink,
-            LinkStrategy::Symlink,
-            LinkStrategy::Copy,
-        ],
+        LinkStrategy::Hardlink => &[LinkStrategy::Hardlink, LinkStrategy::Copy],
         LinkStrategy::Symlink => &[LinkStrategy::Symlink, LinkStrategy::Copy],
         LinkStrategy::Copy => &[LinkStrategy::Copy],
     };
     let mut last_error = None;
     for &attempt in order {
         let result = match attempt {
-            LinkStrategy::Hardlink => fs::hard_link(src, dest),
-            LinkStrategy::Symlink => symlink(src, dest),
-            LinkStrategy::Copy => copy(src, dest),
+            LinkStrategy::Hardlink => fs::hard_link(src, dest).map(|()| None),
+            LinkStrategy::Symlink => symlink(src, dest).map(|()| None),
+            LinkStrategy::Copy => copy(src, dest).map(Some),
         };
         match result {
-            Ok(()) => return Ok(attempt),
+            Ok(read) => return Ok((attempt, read)),
             Err(err) => {
                 debug!(strategy = %attempt, error = %err, "link attempt failed");
                 last_error = Some(io_error(attempt, err));
@@ -163,7 +160,10 @@ mod tests {
             } else {
                 strategy
             };
-            assert_eq!(link_with_fallback(&src, &dest, strategy).unwrap(), expected);
+            assert_eq!(
+                link_with_fallback(&src, &dest, strategy).unwrap().0,
+                expected
+            );
             assert_eq!(fs::read(&dest).unwrap(), b"content");
         }
         // A copy of a read-only blob is writable and carries its
@@ -199,9 +199,38 @@ mod tests {
         std::os::unix::fs::symlink(&real, dir.path().join("m2")).unwrap();
         let dest = dir.path().join("m2/blob");
         assert_eq!(
-            link_with_fallback(&src, &dest, LinkStrategy::Symlink).unwrap(),
+            link_with_fallback(&src, &dest, LinkStrategy::Symlink)
+                .unwrap()
+                .0,
             LinkStrategy::Symlink
         );
+        assert_eq!(fs::read(&dest).unwrap(), b"content");
+    }
+
+    /// Maven 3.10 rejects a symbolic link in its local repository, so a hard
+    /// link that cannot be made, as across file systems, is a copy.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_across_file_systems_is_a_copy() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempdir().expect("tempdir");
+        let device = |path: &std::path::Path| fs::metadata(path).unwrap().dev();
+        let Some(other) = (tempfile::tempdir_in("/dev/shm").ok())
+            .filter(|other| device(other.path()) != device(dir.path()))
+        else {
+            eprintln!("skipped: no second file system at /dev/shm");
+            return;
+        };
+        let src = dir.path().join("blob");
+        fs::write(&src, b"content").unwrap();
+        let dest = other.path().join("blob");
+        assert_eq!(
+            link_with_fallback(&src, &dest, LinkStrategy::Hardlink)
+                .unwrap()
+                .0,
+            LinkStrategy::Copy
+        );
+        assert!(fs::symlink_metadata(&dest).unwrap().is_file());
         assert_eq!(fs::read(&dest).unwrap(), b"content");
     }
 }

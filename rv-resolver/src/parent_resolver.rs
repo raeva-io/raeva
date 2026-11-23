@@ -72,6 +72,27 @@ impl LocalParents {
         }
     }
 
+    /// Check the file at `parent`'s `<relativePath>` as Maven reads it,
+    /// strictly, before it compares its coordinates with the parent's. The
+    /// error comes with the file's path, and names it too when `named`.
+    pub(crate) fn check_strictly(
+        &self,
+        parent: &Parent,
+        named: bool,
+    ) -> Result<(), (String, PomError)> {
+        let Some((base_dir, boundary)) = &self.within else {
+            return Ok(());
+        };
+        let Some((bytes, path)) = local_parent_path(base_dir, boundary, parent)
+            .and_then(|path| Some((rv_config::read_project_input(&path).ok()?, path)))
+        else {
+            return Ok(());
+        };
+        let path = rv_fs::plain_path(&path).display().to_string();
+        rv_maven_model::check_project_pom(&bytes, named.then_some(path.as_str()))
+            .map_err(|error| (path, error))
+    }
+
     pub(crate) fn load(&self, parent: &Parent) -> Option<Pom> {
         let (base_dir, boundary) = self.within.as_ref()?;
         let Some(cache) = self.cache.as_deref() else {
@@ -98,6 +119,8 @@ impl ModelSource for LocalParents {
         parent: &mut Parent,
         _lookup: ParentLookup,
     ) -> Result<Option<Pom>, PomError> {
+        self.check_strictly(parent, true)
+            .map_err(|(_, error)| error)?;
         if let Some(mut pom) = self.load(parent) {
             pom.mark_root_repositories();
             return Ok(Some(pom));
@@ -124,8 +147,11 @@ fn read_and_validate_pom(
     parsed: Option<&ParsedPomCache>,
 ) -> Option<Pom> {
     let pom = match parsed {
-        Some(parsed) => parsed.parse(&rv_maven_types::BlobId::from_bytes(contents), contents),
-        None => rv_maven_model::decode_pom(contents).and_then(|xml| Pom::parse(&xml).map(Arc::new)),
+        Some(parsed) => {
+            parsed.parse_project(&rv_maven_types::BlobId::from_bytes(contents), contents)
+        }
+        None => rv_maven_model::decode_pom(contents)
+            .and_then(|xml| Pom::parse_with_plugins(&xml).map(Arc::new)),
     };
     let mut pom = match pom {
         Ok(pom) => Arc::unwrap_or_clone(pom),
@@ -159,7 +185,7 @@ fn read_and_validate_pom(
 /// Make `pom`'s `<relativePath>` absolute, against `path`, where `pom` was
 /// read from, so its parent is looked up from there whoever reads it.
 pub(crate) fn anchor_parent_path(pom: &mut Pom, path: &Path) {
-    if let Some(parent_ref) = &mut pom.parent {
+    if let Some(parent_ref) = &pom.parent {
         let relative = relative_path_text(parent_ref);
         if !relative.is_empty()
             && let Some(parent_dir) = path.parent()
@@ -171,7 +197,7 @@ pub(crate) fn anchor_parent_path(pom: &mut Pom, path: &Path) {
             if cfg!(windows) && resolved.is_dir() {
                 resolved = rv_fs::join_pom_entry_pom_xml(parent_dir, relative);
             }
-            parent_ref.relative_path = Some(resolved.to_string_lossy().to_string());
+            pom.anchor_relative_path(resolved.to_string_lossy().to_string());
         }
     }
 }
@@ -209,28 +235,7 @@ fn accept_local_parent(
     parsed: Option<&ParsedPomCache>,
 ) -> Option<LocalParentHop> {
     let relative = relative_path_text(parent);
-    if relative.is_empty() {
-        return None;
-    }
-    let mut path = rv_fs::join_pom_entry(base_dir, relative);
-
-    // Reject `<relativePath>` values that escape the project tree (e.g.
-    // `<relativePath>../../../../etc/passwd</relativePath>`); fall through
-    // to remote resolution.
-    if !path_within_root(&path, boundary) {
-        tracing::debug!(
-            relative_path = %rv_maven_types::bounded(relative),
-            "relativePath escapes project root; falling back to remote resolution"
-        );
-        return None;
-    }
-
-    if let Ok(metadata) = std::fs::metadata(&path)
-        && metadata.is_dir()
-    {
-        path = directory_pom(base_dir, boundary, relative)?;
-    }
-
+    let mut path = local_parent_path(base_dir, boundary, parent)?;
     let mut pom = match rv_config::read_project_input(&path) {
         Ok(contents) => read_and_validate_pom(&path, &contents, parent, false, parsed)?,
         Err(e) if io_error_kind(&e) == Some(std::io::ErrorKind::IsADirectory) => {
@@ -253,6 +258,32 @@ fn accept_local_parent(
     };
     pom.set_provenance(Provenance::LocalParent { path: path.clone() });
     Some(LocalParentHop { path, pom })
+}
+
+/// The file `parent`'s `<relativePath>` names from `base_dir`, `pom.xml`
+/// in it when it names a directory, unless it is empty or escapes
+/// `boundary`.
+fn local_parent_path(base_dir: &Path, boundary: &Path, parent: &Parent) -> Option<PathBuf> {
+    let relative = relative_path_text(parent);
+    if relative.is_empty() {
+        return None;
+    }
+    let path = rv_fs::join_pom_entry(base_dir, relative);
+
+    // Reject `<relativePath>` values that escape the project tree (e.g.
+    // `<relativePath>../../../../etc/passwd</relativePath>`); fall through
+    // to remote resolution.
+    if !path_within_root(&path, boundary) {
+        tracing::debug!(
+            relative_path = %rv_maven_types::bounded(relative),
+            "relativePath escapes project root; falling back to remote resolution"
+        );
+        return None;
+    }
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => directory_pom(base_dir, boundary, relative),
+        _ => Some(path),
+    }
 }
 
 /// The `pom.xml` read when `relative` names a directory. It can be a symlink
@@ -398,15 +429,18 @@ pub(crate) fn build_activation_context(
     // `--platforms macos-aarch64` pass on Linux activates the macOS ones.
     let environment = match target_platform {
         Some(target) => config.model_environment(target.os(), target.arch(), target.jdk()),
-        None => config.host().host_environment(),
+        None => (config.host().host_environment()).with_maven_mode(config.lock.maven.mode),
     };
     let settings_properties = config.settings_profile_properties_for(&environment);
+    let settings_repositories = config.settings_model_repositories_for(&environment);
     let mut ctx = ActivationContext::new(environment);
+    ctx.settings_repositories = settings_repositories;
     ctx.base_dir = base_dir;
     ctx.active_profiles = config.active_profiles().to_vec();
     ctx.inactive_profiles = config.inactive_profiles.clone();
     ctx.settings_properties = settings_properties;
     ctx.settings_property_names = config.defined_settings_properties();
+    ctx.configured_central = config.configures_central();
     ctx
 }
 
@@ -492,6 +526,7 @@ mod tests {
     ) -> Result<EffectiveDescriptor, PomError> {
         const DISCOVERY: rv_maven_model::ModelPolicy = rv_maven_model::ModelPolicy {
             root: true,
+            plugins: rv_maven_model::PluginModel::Off,
             missing_parent: rv_maven_model::MissingParent::InheritDeclaredCoordinates,
         };
         let local = LocalParents::new(

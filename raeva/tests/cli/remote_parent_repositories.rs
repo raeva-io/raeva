@@ -390,8 +390,9 @@ fn a_fresh_clone_keeps_a_lock_from_a_remote_parents_repository() {
 /// same bytes, still restores into a fresh home: Maven searches the
 /// parent's repositories too. So does one whose first repository now
 /// serves other bytes for the jar alone, through the resolution that finds
-/// its POM in the parent's repository, but a restore of the lock alone stops
-/// at those bytes.
+/// its POM in the parent's repository, as `lock verify --download` makes
+/// it too, but a restore of the lock alone, as `--module` narrows verify to
+/// one, stops at those bytes.
 #[test]
 fn a_release_moved_to_a_remote_parents_repository_restores() {
     for (own, replaced) in [(false, false), (true, false), (false, true)] {
@@ -454,6 +455,7 @@ fn check_release_moved_to_the_parents_repository(own: bool, replaced: bool) {
         &["sync"][..],
         &["sync", "--frozen"],
         &["lock", "verify", "--download"],
+        &["lock", "verify", "--download", "--module", "pom.xml"],
     ] {
         let output = raeva_command(project.path(), tempfile::tempdir().expect("home").path())
             .env("RAEVA_RETRIES", "0")
@@ -461,7 +463,7 @@ fn check_release_moved_to_the_parents_repository(own: bool, replaced: bool) {
             .output()
             .expect("run raeva");
         let context = format!("own={own} replaced={replaced} {args:?}");
-        if replaced && args[0] == "lock" {
+        if replaced && args.contains(&"--module") {
             assert_eq!(output.status.code(), Some(7), "{context}");
             assert!(
                 String::from_utf8_lossy(&output.stderr)

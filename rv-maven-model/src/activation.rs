@@ -1,13 +1,15 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rv_maven_types::bounded;
+use rv_maven_types::{MavenMode, bounded};
 
+use crate::environment::LauncherSet;
 use crate::{HostInput, ModelEnvironment, PomError};
 
 mod java_regex;
+mod jvm_names;
 
 use java_regex::{MAX_REGEX_LENGTH, full_regex_match};
 
@@ -34,6 +36,27 @@ pub enum PropertySource {
     Import,
     /// Dependency models receive them as system properties, without settings profiles.
     System,
+}
+
+/// The property that turns off Maven 3.10's restricted interpolation of the
+/// models it reads from a repository.
+const FULL_EXTERNAL_INTERPOLATION: &str = "maven.model.dependencyInterpolation.full";
+
+/// Whether Maven 3.10 reads `name` from the user and system properties when
+/// it interpolates a model it reads from a repository.
+pub(crate) fn is_safe_external_property(name: &str) -> bool {
+    name.starts_with("java.")
+        || name.starts_with("os.")
+        || name.starts_with("maven.")
+        || matches!(
+            name,
+            "file.separator"
+                | "path.separator"
+                | "line.separator"
+                | "revision"
+                | "changelist"
+                | "sha1"
+        )
 }
 
 /// What profile activation and model interpolation read from outside the
@@ -80,10 +103,429 @@ pub struct ActivationContext {
     /// the profile activation user properties and injected into the
     /// project's model after its POM profiles.
     pub settings_properties: crate::PropertyMap,
+    /// The repositories of each active `settings.xml` profile whose URL
+    /// still holds a `${...}` once the file is interpolated, root-declared
+    /// and in activation order. Maven injects them into the project's own
+    /// model after its POM profiles, so the model's properties fill them
+    /// in and its parent lookup reads them as written.
+    pub settings_repositories: Vec<Vec<crate::Repository>>,
     /// Every property name defined by any profile in `settings.xml`, active
     /// or not, so project-lineage builds record [`HostInput::SettingsProperty`]
     /// when a resolution-relevant expression or profile condition reads one.
     pub settings_property_names: BTreeSet<String>,
+    /// Whether `settings.xml`, `config.toml` or `raeva.toml` names a
+    /// repository `central`, which Maven 3.10 keeps over the super POM's.
+    pub configured_central: bool,
+    /// The `env.*` entries of the `<properties>` of a model Maven 3.10
+    /// reads from a repository, which a `<property>` condition sees when
+    /// the variable is unset.
+    pub(crate) repository_env: HashMap<String, String>,
+    /// The names of [`Self::system_properties`] a `-D` set, which are the
+    /// build's own even where a `.mvn/jvm.config` value is the same.
+    pub(crate) system_defines: BTreeSet<String>,
+}
+
+/// The system properties [`ActivationContext::system_property`] answers
+/// from the platform, the JDK and the Maven line.
+const SYSTEM_PROPERTY_NAMES: [&str; 11] = [
+    "file.separator",
+    "java.home",
+    "java.specification.version",
+    "java.version",
+    "line.separator",
+    "maven.build.version",
+    "maven.version",
+    "org.jline.terminal.exec.redirectPipeCreationMode",
+    "os.arch",
+    "os.name",
+    "path.separator",
+];
+
+/// The constant value Maven 3.10.0's `bin/mvn` and `mvn.cmd` pass as
+/// `-Dorg.jline.terminal.exec.redirectPipeCreationMode`.
+const JLINE_REDIRECT_MODE: &str = "native,reflection";
+
+/// What Maven's JVM holds for a system property that the JVM, `mvn` or
+/// `MavenCli` sets on every run: the value raeva knows on the platform,
+/// JDK and Maven line of an environment, or [`Self::Unread`] for one raeva
+/// does not read from the host, such as `java.vendor` or `user.name`.
+/// Profile activation, settings.xml interpolation and `-D`/`-P` expansion
+/// all read this one model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostProperty {
+    /// The value Maven sees, from inputs raeva.lock records.
+    Answered(String),
+    /// A value raeva cannot know.
+    Unread,
+}
+
+/// [`HostProperty`] for `name` in `environment`, `None` when neither the
+/// JVM nor this Maven line's launcher sets it, so Maven leaves `${name}` as
+/// written. Nothing is recorded as read: a reader records the value it
+/// takes, or what it tested.
+///
+/// A `.mvn/jvm.config` value comes first. `java.home` is the host JDK's,
+/// and unread under a `[lock] jdks` entry unless the lock lists the host's
+/// JDK alone: raeva does not know another JDK's home.
+pub fn host_property(environment: &ModelEnvironment, name: &str) -> Option<HostProperty> {
+    let mode = environment.maven_mode();
+    // What `mvn` sets in its JVM's environment itself.
+    if let Some(variable) = name.strip_prefix("env.") {
+        return match environment.launcher_set(variable)? {
+            LauncherSet::Value(value) => Some(HostProperty::Answered(value.to_string())),
+            LauncherSet::Unknown => Some(HostProperty::Unread),
+            LauncherSet::Unset => None,
+        };
+    }
+    if environment.unread_system_property(name) {
+        return Some(HostProperty::Unread);
+    }
+    // A `.mvn/jvm.config` value of a JVM-owned name, which some JDKs keep
+    // their own value of (Temurin's `java.vendor.version`, 17's
+    // `java.specification.maintenance.version`), is not one every JDK the
+    // lock covers lets stand.
+    if environment.system_properties().contains_key(name) && jvm_owned(name) {
+        return Some(HostProperty::Unread);
+    }
+    match jvm_names::class(name, mode)? {
+        jvm_names::Class::Fixed(value) => return Some(HostProperty::Answered(value.to_string())),
+        jvm_names::Class::PerHost | jvm_names::Class::Uneven => return Some(HostProperty::Unread),
+        jvm_names::Class::Locked | jvm_names::Class::Unseen => {}
+    }
+    let windows = environment.platform().map(|(os, _)| os == "windows");
+    let known = |value: Option<&str>| {
+        value.map_or(HostProperty::Unread, |value| {
+            HostProperty::Answered(value.to_string())
+        })
+    };
+    Some(match name {
+        // Windows 10, 11 and Server JVMs each report their own.
+        "os.name" if windows == Some(true) && environment.windows_os_name().is_none() => {
+            HostProperty::Unread
+        }
+        "os.name" => known(environment.os_name()),
+        "os.arch" => known(environment.os_arch()),
+        "file.separator" => known(windows.map(|windows| if windows { "\\" } else { "/" })),
+        "path.separator" => known(windows.map(|windows| if windows { ";" } else { ":" })),
+        "line.separator" => known(windows.map(|windows| if windows { "\r\n" } else { "\n" })),
+        // A `[lock] jdks` entry is a feature version, whose patch releases
+        // each report their own.
+        "java.version" if environment.target_jdk().is_some() => HostProperty::Unread,
+        "java.version" => known(Some(environment.host_java_version())),
+        "java.specification.version" => known(Some(java_specification_version(
+            environment.host_java_version(),
+        ))),
+        "java.home" => known(environment.host_java_home()),
+        "maven.version" => known(Some(mode.version())),
+        "maven.build.version" => known(Some(mode.build_version())),
+        "org.jline.terminal.exec.redirectPipeCreationMode" => known(Some(JLINE_REDIRECT_MODE)),
+        "maven.multiModuleProjectDirectory" => known(environment.launcher_root()),
+        _ => HostProperty::Unread,
+    })
+}
+
+/// How a refusal over the unread host property `name` tells the user to
+/// fix it. `user.home` differs from host to host even where `MAVEN_OPTS`
+/// or another JVM option sets it, so only a `-D` both raeva and Maven take
+/// gives every host one. Under `[lock] jdks` naming another JDK than the
+/// host's, no allowlist gives its home.
+pub fn unread_property_fix(name: &str, environment: &ModelEnvironment) -> String {
+    let other_jdk = environment.target_jdk().is_some() && environment.host_java_home().is_none();
+    match name {
+        "user.home" => "give every host one Maven user home with -Duser.home=<dir> on the \
+                        command line of both raeva and mvn; one in MAVEN_OPTS or another JVM \
+                        option is each host's own"
+            .to_string(),
+        "java.home" | "env.JAVA_HOME" if other_jdk => {
+            "raeva knows the home only of the JDK mvn runs on \
+                                          this host, so list that JDK alone in [lock] jdks, \
+                                          or none"
+                .to_string()
+        }
+        _ => match name.strip_prefix("env.") {
+            Some(var) if environment.launcher_set(var).is_some() => {
+                format!("mvn sets {var} itself, to a value raeva cannot know; do not read it")
+            }
+            Some(var) => crate::environment::allow_env_fix(var),
+            None => format!("set it with -D{name}=<value>"),
+        },
+    }
+}
+
+/// The answered system properties whose value differs by locked platform or
+/// JDK; the others raeva answers are the same on every one.
+pub const PLATFORM_PROPERTIES: [&str; 8] = [
+    "file.separator",
+    "java.home",
+    "java.specification.version",
+    "java.version",
+    "line.separator",
+    "os.arch",
+    "os.name",
+    "path.separator",
+];
+
+/// The values of every [`HostProperty::Answered`] name in `environment`.
+pub fn answered_host_properties(environment: &ModelEnvironment) -> Vec<(&'static str, String)> {
+    jvm_names::names()
+        .filter_map(|name| match host_property(environment, name)? {
+            HostProperty::Answered(value) => Some((name, value)),
+            HostProperty::Unread => None,
+        })
+        .collect()
+}
+
+/// The first `${...}` of `text` that names a [`HostProperty::Unread`]
+/// property in `environment`, or a variable set outside the `${env.*}`
+/// allowlist: text Maven expands where raeva cannot.
+pub fn unread_host_reference(text: &str, environment: &ModelEnvironment) -> Option<String> {
+    (crate::properties::expression_names(text).into_iter())
+        .find(|read| {
+            host_property(environment, read) == Some(HostProperty::Unread)
+                || (read.strip_prefix("env.")).is_some_and(|var| environment.hides_env(var))
+        })
+        .map(str::to_string)
+}
+
+/// Whether `name` is a system property a JVM or `mvn` sets where a model
+/// sees it, on some JDK, OS or Maven line Maven was measured on
+/// (`activation/jvm_names.tsv`). Of these, raeva answers only what the
+/// lock's inputs fix on every host it covers ([`host_property`]); any
+/// other name is unset unless the POM, the user or `.mvn/` sets it.
+pub fn jvm_owned(name: &str) -> bool {
+    jvm_names::measured_name(name)
+}
+
+/// The text every `java.version` a JDK of the `[lock] jdks` entry `entry`
+/// reports starts with, followed by nothing or by `.`, `_` or `-`: `1.8.0`
+/// for `1.8`, whose updates all report `1.8.0_N`, else the entry.
+fn covered_root(entry: &str) -> &str {
+    match entry.trim() {
+        "1.8" => "1.8.0",
+        entry => entry,
+    }
+}
+
+/// Whether `version` is one a JDK of the `[lock] jdks` entry `entry` can
+/// report.
+fn covered_version(entry: &str, version: &str) -> bool {
+    (version.strip_prefix(covered_root(entry)))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '_', '-']))
+}
+
+/// The `java.version` profile activation tests on a JDK `environment`
+/// fixes by a `[lock] jdks` entry: one that entry covers, as a test every
+/// JDK it covers answers alike gives its answer on all of them.
+fn tested_java_version<'a>(version: &'a str, environment: &ModelEnvironment) -> &'a str {
+    match environment.target_jdk() {
+        Some(_) => covered_root(version),
+        None => version,
+    }
+}
+
+/// Whether every JDK the `[lock] jdks` entry `entry` covers reports the
+/// `java.version` `value`: `None` when some do and others do not.
+fn equal_on_every_patch(entry: &str, value: &str) -> Option<bool> {
+    (!covered_version(entry, value)).then_some(false)
+}
+
+/// The answer `JdkVersionProfileActivator` gives the `<jdk>` `spec` on
+/// every JDK the `[lock] jdks` entry `entry` covers, `None` when they
+/// differ or Maven fails on one.
+///
+/// A prefix test holds on all of them when it is a prefix of the entry's
+/// [`covered_root`], on some when it continues the root past a separator,
+/// and on none otherwise. A range compares the first three numbers of
+/// `java.version`, split at `.`, `_` and `-`, with each bound's: the entry
+/// fixes the numbers it names and the others take any value, so the
+/// answer changes only where a free number crosses a number some bound
+/// names. Testing each such number, the ones beside it, 0 and
+/// `i32::MAX` covers every case.
+fn jdk_on_every_patch(entry: &str, spec: &str) -> Option<bool> {
+    let root = covered_root(entry);
+    let prefix = |prefix: &str| {
+        if root.starts_with(prefix) {
+            Some(true)
+        } else if (prefix.strip_prefix(root)).is_some_and(|rest| rest.starts_with(['.', '_', '-']))
+        {
+            None
+        } else {
+            Some(false)
+        }
+    };
+    if let Some(negated) = spec.strip_prefix('!') {
+        return prefix(negated).map(|holds| !holds);
+    }
+    if !(spec.starts_with('[') || spec.starts_with('(')) {
+        return prefix(spec);
+    }
+    let fixed: Vec<i32> = (root.split('.'))
+        .map(|part| {
+            part.parse()
+                .ok()
+                .filter(|_| part.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect::<Option<_>>()?;
+    let mut values: BTreeSet<i32> = BTreeSet::from([0, i32::MAX]);
+    for part in spec.split(|c: char| !(c.is_ascii_digit() || c == '-' || c == '+')) {
+        if let Ok(number) = part.parse::<i32>() {
+            values.extend([number.saturating_sub(1), number, number.saturating_add(1)]);
+        }
+    }
+    values.retain(|value| *value >= 0);
+    let mut versions = vec![fixed.clone()];
+    for _ in fixed.len()..3 {
+        versions = (versions.into_iter())
+            .flat_map(|version| {
+                values.iter().map(move |value| {
+                    let mut version = version.clone();
+                    version.push(*value);
+                    version
+                })
+            })
+            .collect();
+    }
+    let mut answers = versions.iter().map(|version| {
+        let text: Vec<String> = version.iter().map(i32::to_string).collect();
+        jdk_in_range(spec, &text.join("."))
+    });
+    let first = answers.next()??;
+    answers.all(|answer| answer == Some(first)).then_some(first)
+}
+
+/// `text` with each `${...}` that names a [`HostProperty::Answered`]
+/// property of `environment` replaced by its value, as Maven's settings
+/// builder and `MavenCli` expand it. Other references stay as written.
+pub fn expand_host_properties(text: &str, environment: &ModelEnvironment) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        let key = rv_maven_types::expression_key(&after[..end]);
+        if matches!(key, "java.version" | "java.specification.version") {
+            environment.record_java_lookup();
+        }
+        let value = match host_property(environment, key) {
+            Some(HostProperty::Answered(value)) => Some(value),
+            _ => None,
+        };
+        output.push_str(&rest[..start]);
+        match value {
+            Some(value) => output.push_str(&value),
+            None => output.push_str(&rest[start..start + 3 + end]),
+        }
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Whether a `.mvn/jvm.config` `-D` of `name` changes nothing in Maven:
+/// JDK 17, 21 and 27 keep their own value of these, the `mvn` launcher of
+/// `mode` passes its own after the file, and `MavenCli.populateProperties`
+/// sets `maven.version` and `maven.build.version` over any.
+pub fn fixed_over_jvm_config(name: &str, mode: MavenMode) -> bool {
+    let launcher = match mode {
+        MavenMode::Maven39 => &["library.jansi.path"][..],
+        MavenMode::Maven310 => &[
+            "library.jline.path",
+            "org.jline.terminal.exec.redirectPipeCreationMode",
+        ][..],
+    };
+    launcher.contains(&name)
+        || matches!(
+            name,
+            "java.version"
+                | "java.version.date"
+                | "java.vendor"
+                | "java.vendor.url"
+                | "java.vendor.url.bug"
+                | "java.class.version"
+                | "java.class.path"
+                | "java.vm.version"
+                | "java.vm.name"
+                | "java.vm.vendor"
+                | "java.vm.info"
+                | "java.vm.compressedOopsMode"
+                | "java.vm.specification.version"
+                | "java.vm.specification.name"
+                | "java.vm.specification.vendor"
+                | "java.specification.version"
+                | "java.specification.maintenance.version"
+                | "java.specification.name"
+                | "java.specification.vendor"
+                | "java.runtime.version"
+                | "java.runtime.name"
+                | "jdk.debug"
+                | "native.encoding"
+                | "sun.jnu.encoding"
+                | "sun.java.launcher"
+                | "sun.java.command"
+                | "sun.boot.library.path"
+                | "sun.management.compiler"
+                | "classworlds.conf"
+                | "maven.home"
+                | "maven.multiModuleProjectDirectory"
+                | "maven.version"
+                | "maven.build.version"
+        )
+}
+
+/// The names [`fixed_over_jvm_config`] drops that some JDKs take a
+/// `.mvn/jvm.config` `-D` of, with the first feature release that keeps
+/// its own: JDK 8 takes each `-D`, JDK 11 those kept from 17, and 11, 17,
+/// 21, 26 and 27 keep the rest. The others some JDKs take, such as
+/// `java.version.date`, are unset on those JDKs, so any read of them
+/// refuses already.
+const KEPT_FROM: [(&str, u32); 8] = [
+    ("java.class.version", 17),
+    ("java.specification.name", 17),
+    ("java.specification.vendor", 17),
+    ("java.specification.version", 17),
+    ("java.vendor", 11),
+    ("java.vendor.url", 11),
+    ("java.vendor.url.bug", 11),
+    ("sun.jnu.encoding", 11),
+];
+
+/// Why the value `value` of `name` that the JVM option channel `channel`
+/// gives gives a lock raeva cannot make, `None` when it can: every JDK of
+/// `jdks`, the `[lock] jdks`
+/// entries, keeps its own value, or `name` is one raeva never answers and
+/// `value` is not empty, so only a presence test reads it, which holds on
+/// every JDK. Without `jdks` the JDK that runs `mvn` is not one the lock
+/// records.
+pub fn jvm_config_by_jdk(
+    name: &str,
+    value: &str,
+    jdks: &[String],
+    channel: &str,
+) -> Option<String> {
+    let &(_, kept_from) = KEPT_FROM.iter().find(|(known, _)| *known == name)?;
+    // Measured on 8, 11, 17 and later only.
+    let keeps = |entry: &String| {
+        let entry = entry.trim();
+        let feature = entry.strip_prefix("1.").unwrap_or(entry);
+        let digits = feature.find(|c: char| !c.is_ascii_digit());
+        let feature: Option<u32> = feature[..digits.unwrap_or(feature.len())].parse().ok();
+        feature.is_some_and(|feature| feature >= kept_from && (feature == 11 || feature >= 17))
+    };
+    let answered = name.starts_with("java.specification.");
+    if (!jdks.is_empty() && jdks.iter().all(keeps)) || (!answered && !value.is_empty()) {
+        return None;
+    }
+    let takers = match kept_from {
+        17 => "JDK 8 and 11 take",
+        _ => "JDK 8 takes",
+    };
+    Some(format!(
+        "{channel} sets -D{name}, which {takers} from it and JDK {kept_from} and newer \
+         ignore, so the value Maven sees depends on the JDK that runs mvn; list JDKs \
+         {kept_from} or newer alone in [lock] jdks, or remove -D{name} from {channel}"
+    ))
 }
 
 impl ActivationContext {
@@ -98,9 +540,15 @@ impl ActivationContext {
             PropertySource::User | PropertySource::Import => self.properties = properties,
             PropertySource::System => {
                 self.system_properties = self.environment.system_properties().clone();
-                self.system_properties.extend(properties);
+                self.define_system_properties(properties);
             }
         }
+    }
+
+    /// Set `properties`, `-D` values, as system properties.
+    pub fn define_system_properties(&mut self, properties: HashMap<String, String>) {
+        self.system_defines.extend(properties.keys().cloned());
+        self.system_properties.extend(properties);
     }
 
     /// A context with no user properties, profile selections or base
@@ -110,6 +558,66 @@ impl ActivationContext {
             system_properties: environment.system_properties().clone(),
             environment,
             ..Self::default()
+        }
+    }
+
+    /// Maven 3.10's `${project.rootDirectory}` for the project in
+    /// [`Self::base_dir`], in the 3.10 mode only.
+    pub(crate) fn root_directory(&self) -> Option<PathBuf> {
+        let base = self.base_dir.as_deref()?;
+        let fallback = (self.environment.launcher_root().map(Path::new))
+            .or(self.environment.reactor_root())
+            .unwrap_or(base);
+        (self.environment.maven_mode() == MavenMode::Maven310)
+            .then(|| root_directory(base, fallback))
+    }
+
+    /// Whether `name` is a directory of the project that a `<file>` path
+    /// reads ahead of the properties: `${basedir}`, `${project.basedir}`
+    /// and, in the 3.10 mode, `${project.rootDirectory}`.
+    pub(crate) fn is_file_directory(&self, name: &str) -> bool {
+        match name {
+            "basedir" | "project.basedir" => self.base_dir.is_some(),
+            "project.rootDirectory" => {
+                self.base_dir.is_some() && self.environment.maven_mode() == MavenMode::Maven310
+            }
+            _ => false,
+        }
+    }
+
+    /// The values of `${basedir}`, `${project.basedir}` and, in the 3.10
+    /// mode, `${project.rootDirectory}`.
+    pub fn file_directories(&self) -> Vec<(&'static str, String)> {
+        let mut directories = Vec::new();
+        if let Some(base) = &self.base_dir {
+            let base = base.to_string_lossy().into_owned();
+            directories.push(("basedir", base.clone()));
+            directories.push(("project.basedir", base));
+        }
+        if let Some(root) = self.root_directory() {
+            directories.push(("project.rootDirectory", root.to_string_lossy().into_owned()));
+        }
+        directories
+    }
+
+    /// Sets `maven.multiModuleProjectDirectory` in the properties of a
+    /// `<file>` path to the launcher's directory, and `java.home` and
+    /// `env.JAVA_HOME` to the host JDK's, each unless a `-D`, settings.xml
+    /// or POM value set it.
+    /// They go in as the project directories do, so the lock keeps what the
+    /// path tested and not the directory.
+    pub fn insert_launcher_root(&self, map: &mut crate::PropertyMap) {
+        for (name, directory) in [
+            (
+                "maven.multiModuleProjectDirectory",
+                self.environment.launcher_root(),
+            ),
+            ("java.home", self.environment.host_java_home()),
+            ("env.JAVA_HOME", self.environment.host_java_home_env()),
+        ] {
+            if let (None, Some(directory)) = (map.get(name), directory) {
+                map.insert(name, directory);
+            }
         }
     }
 
@@ -152,19 +660,50 @@ impl ActivationContext {
     /// Properties for ordinary model interpolation, with external user properties first.
     pub fn model_properties(&self, public: &crate::PropertyMap) -> crate::PropertyMap {
         let mut properties = public.clone();
-        for (name, value) in self.settings_properties.iter() {
-            properties.insert_external(name, value);
-        }
-        for (name, value) in &self.properties {
+        for (name, value) in self.model_user_properties() {
             properties.insert_external(name, value);
         }
         properties.set_input_context(self);
         properties
     }
 
+    /// Whether Maven 3.10 interpolates this model as one it reads from a
+    /// repository: a dependency's, a parent of one, or an imported BOM,
+    /// unless `maven.model.dependencyInterpolation.full` is `true`.
+    pub(crate) fn restricts_interpolation(&self) -> bool {
+        let full = |properties: &HashMap<String, String>| {
+            (properties.get(FULL_EXTERNAL_INTERPOLATION))
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        };
+        self.repository_model() && !full(&self.properties) && !full(&self.system_properties)
+    }
+
+    /// Whether Maven 3.10 reads this model from a repository, so activates
+    /// its profiles apart and never its `<file>` profiles.
+    pub(crate) fn repository_model(&self) -> bool {
+        self.environment.maven_mode() == MavenMode::Maven310
+            && self.property_source != PropertySource::User
+    }
+
+    /// The active settings.xml profile properties, then the user
+    /// properties, that model interpolation reads ahead of the model's own:
+    /// in a [`Self::restricts_interpolation`] model only those Maven 3.10
+    /// reads there.
+    pub(crate) fn model_user_properties(&self) -> impl Iterator<Item = (&String, &String)> {
+        let restricted = self.restricts_interpolation();
+        (self.settings_properties.iter())
+            .chain(&self.properties)
+            .filter(move |(name, _)| !restricted || is_safe_external_property(name))
+    }
+
     /// Properties for activation interpolation, with the POM's own properties first.
     pub fn activation_properties(&self, public: &crate::PropertyMap) -> crate::PropertyMap {
         let mut properties = crate::PropertyMap::new();
+        for name in ["file.separator", "path.separator", "line.separator"] {
+            if let Some(value) = self.system_property(name) {
+                properties.insert_external(name, value);
+            }
+        }
         for (name, value) in self.activation_system_properties() {
             properties.insert_external(name, value);
         }
@@ -196,7 +735,7 @@ impl ActivationContext {
     pub fn file_condition_exists(&self, path: &str) -> bool {
         let path = self.base_dir.as_ref().map_or_else(
             || path.to_string(),
-            |base| crate::project::profiles::align_to_base_directory(path, base),
+            |base| crate::project::profiles::align_to_base_directory(path, base, &self.environment),
         );
         file_active(
             &ActivationFile {
@@ -207,6 +746,20 @@ impl ActivationContext {
             self,
             &self.environment.detached(),
         )
+    }
+
+    /// The value of `name` a `<property>` condition compares, when Maven
+    /// expanded it from a `${...}` before: a `-D` value, one passed to a
+    /// dependency's model, or a settings.xml profile property. A
+    /// `.mvn/jvm.config` value reaches the JVM as written.
+    fn expanded_value(&self, name: &str) -> Option<&str> {
+        let expanded = self.expanded_properties.contains(name);
+        let value = match self.properties.get(name) {
+            Some(value) => Some(value).filter(|_| expanded),
+            None => (self.settings_properties.get(name))
+                .or_else(|| (self.system_properties.get(name)).filter(|_| expanded)),
+        };
+        value.map(String::as_str)
     }
 
     /// A `-D` value, else the system property: what Maven's OS activator
@@ -222,20 +775,67 @@ impl ActivationContext {
         match name {
             "os.name" => self.environment.os_name(),
             "os.arch" => self.environment.os_arch(),
-            "java.version" => Some(self.environment.java_version()),
+            "java.version" => Some(tested_java_version(
+                self.environment.java_version(),
+                &self.environment,
+            )),
+            "java.specification.version" => {
+                Some(java_specification_version(self.environment.java_version()))
+            }
             "java.home" => self.environment.java_home(),
-            _ => None,
+            "maven.version" => Some(self.environment.maven_mode().version()),
+            "maven.build.version" => Some(self.environment.maven_mode().build_version()),
+            "org.jline.terminal.exec.redirectPipeCreationMode" => (self.environment.maven_mode()
+                == MavenMode::Maven310)
+                .then_some(JLINE_REDIRECT_MODE),
+            "file.separator" | "path.separator" | "line.separator" => {
+                let windows = self.environment.platform()?.0 == "windows";
+                Some(match (name, windows) {
+                    ("file.separator", false) => "/",
+                    ("file.separator", true) => "\\",
+                    ("path.separator", false) => ":",
+                    ("path.separator", true) => ";",
+                    (_, false) => "\n",
+                    (_, true) => "\r\n",
+                })
+            }
+            _ => match jvm_names::class(name, self.environment.maven_mode()) {
+                Some(jvm_names::Class::Fixed(value)) => Some(value),
+                _ => None,
+            },
         }
     }
 
-    /// The target platform's `os.*` system properties. Host paths such as
+    /// The target platform's `os.*` system properties, Maven's
+    /// `maven.version` and `maven.build.version`, the jline pipe mode
+    /// 3.10's `mvn` sets, and those every JVM sets alike. Host paths such as
     /// `java.home` stay out.
     pub fn platform_system_properties(&self) -> HashMap<String, String> {
+        let mode = self.environment.maven_mode();
+        // Windows 10, 11 and Server JVMs each report their own `os.name`, so
+        // text that reads it keeps `${os.name}`, and refuses where it can
+        // change the lock.
+        let windows = self
+            .environment
+            .platform()
+            .is_some_and(|(os, _)| os == "windows");
         [
-            ("os.name", self.environment.os_name()),
+            (
+                "os.name",
+                (self.environment.os_name())
+                    .filter(|_| !windows || self.environment.windows_os_name().is_some()),
+            ),
             ("os.arch", self.environment.os_arch()),
+            ("maven.version", Some(mode.version())),
+            ("maven.build.version", Some(mode.build_version())),
+            (
+                "org.jline.terminal.exec.redirectPipeCreationMode",
+                (mode == MavenMode::Maven310).then_some(JLINE_REDIRECT_MODE),
+            ),
         ]
         .into_iter()
+        .chain(jvm_names::fixed_values().map(|(name, value)| (name, Some(value))))
+        .filter(|(key, _)| !self.environment.unread_system_property(key))
         .filter_map(|(key, value)| Some((key.to_string(), value?.to_string())))
         .collect()
     }
@@ -278,18 +878,67 @@ impl ActivationContext {
         properties
     }
 
+    /// This context as Maven 3.10 activates the profiles of a model it reads
+    /// from a repository with: no user or settings.xml profile property,
+    /// and `own`, the POM's `<properties>`, below the system properties. A
+    /// property the JVM, the Maven launcher or the environment always sets
+    /// keeps its value, an `env.*` one while the variable is set; others,
+    /// such as `jdk.version`, are the POM's. `mvn`
+    /// copies each `-D` into the system properties, so it still counts, but
+    /// the `packaging` the model builder adds does not.
+    fn external_activation(&self, own: &crate::PropertyMap) -> Self {
+        // A JVM that sets an unevenly set name keeps its value over the POM's,
+        // so the POM's decides nothing.
+        let set_by_host = |name: &str| {
+            name.starts_with("env.")
+                || always_set(name, self)
+                || jvm_names::class(name, self.environment.maven_mode())
+                    == Some(jvm_names::Class::Uneven)
+        };
+        let mut system_properties: HashMap<String, String> = (own.iter())
+            .filter(|(name, _)| !set_by_host(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let repository_env = (own.iter())
+            .filter(|(name, _)| name.starts_with("env."))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        system_properties.extend(self.system_properties.clone());
+        system_properties.extend(
+            (self.properties.iter())
+                .filter(|(name, _)| !self.packaging_injected || *name != "packaging")
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        let mut system_defines = self.system_defines.clone();
+        system_defines.extend(self.properties.keys().cloned());
+        Self {
+            properties: HashMap::new(),
+            settings_properties: crate::PropertyMap::new(),
+            settings_repositories: Vec::new(),
+            system_properties,
+            system_defines,
+            repository_env,
+            ..self.clone()
+        }
+    }
+
     /// The environment a model of this context is interpolated in: without
     /// classifier likes when [`Self::system_properties`] sets
     /// `os.detected.classifier`, which a dependency's model then reads as
-    /// it is.
+    /// it is, and [`ModelEnvironment::restricted`] when this context
+    /// [`Self::restricts_interpolation`].
     pub(crate) fn model_environment(&self) -> ModelEnvironment {
-        if self
+        let environment = if self
             .system_properties
             .contains_key("os.detected.classifier")
         {
             self.environment.with_classifier_likes(None)
         } else {
             self.environment.clone()
+        };
+        match self.restricts_interpolation() {
+            true => environment.restricted(),
+            false => environment,
         }
     }
 }
@@ -398,6 +1047,227 @@ pub(crate) struct ConditionReads {
 }
 
 impl Activation {
+    /// A property the JVM or the launcher sets whose value raeva does not
+    /// know, such as `java.vendor` or `os.version`, when this interpolated
+    /// activation tests its value, reads it through `${...}`, or tests the
+    /// presence of one only some JDKs set: no `-D` sets it and the other
+    /// conditions do not already keep the profile off.
+    pub fn unread_host_property(&self, ctx: &ActivationContext) -> Option<String> {
+        // A `-D`, a settings.xml property or, for a dependency's model, a
+        // user property passed as a system property: its value is the
+        // build's own. A `.mvn/jvm.config` value of a JVM-owned name is not.
+        let jvm_config = ctx.environment.system_properties();
+        let jvm_config_only = |name: &str| {
+            jvm_config.contains_key(name)
+                && !ctx.system_defines.contains(name)
+                && ctx.system_properties.get(name) == jvm_config.get(name)
+                && !ctx.properties.contains_key(name)
+                && ctx.settings_properties.get(name).is_none()
+        };
+        let user_set = |name: &str| {
+            ctx.properties.contains_key(name)
+                || ctx.settings_properties.get(name).is_some()
+                || (ctx.system_properties.contains_key(name) && !jvm_config_only(name))
+        };
+        // `java.home` and the `java.version` family are host inputs of
+        // their own, which a read here would record. Without a JDK,
+        // `${java.home}` stays as written, and the lock records what a path
+        // holding it tested.
+        let windows = ctx
+            .environment
+            .platform()
+            .is_some_and(|(os, _)| os == "windows");
+        let target_jdk = ctx
+            .environment
+            .target_jdk()
+            .filter(|_| !user_set("java.version"));
+        let host_java_home = ctx.environment.host_java_home().is_some();
+        let answered_on_every_edition = self
+            .answer_on_every_windows_edition(ctx, &ctx.environment.detached())
+            .is_some();
+        let unread_value = |name: &str| {
+            // A JVM option may set it in a way raeva does not read.
+            ctx.environment.unread_system_property(name)
+                || match name {
+                    // Unknown for a `[lock] jdks` JDK other than the host's.
+                    "java.home" | "env.JAVA_HOME" => {
+                        ctx.environment.target_jdk().is_some() && !host_java_home
+                    }
+                    // The target platform and JDK answer these, but Windows
+                    // JVMs each report their own `os.name`, and the patch
+                    // releases of a `[lock] jdks` entry their own `java.version`.
+                    "os.name" => windows && !answered_on_every_edition,
+                    "java.version" => target_jdk.is_some(),
+                    "os.arch"
+                    | "file.separator"
+                    | "path.separator"
+                    | "line.separator"
+                    | "java.specification.version" => false,
+                    _ => host_property(&ctx.environment, name) == Some(HostProperty::Unread),
+                }
+        };
+        let unread_path = |name: &str| {
+            let hidden =
+                || (name.strip_prefix("env.")).is_some_and(|var| ctx.environment.hides_env(var));
+            (unread_value(name) || hidden()) && !user_set(name)
+        };
+        // The launcher's directory, which the lock records what a path
+        // holding it tested, but not what a `<property>` condition on it
+        // compared.
+        let launcher = |name: &str| {
+            matches!(
+                name,
+                "maven.multiModuleProjectDirectory" | LAUNCHER_ROOT_VARIABLE
+            ) && always_set(name, ctx)
+                && !user_set(name)
+        };
+        let unread = |name: &str| unread_path(name) || launcher(name);
+        let in_text = |text: &Option<String>, unread: &dyn Fn(&str) -> bool| {
+            (crate::properties::expression_names(text.as_deref()?).into_iter())
+                .find(|read| unread(read))
+                .map(str::to_string)
+        };
+        // Maven 3.9.12 and 3.10.0 interpolate every kind of condition with
+        // all system properties, so text still holding one of these after
+        // interpolation would be compared as written where Maven compares
+        // the host's value. Condition interpolation leaves `java.home` out,
+        // as model interpolation does, except in a `<file>` path.
+        let unread_text = |name: &str| unread(name) || name == "java.home";
+        let target_jdk = ctx
+            .environment
+            .target_jdk()
+            .filter(|_| !user_set("java.version"));
+        let mut others = self.clone();
+        let mut found = None;
+        if let Some(property) = &self.property {
+            let (_, name) = negation(property.name.as_deref().unwrap_or_default());
+            let valued = (property.value.as_deref()).is_some_and(|value| !value.is_empty());
+            let decided = (property.value.as_deref())
+                .is_some_and(|value| !could_be_host_value(name, negation(value).1));
+            // A test every patch release of a `[lock] jdks` entry answers
+            // alike, such as `!1.8`.
+            let same_on_every_patch = name == "java.version"
+                && target_jdk.is_some_and(|entry| {
+                    (property.value.as_deref())
+                        .filter(|value| !value.is_empty())
+                        .is_none_or(|value| {
+                            equal_on_every_patch(entry, negation(value).1).is_some()
+                        })
+                });
+            let unread_name = match hidden_value_decides_nothing(property, ctx) {
+                true => unread_value(name) && !user_set(name),
+                false => unread(name),
+            };
+            // A presence test holds only where every JVM sets the name.
+            let tested = (unread_name
+                && !decided
+                && !same_on_every_patch
+                && (valued || !set_on_every_run(name, ctx.environment.maven_mode())))
+            .then(|| name.to_string());
+            // The compared value can hold one too: a `-D` value `MavenCli`
+            // expands, or a settings.xml property its builder expands, that
+            // still reads `${java.vendor}`. Any value passes a presence test.
+            let compared = (valued && !name.contains("${"))
+                .then(|| ctx.expanded_value(name))
+                .flatten()
+                .and_then(|value| unread_host_reference(value, &ctx.environment));
+            // A name no one sets keeps the profile off, or with a negated
+            // value on, whatever the value reads.
+            let unset = !name.contains("${")
+                && !name.starts_with("env.")
+                && !ctx.properties.contains_key(name)
+                && ctx.settings_properties.get(name).is_none()
+                && !ctx.system_properties.contains_key(name)
+                && !always_set(name, ctx)
+                && !jvm_owned(name)
+                && !SYSTEM_PROPERTY_NAMES.contains(&name);
+            found = tested
+                .or(compared)
+                .or_else(|| in_text(&property.name, &unread_text))
+                .or_else(|| {
+                    (!unset)
+                        .then(|| in_text(&property.value, &unread_text))
+                        .flatten()
+                });
+            if found.is_some() {
+                others.property = None;
+            }
+        }
+        if let (Some(os), Some(stripped)) = (&self.os, &mut others.os) {
+            for (field, text) in [
+                (&mut stripped.family, &os.family),
+                (&mut stripped.name, &os.name),
+                (&mut stripped.arch, &os.arch),
+                (&mut stripped.version, &os.version),
+            ] {
+                if let Some(name) = in_text(text, &unread_text) {
+                    found.get_or_insert(name);
+                    *field = None;
+                }
+            }
+            // Windows 10, 11 and Server JVMs each report their own `os.name`;
+            // `<family>` and `<arch>` hold on all of them.
+            if (os.name.as_deref()).is_some_and(|name| is_windows_name(negation(name).1))
+                && unread("os.name")
+            {
+                found.get_or_insert_with(|| "os.name".to_string());
+                stripped.name = None;
+            }
+            // The OS activator reads no settings.xml profile property.
+            if os.version.is_some() && ctx.user_or_system_property("os.version").is_none() {
+                found.get_or_insert_with(|| "os.version".to_string());
+                stripped.version = None;
+            }
+            if [
+                &stripped.family,
+                &stripped.name,
+                &stripped.arch,
+                &stripped.version,
+            ]
+            .iter()
+            .all(|field| field.is_none())
+            {
+                others.os = None;
+            }
+        }
+        if let Some(name) = in_text(&self.jdk, &unread_text) {
+            found.get_or_insert(name);
+            others.jdk = None;
+        }
+        // A `<jdk>` every patch release of a `[lock] jdks` entry answers
+        // alike, such as `21` or `[17,22)`, holds; `21.0.13` does not.
+        if let (Some(jdk), Some(feature)) = (&self.jdk, target_jdk)
+            && !jdk.contains("${")
+            && jdk.is_ascii()
+            && jdk_on_every_patch(feature, jdk).is_none()
+        {
+            found.get_or_insert_with(|| "java.version".to_string());
+            others.jdk = None;
+        }
+        // Maven tests `<missing>` only when `<exists>` is empty.
+        let tested_file = self.file.as_ref().and_then(|condition| {
+            match condition.exists.as_deref().filter(|path| !path.is_empty()) {
+                Some(_) => in_text(&condition.exists, &unread_path),
+                None => in_text(&condition.missing, &unread_path),
+            }
+        });
+        if let Some(name) = tested_file {
+            found.get_or_insert(name);
+            others.file = None;
+        }
+        let name = found?;
+        let conditions = [
+            others.property.is_some(),
+            others.os.is_some(),
+            others.jdk.is_some(),
+        ];
+        let decided = (conditions.contains(&true) || others.file.is_some())
+            && !others
+                .explicit_conditions_active(ctx, &ctx.environment.detached())
+                .unwrap_or(true);
+        (!decided).then_some(name)
+    }
+
     /// Returns whether this single `<activation>` block matches the runtime
     /// context, **without** Maven's POM-level suppression rule.
     ///
@@ -424,13 +1294,18 @@ impl Activation {
 
     /// Whether the explicit conditions match, as [`Self::is_active`] decides
     /// them without `<activeByDefault>`, and the host values and files they
-    /// tested that decide it. Nothing is recorded in `ctx`'s environment.
-    pub fn evaluate(&self, ctx: &ActivationContext) -> (bool, BTreeSet<HostInput>) {
+    /// tested that decide it, or the error Maven fails the profile `id`
+    /// with. Nothing is recorded in `ctx`'s environment.
+    pub fn evaluate(
+        &self,
+        id: &str,
+        ctx: &ActivationContext,
+    ) -> Result<(bool, BTreeSet<HostInput>), PomError> {
         let recorder = ctx.environment.detached();
         let active = self
             .explicit_conditions_active(ctx, &recorder)
-            .unwrap_or(false);
-        (active, recorder.take_reads())
+            .map_err(|error| error.into_pom_error(id))?;
+        Ok((active, recorder.take_reads()))
     }
 
     /// Maven's `DefaultProfileSelector.isActive`: whether every explicit
@@ -453,6 +1328,9 @@ impl Activation {
         if self.property.is_none() && self.os.is_none() && self.jdk.is_none() && self.file.is_none()
         {
             return Ok(false);
+        }
+        if let Some(answer) = self.answer_on_every_windows_edition(ctx, recorder) {
+            return Ok(answer);
         }
         let mut active = true;
         let mut test =
@@ -487,6 +1365,9 @@ impl Activation {
             })?;
         }
         if let Some(jdk) = &self.jdk {
+            if (jdk.starts_with('[') || jdk.starts_with('(')) && !jdk.is_ascii() {
+                return Err(ActivationError::NonAsciiJdkRange(jdk.clone()));
+            }
             test((&interpolation.jdk, jdk_java), &|reads| {
                 Ok(jdk_active(jdk, self.jdk_from_input, ctx, reads))
             })?;
@@ -503,6 +1384,106 @@ impl Activation {
             })?;
         }
         Ok(active)
+    }
+
+    /// The answer this activation gives on every Windows edition, where
+    /// the platform is Windows, the activation reads `os.name`, which each
+    /// edition's JVM reports its own of ([`WINDOWS_OS_NAMES`]), no `-D` or
+    /// settings.xml property sets it, and the editions agree. `None` where
+    /// they differ, or the rule does not apply. Each edition's reads go to
+    /// `recorder`.
+    fn answer_on_every_windows_edition(
+        &self,
+        ctx: &ActivationContext,
+        recorder: &ModelEnvironment,
+    ) -> Option<bool> {
+        let windows = (ctx.environment.platform()).is_some_and(|(os, _)| os == "windows");
+        let set = ctx.properties.contains_key("os.name")
+            || ctx.system_properties.contains_key("os.name")
+            || ctx.settings_properties.get("os.name").is_some();
+        if !windows || set || ctx.environment.windows_os_name().is_some() {
+            return None;
+        }
+        let property_name = (self.property.as_ref())
+            .and_then(|property| property.name.as_deref())
+            .is_some_and(|name| negation(name).1 == "os.name");
+        let os_name = (self.os.as_ref()).is_some_and(|os| os.name.is_some());
+        let mut texts = self.texts();
+        let in_text =
+            texts.any(|text| crate::properties::expression_names(text).contains(&"os.name"));
+        if !(property_name || os_name || in_text) {
+            return None;
+        }
+        let mut answer = None;
+        for name in WINDOWS_OS_NAMES {
+            let mut edition = ctx.clone();
+            edition.environment = ctx.environment.with_windows_os_name(name);
+            let activation = self.with_windows_os_name(name, &edition);
+            let active = activation
+                .explicit_conditions_active(&edition, recorder)
+                .ok()?;
+            if *answer.get_or_insert(active) != active {
+                return None;
+            }
+        }
+        answer
+    }
+
+    /// The text of each condition.
+    fn texts(&self) -> impl Iterator<Item = &str> {
+        let property = (self.property.iter()).flat_map(|p| [&p.name, &p.value]);
+        let os = (self.os.iter()).flat_map(|os| [&os.name, &os.family, &os.arch, &os.version]);
+        let file = (self.file.iter()).flat_map(|f| [&f.exists, &f.missing]);
+        (std::iter::once(&self.jdk)
+            .chain(property)
+            .chain(os)
+            .chain(file))
+        .flatten()
+        .map(String::as_str)
+    }
+
+    /// This activation with `${os.name}` in its text as the Windows edition
+    /// `name`'s JVM expands it, and a relative `<file>` path that then
+    /// holds no reference aligned to the project directory, as Maven aligns
+    /// one.
+    fn with_windows_os_name(&self, name: &str, ctx: &ActivationContext) -> Self {
+        let mut activation = self.clone();
+        let property = (activation.property.iter_mut()).flat_map(|p| [&mut p.name, &mut p.value]);
+        let os = (activation.os.iter_mut())
+            .flat_map(|os| [&mut os.name, &mut os.family, &mut os.arch, &mut os.version]);
+        for text in property.chain(os).chain([&mut activation.jdk]).flatten() {
+            *text = with_os_name(text, name);
+        }
+        let file = (activation.file.iter_mut()).flat_map(|f| [&mut f.exists, &mut f.missing]);
+        for path in file.flatten() {
+            if !crate::properties::expression_names(path).contains(&"os.name") {
+                continue;
+            }
+            *path = with_os_name(path, name);
+            if let Some(base) = &ctx.base_dir
+                && !path.contains("${")
+                && !Path::new(path.as_str()).is_absolute()
+            {
+                *path =
+                    crate::project::profiles::align_to_base_directory(path, base, &ctx.environment);
+            }
+        }
+        activation
+    }
+
+    /// This settings.xml activation with the system properties raeva
+    /// answers on `ctx`'s platform and JDK expanded in its `<property>`,
+    /// `<os>` and `<jdk>` text, which Maven expands with the rest of
+    /// settings.xml. The `<file>` path expands apart, on the host.
+    #[must_use]
+    pub fn with_host_properties(mut self, ctx: &ActivationContext) -> Self {
+        let property = (self.property.iter_mut()).flat_map(|p| [&mut p.name, &mut p.value]);
+        let os = (self.os.iter_mut())
+            .flat_map(|os| [&mut os.name, &mut os.family, &mut os.arch, &mut os.version]);
+        for text in property.chain(os).chain([&mut self.jdk]).flatten() {
+            *text = expand_host_properties(text, &ctx.environment);
+        }
+        self
     }
 
     /// This activation of a profile from outside the POM, such as a
@@ -527,6 +1508,12 @@ pub(crate) struct ProfileSelection {
     /// For each profile, whether its activation read `java.version`, also
     /// through a lookup that keeps only the expression.
     pub(crate) reads_java: Vec<bool>,
+    /// For each profile, the property its activation tests that raeva does
+    /// not read from the host, if any.
+    pub(crate) unread: Vec<Option<String>>,
+    /// For each profile, whether `-P` or its conditions activated it, or
+    /// `None` when it was left out of the selection.
+    selected: Vec<Option<bool>>,
 }
 
 impl ProfileSelection {
@@ -539,6 +1526,41 @@ impl ProfileSelection {
         let reads_host = |reads: &BTreeSet<HostInput>| reads.iter().any(HostInput::is_host_read);
         reads_host(&self.reads[index])
             || (is_active_by_default(&profiles[index]) && self.reads.iter().any(reads_host))
+    }
+
+    /// A profile whose activation tests a value raeva does not read, and
+    /// that value, when that decides which of the profiles `relevant` marks
+    /// Maven activates. Once another profile is activated, the defaults are
+    /// off whatever such a condition gives, so only a relevant profile with
+    /// one decides. Otherwise any of them can turn the defaults off; the
+    /// one exception is an `activeByDefault` profile that is the only
+    /// relevant default and the only one with such a condition, which is
+    /// active whether that condition holds or not.
+    pub(crate) fn undecided(
+        &self,
+        profiles: &[crate::Profile],
+        relevant: &[bool],
+    ) -> Option<(usize, &str)> {
+        let unknown: Vec<usize> = (0..profiles.len())
+            .filter(|&index| self.unread[index].is_some())
+            .collect();
+        let activated = (0..profiles.len())
+            .any(|index| self.unread[index].is_none() && self.selected[index] == Some(true));
+        let deciding = if activated {
+            unknown.iter().copied().find(|&index| relevant[index])
+        } else {
+            let defaults: Vec<usize> = (0..profiles.len())
+                .filter(|&index| {
+                    relevant[index]
+                        && self.selected[index].is_some()
+                        && is_active_by_default(&profiles[index])
+                })
+                .collect();
+            let decided = (defaults.is_empty() && !unknown.iter().any(|&index| relevant[index]))
+                || (unknown.len() == 1 && defaults == unknown);
+            unknown.first().copied().filter(|_| !decided)
+        };
+        deciding.and_then(|index| Some((index, self.unread[index].as_deref()?)))
     }
 }
 
@@ -567,11 +1589,20 @@ pub(crate) fn is_active_by_default(profile: &crate::Profile) -> bool {
 ///
 /// Nothing is recorded in `ctx`'s environment: the caller decides which
 /// profiles' host reads count.
+///
+/// Maven 3.10 selects the profiles of a model it reads from a repository
+/// apart: it leaves out every profile with a `<file>` condition, and the
+/// conditions see no user property, with `own`, the POM's `<properties>`
+/// as written, below the system properties.
 pub(crate) fn select_profiles(
     profiles: &[crate::Profile],
+    own: &crate::PropertyMap,
     ctx: &ActivationContext,
 ) -> Result<ProfileSelection, PomError> {
     use std::collections::HashSet;
+
+    let external = ctx.repository_model().then(|| ctx.external_activation(own));
+    let ctx = external.as_ref().unwrap_or(ctx);
 
     let explicit_active: HashSet<&str> = ctx.active_profiles.iter().map(String::as_str).collect();
     let explicit_inactive: HashSet<&str> =
@@ -579,15 +1610,21 @@ pub(crate) fn select_profiles(
 
     let mut activated = Vec::new();
     let mut defaults = Vec::new();
+    let mut selection = Vec::with_capacity(profiles.len());
     let mut reads = Vec::with_capacity(profiles.len());
     let mut reads_java = Vec::with_capacity(profiles.len());
+    let mut unread = Vec::with_capacity(profiles.len());
     for (index, profile) in profiles.iter().enumerate() {
         let id = profile.id.as_str();
         let mut read = BTreeSet::new();
         let java_read = Arc::new(AtomicBool::new(false));
-        if explicit_inactive.contains(id) {
+        let file =
+            (profile.activation.as_ref()).is_some_and(|activation| activation.file.is_some());
+        if explicit_inactive.contains(id) || (external.is_some() && file) {
             reads.push(read);
             reads_java.push(false);
+            unread.push(None);
+            selection.push(None);
             continue;
         }
         let selected = explicit_active.contains(id)
@@ -604,6 +1641,12 @@ pub(crate) fn select_profiles(
             };
         reads.push(read);
         reads_java.push(java_read.load(Ordering::Relaxed));
+        unread.push(
+            (profile.activation.as_ref())
+                .filter(|_| !explicit_active.contains(id))
+                .and_then(|activation| activation.unread_host_property(ctx)),
+        );
+        selection.push(Some(selected));
         if selected {
             activated.push(index);
         } else if is_active_by_default(profile) {
@@ -618,6 +1661,8 @@ pub(crate) fn select_profiles(
         },
         reads,
         reads_java,
+        unread,
+        selected: selection,
     })
 }
 
@@ -627,7 +1672,7 @@ pub(crate) fn evaluate_profiles<'a>(
     profiles: &'a [crate::Profile],
     ctx: &ActivationContext,
 ) -> Result<Vec<&'a crate::Profile>, PomError> {
-    let selection = select_profiles(profiles, ctx)?;
+    let selection = select_profiles(profiles, &crate::PropertyMap::new(), ctx)?;
     for input in selection.reads.into_iter().flatten() {
         ctx.environment.record(input);
     }
@@ -650,6 +1695,8 @@ enum ActivationError {
         construct: String,
         why: &'static str,
     },
+    /// A `<jdk>` range with a character that is not ASCII, held here.
+    NonAsciiJdkRange(String),
 }
 
 impl ActivationError {
@@ -674,6 +1721,18 @@ impl ActivationError {
                 bounded(id),
                 bounded(&construct)
             ),
+            // `Integer.parseInt` reads the bounds, and takes the decimal
+            // digits of the JDK's Unicode version.
+            ActivationError::NonAsciiJdkRange(range) => {
+                return PomError::Unlockable(format!(
+                    "the <jdk> range {} of profile {} holds a character that is not ASCII; \
+                     Maven parses its bounds with Java's Integer.parseInt, which takes other \
+                     decimal digits, such as U+FF12 for 2, and more of them on newer JDKs, so \
+                     raeva cannot tell where the profile is active; write the bounds in ASCII",
+                    bounded(&range),
+                    bounded(id)
+                ));
+            }
         })
     }
 }
@@ -709,6 +1768,8 @@ fn property_active(
     // system property, of any name comes first, `env.*` included: Maven
     // keeps the environment in its system properties as `env.*` entries,
     // below the `-D` and settings profile values.
+    let value = property.value.as_deref().filter(|value| !value.is_empty());
+    let specification;
     let (actual, host_input) = if let Some(value) = ctx.properties.get(name) {
         (Some(value.as_str()), None)
     } else if let Some(value) = ctx.settings_properties.get(name) {
@@ -723,19 +1784,48 @@ fn property_active(
         if !allowed {
             ctx.environment.warn_hidden_env(key);
         }
-        let input = allowed.then(|| HostInput::Env(key.to_string()));
-        (ctx.environment.host_env_var(key), input)
+        // Unset, the variable gives way to the model's own value, so the
+        // outcome follows the variable's value rather than the condition.
+        match ctx.repository_env.get(name) {
+            Some(own) => {
+                if allowed && !name_from_input {
+                    recorder.record(HostInput::Env(key.to_string()));
+                }
+                let value = ctx.environment.host_env_var(key).or(Some(own.as_str()));
+                (value, None)
+            }
+            None => {
+                let input = allowed.then(|| HostInput::Env(key.to_string()));
+                (ctx.environment.host_env_var(key), input)
+            }
+        }
     } else {
         match name {
             "java.version" => (
-                Some(ctx.environment.host_java_version()),
+                Some(tested_java_version(
+                    ctx.environment.host_java_version(),
+                    &ctx.environment,
+                )),
                 Some(HostInput::JavaVersion),
             ),
-            "java.home" => (ctx.environment.host_java_home(), Some(HostInput::JavaHome)),
-            _ => (ctx.property(name), None),
+            // Every JVM sets it, so a presence test holds without a JDK too.
+            "java.home" => (
+                (ctx.environment.host_java_home()).or(value.is_none().then_some("set")),
+                Some(HostInput::JavaHome),
+            ),
+            "java.specification.version" => {
+                specification = java_specification_version(ctx.environment.host_java_version());
+                (Some(specification), Some(HostInput::JavaVersion))
+            }
+            // The JVM or the launcher sets these on every host, so a presence
+            // check holds. A value test of one raeva does not know refuses
+            // the lock in `unread_host_property`.
+            _ => match ctx.property(name) {
+                None if value.is_none() && always_set(name, ctx) => (Some("set"), None),
+                actual => (actual, None),
+            },
         }
     };
-    let value = property.value.as_deref().filter(|value| !value.is_empty());
     let raw_name = property.name.as_deref().unwrap_or_default();
     if let Some(input) = host_input.filter(|_| !name_from_input) {
         recorder.record(if text_from_input {
@@ -748,6 +1838,97 @@ fn property_active(
         });
     }
     Ok(property_matches(raw_name, value, actual))
+}
+
+/// Whether the valued `<property>` test `property` of a hidden variable,
+/// `env.NAME`, gives the outcome with the variable's value that it gives
+/// with the variable unset, as [`property_active`] reads it: then the value
+/// decides nothing, and activation goes on as where it is unset. A presence
+/// test of a set variable can differ, and the value of one `mvn` sets
+/// itself is unknown.
+fn hidden_value_decides_nothing(property: &ActivationProperty, ctx: &ActivationContext) -> bool {
+    let raw_name = property.name.as_deref().unwrap_or_default();
+    let (_, name) = negation(raw_name);
+    let value = property.value.as_deref().filter(|value| !value.is_empty());
+    let Some(actual) = (value.and(name.strip_prefix("env.")))
+        .and_then(|variable| ctx.environment.hidden_env_value(variable))
+    else {
+        return false;
+    };
+    let unset = ctx.repository_env.get(name).map(String::as_str);
+    property_matches(raw_name, value, Some(actual)) == property_matches(raw_name, value, unset)
+}
+
+/// Whether `value` can be what Maven's launcher passes for `name`: 3.10.0's
+/// `library.jline.path` is always the Maven home's `lib/jline-native`, so a
+/// value test against other text is decided whatever the home is.
+fn could_be_host_value(name: &str, value: &str) -> bool {
+    match name {
+        "library.jline.path" => {
+            value.ends_with("/lib/jline-native") || value.ends_with("\\lib\\jline-native")
+        }
+        // Every Windows JVM's `os.name` starts with `Windows`.
+        "os.name" => is_windows_name(value),
+        _ => true,
+    }
+}
+
+fn is_windows_name(value: &str) -> bool {
+    (value.get(..7)).is_some_and(|start| start.eq_ignore_ascii_case("windows"))
+}
+
+/// Whether the JVM or the Maven launcher of `ctx`'s line sets the system
+/// property `name` on every run.
+/// `text` with each `${os.name}`, in any spelling Maven reads it by, as
+/// `value`.
+fn with_os_name(text: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        if rv_maven_types::expression_key(&after[..end]) == "os.name" {
+            out.push_str(value);
+        } else {
+            out.push_str(&rest[start..start + 3 + end]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn always_set(name: &str, ctx: &ActivationContext) -> bool {
+    set_on_every_run(name, ctx.environment.maven_mode())
+}
+
+/// Whether every JVM and the Maven launcher of `mode` set the system
+/// property `name` on every run.
+fn set_on_every_run(name: &str, mode: MavenMode) -> bool {
+    name == LAUNCHER_ROOT_VARIABLE
+        || matches!(
+            jvm_names::class(name, mode),
+            Some(jvm_names::Class::Locked | jvm_names::Class::Fixed(_) | jvm_names::Class::PerHost)
+        )
+}
+
+/// The variable `mvn` exports as `maven.multiModuleProjectDirectory`.
+const LAUNCHER_ROOT_VARIABLE: &str = "env.MAVEN_PROJECTBASEDIR";
+
+/// The JVM's `java.specification.version` for its `java.version`: `1.8`
+/// for `1.8.0_442`, the feature release from Java 9 on.
+pub(crate) fn java_specification_version(java_version: &str) -> &str {
+    let digits = |text: &str| {
+        text.find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(text.len())
+    };
+    match java_version.strip_prefix("1.") {
+        Some(rest) => &java_version[..2 + digits(rest)],
+        None => &java_version[..digits(java_version)],
+    }
 }
 
 pub(crate) fn property_matches(name: &str, value: Option<&str>, actual: Option<&str>) -> bool {
@@ -781,7 +1962,10 @@ fn os_active(
     };
     let name = actual("os.name");
     if active && let Some(family) = &os.family {
-        active = family_matches(family, name.as_deref(), ctx.path_separator());
+        // `dos` and `unix` test the JVM's `path.separator`, which `-D` sets.
+        // The lock lists a set one whether or not a condition reads it.
+        let separator = ctx.user_or_system_property("path.separator");
+        active = family_matches(family, name.as_deref(), separator);
     }
     if active && let Some(expected) = &os.name {
         active = exact_matches(expected, name.as_deref());
@@ -821,17 +2005,17 @@ fn version_matches(expected: &str, actual: Option<&str>) -> Result<bool, Activat
     }
 }
 
-fn family_matches(expected: &str, os_name: Option<&str>, path_separator: Option<char>) -> bool {
+fn family_matches(expected: &str, os_name: Option<&str>, path_separator: Option<&str>) -> bool {
     let test = expected.to_lowercase();
     let (reverse, test) = negation(&test);
     os_name.is_some_and(|os_name| is_family(test, os_name, path_separator) != reverse)
 }
 
 /// Maven 3.9's `org.apache.maven.utils.Os.isFamily` for a lowercased family
-/// and `os.name`. `dos` and `unix` test the platform's path separator, which
-/// a `-D` override of `os.name` does not change. A family Maven does not name
+/// and `os.name`. `dos` and `unix` test `path.separator`, which a `-D`
+/// override of `os.name` does not change. A family Maven does not name
 /// matches when `os.name` contains it, so `linux` matches Linux only.
-fn is_family(family: &str, os_name: &str, path_separator: Option<char>) -> bool {
+fn is_family(family: &str, os_name: &str, path_separator: Option<&str>) -> bool {
     let windows = os_name.contains("windows");
     let win9x = windows && ["95", "98", "me", "ce"].iter().any(|t| os_name.contains(t));
     let mac = os_name.contains("mac") || os_name.contains("darwin");
@@ -840,11 +2024,11 @@ fn is_family(family: &str, os_name: &str, path_separator: Option<char>) -> bool 
         "win9x" => win9x,
         "winnt" => windows && !win9x,
         "os/2" | "netware" | "os/400" | "openvms" => os_name.contains(family),
-        "dos" => path_separator == Some(';') && !os_name.contains("netware") && !windows,
+        "dos" => path_separator == Some(";") && !os_name.contains("netware") && !windows,
         "mac" => mac,
         "tandem" => os_name.contains("nonstop_kernel"),
         "unix" => {
-            path_separator == Some(':')
+            path_separator == Some(":")
                 && !os_name.contains("openvms")
                 && (!mac || os_name.ends_with('x'))
         }
@@ -881,15 +2065,16 @@ fn jdk_active(
             } else {
                 HostInput::Jdk(jdk.to_string())
             });
-            jdk_matches(jdk, ctx.environment.host_java_version())
+            jdk_matches(
+                jdk,
+                tested_java_version(ctx.environment.host_java_version(), &ctx.environment),
+            )
         }
     }
 }
 
+/// Maven compares `java.version` as it is set, spaces included.
 pub(crate) fn jdk_matches(req: &str, found: &str) -> bool {
-    // Maven compares the value as interpolated, spaces included.
-    let found = found.trim();
-
     if let Some(negated) = req.strip_prefix('!') {
         return !found.starts_with(negated);
     }
@@ -983,6 +2168,31 @@ fn jdk_relation(actual: &str, bound: &JdkBound, is_left: bool) -> Option<std::cm
     })
 }
 
+/// Maven 3.10's `DefaultRootLocator.findMandatoryRoot` for a project in
+/// `base`: the nearest directory from `base` up to the file system root
+/// that holds a `.mvn` directory, else `fallback`, the launcher's
+/// `maven.multiModuleProjectDirectory`, normalized.
+fn root_directory(base: &Path, fallback: &Path) -> PathBuf {
+    let normalized = |path: &Path| {
+        let mut normal = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normal.pop();
+                }
+                other => normal.push(other),
+            }
+        }
+        normal
+    };
+    let (base, fallback) = (normalized(base), normalized(fallback));
+    (base.ancestors())
+        .find(|dir| dir.join(".mvn").is_dir())
+        .unwrap_or(&fallback)
+        .to_path_buf()
+}
+
 /// Maven's `FileProfileActivator`: a non-empty `<exists>` is tested and
 /// `<missing>` is then ignored, the value is used as interpolated, spaces
 /// included, and a path that is still relative without a base directory
@@ -1002,7 +2212,10 @@ fn file_active(
     };
     let path = PathBuf::from(without_trailing_separator(&path));
     let path = match &ctx.base_dir {
-        Some(base) if !path.is_absolute() => base.join(path),
+        Some(base) if !path.is_absolute() => {
+            crate::properties::java_absolute_path(&path, base, &ctx.environment)
+                .unwrap_or_else(|| base.join(path))
+        }
         _ => path,
     };
     if !path.is_absolute() {
@@ -1045,6 +2258,38 @@ pub(crate) fn jvm_os_name(rust_os: &str) -> &str {
     }
 }
 
+/// Every `os.name` a Windows JVM of JDK 17, 21, 25 or 27 reports: the
+/// values `src/java.base/windows/native/libjava/java_props_md.c` sets, as
+/// of openjdk/jdk17u d2b244d8, jdk21u c673c524, jdk25u 082ecfa4 and jdk
+/// c368bac4. 25 and 27 dropped the releases before Windows 8, which 17 and
+/// 21 still name.
+const WINDOWS_OS_NAMES: [&str; 24] = [
+    "Windows 95",
+    "Windows 98",
+    "Windows Me",
+    "Windows 9X (unknown)",
+    "Windows NT",
+    "Windows 2000",
+    "Windows XP",
+    "Windows 2003",
+    "Windows Vista",
+    "Windows Server 2008",
+    "Windows 7",
+    "Windows Server 2008 R2",
+    "Windows 8",
+    "Windows Server 2012",
+    "Windows 8.1",
+    "Windows Server 2012 R2",
+    "Windows 10",
+    "Windows Server 2016",
+    "Windows Server 2019",
+    "Windows Server 2022",
+    "Windows 11",
+    "Windows Server 2025",
+    "Windows NT (unknown)",
+    "Windows (unknown)",
+];
+
 /// The JVM's `os.arch` for a Rust target. OpenJDK reports x86_64 as `amd64`
 /// everywhere except macOS, and POMs activate native profiles on that value.
 /// `amd64` and `arm64` are accepted as `--platforms` spellings.
@@ -1073,8 +2318,94 @@ mod tests {
         }
     }
 
+    /// The root is the nearest directory up from the project that holds a
+    /// `.mvn` directory, above the reactor root too, else the fallback; the
+    /// project path is normalized first.
+    #[test]
+    fn root_directory_is_the_nearest_with_a_mvn_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let reactor = dir.path().join("reactor");
+        for path in [
+            ".mvn",
+            "reactor/sub/.mvn",
+            "reactor/sub/mod",
+            "reactor/other",
+        ] {
+            std::fs::create_dir_all(dir.path().join(path)).unwrap();
+        }
+        let sub = reactor.join("sub");
+        let (above, fallback) = (dir.path().to_path_buf(), Path::new("/fallback"));
+        for (base, root) in [
+            (sub.join("mod"), &sub),
+            (sub.clone(), &sub),
+            (reactor.join("other"), &above),
+            (reactor.clone(), &above),
+            (sub.join("mod/../../other"), &above),
+            (sub.join("mod/./../mod"), &sub),
+            (reactor.join("../reactor/sub/mod"), &sub),
+            (dir.path().to_path_buf(), &above),
+        ] {
+            assert_eq!(&root_directory(&base, fallback), root, "{}", base.display());
+        }
+        let environment = (crate::HostSnapshot::for_testing(&[]).with_reactor_root(&reactor))
+            .environment("linux", "x86_64");
+        let mut ctx = ActivationContext::new(environment.with_maven_mode(MavenMode::Maven39));
+        ctx.base_dir = Some(sub.join("mod"));
+        assert_eq!(ctx.root_directory(), None);
+        assert!(!ctx.is_file_directory("project.rootDirectory"));
+        ctx.environment = environment.clone().with_maven_mode(MavenMode::Maven310);
+        assert_eq!(ctx.root_directory(), Some(sub.clone()));
+        ctx.base_dir = Some(reactor.join("other"));
+        assert_eq!(ctx.root_directory(), Some(above.clone()));
+        ctx.base_dir = Some(sub.join("mod"));
+        assert!(ctx.is_file_directory("project.rootDirectory"));
+        ctx.base_dir = None;
+        assert_eq!(ctx.root_directory(), None);
+        assert!(!ctx.is_file_directory("project.rootDirectory"));
+        // The launcher's `maven.multiModuleProjectDirectory` looks above
+        // the reactor too, and does not follow the module.
+        ctx.base_dir = Some(sub.join("mod"));
+        let mut file = ActivationFile {
+            exists: Some("${maven.multiModuleProjectDirectory}/x".to_string()),
+            missing: None,
+        };
+        crate::project::profiles::interpolate_external_file(&mut file, &ctx);
+        assert_eq!(file.exists.map(PathBuf::from), Some(dir.path().join("x")));
+        let path = "<file><exists>${maven.multiModuleProjectDirectory}/x</exists></file>";
+        assert_eq!(activation(path).unread_host_property(&ctx).as_deref(), None);
+        // A `<property>` condition on it is not one raeva.lock can record.
+        ctx.properties.insert("x".to_string(), "/x".to_string());
+        for text in [
+            "<property><name>maven.multiModuleProjectDirectory</name><value>/x</value></property>",
+            "<property><name>x</name><value>${maven.multiModuleProjectDirectory}</value></property>",
+        ] {
+            let unread = activation(text).unread_host_property(&ctx);
+            let unread = unread.as_deref();
+            assert_eq!(unread, Some("maven.multiModuleProjectDirectory"), "{text}");
+        }
+        let presence = "<property><name>maven.multiModuleProjectDirectory</name></property>";
+        assert!(activation(presence).is_active(&ctx));
+        std::fs::remove_dir(dir.path().join(".mvn")).unwrap();
+        assert_eq!(root_directory(&reactor, fallback), fallback);
+        let environment = crate::HostSnapshot::for_testing(&[]).with_reactor_root(&reactor);
+        let launcher = reactor.to_string_lossy();
+        assert_eq!(
+            environment.host_environment().launcher_root(),
+            Some(&*launcher)
+        );
+    }
+
     fn activation(conditions: &str) -> Activation {
         quick_xml::de::from_str(&format!("<activation>{conditions}</activation>")).unwrap()
+    }
+
+    fn property(name: &str, value: &str) -> Activation {
+        let value = if value.is_empty() {
+            String::new()
+        } else {
+            format!("<value>{value}</value>")
+        };
+        activation(&format!("<property><name>{name}</name>{value}</property>"))
     }
 
     fn with_properties(properties: &[(&str, &str)]) -> ActivationContext {
@@ -1090,14 +2421,6 @@ mod tests {
     /// `env.X` counts without the environment.
     #[test]
     fn property_conditions_follow_maven() {
-        let property = |name: &str, value: &str| {
-            let value = if value.is_empty() {
-                String::new()
-            } else {
-                format!("<value>{value}</value>")
-            };
-            activation(&format!("<property><name>{name}</name>{value}</property>"))
-        };
         for (name, value, properties, active) in [
             ("feature", "on", &[("feature", "on")][..], true),
             ("feature", "on", &[("feature", "off")], false),
@@ -1107,6 +2430,9 @@ mod tests {
             ("!feature", "on", &[("feature", "off")], false),
             ("feature", "!on", &[("feature", "off")], true),
             ("feature", "!on", &[("feature", "on")], false),
+            ("user.home", "", &[], true),
+            ("!user.dir", "", &[], false),
+            ("user.name", "root", &[], false),
             (
                 "env.RAEVA_TEST_UNSET_ENV",
                 "yes",
@@ -1129,6 +2455,538 @@ mod tests {
         assert!(property("env.RAEVA_TEST_ENV", "on").is_active(&ctx));
     }
 
+    /// What Maven 3.9.12 and 3.10.0 activated on JDK 27: the launcher's
+    /// `maven.version` and `maven.build.version` are those of the line, a
+    /// name the JVM or the launcher always sets is present, and
+    /// `java.specification.version` follows `java.version`.
+    #[test]
+    fn properties_the_jvm_and_launcher_set_are_present() {
+        let host = crate::HostSnapshot::for_testing(&[]).with_java_version("1.8.0_442");
+        let environment = host.environment("linux", "x86_64");
+        for (mode, name, value, active) in [
+            (MavenMode::Maven39, "maven.version", "3.9.12", true),
+            (MavenMode::Maven310, "maven.version", "3.9.12", false),
+            (MavenMode::Maven310, "maven.version", "3.10.0", true),
+            (MavenMode::Maven310, "!maven.version", "", false),
+            (
+                MavenMode::Maven310,
+                "maven.build.version",
+                "Apache Maven 3.10.0 (c43a36b8d67be7e0805a411bc0898af1a51f5472)",
+                true,
+            ),
+            (MavenMode::Maven39, "maven.home", "", true),
+            (MavenMode::Maven39, "!os.version", "", false),
+            (MavenMode::Maven39, "!file.encoding", "", false),
+            (MavenMode::Maven39, "!path.separator", "", false),
+            (MavenMode::Maven39, "user.language", "", true),
+            (MavenMode::Maven39, "library.jansi.path", "", true),
+            (MavenMode::Maven310, "library.jansi.path", "", false),
+            (MavenMode::Maven39, "maven.build.timestamp", "", false),
+            (
+                MavenMode::Maven39,
+                "java.specification.version",
+                "1.8",
+                true,
+            ),
+            (MavenMode::Maven39, "java.specification.version", "8", false),
+        ] {
+            let ctx = ActivationContext::new(environment.with_maven_mode(mode));
+            assert_eq!(
+                property(name, value).is_active(&ctx),
+                active,
+                "{mode} {name}={value}"
+            );
+        }
+        for (java, specification) in [("21.0.1", "21"), ("27-ea", "27"), ("1.8.0_442", "1.8")] {
+            assert_eq!(java_specification_version(java), specification);
+        }
+        let ctx = ActivationContext::new(environment.clone());
+        let reads = property("java.specification.version", "1.8")
+            .evaluate("spec", &ctx)
+            .unwrap()
+            .1;
+        let input = HostInput::Property {
+            name: "java.specification.version".to_string(),
+            value: Some("1.8".to_string()),
+        };
+        assert!(reads.contains(&input), "{reads:?}");
+        assert_eq!(host.holds(&input), Some(true));
+        // Maven 3.10's launcher sets no library.jansi.path, so a dependency
+        // model's own value activates.
+        let ctx = ActivationContext::new(environment.with_maven_mode(MavenMode::Maven310));
+        let mut own = crate::PropertyMap::new();
+        own.insert("library.jansi.path", "x");
+        let external = ctx.external_activation(&own);
+        assert!(property("library.jansi.path", "x").is_active(&external));
+        // Its own `env.X` stands in for an unset variable X, by Maven 3.10.0
+        // runs, and the variable decides once set.
+        let mut own = crate::PropertyMap::new();
+        own.insert("env.RAEVA_TEST_FLAG", "on");
+        for (set, active) in [(None, true), (Some("off"), false), (Some("on"), true)] {
+            let environment = ModelEnvironment::builder()
+                .env("RAEVA_TEST_FLAG", set)
+                .build()
+                .with_maven_mode(MavenMode::Maven310);
+            let external = ActivationContext::new(environment).external_activation(&own);
+            let (outcome, reads) = property("env.RAEVA_TEST_FLAG", "on")
+                .evaluate("flag", &external)
+                .unwrap();
+            assert_eq!(outcome, active, "{set:?}");
+            let env = HostInput::Env("RAEVA_TEST_FLAG".to_string());
+            let user = HostInput::UserProperty("env.RAEVA_TEST_FLAG".to_string());
+            assert_eq!(reads, [env, user].into());
+        }
+        // A `[lock] jdks` JDK decides it, as it decides `java.version`.
+        let ctx = ActivationContext::new(ModelEnvironment::builder().target_jdk("21.0.1").build());
+        assert!(property("java.specification.version", "21").is_active(&ctx));
+        let override_read = HostInput::UserProperty("java.specification.version".to_string());
+        assert_eq!(ctx.environment.take_reads(), [override_read].into());
+        // The replay of a `${...}` condition name reads it this way.
+        assert_eq!(ctx.property("java.specification.version"), Some("21"));
+    }
+
+    /// A JVM-owned name is answered only where the platform, the
+    /// `[lock] jdks` entry or a `-D` fixes it on every host the section
+    /// covers; any other read of one refuses the lock.
+    #[test]
+    fn jvm_owned_names_refuse_unless_the_lock_fixes_them() {
+        let host = crate::HostSnapshot::for_testing(&[]);
+        let refused =
+            |ctx: &ActivationContext, text: &str| activation(text).unread_host_property(ctx);
+        // Windows JVMs set names Linux ones do not, and each Windows
+        // release reports its own `os.name`.
+        let windows = ActivationContext::new(host.environment("windows", "x86_64"));
+        for (text, name) in [
+            (
+                "<property><name>sun.cpu.isalist</name></property>",
+                "sun.cpu.isalist",
+            ),
+            (
+                "<property><name>!user.script</name></property>",
+                "user.script",
+            ),
+            (
+                "<property><name>sun.os.patch.level</name><value>x</value></property>",
+                "sun.os.patch.level",
+            ),
+            ("<os><name>Windows 11</name></os>", "os.name"),
+            ("<os><name>!windows 10</name></os>", "os.name"),
+            (
+                "<property><name>os.name</name><value>Windows 11</value></property>",
+                "os.name",
+            ),
+            (
+                "<file><exists>${user.variant}x</exists></file>",
+                "user.variant",
+            ),
+        ] {
+            assert_eq!(refused(&windows, text).as_deref(), Some(name), "{text}");
+        }
+        // A test every Windows edition's `os.name` answers alike holds.
+        for text in [
+            "<os><name>!Linux</name></os>",
+            "<property><name>!os.name</name></property>",
+            "<file><missing>m-${os.name}</missing></file>",
+        ] {
+            assert_eq!(refused(&windows, text), None, "{text}");
+        }
+        for text in [
+            "<os><family>windows</family></os>",
+            "<os><arch>amd64</arch></os>",
+            "<os><name>Linux</name></os>",
+            "<property><name>os.name</name><value>Linux</value></property>",
+            "<property><name>os.detected.name</name></property>",
+            "<property><name>user.timezone</name></property>",
+        ] {
+            assert_eq!(refused(&windows, text), None, "{text}");
+        }
+        let linux = ActivationContext::new(host.environment("linux", "x86_64"));
+        assert_eq!(refused(&linux, "<os><name>Linux</name></os>"), None);
+        // A `-D` decides one.
+        let mut set = windows.clone();
+        set.properties
+            .insert("sun.cpu.isalist".into(), "amd64".into());
+        set.properties.insert("os.name".into(), "Windows 11".into());
+        assert_eq!(
+            refused(&set, "<property><name>sun.cpu.isalist</name></property>"),
+            None
+        );
+        assert_eq!(refused(&set, "<os><name>Windows 11</name></os>"), None);
+
+        // Some JDKs keep their own value of a JVM-owned name over
+        // `.mvn/jvm.config`'s, so that value answers nothing; another name's
+        // stands.
+        let jvm_config: HashMap<String, String> = [
+            ("java.vendor.version", "V"),
+            ("java.specification.maintenance.version", "9"),
+            ("own", "yes"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .into();
+        let configured = host.clone().with_system_properties(jvm_config.clone());
+        let environment = configured.environment("linux", "x86_64");
+        assert_eq!(
+            host_property(&environment, "java.vendor.version"),
+            Some(HostProperty::Unread)
+        );
+        assert_eq!(host_property(&environment, "own"), None);
+        let mut ctx = ActivationContext::new(environment);
+        ctx.system_properties = jvm_config;
+        for name in [
+            "java.vendor.version",
+            "java.specification.maintenance.version",
+        ] {
+            let text = format!("<property><name>{name}</name><value>V</value></property>");
+            assert_eq!(refused(&ctx, &text).as_deref(), Some(name));
+        }
+        assert_eq!(
+            refused(
+                &ctx,
+                "<property><name>own</name><value>yes</value></property>"
+            ),
+            None
+        );
+
+        // A `[lock] jdks` entry fixes the feature release, not the patch.
+        let jdk = ActivationContext::new(host.environment_for("linux", "x86_64", Some("21")));
+        for text in [
+            "<jdk>21</jdk>",
+            "<jdk>[17,22)</jdk>",
+            "<jdk>!1.8</jdk>",
+            "<jdk>17</jdk>",
+            "<property><name>java.version</name><value>!1.8</value></property>",
+            "<property><name>java.specification.version</name><value>21</value></property>",
+            "<property><name>java.version</name></property>",
+        ] {
+            assert_eq!(refused(&jdk, text), None, "{text}");
+        }
+        for text in [
+            "<jdk>21.0.13</jdk>",
+            "<jdk>[21.0.5,22)</jdk>",
+            "<jdk>[21.0.7,21.0.8)</jdk>",
+            "<jdk>(21.0.7,22)</jdk>",
+            "<property><name>java.version</name><value>21</value></property>",
+            "<property><name>java.version</name><value>21.0.13.0.3</value></property>",
+        ] {
+            assert_eq!(
+                refused(&jdk, text).as_deref(),
+                Some("java.version"),
+                "{text}"
+            );
+        }
+        let mut x = jdk.clone();
+        x.properties.insert("x".into(), "21.0.13".into());
+        let read = "<property><name>x</name><value>${java.version}</value></property>";
+        assert_eq!(refused(&x, read).as_deref(), Some("java.version"));
+        let mut defined = jdk.clone();
+        defined
+            .properties
+            .insert("java.version".into(), "21.0.13".into());
+        assert_eq!(refused(&defined, "<jdk>21.0.13</jdk>"), None);
+    }
+
+    /// One model of what Maven's JVM holds, per platform, JDK and line:
+    /// answered names expand, unread ones are named, and a name neither
+    /// the JVM nor that line's `mvn` sets is none of them.
+    #[test]
+    fn host_properties_follow_the_platform_jdk_and_line() {
+        let host = crate::HostSnapshot::default();
+        for mode in [MavenMode::Maven39, MavenMode::Maven310] {
+            let windows = host.environment("windows", "x86_64").with_maven_mode(mode);
+            let answered = |name| match host_property(&windows, name) {
+                Some(HostProperty::Answered(value)) => Some(value),
+                _ => None,
+            };
+            // Windows 10, 11 and Server JVMs each report their own.
+            assert_eq!(
+                host_property(&windows, "os.name"),
+                Some(HostProperty::Unread)
+            );
+            assert_eq!(answered("path.separator").as_deref(), Some(";"));
+            assert_eq!(answered("maven.version").as_deref(), Some(mode.version()));
+            let jline = (mode == MavenMode::Maven310).then(|| "native,reflection".to_string());
+            assert_eq!(
+                answered("org.jline.terminal.exec.redirectPipeCreationMode"),
+                jline
+            );
+            assert_eq!(
+                host_property(&windows, "java.vendor"),
+                Some(HostProperty::Unread)
+            );
+            assert_eq!(
+                host_property(&windows, "java.home"),
+                Some(HostProperty::Unread)
+            );
+            assert_eq!(host_property(&windows, "no.such"), None);
+            let (jansi, jline) = (
+                host_property(&windows, "library.jansi.path"),
+                host_property(&windows, "library.jline.path"),
+            );
+            match mode {
+                MavenMode::Maven39 => {
+                    assert_eq!((jansi, jline), (Some(HostProperty::Unread), None))
+                }
+                MavenMode::Maven310 => {
+                    assert_eq!((jansi, jline), (None, Some(HostProperty::Unread)))
+                }
+            }
+            assert_eq!(
+                expand_host_properties("${os.name}|${.os.arch}|${java.vendor}|${x", &windows),
+                "${os.name}|amd64|${java.vendor}|${x"
+            );
+            assert_eq!(
+                unread_host_reference("a-${user.name}-${os.name}", &windows).as_deref(),
+                Some("user.name")
+            );
+            assert!(fixed_over_jvm_config("maven.version", mode));
+            assert!(!fixed_over_jvm_config("os.name", mode));
+            assert_eq!(
+                fixed_over_jvm_config("library.jansi.path", mode),
+                mode == MavenMode::Maven39
+            );
+        }
+        let jdk = host.environment_for("linux", "x86_64", Some("17"));
+        assert_eq!(host_property(&jdk, "java.home"), Some(HostProperty::Unread));
+        assert_eq!(
+            host_property(&jdk, "java.specification.version"),
+            Some(HostProperty::Answered("17".to_string()))
+        );
+    }
+
+    /// Maven 3.9.12 and 3.10.0 compare a `<value>` with the JVM's system
+    /// property. The separators are those of the locked platform, in a
+    /// condition and in its interpolation; a value raeva cannot know, or the
+    /// presence of a property only some JDKs set, refuses the lock in both
+    /// forms unless `-D` sets it, instead of reading as absent.
+    #[test]
+    fn jvm_property_values_follow_the_platform_or_refuse() {
+        let separators = |os| match os {
+            "windows" => ["\\", ";", "\r\n"],
+            _ => ["/", ":", "\n"],
+        };
+        let valued = [
+            "file.separator",
+            "java.home",
+            "java.specification.version",
+            "java.version",
+            "line.separator",
+            "maven.build.version",
+            "maven.version",
+            "org.jline.terminal.exec.redirectPipeCreationMode",
+            "os.arch",
+            "os.name",
+            "path.separator",
+        ];
+        for os in ["linux", "macos", "windows"] {
+            for mode in [MavenMode::Maven39, MavenMode::Maven310] {
+                let environment = (crate::HostSnapshot::for_testing(&[]))
+                    .environment(os, "x86_64")
+                    .with_maven_mode(mode);
+                let ctx = ActivationContext::new(environment);
+                for (name, actual) in ["file.separator", "path.separator", "line.separator"]
+                    .into_iter()
+                    .zip(separators(os))
+                {
+                    assert_eq!(ctx.property(name), Some(actual), "{os} {name}");
+                    let other = if actual == "/" { "\\" } else { "/" };
+                    for (value, active) in [
+                        (actual.to_string(), true),
+                        (format!("!{actual}"), false),
+                        (other.to_string(), false),
+                        (format!("!{other}"), true),
+                    ] {
+                        let activation = Activation {
+                            property: Some(ActivationProperty {
+                                name: Some(name.to_string()),
+                                value: Some(value.clone()),
+                            }),
+                            ..Activation::default()
+                        };
+                        assert_eq!(activation.is_active(&ctx), active, "{os} {name}={value:?}");
+                        assert_eq!(
+                            activation.unread_host_property(&ctx).as_deref(),
+                            None,
+                            "{name}"
+                        );
+                    }
+                }
+                // Without a JDK, `java.home` is a host input as the
+                // `java.version` family is, unknown to a value test.
+                for (name, _, _) in jvm_names::JVM_NAMES {
+                    let class = jvm_names::class(name, mode);
+                    let uneven = class == Some(jvm_names::Class::Uneven);
+                    let fixed = matches!(class, Some(jvm_names::Class::Fixed(_)));
+                    for value in ["x", "!x"] {
+                        let unread = property(name, value).unread_host_property(&ctx);
+                        let unread = unread.as_deref();
+                        // 3.10's `library.jline.path` ends in `lib/jline-native`.
+                        let expected =
+                            ((always_set(name, &ctx) && !valued.contains(&name) && !fixed)
+                                || uneven)
+                                && could_be_host_value(name, "x");
+                        let expected = expected.then_some(name);
+                        assert_eq!(unread, expected, "{os} {mode} {name}={value}");
+                    }
+                    let presence = uneven.then_some(name);
+                    assert_eq!(
+                        property(name, "").unread_host_property(&ctx).as_deref(),
+                        presence,
+                        "{name}"
+                    );
+                }
+                let interpolation = ctx.activation_properties(&crate::PropertyMap::new());
+                assert_eq!(
+                    interpolation.get("file.separator").map(String::as_str),
+                    Some(separators(os)[0]),
+                    "{os}"
+                );
+                // Maven keeps the space after the `!`, so this name is unset.
+                let spaced = property("! java.vendor", "!Acme");
+                assert_eq!(spaced.unread_host_property(&ctx).as_deref(), None);
+                assert!(spaced.is_active(&ctx));
+                // No JDK raeva supports sets `user.timezone` before activation.
+                assert!(property("!user.timezone", "").is_active(&ctx));
+                // Without the directory raeva runs in, there is no launcher's.
+                let path = "<file><exists>${maven.multiModuleProjectDirectory}/x</exists></file>";
+                let unread = activation(path).unread_host_property(&ctx);
+                let unread = unread.as_deref();
+                assert_eq!(unread, Some("maven.multiModuleProjectDirectory"));
+                for file in [
+                    "<file><exists>m-${java.vendor}</exists></file>",
+                    "<file><missing>m-${java.vendor}</missing></file>",
+                ] {
+                    let file = activation(file);
+                    assert_eq!(
+                        file.unread_host_property(&ctx).as_deref(),
+                        Some("java.vendor")
+                    );
+                }
+                let dotted = activation("<file><exists>m-${.java.vendor}</exists></file>");
+                assert_eq!(
+                    dotted.unread_host_property(&ctx).as_deref(),
+                    Some("java.vendor")
+                );
+                for text in [
+                    "<file><exists>m-${unknown.prop}</exists></file>",
+                    "<file><exists>m-${unknown.${java.vendor}}</exists></file>",
+                    "<os><name>${unknown.prop}</name></os>",
+                ] {
+                    assert_eq!(
+                        activation(text).unread_host_property(&ctx).as_deref(),
+                        None,
+                        "{text}"
+                    );
+                }
+                // Maven expands every system property in each kind of
+                // condition, so `<os>` and `<jdk>` text cannot compare one
+                // raeva does not know as written.
+                for (text, name) in [
+                    ("<os><name>${java.vendor}</name></os>", "java.vendor"),
+                    ("<os><family>!${.java.vendor}</family></os>", "java.vendor"),
+                    ("<os><arch>${os.version}</arch></os>", "os.version"),
+                    ("<jdk>!${java.vendor}</jdk>", "java.vendor"),
+                    ("<jdk>${java.home}</jdk>", "java.home"),
+                    ("<os><name>${java.home}</name></os>", "java.home"),
+                ] {
+                    assert_eq!(
+                        activation(text).unread_host_property(&ctx).as_deref(),
+                        Some(name),
+                        "{text}"
+                    );
+                }
+                // A `-D` value is known.
+                let mut defined = ctx.clone();
+                defined
+                    .properties
+                    .insert("java.vendor".into(), "Acme".into());
+                let vendor = activation("<os><name>${java.vendor}</name></os>");
+                assert_eq!(vendor.unread_host_property(&defined).as_deref(), None);
+                // Without a JDK the path keeps `${java.home}` as written,
+                // and the lock records what it tested.
+                let home = "<file><exists>${java.home}/release</exists></file>";
+                assert_eq!(activation(home).unread_host_property(&ctx).as_deref(), None);
+                let mut jdk = ctx.clone();
+                jdk.environment = (ModelEnvironment::builder())
+                    .platform(os, "x86_64")
+                    .java_home("/jdk")
+                    .build();
+                jdk.properties.insert("p".to_string(), "x".to_string());
+                for (text, expected) in [
+                    (home, None),
+                    (
+                        "<property><name>java.home</name><value>/jdk</value></property>",
+                        None,
+                    ),
+                    ("<property><name>java.home</name></property>", None),
+                    // Activation interpolation leaves `java.home` out of a
+                    // `<property>` condition, and Maven's ends at the first `}`.
+                    (
+                        "<property><name>p</name><value>${java.home}</value></property>",
+                        Some("java.home"),
+                    ),
+                    (
+                        "<property><name>${java.home}</name></property>",
+                        Some("java.home"),
+                    ),
+                    (
+                        "<property><name>p</name><value>${.java.home}</value></property>",
+                        Some("java.home"),
+                    ),
+                    (
+                        "<property><name>p</name><value>${foo.${java.home}}</value></property>",
+                        None,
+                    ),
+                    // No one sets `q`, which decides the condition: by
+                    // Maven 3.9.12 and 3.10.0 runs, inactive, or active with
+                    // a negated value.
+                    (
+                        "<property><name>q</name><value>${java.home}</value></property>",
+                        None,
+                    ),
+                    (
+                        "<property><name>!q</name><value>!${.java.home}</value></property>",
+                        None,
+                    ),
+                ] {
+                    let unread = activation(text).unread_host_property(&jdk);
+                    let unread = unread.as_deref();
+                    assert_eq!(unread, expected, "{text}");
+                }
+                let settings = property("file.separator", "!${file.separator}");
+                assert!(settings.is_active(&ctx));
+                assert!(!settings.with_host_properties(&ctx).is_active(&ctx));
+                let version = activation("<os><version>5.0</version></os>");
+                assert_eq!(
+                    version.unread_host_property(&ctx).as_deref(),
+                    Some("os.version")
+                );
+                // The OS activator does not read a settings.xml profile property.
+                let mut settings = ctx.clone();
+                settings.settings_properties.insert("os.version", "5.0");
+                assert_eq!(
+                    version.unread_host_property(&settings).as_deref(),
+                    Some("os.version")
+                );
+                let other = if os == "windows" { "unix" } else { "windows" };
+                let moot = format!("<os><family>{other}</family><version>5.0</version></os>");
+                assert_eq!(
+                    activation(&moot).unread_host_property(&ctx).as_deref(),
+                    None
+                );
+                let mut set = ctx.clone();
+                set.properties
+                    .insert("java.vendor".to_string(), "Acme".to_string());
+                assert_eq!(
+                    property("java.vendor", "Acme")
+                        .unread_host_property(&set)
+                        .as_deref(),
+                    None
+                );
+                assert!(property("java.vendor", "Acme").is_active(&set));
+            }
+        }
+    }
+
     // Security: an `env.X` profile condition must NOT activate when the
     // variable is not on the substitution allowlist. Otherwise a transitive
     // POM author could key a profile off host secrets (AWS_SECRET_ACCESS_KEY,
@@ -1144,6 +3002,61 @@ mod tests {
         for value in ["<value>on</value>", ""] {
             let activation = activation(&format!("<property>{condition}{value}</property>"));
             assert!(!activation.is_active(&ctx), "{value}");
+        }
+    }
+
+    /// A hidden variable whose value gives a valued test the outcome it
+    /// gives unset decides nothing: Maven 3.9.12 leaves a `true` profile
+    /// off for `CI=false` and `CI=1`, as where `CI` is unset. A value that
+    /// changes the outcome refuses, and so does any value of a presence
+    /// test. Under Maven 3.10, a dependency's own `env.CI` stands in for the
+    /// unset variable.
+    #[test]
+    fn a_hidden_value_that_gives_the_unset_outcome_decides_nothing() {
+        let outcomes = |own: Option<&str>, set: Option<&str>| {
+            let mut environment = ModelEnvironment::builder();
+            if let Some(set) = set {
+                environment = environment.hidden_env("RAEVA_TEST_CI", set);
+            }
+            let environment = environment.build().with_maven_mode(MavenMode::Maven310);
+            let ctx = ActivationContext::new(environment);
+            match own {
+                Some(own) => {
+                    let mut own_properties = crate::PropertyMap::new();
+                    own_properties.insert("env.RAEVA_TEST_CI", own);
+                    ctx.external_activation(&own_properties)
+                }
+                None => ctx,
+            }
+        };
+        for (name, value, own, set, refused) in [
+            ("env.RAEVA_TEST_CI", "true", None, "false", false),
+            ("env.RAEVA_TEST_CI", "true", None, "1", false),
+            ("env.RAEVA_TEST_CI", "true", None, "", false),
+            ("env.RAEVA_TEST_CI", "true", None, "true", true),
+            ("env.RAEVA_TEST_CI", "!true", None, "false", false),
+            ("env.RAEVA_TEST_CI", "!true", None, "true", true),
+            ("!env.RAEVA_TEST_CI", "true", None, "false", false),
+            ("env.RAEVA_TEST_CI", "", None, "false", true),
+            ("!env.RAEVA_TEST_CI", "", None, "false", true),
+            ("env.RAEVA_TEST_CI", "on", Some("on"), "on", false),
+            ("env.RAEVA_TEST_CI", "on", Some("on"), "off", true),
+            ("env.RAEVA_TEST_CI", "on", Some("off"), "true", false),
+        ] {
+            let case = format!("{name}={value:?} own {own:?} set {set:?}");
+            let activation = property(name, value);
+            let ctx = outcomes(own, Some(set));
+            let unread = activation.unread_host_property(&ctx);
+            let expected = refused.then_some("env.RAEVA_TEST_CI");
+            assert_eq!(unread.as_deref(), expected, "{case}");
+            if !refused {
+                let unset = outcomes(own, None);
+                assert_eq!(
+                    activation.is_active(&ctx),
+                    activation.is_active(&unset),
+                    "{case}"
+                );
+            }
         }
     }
 
@@ -1216,20 +3129,20 @@ mod tests {
             );
         }
         for (family, name, separator, matches) in [
-            ("!windows", Some("linux"), ':', true),
-            ("!unix", Some("linux"), ':', false),
+            ("!windows", Some("linux"), ":", true),
+            ("!unix", Some("linux"), ":", false),
             // `!!windows` tests the family `!windows`, which no name contains.
-            ("!!windows", Some("linux"), ':', true),
+            ("!!windows", Some("linux"), ":", true),
             // An empty family is contained in every name; `!` alone negates it.
-            ("", Some("linux"), ':', true),
-            ("!", Some("linux"), ':', false),
-            ("unix", None, ':', false),
-            ("!unix", None, ':', false),
-            ("nux", Some("linux"), ':', true),
-            ("linux", Some("mac os x"), ':', false),
-            ("darwin", Some("mac os x"), ':', false),
-            ("win", Some("windows 10"), ';', true),
-            ("bsd", Some("freebsd"), ':', true),
+            ("", Some("linux"), ":", true),
+            ("!", Some("linux"), ":", false),
+            ("unix", None, ":", false),
+            ("!unix", None, ":", false),
+            ("nux", Some("linux"), ":", true),
+            ("linux", Some("mac os x"), ":", false),
+            ("darwin", Some("mac os x"), ":", false),
+            ("win", Some("windows 10"), ";", true),
+            ("bsd", Some("freebsd"), ":", true),
         ] {
             assert_eq!(
                 family_matches(family, name, Some(separator)),
@@ -1270,7 +3183,9 @@ mod tests {
             let lower = name.to_lowercase();
             let matched: Vec<&str> = FAMILIES
                 .into_iter()
-                .filter(|family| family_matches(family, Some(&lower), ctx.path_separator()))
+                .filter(|family| {
+                    family_matches(family, Some(&lower), ctx.property("path.separator"))
+                })
                 .collect();
             assert_eq!(matched, families, "{rust_os}");
         }
@@ -1294,6 +3209,38 @@ mod tests {
         assert!(os_active(&os("windows"), &ctx, &ctx.environment).unwrap());
         assert!(os_active(&os("winnt"), &ctx, &ctx.environment).unwrap());
         assert!(!os_active(&os("mac"), &ctx, &ctx.environment).unwrap());
+    }
+
+    /// Recorded with Maven 3.9.12 and 3.10.0: `-Dpath.separator=;` on a
+    /// Linux host matches `dos` and not `unix`, in the project's POM and in
+    /// a dependency's, where the `-D` is a system property.
+    #[test]
+    fn a_path_separator_override_moves_dos_and_unix() {
+        let os = |family: &str| ActivationOs {
+            name: None,
+            family: Some(family.to_string()),
+            arch: None,
+            version: None,
+        };
+        for dependency in [false, true] {
+            let mut ctx = ActivationContext::default();
+            ctx.set_platform("linux", "x86_64");
+            let properties = if dependency {
+                &mut ctx.system_properties
+            } else {
+                &mut ctx.properties
+            };
+            properties.insert("path.separator".to_string(), ";".to_string());
+            let recorder = ctx.environment.detached();
+            assert!(os_active(&os("dos"), &ctx, &recorder).unwrap());
+            assert!(!os_active(&os("unix"), &ctx, &recorder).unwrap());
+            assert!(os_active(&os("!unix"), &ctx, &recorder).unwrap());
+        }
+        let mut ctx = ActivationContext::default();
+        ctx.set_platform("linux", "x86_64");
+        let recorder = ctx.environment.detached();
+        assert!(os_active(&os("unix"), &ctx, &recorder).unwrap());
+        assert!(!os_active(&os("dos"), &ctx, &recorder).unwrap());
     }
 
     /// A settings.xml profile property is a user property of activation,
@@ -1342,6 +3289,62 @@ mod tests {
                 jvm_os_arch(rust_os, rust_arch),
                 jvm,
                 "{rust_os} {rust_arch}"
+            );
+        }
+    }
+
+    /// A `<jdk>` or `java.version` test is decided for a `[lock] jdks`
+    /// entry only where every JDK it covers answers it alike, whatever
+    /// numbers a bound spells.
+    #[test]
+    fn a_jdk_test_holds_for_an_entry_only_when_every_patch_answers_alike() {
+        for (entry, spec, expected) in [
+            ("21", "21", Some(true)),
+            ("21", "2", Some(true)),
+            ("21", "21.0", None),
+            ("21", "21-", None),
+            ("21", "210", Some(false)),
+            ("21", "17", Some(false)),
+            ("21", "!21", Some(false)),
+            ("21", "!21.0.1", None),
+            ("1.8", "1.8.0", Some(true)),
+            ("1.8", "1.8.0_4", None),
+            ("1.8", "!1.8", Some(false)),
+            ("1.8", "1.8.1", Some(false)),
+            ("21", "[17,22)", Some(true)),
+            ("21", "[21,)", Some(true)),
+            ("21", "[22,)", Some(false)),
+            ("21", "(,21]", None),
+            ("21", "(,21)", Some(false)),
+            ("21", "[21.0.11,21.0.12]", None),
+            ("21", "[021.0.11,021.0.12]", None),
+            ("21", "[+21.0.11,+21.0.12]", None),
+            ("21", "[21.0.011,21.0.012]", None),
+            ("21", "[21,21.0.0]", None),
+            ("21", "[21,21.2147483647.2147483647]", Some(true)),
+            ("21", "[21.x,22)", None),
+            ("17", "[21.x,22)", Some(false)),
+            ("1.8", "[1.8,1.9)", Some(true)),
+            ("1.8", "[1.8.0,1.8.0]", Some(true)),
+            ("1.8", "(1.8.0,1.9)", Some(false)),
+            ("21.0.2", "[21.0.2,21.0.3)", Some(true)),
+            ("21-ea", "[21,22)", None),
+        ] {
+            assert_eq!(jdk_on_every_patch(entry, spec), expected, "{entry} {spec}");
+        }
+        for (entry, value, expected) in [
+            ("21", "21", None),
+            ("21", "21.0.1", None),
+            ("21", "21.", None),
+            ("21", "2", Some(false)),
+            ("21", "210", Some(false)),
+            ("1.8", "1.8", Some(false)),
+            ("1.8", "1.8.0_442", None),
+        ] {
+            assert_eq!(
+                equal_on_every_patch(entry, value),
+                expected,
+                "{entry} {value}"
             );
         }
     }
@@ -1422,6 +3425,18 @@ mod tests {
                 *expected,
                 "<jdk>{jdk}</jdk> on java.version {version}"
             );
+        }
+        // `-Djava.version=" 17"`, as Maven 3.9.12 and 3.10.0 activated it.
+        for (jdk, expected) in [
+            ("17", false),
+            ("!17", true),
+            ("[17,)", true),
+            ("[18,)", false),
+        ] {
+            let mut ctx = ActivationContext::default();
+            ctx.properties.insert("java.version".into(), " 17".into());
+            let active = activation(&format!("<jdk>{jdk}</jdk>")).is_active(&ctx);
+            assert_eq!(active, expected, "<jdk>{jdk}</jdk>");
         }
         // Maven refuses an empty `java.version` and activates no `<jdk>`.
         for jdk in ["", "!17", "17"] {

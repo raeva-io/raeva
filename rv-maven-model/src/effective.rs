@@ -63,6 +63,9 @@ pub struct EffectiveDescriptor {
     pub modules: Vec<String>,
     /// Interpolated repositories from this model and its active parent/profile lineage.
     pub repositories: Vec<crate::Repository>,
+    /// The same of `<pluginRepositories>`, the super POM's `central` last.
+    /// One whose interpolation fails is left out.
+    pub plugin_repositories: Vec<crate::Repository>,
     /// Resolution-bearing declarations after local inheritance and profile
     /// injection, with the public POM values their interpolation can read.
     /// External values belong only to the aggregate configuration hash.
@@ -198,10 +201,29 @@ impl Activated {
             &properties,
             &project,
         )?;
+        // Only checks without resolution read these, so what they read from
+        // the host is no input of the build, and a `java.version` read
+        // warns of nothing.
+        let detached = ProjectInfo {
+            environment: (project.environment).selection(&Default::default()),
+            ..project.clone()
+        };
+        let plugin_repositories = (pom.plugin_repositories.into_iter())
+            .filter_map(|repo| {
+                crate::project::repositories::resolve_repositories(
+                    vec![repo],
+                    &properties,
+                    &detached,
+                )
+                .ok()
+            })
+            .flatten()
+            .collect();
 
         Ok(EffectiveDescriptor {
             unread_parent_decides,
             repositories,
+            plugin_repositories,
             gav: Gav {
                 group_id: project.group_id,
                 artifact_id: project.artifact_id,
@@ -295,12 +317,6 @@ fn resolution_context(pom: &Pom, ctx: &ActivationContext) -> Vec<Option<String>>
     let mut conservative = pom.unread_parent.is_some();
     while let Some(input) = pending.pop() {
         for name in crate::properties::expression_names(&input) {
-            // A computed name or external expression can reach any public
-            // property. Never expand external values into a module digest.
-            if name.contains("${") {
-                conservative = true;
-                continue;
-            }
             let name = name
                 .strip_prefix("project.properties.")
                 .or_else(|| name.strip_prefix("pom.properties."))
@@ -341,9 +357,17 @@ fn resolution_context(pom: &Pom, ctx: &ActivationContext) -> Vec<Option<String>>
             "parent.version",
             "prerequisites.maven",
         ];
-        let build = crate::pom::Build::NAMES
-            .iter()
-            .map(|name| format!("build.{name}"));
+        // The super POM's reporting directory follows the build directory,
+        // so only a declared one adds to what is here. The plain text
+        // fields are left out: most parents declare a description, which an
+        // external expression reads too rarely to cost every module its
+        // freshness when it is edited.
+        let build = (crate::pom::Build::FIELDS.iter())
+            .filter(|field| {
+                field.name.starts_with("build.")
+                    || (field.translated && pom.build.value(field).is_some())
+            })
+            .map(|field| field.name.to_owned());
         for name in fields.into_iter().map(str::to_owned).chain(build) {
             let key = format!("project.{name}");
             model_reads.insert(
@@ -383,6 +407,7 @@ fn context_coordinates(
                         && !name.starts_with("project.")
                         && !name.starts_with("pom.")
                         && name != "basedir"
+                        && (name != "rootDirectory" || ctx.root_directory().is_none())
                     {
                         properties.insert(name, value);
                     }
@@ -453,11 +478,8 @@ fn model_value<'a>(pom: &'a Pom, name: &str) -> Option<Option<&'a str>> {
         "basedir" | "baseUri" => None,
         "prerequisites.maven" => pom.prerequisites.as_ref().and_then(|p| p.maven.as_deref()),
         _ => {
-            let field = name.strip_prefix("build.")?;
-            pom.build
-                .field(field)?
-                .as_deref()
-                .or_else(|| crate::properties::super_pom_build(field))
+            let field = crate::pom::Build::model_field(name)?;
+            pom.build.value(field).as_deref().or(field.super_pom)
         }
     })
 }
@@ -474,7 +496,7 @@ fn reads_host_values(pom: &Pom, properties: &PropertyMap, project: &ProjectInfo)
     !crate::model::project_info_in(
         pom,
         properties,
-        project.basedir.clone(),
+        (project.basedir.clone(), project.root_directory.clone()),
         HashMap::new(),
         &environment,
     )
@@ -492,6 +514,7 @@ mod tests {
     fn describe(pom: &Pom, ctx: &ActivationContext) -> EffectiveDescriptor {
         let policy = ModelPolicy {
             root: false,
+            plugins: crate::PluginModel::Off,
             missing_parent: MissingParent::InheritDeclaredCoordinates,
         };
         let source = crate::MemorySource::new();
@@ -641,13 +664,13 @@ mod tests {
                 &ctx
             )
         );
-        let indirect = child.replace("${v}", "${${selector}}");
+        let indirect = child.replace("${v}", "${selector}");
         ctx.properties.insert("v".into(), "${unused}".into());
         assert_ne!(
             inherited_context("", child, &ctx),
             inherited_context("<properties><unused>2</unused></properties>", child, &ctx)
         );
-        ctx.properties.insert("selector".into(), "v".into());
+        ctx.properties.insert("selector".into(), "${v}".into());
         assert_ne!(
             inherited_context("", &indirect, &ctx),
             inherited_context("<properties><v>2</v></properties>", &indirect, &ctx)
@@ -661,17 +684,28 @@ mod tests {
     fn an_indirect_name_can_reach_every_model_value() {
         let mut ctx = ActivationContext::default();
         ctx.properties
-            .insert("selector".into(), "project.prerequisites.maven".into());
+            .insert("selector".into(), "${project.prerequisites.maven}".into());
         let child = |maven| {
             format!(
                 "<prerequisites><maven>{maven}</maven></prerequisites><dependencies><dependency>\
-                 <groupId>g</groupId><artifactId>lib</artifactId><version>${{${{selector}}}}</version>\
+                 <groupId>g</groupId><artifactId>lib</artifactId><version>${{selector}}</version>\
                  </dependency></dependencies>"
             )
         };
         assert_ne!(
             inherited_context("", &child("3"), &ctx),
             inherited_context("", &child("4"), &ctx)
+        );
+        ctx.properties.insert(
+            "selector".into(),
+            "${project.reporting.outputDirectory}".into(),
+        );
+        let parent = |directory| {
+            format!("<reporting><outputDirectory>{directory}</outputDirectory></reporting>")
+        };
+        assert_ne!(
+            inherited_context(&parent("one"), &child("3"), &ctx),
+            inherited_context(&parent("two"), &child("3"), &ctx)
         );
     }
 
@@ -692,6 +726,7 @@ mod tests {
                 &source,
                 ModelPolicy {
                     root: true,
+                    plugins: crate::PluginModel::Off,
                     missing_parent: MissingParent::InheritDeclaredCoordinates,
                 },
                 &ActivationContext::default(),
@@ -821,9 +856,9 @@ mod tests {
         let ctx = ActivationContext::default();
         assert_eq!(describe(&pom, &ctx).modules, ["m-2.0"]);
         let mut properties = PropertyMap::new();
-        properties.insert("selector", "project.prerequisites.maven");
+        properties.insert("selector", "${project.prerequisites.maven}");
         let lookup = crate::properties::ModelLookup::new(&pom, None);
-        let (value, _) = lookup.interpolate("${${selector}}", &properties, &ctx);
+        let (value, _) = lookup.interpolate("${selector}", &properties, &ctx);
         assert_eq!(value.unwrap(), "2.0");
     }
 
@@ -842,9 +877,58 @@ mod tests {
         let project = crate::model::project_info(&pom, &properties, &ctx).unwrap();
         let lookup = project.model_lookup.expect("a model lookup");
         let mut replayed = PropertyMap::new();
-        replayed.insert("selector", "project.groupId");
-        let (value, _) = lookup.interpolate("${${selector}}", &replayed, &ctx);
+        replayed.insert("selector", "${project.groupId}");
+        let (value, _) = lookup.interpolate("${selector}", &replayed, &ctx);
         assert_eq!(value.unwrap(), "com.example");
+    }
+
+    /// Maven 3.10 gives a project's `<file>` conditions and its model
+    /// `${project.rootDirectory}`: the nearest directory up from the project
+    /// that holds `.mvn`, here a directory between the project and the
+    /// reactor root. The 3.9 mode leaves the expression as it is.
+    #[test]
+    fn maven_310_reads_the_root_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sub");
+        let base = root.join("module");
+        std::fs::create_dir_all(root.join(".mvn")).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(root.join("marker"), b"").unwrap();
+        let pom = Pom::parse(
+            "<project><groupId>g</groupId><artifactId>a</artifactId>\
+             <version>${rootDirectory}</version>\
+             <repositories><repository><id>r</id><url>file://${project.rootDirectory}/r</url>\
+             </repository></repositories><profiles><profile><id>p</id><activation>\
+             <file><exists>${project.rootDirectory}/marker</exists></file></activation>\
+             <modules><module>m</module></modules></profile></profiles></project>",
+        )
+        .unwrap();
+        let host = crate::HostSnapshot::for_testing(&[]).with_reactor_root(dir.path());
+        for (mode, active, url) in [
+            (
+                rv_maven_types::MavenMode::Maven39,
+                false,
+                "file://${project.rootDirectory}/r".to_string(),
+            ),
+            (
+                rv_maven_types::MavenMode::Maven310,
+                true,
+                format!("file://{}/r", root.display()),
+            ),
+        ] {
+            let environment = host.environment("linux", "x86_64").with_maven_mode(mode);
+            let mut ctx = ActivationContext::new(environment);
+            ctx.base_dir = Some(base.clone());
+            ctx.property_source = crate::PropertySource::User;
+            let descriptor = describe(&pom, &ctx);
+            assert_eq!(descriptor.modules == ["m"], active, "{mode:?}");
+            assert_eq!(descriptor.repositories[0].url, url, "{mode:?}");
+            // The coordinates read it too, as no host value.
+            assert_eq!(descriptor.gav_is_provisional(), !active, "{mode:?}");
+            if active {
+                assert_eq!(descriptor.gav.version, root.display().to_string());
+            }
+        }
     }
 
     /// A `<file>` condition tests the project, so it counts as a host

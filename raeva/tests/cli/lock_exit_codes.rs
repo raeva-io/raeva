@@ -5,7 +5,7 @@
 
 use std::fs;
 
-use crate::common::{assert_status, assert_success, raeva_command, sha256_hex, write_repo_toml};
+use crate::common::{assert_status, assert_success, run_raeva, sha256_hex, write_repo_toml};
 use crate::offline_project::Project;
 
 /// The commands that re-check the project against raeva.lock, plus `lock
@@ -102,27 +102,31 @@ fn a_lock_from_a_newer_raeva_asks_for_an_upgrade() {
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), edited, "{args:?}");
     }
 
-    // A conflict with a newer schema on one side is refused too.
-    let conflicted = original.replace(
-        &current,
-        &format!("<<<<<<< ours\n{current}=======\n{newer}>>>>>>> theirs\n"),
-    );
-    fs::write(&lock_path, &conflicted).expect("write lock");
-    let output = project.raeva(&["--json", "sync", "--offline"]);
-    assert_status(&output, 3, "plain sync on a conflict with a newer schema");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Upgrade raeva"),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert_eq!(fs::read_to_string(&lock_path).unwrap(), conflicted);
-    let output = project.raeva(&["--json", "sync", "--frozen", "--offline"]);
-    assert_status(&output, 3, "frozen on a conflict with a newer schema");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Upgrade raeva"),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+    // A conflict with a newer schema on one side is refused too, with
+    // markers of any length Git writes.
+    for size in [9, 7] {
+        let [open, split, close] = ['<', '=', '>'].map(|c| c.to_string().repeat(size));
+        let conflicted = original.replace(
+            &current,
+            &format!("{open} ours\n{current}{split}\n{newer}{close} theirs\n"),
+        );
+        fs::write(&lock_path, &conflicted).expect("write lock");
+        let output = project.raeva(&["--json", "sync", "--offline"]);
+        assert_status(&output, 3, "plain sync on a conflict with a newer schema");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Upgrade raeva"),
+            "{size}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), conflicted);
+        let output = project.raeva(&["--json", "sync", "--frozen", "--offline"]);
+        assert_status(&output, 3, "frozen on a conflict with a newer schema");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Upgrade raeva"),
+            "{size}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 
     // A newer --baseline names the upgrade too.
     let baseline = project.root().join("baseline.lock");
@@ -333,7 +337,7 @@ fn frozen_and_exports_accept_pom_edits_that_preserve_pins() {
         let output = project.raeva(args);
         assert_status(&output, 7, "frozen after packaging change");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("changes these entries:"), "{stderr}");
+        assert!(stderr.contains("these entries change:"), "{stderr}");
         assert!(
             stderr.contains("lib:pom") && stderr.contains("added"),
             "{stderr}"
@@ -638,7 +642,7 @@ fn pom_repository_reordering_keeps_a_declared_frozen_origin() {
 
 #[test]
 fn fresh_offline_commands_verify_an_unchecked_cached_parent_with_its_pin() {
-    use rv_store::metadata_cache::{CacheTable, MetadataCache};
+    use rv_store::metadata_cache::{CacheTable, Expiry, MetadataCache};
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let repository = "https://repo.example/";
@@ -655,14 +659,16 @@ fn fresh_offline_commands_verify_an_unchecked_cached_parent_with_its_pin() {
         <version>1</version><packaging>pom</packaging></project>";
     // Seed the entry an earlier --allow-missing-checksums fetch leaves.
     cache
-        .insert_with_ttl(CacheTable::Pom, &scope, parent_path, parent, 86400, false)
+        .insert(
+            CacheTable::Pom,
+            &scope,
+            parent_path,
+            parent,
+            Expiry::After(86400),
+            false,
+        )
         .unwrap();
-    let run = |args: &[&str]| {
-        raeva_command(project.path(), home.path())
-            .args(args)
-            .output()
-            .unwrap()
-    };
+    let run = |args: &[&str]| run_raeva(project.path(), home.path(), args);
     assert_success(
         &run(&["sync", "--offline", "--allow-missing-checksums"]),
         "pin cached parent",
@@ -685,19 +691,31 @@ fn fresh_offline_commands_verify_an_unchecked_cached_parent_with_its_pin() {
     }
 
     cache
-        .insert_with_ttl(
+        .insert(
             CacheTable::Pom,
             &scope,
             parent_path,
             b"changed bytes",
-            86400,
+            Expiry::After(86400),
             false,
         )
         .unwrap();
-    let output = run(&["--json", "sbom", "--offline"]);
-    assert_status(&output, 5, "sbom after cache rewrite");
-    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(envelope["code"], "OFFLINE_NOT_CACHED", "{envelope}");
+    // The store's copy, which the pin vouches for, never takes the place of
+    // a cached one that differs.
+    for args in [
+        &["--json", "sbom", "--offline"][..],
+        &["--json", "sync", "--frozen", "--offline"],
+    ] {
+        let output = run(args);
+        assert_status(&output, 5, &format!("{args:?} after cache rewrite"));
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["code"], "OFFLINE_NOT_CACHED", "{envelope}");
+        let cached = cache.get(CacheTable::Pom, &scope, parent_path).unwrap();
+        assert_eq!(
+            cached.map(|entry| entry.content),
+            Some(b"changed bytes".to_vec())
+        );
+    }
 }
 
 /// Maven refuses a `.mvn/maven.config` it cannot read or parse, and so does

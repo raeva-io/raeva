@@ -29,6 +29,8 @@ pub(crate) enum ErrorClass {
     Offline,
     /// raeva.lock cannot be used as written, such as a row without a checksum.
     Lockfile,
+    /// A bug in raeva, such as a poisoned lock or a task that panicked.
+    Internal,
     /// Anything else: invalid metadata, a refused redirect, a missing
     /// sidecar, a status or transport failure the fetch does not retry.
     Other,
@@ -55,6 +57,7 @@ impl ErrorClass {
             RepoClass::Offline => Self::Offline,
             RepoClass::Config => Self::Config,
             RepoClass::Lockfile => Self::Lockfile,
+            RepoClass::Internal => Self::Internal,
             _ => Self::Other,
         }
     }
@@ -67,7 +70,7 @@ impl ErrorClass {
             Self::Network => ExitStatus::Network,
             Self::Integrity(IntegritySource::Sidecar) => ExitStatus::Integrity,
             Self::Integrity(IntegritySource::LockPin) => ExitStatus::LockMismatch,
-            Self::Store => ExitStatus::Failure,
+            Self::Store | Self::Internal => ExitStatus::Failure,
             Self::NotFound | Self::Offline | Self::Other => ExitStatus::Resolution,
         }
     }
@@ -104,6 +107,17 @@ mod tests {
                 IntegritySource::LockPin
             )),
             ExitStatus::LockMismatch
+        );
+    }
+
+    #[test]
+    fn a_failure_inside_raeva_is_internal() {
+        let internal = RepoError::Internal("fetch dedup map poisoned".into());
+        assert_eq!(ErrorClass::of(&internal), ErrorClass::Internal);
+        assert_eq!(status(internal), ExitStatus::Failure);
+        assert_eq!(
+            crate::error::diagnose::class_code(ErrorClass::Internal),
+            "INTERNAL"
         );
     }
 }

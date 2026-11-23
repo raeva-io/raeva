@@ -13,18 +13,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 
-use rv_maven_types::{ArtifactCoord, Digest, Gav, HashAlgorithm, Sha256, SnapshotStamp};
+use rv_maven_types::{
+    ArtifactCoord, CoordinateField, Digest, Gav, HashAlgorithm, ManagedKind, ManagedSource,
+    MavenMode, Sha256, SnapshotStamp, validate_coordinate_component,
+};
 use serde::{Deserialize, Serialize};
 
+use crate::Scope;
 use crate::ambient::AmbientInput;
 use crate::error::{LockError, printable};
 use crate::lock::{
-    LockArtifact, LockEdge, LockModule, LockModulePackage, LockPlatform, LockResolution, Lockfile,
-    ModelInputs, SupportPom, check_schema_version,
+    EvictedRange, ExtensionJar, LockArtifact, LockEdge, LockModule, LockModulePackage,
+    LockPlatform, LockResolution, Lockfile, MetadataVersion, ModelInputs, RangeVersion, SupportPom,
+    check_schema_version,
 };
 use crate::lock_origin::{decode_repo_id_lines, encode_repo_id_lines};
 use crate::platform::Platform;
-use crate::scope::Scope;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +36,8 @@ pub(crate) struct RawLockfile {
     schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     config_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maven: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolution: Option<RawResolution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -68,6 +74,8 @@ struct RawPlatform {
     modules: Vec<RawModule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     support_poms: Vec<RawSupportPom>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plugins: Option<crate::plugins::RawPlugins>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +144,10 @@ struct RawArtifact {
     pom_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pom_repo_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    missing_checksum: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pom_missing_checksum: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -146,6 +158,8 @@ struct RawSupportPom {
     sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     snapshot: Option<RawSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    missing_checksum: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -187,21 +201,48 @@ struct RawModule {
     /// system path and the system SHA-256. Empty trailing columns are left
     /// out. A reactor version or a path may hold `:` or spaces, never a tab.
     packages: String,
-    /// One edge per line: `from to`, then the scope and `optional`, each
-    /// only when set.
+    /// One edge per line: `from to scope`, then `optional` when set.
     edges: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parent_ranges: Vec<crate::ParentRange>,
     /// One support POM coordinate per line.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     support_poms: String,
+    /// The lineage's parents from a repository, one coordinate per line,
+    /// nearest first.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    parents: String,
+    /// One source of managed versions per line, in tab-separated columns:
+    /// `pom`, `import` or `property`, the `group:artifact` of the POM, BOM
+    /// or parent, the property (empty for none), and the indexes of the
+    /// packages whose version it supplied.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    managed: String,
+    /// One evicted range per line and repository, in tab-separated columns:
+    /// `group:artifact`, the range, the origin of the repository that
+    /// listed versions in it, and those versions separated by spaces.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    evicted_ranges: String,
+    /// One build extension per line: `group:artifact:version`, a tab and
+    /// the SHA-256 of its jar.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    extensions: String,
+    /// One version read from metadata per line, as
+    /// [`encode_metadata_versions`] writes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    metadata_versions: String,
+    /// One range version per line, as [`encode_range_versions`] writes it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    range_versions: String,
 }
 
 /// Parse `contents`, the text of the lockfile at `path`, into a valid
 /// [`Lockfile`]. The origin check against the project directory is the
 /// caller's.
 pub(crate) fn decode(contents: &str, path: &Path) -> Result<Lockfile, LockError> {
-    if let Some(line) = conflict_marker_line(contents) {
+    // A marker can be valid TOML inside a multiline string, but never a
+    // valid lockfile row.
+    if let Some(line) = crate::conflict::first_marker_line(contents) {
         return Err(LockError::Toml {
             path: path.to_path_buf(),
             message: format!("it has a Git merge conflict marker at line {line}"),
@@ -233,21 +274,69 @@ pub(crate) fn decode(contents: &str, path: &Path) -> Result<Lockfile, LockError>
     Lockfile::try_from(raw)
 }
 
-/// The first line, counted from 1, that a Git merge left as a conflict
-/// marker. It can be valid TOML inside a multiline string, but never a
-/// valid lockfile row.
-fn conflict_marker_line(contents: &str) -> Option<usize> {
-    contents
-        .lines()
-        .position(|line| {
-            ["<<<<<<<", "|||||||", "=======", ">>>>>>>"]
-                .iter()
-                .any(|marker| {
-                    line.strip_prefix(marker)
-                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+/// The artifact rows, support POMs and modules' build extension jars of
+/// each `[[platforms]]` table of `contents`, without the checks across
+/// tables or rows a whole lockfile passes, and whatever its schema version:
+/// what a lock that does not read still pins. Every row must decode and pin its file, and every platform
+/// must list a module, which is written after its rows, so a text cut off
+/// within them is refused.
+pub(crate) fn decode_pins(contents: &str) -> Result<Vec<LockPlatform>, LockError> {
+    let path = Path::new("raeva.lock");
+    let doc =
+        crate::split_parse::parse(contents).map_err(|err| toml_error(path, &err, contents))?;
+    let Some(platforms) = doc.get("platforms") else {
+        return Ok(Vec::new());
+    };
+    let not_tables = || LockError::Invalid("platforms must be an array of tables".to_string());
+    (platforms.as_array().ok_or_else(not_tables)?.iter())
+        .map(|table| {
+            let mut table = table.as_table().ok_or_else(not_tables)?.clone();
+            let modules = (table.remove("modules"))
+                .and_then(|modules| modules.as_array().cloned())
+                .filter(|modules| !modules.is_empty())
+                .ok_or_else(|| {
+                    LockError::Invalid("a platform graph lists no module".to_string())
+                })?;
+            let raw: RawPlatform = toml::Value::Table(table)
+                .try_into()
+                .map_err(|err| toml_error(path, &err, ""))?;
+            let target = raw.targets.first().ok_or_else(|| {
+                LockError::Invalid("a platform graph must cover at least one target".to_string())
+            })?;
+            let platform = parse_target(target)?;
+            let mut decoded = decode_platform(raw, platform)?;
+            let on = format!("on platform '{}'", decoded.platform);
+            for (coord, pin) in &decoded.support_poms {
+                crate::lock::check_support_pom(coord, pin, &on)?;
+            }
+            // Of a module, only the build extension jars it pins.
+            decoded.modules = (modules.iter())
+                .map(|module| {
+                    let invalid = || {
+                        LockError::Invalid(format!(
+                            "a module {on} must be a table whose extensions are a string"
+                        ))
+                    };
+                    let block = match module.as_table().ok_or_else(invalid)?.get("extensions") {
+                        Some(block) => block.as_str().ok_or_else(invalid)?,
+                        None => "",
+                    };
+                    let mut pins = LockModule::new("", Gav::new("", "", ""), "");
+                    pins.extensions = lines(block)
+                        .map(|line| decode_extension(line, "a module"))
+                        .collect::<Result<_, _>>()?;
+                    Ok(pins)
                 })
+                .collect::<Result<_, LockError>>()?;
+            if let Some(row) = (decoded.artifacts.iter()).find(|row| row.checksums.is_empty()) {
+                return Err(LockError::Invalid(format!(
+                    "artifact '{}' has no checksum",
+                    printable(&row.coordinate.to_string())
+                )));
+            }
+            Ok(decoded)
         })
-        .map(|index| index + 1)
+        .collect()
 }
 
 /// `err` at its line and column in `contents`, noting a file that ends
@@ -396,8 +485,23 @@ impl TryFrom<RawLockfile> for Lockfile {
         }
         platforms.sort_by_key(|entry| entry.platform.to_string());
         let metadata = raw.metadata.unwrap_or_default();
+        let maven = match raw.maven.as_deref() {
+            None => MavenMode::Maven39,
+            // Written only for another mode than 3.9, so a lock has one
+            // spelling.
+            Some(text) if MavenMode::parse(text) == Some(MavenMode::Maven310) => {
+                MavenMode::Maven310
+            }
+            Some(text) => {
+                return Err(LockError::Invalid(format!(
+                    "maven {:?} must be \"3.10\" or left out for Maven 3.9",
+                    printable(text)
+                )));
+            }
+        };
         let lock = Lockfile {
             config_hash: raw.config_hash,
+            maven,
             resolution,
             platforms,
             repo_ids: decode_repo_id_lines(metadata.repo_ids.as_deref().unwrap_or_default())?,
@@ -541,6 +645,9 @@ fn decode_platform(raw: RawPlatform, platform: Platform) -> Result<LockPlatform,
             repo_url: pom.repo_url,
             sha256,
             snapshot,
+            missing_checksum: only_true(pom.missing_checksum, || {
+                format!("missing_checksum of support POM '{coord}' on {on}")
+            })?,
         };
         if support_poms.insert(pom.coordinate, pin).is_some() {
             return Err(LockError::Invalid(format!(
@@ -557,6 +664,10 @@ fn decode_platform(raw: RawPlatform, platform: Platform) -> Result<LockPlatform,
         model_inputs: None,
         repo_ids: None,
         host_inputs: None,
+        plugins: raw
+            .plugins
+            .map(|plugins| crate::plugins::decode(plugins, &on))
+            .transpose()?,
     })
 }
 
@@ -644,15 +755,16 @@ fn decode_artifact(raw: RawArtifact, platform: &Platform) -> Result<LockArtifact
     };
     let snapshot = raw.snapshot.map(decode).transpose()?;
     let pom_snapshot = raw.pom_snapshot.map(decode).transpose()?;
-    // Written only when true, so a lock has one spelling.
-    let pom_base = match raw.pom_base {
-        Some(false) => {
-            return Err(LockError::Invalid(format!(
-                "pom_base for artifact '{coord}' on platform '{platform}' is written only as true"
-            )));
-        }
-        pom_base => pom_base.is_some(),
-    };
+    let on = |field: &str| format!("{field} for artifact '{coord}' on platform '{platform}'");
+    let pom_base = only_true(raw.pom_base, || on("pom_base"))?;
+    let missing_checksum = only_true(raw.missing_checksum, || on("missing_checksum"))?;
+    let pom_missing_checksum = only_true(raw.pom_missing_checksum, || on("pom_missing_checksum"))?;
+    if pom_missing_checksum && raw.pom_sha256.is_none() {
+        return Err(LockError::Invalid(format!(
+            "{} needs pom_sha256",
+            on("pom_missing_checksum")
+        )));
+    }
     // Hex in either case is accepted and kept lowercase: every comparison
     // downstream (blob id, lock equality, the frozen match) is byte-wise.
     let pom_sha256 = raw
@@ -690,34 +802,45 @@ fn decode_artifact(raw: RawArtifact, platform: &Platform) -> Result<LockArtifact
         pom_base,
         pom_sha256,
         pom_repo_urls: raw.pom_repo_urls,
+        missing_checksum,
+        pom_missing_checksum,
     })
 }
 
-fn decode_scope(
-    scope: Option<String>,
-    what: impl FnOnce() -> String,
-) -> Result<Option<Scope>, LockError> {
-    scope
-        .map(|scope| {
-            Scope::from_str(&scope).map_err(|_| {
-                LockError::Invalid(format!(
-                    "{} is {scope:?}; expected one of {}",
-                    what(),
-                    Scope::ALL.map(Scope::as_str).join(", ")
-                ))
-            })
-        })
-        .transpose()
+/// A flag written only when true, so a lock has one spelling.
+fn only_true(value: Option<bool>, what: impl FnOnce() -> String) -> Result<bool, LockError> {
+    match value {
+        Some(false) => Err(LockError::Invalid(format!(
+            "{} is written only as true",
+            what()
+        ))),
+        value => Ok(value.is_some()),
+    }
+}
+
+/// How a package row writes [`Scope::Empty`] as the scope it resolves to,
+/// since an empty column means the direct scope or compile.
+const EMPTY_SCOPE: &str = "?";
+
+fn decode_scope(scope: &str, what: impl FnOnce() -> String) -> Result<Scope, LockError> {
+    Scope::read(scope).ok_or_else(|| {
+        LockError::Invalid(format!(
+            "{} is {:?}, which is not a scope",
+            what(),
+            printable(scope)
+        ))
+    })
 }
 
 fn decode_module(raw: &RawModule, platform: &Platform) -> Result<LockModule, LockError> {
     let row = format!("module '{}' on platform '{platform}'", printable(&raw.path));
-    let packages = lines(&raw.packages)
+    let mut packages: Vec<LockModulePackage> = lines(&raw.packages)
         .enumerate()
         .map(|(index, line)| {
             decode_package(line, || format!("package line {} of {row}", index + 1))
         })
         .collect::<Result<_, _>>()?;
+    decode_managed(&raw.managed, &mut packages, &row)?;
     let edges = lines(&raw.edges)
         .enumerate()
         .map(|(index, line)| decode_edge(line, || format!("edge line {} of {row}", index + 1)))
@@ -728,12 +851,15 @@ fn decode_module(raw: &RawModule, platform: &Platform) -> Result<LockModule, Loc
             printable(&raw.gav)
         )));
     };
-    let support_poms = lines(&raw.support_poms)
-        .map(|coord| {
-            crate::lock::validate_support_pom_coord(coord)?;
-            Ok(coord.to_owned())
-        })
-        .collect::<Result<_, LockError>>()?;
+    let coords = |text| {
+        lines(text)
+            .map(|coord| {
+                crate::lock::validate_support_pom_coord(coord)?;
+                Ok(coord.to_owned())
+            })
+            .collect::<Result<_, LockError>>()
+    };
+    let (support_poms, parents) = (coords(&raw.support_poms)?, coords(&raw.parents)?);
     Ok(LockModule {
         path: raw.path.clone(),
         gav: Gav::new(group, artifact, version),
@@ -742,7 +868,215 @@ fn decode_module(raw: &RawModule, platform: &Platform) -> Result<LockModule, Loc
         edges,
         parent_ranges: raw.parent_ranges.clone(),
         support_poms,
+        parents,
+        evicted_ranges: decode_evicted_ranges(&raw.evicted_ranges, &row)?,
+        extensions: lines(&raw.extensions)
+            .map(|line| decode_extension(line, &row))
+            .collect::<Result<_, _>>()?,
+        metadata_versions: decode_metadata_versions(&raw.metadata_versions, &row)?,
+        range_versions: decode_range_versions(&raw.range_versions, &row)?,
     })
+}
+
+/// `reads` one per line, in tab-separated columns: `group:artifact`, the
+/// version and the origin.
+pub(crate) fn encode_range_versions(reads: &[RangeVersion]) -> String {
+    let lines: Vec<String> = (reads.iter())
+        .map(|read| {
+            let (group, artifact) = (&read.group, &read.artifact);
+            format!("{group}:{artifact}\t{}\t{}", read.version, read.origin)
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// The range versions `block` writes, sorted and each once. The
+/// coordinates and the origin are checked with the rest of the lock.
+pub(crate) fn decode_range_versions(
+    block: &str,
+    row: &str,
+) -> Result<Vec<RangeVersion>, LockError> {
+    let mut reads: Vec<RangeVersion> = Vec::new();
+    for (number, line) in lines(block).enumerate() {
+        let invalid = || {
+            LockError::Invalid(format!(
+                "range version line {} of {row} must be 'group:artifact', a version and an \
+                 origin, separated by tabs, sorted and each once",
+                number + 1
+            ))
+        };
+        let columns: Vec<&str> = line.split('\t').collect();
+        let [coordinate, version, origin] = columns[..] else {
+            return Err(invalid());
+        };
+        let (group, artifact) = coordinate.split_once(':').ok_or_else(invalid)?;
+        let read = RangeVersion {
+            group: group.to_string(),
+            artifact: artifact.to_string(),
+            version: version.to_string(),
+            origin: origin.to_string(),
+        };
+        if reads.last().is_some_and(|previous| *previous >= read) {
+            return Err(invalid());
+        }
+        reads.push(read);
+    }
+    Ok(reads)
+}
+
+/// `versions` one per line, in tab-separated columns: `group:artifact`,
+/// the kind and the version.
+pub(crate) fn encode_metadata_versions(versions: &[MetadataVersion]) -> String {
+    let lines: Vec<String> = (versions.iter())
+        .map(|read| {
+            let kind = read.kind.as_str();
+            format!("{}:{}\t{kind}\t{}", read.group, read.artifact, read.version)
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// The versions `block` writes, which must be valid coordinates, sorted and
+/// each once.
+pub(crate) fn decode_metadata_versions(
+    block: &str,
+    row: &str,
+) -> Result<Vec<MetadataVersion>, LockError> {
+    let mut versions: Vec<MetadataVersion> = Vec::new();
+    for (number, line) in lines(block).enumerate() {
+        let invalid = || {
+            LockError::Invalid(format!(
+                "metadata version line {} of {row} must be 'group:artifact', a kind (release, \
+                 latest or range) and a version, separated by tabs, sorted and each once",
+                number + 1
+            ))
+        };
+        let columns: Vec<&str> = line.split('\t').collect();
+        let [coordinate, kind, version] = columns[..] else {
+            return Err(invalid());
+        };
+        let (group, artifact) = coordinate.split_once(':').ok_or_else(invalid)?;
+        for (field, value) in [
+            (CoordinateField::Group, group),
+            (CoordinateField::Artifact, artifact),
+            (CoordinateField::Version, version),
+        ] {
+            validate_coordinate_component(field, value).map_err(|_| invalid())?;
+        }
+        let read = MetadataVersion {
+            group: group.to_string(),
+            artifact: artifact.to_string(),
+            kind: kind.parse().map_err(|()| invalid())?,
+            version: version.to_string(),
+        };
+        if versions.last().is_some_and(|previous| *previous >= read) {
+            return Err(invalid());
+        }
+        versions.push(read);
+    }
+    Ok(versions)
+}
+
+fn decode_extension(line: &str, row: &str) -> Result<ExtensionJar, LockError> {
+    let invalid = || {
+        LockError::Invalid(format!(
+            "build extension {:?} of {row} must be 'group:artifact:version', with \
+             ':classifier' for a classified jar, a tab and the SHA-256 of its jar",
+            printable(line)
+        ))
+    };
+    let (coord, sha256) = line.split_once('\t').ok_or_else(invalid)?;
+    let mut parts = coord.split(':');
+    let (Some(group), Some(artifact), Some(version), classifier, None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return Err(invalid());
+    };
+    if classifier == Some("") {
+        return Err(invalid());
+    }
+    let jar = ExtensionJar {
+        gav: Gav::new(group, artifact, version),
+        classifier: classifier.map(str::to_string),
+        sha256: lowercase_sha256(sha256).ok_or_else(invalid)?,
+    };
+    jar.coord().validate().map_err(|_| invalid())?;
+    Ok(jar)
+}
+
+/// The `extensions` lines of a module.
+pub(crate) fn encode_extensions(module: &LockModule) -> String {
+    let lines: Vec<String> = (module.extensions.iter())
+        .map(|jar| format!("{jar}\t{}", jar.sha256))
+        .collect();
+    lines.join("\n")
+}
+
+/// The `evicted_ranges` lines of a module, sorted, one per range and origin.
+pub(crate) fn encode_evicted_ranges(module: &LockModule) -> String {
+    let lines: Vec<String> = (module.evicted_ranges.iter())
+        .map(|range| {
+            format!(
+                "{}:{}\t{}\t{}\t{}",
+                range.group,
+                range.artifact,
+                range.range,
+                range.origin,
+                range.versions.join(" ")
+            )
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// The evicted ranges `block` writes. The coordinates, the range and the
+/// versions are checked with the rest of the lock.
+fn decode_evicted_ranges(block: &str, row: &str) -> Result<Vec<EvictedRange>, LockError> {
+    let mut ranges: Vec<EvictedRange> = Vec::new();
+    for (number, line) in lines(block).enumerate() {
+        let invalid = |what: &str| {
+            LockError::Invalid(format!(
+                "invalid evicted range line {} of {row}: {what}",
+                number + 1
+            ))
+        };
+        let columns: Vec<&str> = line.split('\t').collect();
+        let [coordinate, range, origin, versions] = columns[..] else {
+            return Err(invalid(
+                "expected group:artifact, the range, its origin and its versions",
+            ));
+        };
+        let (group, artifact) = coordinate
+            .split_once(':')
+            .ok_or_else(|| invalid("expected group:artifact"))?;
+        let range = EvictedRange {
+            group: group.to_string(),
+            artifact: artifact.to_string(),
+            range: range.to_string(),
+            versions: versions.split(' ').map(str::to_string).collect(),
+            origin: origin.to_string(),
+        };
+        let key = |range: &EvictedRange| {
+            (
+                range.group.clone(),
+                range.artifact.clone(),
+                range.range.clone(),
+                range.origin.clone(),
+            )
+        };
+        if ranges
+            .last()
+            .is_some_and(|previous| key(previous) >= key(&range))
+        {
+            return Err(invalid("lines must be sorted, one per range and origin"));
+        }
+        ranges.push(range);
+    }
+    Ok(ranges)
 }
 
 fn lines(block: &str) -> impl Iterator<Item = &str> {
@@ -768,13 +1102,17 @@ fn decode_package(line: &str, row: impl Fn() -> String) -> Result<LockModulePack
         .ok_or_else(|| {
             invalid("it must start with group:artifact:version and packaging[:classifier]")
         })?;
-    let direct_scope = decode_scope(column().map(str::to_string), || {
-        format!("the direct scope in the {}", row())
-    })?;
+    let direct_scope = column()
+        .map(|scope| decode_scope(scope, || format!("the direct scope in the {}", row())))
+        .transpose()?;
     let mut package = LockModulePackage::new(coordinate, direct_scope);
-    if let Some(scope) = decode_scope(column().map(str::to_string), || {
-        format!("the scope in the {}", row())
-    })? {
+    if let Some(scope) = column()
+        .map(|scope| match scope {
+            EMPTY_SCOPE => Ok(Scope::Empty),
+            _ => decode_scope(scope, || format!("the scope in the {}", row())),
+        })
+        .transpose()?
+    {
         if scope == package.scope {
             return Err(invalid(
                 "its scope column must be empty when it is the direct scope or compile",
@@ -799,7 +1137,7 @@ fn decode_package(line: &str, row: impl Fn() -> String) -> Result<LockModulePack
 fn decode_edge(line: &str, row: impl Fn() -> String) -> Result<LockEdge, LockError> {
     let invalid = || {
         LockError::Invalid(format!(
-            "invalid {}: {:?} is not 'from to [scope] [optional]'",
+            "invalid {}: {:?} is not 'from to scope [optional]'",
             row(),
             printable(line)
         ))
@@ -814,21 +1152,17 @@ fn decode_edge(line: &str, row: impl Fn() -> String) -> Result<LockEdge, LockErr
             .ok_or_else(invalid)
     };
     let (from, to) = (index()?, index()?);
-    let mut edge = LockEdge::new(from, to, None, false);
-    for field in fields {
-        if edge.optional {
-            return Err(invalid());
-        } else if field == "optional" {
-            edge.optional = true;
-        } else if edge.scope.is_none() {
-            edge.scope = decode_scope(Some(field.to_string()), || {
-                format!("the scope in the {}", row())
-            })?;
-        } else {
-            return Err(invalid());
-        }
-    }
-    Ok(edge)
+    // The scope is always written, so a scope named `optional` stays apart
+    // from the flag.
+    let scope = decode_scope(fields.next().ok_or_else(invalid)?, || {
+        format!("the scope in the {}", row())
+    })?;
+    let optional = match (fields.next(), fields.next()) {
+        (None, _) => false,
+        (Some("optional"), None) => true,
+        _ => return Err(invalid()),
+    };
+    Ok(LockEdge::new(from, to, scope, optional))
 }
 
 pub(crate) fn encode_packages(module: &LockModule) -> String {
@@ -847,6 +1181,7 @@ pub(crate) fn encode_packages(module: &LockModule) -> String {
             package.direct_scope.map_or("", Scope::as_str),
             match package.direct_scope.unwrap_or(Scope::Compile) {
                 scope if scope == package.scope => "",
+                _ if package.scope == Scope::Empty => EMPTY_SCOPE,
                 _ => package.scope.as_str(),
             },
             package.workspace_module.as_deref().unwrap_or_default(),
@@ -870,6 +1205,100 @@ pub(crate) fn encode_packages(module: &LockModule) -> String {
     block
 }
 
+/// The `managed` lines of `module`, sorted by source, each package index
+/// once and in order.
+pub(crate) fn encode_managed(module: &LockModule) -> String {
+    use std::fmt::Write;
+    let mut sources: BTreeMap<&ManagedSource, Vec<usize>> = BTreeMap::new();
+    for (index, package) in module.packages.iter().enumerate() {
+        if let Some(source) = &package.managed {
+            sources.entry(source).or_default().push(index);
+        }
+    }
+    let mut block = String::new();
+    for (source, indexes) in sources {
+        if !block.is_empty() {
+            block.push('\n');
+        }
+        let property = source.property.as_deref().unwrap_or_default();
+        let _ = write!(
+            block,
+            "{}\t{}\t{property}\t",
+            source.kind.as_str(),
+            source.pom
+        );
+        for (at, index) in indexes.iter().enumerate() {
+            if at > 0 {
+                block.push(' ');
+            }
+            let _ = write!(block, "{index}");
+        }
+    }
+    block
+}
+
+/// Set the `managed` source of each package `block` names.
+fn decode_managed(
+    block: &str,
+    packages: &mut [LockModulePackage],
+    row: &str,
+) -> Result<(), LockError> {
+    let mut previous: Option<ManagedSource> = None;
+    for (number, line) in lines(block).enumerate() {
+        let invalid = |what: &str| {
+            LockError::Invalid(format!(
+                "invalid managed line {} of {row}: {what}",
+                number + 1
+            ))
+        };
+        let columns: Vec<&str> = line.split('\t').collect();
+        let [kind, pom, property, indexes] = columns[..] else {
+            return Err(invalid("expected kind, POM, property and package indexes"));
+        };
+        let kind = ManagedKind::parse(kind)
+            .ok_or_else(|| invalid("kind must be pom, import or property"))?;
+        let source = pom
+            .split_once(':')
+            .and_then(|(group, artifact)| ManagedSource::new(kind, group, artifact, None))
+            .filter(|source| source.pom == pom)
+            .ok_or_else(|| invalid("the POM must be 'group:artifact'"))?;
+        if !property.is_empty() && !ManagedSource::is_property_name(property) {
+            return Err(invalid("the property is not a property name"));
+        }
+        if property.is_empty() && kind == ManagedKind::Property {
+            return Err(invalid("a property line names its property"));
+        }
+        let source = ManagedSource {
+            property: (!property.is_empty()).then(|| property.to_string()),
+            ..source
+        };
+        if previous
+            .as_ref()
+            .is_some_and(|previous| *previous >= source)
+        {
+            return Err(invalid("lines must be sorted, one per source"));
+        }
+        let shared = std::sync::Arc::new(source.clone());
+        let mut last = None;
+        for index in indexes.split(' ') {
+            // Written as `usize` displays it, so `+1` or `01` is no index.
+            let index: usize = (index.parse().ok())
+                .filter(|parsed: &usize| parsed.to_string() == index)
+                .filter(|index| last.is_none_or(|last| *index > last))
+                .filter(|index| *index < packages.len())
+                .ok_or_else(|| invalid("package indexes must be ascending and name packages"))?;
+            let package = &mut packages[index];
+            if package.managed.is_some() {
+                return Err(invalid("a package has one source"));
+            }
+            package.managed = Some(std::sync::Arc::clone(&shared));
+            last = Some(index);
+        }
+        previous = Some(source);
+    }
+    Ok(())
+}
+
 pub(crate) fn encode_edges(module: &LockModule) -> String {
     use std::fmt::Write;
     let mut block = String::new();
@@ -877,11 +1306,7 @@ pub(crate) fn encode_edges(module: &LockModule) -> String {
         if index > 0 {
             block.push('\n');
         }
-        let _ = write!(block, "{} {}", edge.from, edge.to);
-        if let Some(scope) = edge.scope {
-            block.push(' ');
-            block.push_str(scope.as_str());
-        }
+        let _ = write!(block, "{} {} {}", edge.from, edge.to, edge.scope);
         if edge.optional {
             block.push_str(" optional");
         }
@@ -897,6 +1322,7 @@ pub(crate) fn encode(lock: &Lockfile) -> Result<RawLockfile, LockError> {
     Ok(RawLockfile {
         schema_version: crate::lock::LOCKFILE_SCHEMA_VERSION,
         config_hash: lock.config_hash.clone(),
+        maven: (lock.maven != MavenMode::Maven39).then(|| lock.maven.as_str().to_string()),
         resolution: (lock.resolution != LockResolution::default()).then(|| RawResolution {
             ambient_inputs: lock
                 .resolution
@@ -913,6 +1339,7 @@ pub(crate) fn encode(lock: &Lockfile) -> Result<RawLockfile, LockError> {
                     other.artifacts == platform.artifacts
                         && other.modules == platform.modules
                         && other.support_poms == platform.support_poms
+                        && other.plugins == platform.plugins
                 }) {
                     graph.targets.push(target_name(&platform.platform));
                 } else {
@@ -991,6 +1418,8 @@ fn encode_platform(platform: &LockPlatform) -> Result<RawPlatform, LockError> {
                 pom_base: artifact.pom_base.then_some(true),
                 pom_sha256: artifact.pom_sha256.as_ref().map(ToString::to_string),
                 pom_repo_urls: artifact.pom_repo_urls.clone(),
+                missing_checksum: artifact.missing_checksum.then_some(true),
+                pom_missing_checksum: artifact.pom_missing_checksum.then_some(true),
             })
             .collect(),
         modules: rv_maven_types::par_map(&platform.modules, |module| RawModule {
@@ -1001,6 +1430,12 @@ fn encode_platform(platform: &LockPlatform) -> Result<RawPlatform, LockError> {
             edges: encode_edges(module),
             parent_ranges: module.parent_ranges.clone(),
             support_poms: module.support_poms.join("\n"),
+            parents: module.parents.join("\n"),
+            managed: encode_managed(module),
+            evicted_ranges: encode_evicted_ranges(module),
+            extensions: encode_extensions(module),
+            metadata_versions: encode_metadata_versions(&module.metadata_versions),
+            range_versions: encode_range_versions(&module.range_versions),
         }),
         support_poms: platform
             .support_poms
@@ -1010,8 +1445,14 @@ fn encode_platform(platform: &LockPlatform) -> Result<RawPlatform, LockError> {
                 repo_url: pin.repo_url.clone(),
                 sha256: pin.sha256.to_string(),
                 snapshot: pin.snapshot.as_ref().map(encode_snapshot),
+                missing_checksum: pin.missing_checksum.then_some(true),
             })
             .collect(),
+        plugins: platform
+            .plugins
+            .as_ref()
+            .map(crate::plugins::encode)
+            .transpose()?,
     })
 }
 
@@ -1032,6 +1473,7 @@ type Shape = [&'static str];
 const TOP: &Shape = &[
     "schema_version",
     "config_hash?",
+    "maven?",
     "resolution?",
     "platforms?",
     "inputs?",
@@ -1039,7 +1481,13 @@ const TOP: &Shape = &[
 ];
 const RESOLUTION: &Shape = &["ambient_inputs?", "command_line?"];
 const METADATA: &Shape = &["repo_ids?"];
-const PLATFORM: &Shape = &["targets", "artifacts?", "modules?", "support_poms?"];
+const PLATFORM: &Shape = &[
+    "targets",
+    "artifacts?",
+    "modules?",
+    "support_poms?",
+    "plugins?",
+];
 const INPUTS: &Shape = &[
     "target",
     "model_hash?",
@@ -1050,7 +1498,13 @@ const INPUTS: &Shape = &[
     "host_inputs?",
 ];
 const POM_INPUT: &Shape = &["path", "sha256", "graph?", "ambient_inputs?"];
-const SUPPORT_POM: &Shape = &["coordinate", "repo_url", "sha256", "snapshot?"];
+const SUPPORT_POM: &Shape = &[
+    "coordinate",
+    "repo_url",
+    "sha256",
+    "snapshot?",
+    "missing_checksum?",
+];
 const ARTIFACT: &Shape = &[
     "coordinate",
     "repo_url",
@@ -1061,6 +1515,8 @@ const ARTIFACT: &Shape = &[
     "pom_base?",
     "pom_sha256?",
     "pom_repo_urls?",
+    "missing_checksum?",
+    "pom_missing_checksum?",
 ];
 const COORDINATE: &Shape = &["group", "artifact", "version", "packaging", "classifier?"];
 const CHECKSUM: &Shape = &["algorithm", "digest"];
@@ -1073,6 +1529,12 @@ const MODULE: &Shape = &[
     "edges",
     "parent_ranges?",
     "support_poms?",
+    "parents?",
+    "managed?",
+    "evicted_ranges?",
+    "extensions?",
+    "metadata_versions?",
+    "range_versions?",
 ];
 
 /// `None` when `table` has the keys of `shape`; otherwise the first unknown
@@ -1199,6 +1661,16 @@ fn check_shape(doc: &toml::Table) -> Result<(), LockError> {
                 && let Some(problem) = shape_problem(table, SNAPSHOT)
             {
                 return invalid(problem, format!("the snapshot table of {row}"));
+            }
+        }
+        if let Some(plugins) = platform.get("plugins").and_then(toml::Value::as_table) {
+            if let Some(problem) = shape_problem(plugins, crate::plugins::PLUGINS_SHAPE) {
+                return invalid(problem, format!("the plugins table of {on}"));
+            }
+            for set in rows(plugins, "sets") {
+                if let Some(problem) = shape_problem(set, crate::plugins::SET_SHAPE) {
+                    return invalid(problem, format!("a plugin set of {on}"));
+                }
             }
         }
         for (index, module) in rows(platform, "modules").enumerate() {

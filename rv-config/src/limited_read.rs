@@ -11,11 +11,21 @@ pub const MAX_PROJECT_INPUT_SIZE: usize = 5 * 1024 * 1024;
 pub(crate) enum CappedReadError {
     Io(std::io::Error),
     TooLarge,
+    /// A FIFO, device or directory, whose open or read can block.
+    NotRegular,
 }
 
 /// Reads `path` up to `limit` bytes, stopping one byte past the limit so an
-/// oversized file is never held in memory whole.
+/// oversized file is never held in memory whole. Only a regular file, or a
+/// link to one, is opened, as `mvn`'s `[ -f ... ]` and `MavenCli`'s
+/// `isFile()` test it.
 pub(crate) fn read_capped(path: &Path, limit: usize) -> Result<Vec<u8>, CappedReadError> {
+    if !std::fs::metadata(path)
+        .map_err(CappedReadError::Io)?
+        .is_file()
+    {
+        return Err(CappedReadError::NotRegular);
+    }
     let file = File::open(path).map_err(CappedReadError::Io)?;
     let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
     file.take(limit as u64 + 1)
@@ -28,11 +38,15 @@ pub(crate) fn read_capped(path: &Path, limit: usize) -> Result<Vec<u8>, CappedRe
 }
 
 /// Reads `path` in full, refusing a file larger than
-/// [`MAX_PROJECT_INPUT_SIZE`] with [`ConfigError::ProjectInputTooLarge`].
-/// The read stops one byte past the limit, so an oversized file is never
-/// held in memory whole.
+/// [`MAX_PROJECT_INPUT_SIZE`] with [`ConfigError::ProjectInputTooLarge`],
+/// and one that is not a regular file. The read stops one byte past the
+/// limit, so an oversized file is never held in memory whole.
 pub fn read_project_input(path: &Path) -> Result<Vec<u8>, ConfigError> {
     read_capped(path, MAX_PROJECT_INPUT_SIZE).map_err(|error| match error {
+        CappedReadError::NotRegular => ConfigError::ProjectInputIo {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, NOT_REGULAR),
+        },
         CappedReadError::Io(source) => ConfigError::ProjectInputIo {
             path: path.to_path_buf(),
             source,
@@ -44,7 +58,10 @@ pub fn read_project_input(path: &Path) -> Result<Vec<u8>, ConfigError> {
     })
 }
 
-/// [`read_project_input`], with `None` for a file that does not exist.
+const NOT_REGULAR: &str = "not a regular file";
+
+/// [`read_project_input`], with `None` for a file that does not exist or
+/// is no regular file, which the launcher and `MavenCli` skip.
 pub fn read_optional_project_input(path: &Path) -> Result<Option<Vec<u8>>, ConfigError> {
     not_found_none(read_project_input(path))
 }
@@ -58,7 +75,7 @@ pub fn read_project_input_string(path: &Path) -> Result<String, ConfigError> {
 }
 
 /// [`read_project_input_string`], with `None` for a file that does not
-/// exist.
+/// exist or is no regular file.
 pub fn read_optional_project_input_string(path: &Path) -> Result<Option<String>, ConfigError> {
     not_found_none(read_project_input_string(path))
 }
@@ -67,7 +84,8 @@ fn not_found_none<T>(result: Result<T, ConfigError>) -> Result<Option<T>, Config
     match result {
         Ok(value) => Ok(Some(value)),
         Err(ConfigError::ProjectInputIo { source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound =>
+            if source.kind() == std::io::ErrorKind::NotFound
+                || source.to_string() == NOT_REGULAR =>
         {
             Ok(None)
         }
@@ -101,5 +119,28 @@ mod tests {
                 .as_deref(),
             Some("ok")
         );
+        // A directory is no regular file; it is skipped, as a FIFO is.
+        assert!(read_optional_project_input(temp.path()).unwrap().is_none());
+        assert!(read_project_input(temp.path()).is_err());
+    }
+
+    /// A FIFO without a writer blocks an open: it is skipped as optional
+    /// input and refused otherwise, without opening it.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_not_opened() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let fifo = temp.path().join("jvm.config");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.is_ok_and(|status| status.success()));
+        let (sent, received) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let optional = read_optional_project_input_string(&path).map(|text| text.is_none());
+            let required = read_project_input(&path).is_err();
+            let _ = sent.send((optional.ok(), required));
+        });
+        let read = received.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(read.ok(), Some((Some(true), true)));
     }
 }

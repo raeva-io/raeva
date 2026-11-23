@@ -68,6 +68,16 @@ pub enum VulnError {
     /// The message does not quote the body.
     #[error("invalid response: {0}")]
     InvalidResponse(String),
+    /// OSV's response ended short of its Content-Length, as an HTTP/2
+    /// stream reset with `NO_ERROR` ends it. Retried, as a broken
+    /// connection is.
+    #[error("OSV response ended after {read} of its {declared} bytes")]
+    Truncated {
+        /// The Content-Length.
+        declared: u64,
+        /// The bytes that arrived.
+        read: u64,
+    },
 }
 
 /// A `Result` whose error is [`VulnError`].

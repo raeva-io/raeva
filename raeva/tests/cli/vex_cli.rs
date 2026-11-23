@@ -351,6 +351,31 @@ fn vex_suppresses_per_module_before_the_modules_combine() {
     server.stop();
 }
 
+/// A purl that names the default `type=jar`, as many generators write it,
+/// names the same component as one without it.
+#[test]
+fn a_purl_with_the_default_jar_type_matches() {
+    let (project, home) = golden_project("reactor");
+    let (osv, server) = osv(false);
+    let statements = [API, APP]
+        .map(|module| {
+            json!({
+                "vulnerability": {"name": "OSV-UTIL-1"},
+                "products": [{"@id": format!("{module}?type=jar"),
+                    "subcomponents": [{"@id": format!("{UTIL}?type=jar")}]}],
+                "status": "not_affected",
+                "justification": "component_not_present",
+            })
+        })
+        .to_vec();
+    let vex = write_vex(project.path(), "typed.vex.json", statements);
+    let vex = vex.to_str().expect("path");
+    let (code, envelope) = json_vuln(project.path(), home.path(), &osv, &["--vex", vex]);
+    assert_eq!(code, 0, "{envelope}");
+    assert_eq!(envelope["data"]["summary"]["suppressed"], 1);
+    server.stop();
+}
+
 /// Two statements that disagree fail before OSV is asked anything.
 #[test]
 fn conflicting_vex_statements_fail_before_the_scan() {
@@ -618,6 +643,99 @@ fn triage_records_one_unambiguous_finding() {
     let (code, envelope) = json_vuln(project.path(), home.path(), &osv, &["--vex", vex]);
     assert_eq!(code, 0, "{envelope}");
     assert_eq!(envelope["data"]["summary"]["suppressed"], 1);
+    server.stop();
+}
+
+/// The global and Maven options may stand between `vuln` and `triage`; an
+/// option only the scan takes may not.
+#[test]
+fn triage_takes_global_options_after_vuln() {
+    let (project, home) = golden_project("reactor");
+    let (osv, server) = osv(false);
+    let path = project.path().join("vex.json");
+    let triage = [
+        "triage",
+        "CVE-2024-0001",
+        "--justification",
+        "vulnerable_code_not_in_execute_path",
+        "--vex",
+        path.to_str().expect("path"),
+        "--author",
+        "Example",
+        "--module",
+        "api/pom.xml",
+    ];
+    let output = vuln(
+        project.path(),
+        home.path(),
+        &osv,
+        &[&["vuln", "--json"], &triage[..]].concat(),
+    );
+    assert_success(&output, "vuln --json triage");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert_eq!(envelope["data"]["written"], true, "{envelope}");
+    let args = [&["vuln", "--json", "-P", "other"], &triage[..]].concat();
+    let output = vuln(project.path(), home.path(), &osv, &args);
+    assert_status(&output, 7, "vuln -P triage");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("JSON envelope");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("-Pother")),
+        "{envelope}"
+    );
+    for scan in [
+        &["--format", "sarif"][..],
+        &["--baseline", "raeva.lock"],
+        &["--include-test"],
+    ] {
+        let args = [&["vuln"][..], scan, &triage].concat();
+        let output = vuln(project.path(), home.path(), &osv, &args);
+        assert_status(&output, 2, &format!("vuln {scan:?} triage"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("cannot be used with '{}'", scan[0])),
+            "{stderr}"
+        );
+    }
+    server.stop();
+}
+
+/// A `--vex` path triage cannot look at or write exits 2 with `IO`, since
+/// `raeva vuln` exits 1 for findings alone.
+#[cfg(unix)]
+#[test]
+fn a_vex_file_triage_cannot_write_exits_2() {
+    use std::os::unix::fs::PermissionsExt;
+    let (project, home) = golden_project("reactor");
+    let (osv, server) = osv(false);
+    for mode in [0o000, 0o555] {
+        let dir = project.path().join(format!("vex-{mode:o}"));
+        fs::create_dir(&dir).expect("dir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).expect("chmod");
+        // A process that may override file modes, such as root in a user
+        // namespace, writes there anyway.
+        if fs::write(dir.join("probe"), b"").is_ok() {
+            continue;
+        }
+        let vex = dir.join("vex.json");
+        let args = [
+            "CVE-2024-0001",
+            "--justification",
+            "vulnerable_code_not_in_execute_path",
+            "--vex",
+            vex.to_str().expect("path"),
+            "--author",
+            "Example",
+            "--module",
+            "api/pom.xml",
+        ];
+        let (code, envelope) = triage(project.path(), home.path(), &osv, &args);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(code, 2, "mode {mode:o}: {envelope}");
+        assert_eq!(envelope["exit_code"], 2, "{envelope}");
+        assert_eq!(envelope["code"], "IO", "{envelope}");
+    }
     server.stop();
 }
 

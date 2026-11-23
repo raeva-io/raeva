@@ -1,0 +1,44 @@
+# The elements and attributes the strict MavenXpp3Reader of Maven 3.9.12
+# and 3.10.0 (maven-model 3.9.12 and 3.10.0, which agree) takes in each
+# model class, read off its bytecode with javap. One class per line: its
+# name, then `@attribute` for each attribute it takes besides those with a
+# `:`, then each child element: `name` holds text, `name:Class` a class,
+# `name[item]` a list of text items, `name[item:Class]` a list of classes,
+# `name*` properties, whose children hold text, and `name~` any XML. `|`
+# separates the names of one element.
+Model @xmlns @child.project.url.inherit.append.path modelVersion parent:Parent groupId artifactId version packaging name description url inceptionYear organization|organisation:Organization licenses[license:License] developers[developer:Developer] contributors[contributor:Contributor] mailingLists[mailingList:MailingList] prerequisites:Prerequisites modules[module] scm:Scm issueManagement:IssueManagement ciManagement:CiManagement distributionManagement:DistributionManagement properties* dependencyManagement:DependencyManagement dependencies[dependency:Dependency] repositories[repository:Repository] pluginRepositories[pluginRepository:Repository] build:Build reports~ reporting:Reporting profiles[profile:Profile]
+Activation activeByDefault jdk os:ActivationOS property:ActivationProperty file:ActivationFile
+ActivationFile missing exists
+ActivationOS name family arch version
+ActivationProperty name value
+Build sourceDirectory scriptSourceDirectory testSourceDirectory outputDirectory testOutputDirectory extensions[extension:Extension] defaultGoal resources[resource:Resource] testResources[testResource:Resource] directory finalName filters[filter] pluginManagement:PluginManagement plugins[plugin:Plugin]
+BuildBase defaultGoal resources[resource:Resource] testResources[testResource:Resource] directory finalName filters[filter] pluginManagement:PluginManagement plugins[plugin:Plugin]
+CiManagement system url notifiers[notifier:Notifier]
+Contributor name email url organization|organisation organizationUrl|organisationUrl roles[role] timezone properties*
+Dependency groupId artifactId version type classifier scope systemPath exclusions[exclusion:Exclusion] optional
+DependencyManagement dependencies[dependency:Dependency]
+DeploymentRepository uniqueVersion releases:RepositoryPolicy snapshots:RepositoryPolicy id name url layout
+Developer id name email url organization|organisation organizationUrl|organisationUrl roles[role] timezone properties*
+DistributionManagement repository:DeploymentRepository snapshotRepository:DeploymentRepository site:Site downloadUrl relocation:Relocation status
+Exclusion groupId artifactId
+Extension groupId artifactId version
+IssueManagement system url
+License name url distribution comments
+MailingList name subscribe unsubscribe post archive otherArchives[otherArchive]
+Notifier type sendOnError sendOnFailure sendOnSuccess sendOnWarning address configuration*
+Organization name url
+Parent groupId artifactId version relativePath
+Plugin groupId artifactId version extensions executions[execution:PluginExecution] dependencies[dependency:Dependency] goals~ inherited configuration~
+PluginExecution id phase goals[goal] inherited configuration~
+PluginManagement plugins[plugin:Plugin]
+Prerequisites maven
+Profile id activation:Activation build:BuildBase modules[module] distributionManagement:DistributionManagement properties* dependencyManagement:DependencyManagement dependencies[dependency:Dependency] repositories[repository:Repository] pluginRepositories[pluginRepository:Repository] reports~ reporting:Reporting
+Relocation groupId artifactId version message
+ReportPlugin groupId artifactId version reportSets[reportSet:ReportSet] inherited configuration~
+ReportSet id reports[report] inherited configuration~
+Reporting excludeDefaults outputDirectory plugins[plugin:ReportPlugin]
+Repository releases:RepositoryPolicy snapshots:RepositoryPolicy id name url layout
+RepositoryPolicy enabled updatePolicy checksumPolicy
+Resource targetPath filtering directory includes[include] excludes[exclude]
+Scm @child.scm.connection.inherit.append.path @child.scm.developerConnection.inherit.append.path @child.scm.url.inherit.append.path connection developerConnection tag url
+Site @child.site.url.inherit.append.path id name url

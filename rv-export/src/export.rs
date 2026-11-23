@@ -11,8 +11,8 @@ use tokio::task::spawn_blocking;
 
 use rv_lock::LockArtifact;
 use rv_maven_types::{
-    ArtifactCoord, CoordinateField, Digest, Gav, TimestampedSnapshot, Version, VersionReq, layout,
-    validate_coordinate_component,
+    ArtifactCoord, CoordinateField, Digest, Gav, MavenMode, TimestampedSnapshot, Version,
+    VersionReq, layout, validate_coordinate_component,
 };
 use rv_store::{BlobId, PinCheck, Store};
 
@@ -22,22 +22,26 @@ use super::metadata::{
     ArtifactMetaKey, ArtifactMetaState, ArtifactMetadata, MetadataAccumulator,
     RemoteRepositoriesAccumulator, SnapshotMetaKey, SnapshotMetaState, SnapshotVersionEntry,
     VersionedMetadata, compact_updated, later_stamp, merge_snapshot_entries,
-    read_existing_metadata, render_artifact_metadata, render_empty_metadata,
-    render_versioned_metadata, write_atomic as write_metadata_atomic,
+    read_existing_metadata, read_existing_prefixes, render_artifact_metadata,
+    render_empty_metadata, render_group_metadata, render_versioned_metadata,
+    write_atomic as write_metadata_atomic,
 };
-use crate::plan::{ExportPlan, Reactor};
+use crate::plan::{ExportPlan, GroupPrefixes, Reactor};
 use crate::warning::ExportWarning;
 
 /// Where and how an [`Exporter`] writes.
 #[derive(Debug, Clone)]
 pub struct ExportOptions {
-    /// Check the plan and the store without writing anything. Every artifact
-    /// whose blob exists counts as exported with [`Self::link_strategy`];
-    /// no metadata, sidecar or marker is written.
+    /// Judge every destination as an export does, refusing what it would
+    /// refuse, and write nothing. A file it would keep counts as skipped,
+    /// one it would write as exported with [`Self::link_strategy`]. Only
+    /// the store may record that it checked a blob.
     pub dry_run: bool,
     /// Replace a destination file that holds other bytes than the locked
     /// blob. Without it such a file fails the export with
-    /// [`ExportError::DestinationMismatch`](crate::ExportError::DestinationMismatch).
+    /// [`ExportError::DestinationMismatch`](crate::ExportError::DestinationMismatch),
+    /// unless it is a plain `-SNAPSHOT` file outside the shared repository,
+    /// which Maven rewrites on every update.
     pub overwrite: bool,
     /// How to put each blob in place. A failed attempt falls back along
     /// hard link, symbolic link, copy, starting at this one.
@@ -47,8 +51,41 @@ pub struct ExportOptions {
     /// `m2_path` is the Maven local repository other builds share. The
     /// locked metadata is written, but no `maven-metadata-*.xml` is removed
     /// and an artifact's version list keeps the versions it already lists,
-    /// so `mvn install` output and other projects' listings survive.
+    /// so `mvn install` output and other projects' listings survive. A plain
+    /// `-SNAPSHOT` file there is replaced without [`Self::overwrite`] only
+    /// when its `.sha256` sidecar names its bytes, as an export leaves it.
     pub shared: bool,
+}
+
+/// What an export would write into an empty local repository: see
+/// [`Exporter::layout`].
+#[derive(Debug, Default, Clone)]
+#[non_exhaustive]
+pub struct RepositoryLayout {
+    /// The files taken from the store, by path.
+    pub files: Vec<RemoteFile>,
+    /// The files the export writes itself, as `(path, text)` by path: the
+    /// checksum sidecars, `_remote.repositories` markers and
+    /// `maven-metadata-*.xml` files.
+    pub generated: Vec<(String, String)>,
+    /// What the export would report.
+    pub warnings: Vec<ExportWarning>,
+}
+
+/// A file of a [`RepositoryLayout`] that a repository serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RemoteFile {
+    /// Its path below the local repository, with `/` separators.
+    pub path: String,
+    /// Where the repository raeva.lock records for it serves it: the
+    /// repository URL, without credentials, or for a repository inside the
+    /// project, a path relative to raeva.lock's directory. `None` for the
+    /// empty origin: only the mirror of a repository whose URL raeva.lock
+    /// cannot record served it, and a mirror's URL is never shown.
+    pub url: Option<String>,
+    /// Its SHA-256, as hex.
+    pub sha256: String,
 }
 
 /// What one export wrote, skipped and survived. Counts are per file:
@@ -62,9 +99,8 @@ pub struct ExportStats {
     /// Files left alone because the destination already held the locked
     /// bytes.
     pub skipped_count: usize,
-    /// Of `skipped_count`, the files of coordinates with a classifier, such
-    /// as sources jars.
-    pub skipped_classified_count: usize,
+    /// Of `exported_count`, the files of the optional items, by classifier.
+    pub optional_exported: BTreeMap<String, usize>,
     /// Files written by copying, including fallbacks to a copy.
     pub copied_count: usize,
     /// Files written as a hard or symbolic link.
@@ -124,6 +160,8 @@ pub(crate) struct SupportPomPin {
     pub(crate) repo_ids: Vec<String>,
     /// The lock keys of the repositories the platforms' pins record.
     pub(crate) origins: HashSet<String>,
+    /// The origin of the pin raeva.lock records first.
+    pub(crate) repo_url: String,
     pub(crate) sha256: BlobId,
     /// The timestamped version of the build a `-SNAPSHOT` POM was pinned to.
     pub(crate) build: Option<String>,
@@ -157,7 +195,7 @@ impl UnitSource {
 /// One file to materialize into the Maven local repository, at the path
 /// `key` names. `repo_ids` are the repository ids recorded in
 /// `_remote.repositories` next to the file; none means the file gets no
-/// marker (see `repo_id_recorded`).
+/// marker.
 struct ExportUnit {
     key: ArtifactCoord,
     blob: BlobId,
@@ -165,17 +203,21 @@ struct ExportUnit {
     /// [`ExportError::ConflictingExportSources`].
     source: UnitSource,
     repo_ids: Vec<String>,
-    /// True when `repo_ids` came from the support-POM provenance `raeva sync`
-    /// recorded for this exact coordinate, rather than being derived from the
-    /// origins of whichever package referenced it. Decides the winner when
-    /// the same POM is queued as both support metadata and a companion POM;
-    /// a recorded but empty id wins too, because "the serving repository has no
-    /// id" is knowledge, and the guess it displaces is not.
-    repo_id_recorded: bool,
-    /// A plain `-SNAPSHOT` copy, which Maven rewrites on every snapshot
-    /// update: other bytes there are an earlier copy, replaced without
-    /// `--overwrite`.
-    replace: bool,
+    /// The origin raeva.lock records for the file, and the file's
+    /// coordinate there: `key`, or for a plain `-SNAPSHOT` copy, the build
+    /// it copies.
+    origin: String,
+    remote: ArtifactCoord,
+    /// A plain `-SNAPSHOT` file, which Maven rewrites on every snapshot
+    /// update: other bytes there may be an earlier copy. See [`Replace`].
+    plain_snapshot: bool,
+    /// A support POM whose pin records a repository without an id. It gets
+    /// no marker, which Maven reads from every repository, so the ids of
+    /// another unit for the file are dropped rather than make it a file
+    /// only they may serve.
+    no_id: bool,
+    /// From the optional items of [`Exporter::export`], or a copy of one.
+    optional: bool,
 }
 
 /// The work one export accumulates before fanning out: the coordinate dedupe
@@ -211,27 +253,24 @@ struct StoreFacts {
 
 impl StoreFacts {
     async fn gather(store: &Store, poms: HashSet<BlobId>, others: HashSet<BlobId>) -> Self {
-        let jobs: Vec<(BlobId, PathBuf, bool)> = (poms.into_iter().map(|blob| (blob, true)))
+        let jobs: Vec<(BlobId, bool)> = (poms.into_iter().map(|blob| (blob, true)))
             .chain(others.into_iter().map(|blob| (blob, false)))
-            .map(|(blob, pom)| {
-                let path = store.get_path(&blob);
-                (blob, path, pom)
-            })
             .collect();
         let chunk = jobs.len().div_ceil(export_parallelism()).max(1);
         let tasks: Vec<_> = jobs
             .chunks(chunk)
             .map(|jobs| {
                 let jobs = jobs.to_vec();
+                let store = store.clone();
                 spawn_blocking(move || {
                     jobs.into_iter()
-                        .filter_map(|(blob, path, pom)| {
+                        .filter_map(|(blob, pom)| {
                             if !pom {
-                                return fs::metadata(&path)
+                                return fs::metadata(store.get_path(&blob))
                                     .is_ok_and(|meta| meta.is_file())
                                     .then_some((blob, None));
                             }
-                            let bytes = fs::read(&path).ok()?;
+                            let bytes = store.read_blob(&blob).ok().flatten()?;
                             let parent = stored_parent(&bytes, &blob);
                             Some((blob, Some(parent)))
                         })
@@ -259,7 +298,7 @@ impl StoreFacts {
     fn parent(&self, store: &Store, blob: &BlobId) -> Option<(String, String, String)> {
         match self.parents.get(blob) {
             Some(parent) => parent.clone(),
-            None => stored_parent(&fs::read(store.get_path(blob)).ok()?, blob),
+            None => stored_parent(&store.read_blob(blob).ok().flatten()?, blob),
         }
     }
 }
@@ -289,9 +328,6 @@ impl ExportQueue {
     /// units sharing a key name the same file. Letting both through would write
     /// that file twice from `buffer_unordered`, double it in the stats, and
     /// leave its `_remote.repositories` marker to whichever unit finished last.
-    /// On collision the recorded support-POM repository id replaces the ids
-    /// of a companion POM, which are inferred from the referencing package's
-    /// origins; every other pair of ids is merged.
     ///
     /// Collapsing is only legitimate when both units name the same bytes. One
     /// coordinate can be pinned by three independent recordings: an
@@ -310,6 +346,7 @@ impl ExportQueue {
             return Ok(());
         };
         let previous = &mut self.units[existing];
+        previous.plain_snapshot |= unit.plain_snapshot;
         if previous.blob != unit.blob {
             return Err(ExportError::ConflictingExportSources {
                 coordinate: unit.key.to_string(),
@@ -319,21 +356,19 @@ impl ExportQueue {
                 second: unit.blob.to_string(),
             });
         }
-        let guessed = |unit: &ExportUnit| {
-            matches!(unit.source, UnitSource::CompanionPom) && !unit.repo_id_recorded
-        };
-        if unit.repo_id_recorded && guessed(previous) {
-            previous.repo_ids = unit.repo_ids;
-            previous.repo_id_recorded = true;
-        } else if !(previous.repo_id_recorded && guessed(&unit)) {
-            // One file served to different modules or platforms by different
-            // repositories, such as a POM a jar and its classifier jar share,
-            // or a BOM one module imports and another depends on, is
-            // labelled with each.
+        // Maven accepts a file offline from any repository its marker lists,
+        // and one with no marker from every repository. One file served to
+        // different modules or platforms by different repositories, such as
+        // a POM a jar and its classifier jar share, or a BOM one module
+        // imports and another depends on, is labelled with each; served by
+        // a repository without an id, it stays unlabelled for all.
+        previous.no_id |= unit.no_id;
+        if previous.no_id {
+            previous.repo_ids.clear();
+        } else {
             previous.repo_ids.extend(unit.repo_ids);
             previous.repo_ids.sort();
             previous.repo_ids.dedup();
-            previous.repo_id_recorded |= unit.repo_id_recorded;
         }
         Ok(())
     }
@@ -412,8 +447,14 @@ impl<'a> Exporter<'a> {
     /// for it, so strict offline resolution keeps working for the common
     /// case.
     fn repo_ids_for(&self, artifact: &LockArtifact) -> Vec<String> {
+        self.origin_ids(artifact.origins())
+    }
+
+    /// The ids Maven reads `origins` under, `central` for one the lock
+    /// records none for.
+    fn origin_ids<'o>(&self, origins: impl IntoIterator<Item = &'o str>) -> Vec<String> {
         let mut ids = BTreeSet::new();
-        for origin in artifact.origins() {
+        for origin in origins {
             match self.plan.repo_ids.get(&rv_lock::recorded_key(origin)) {
                 Some(known) => ids.extend(known.iter().cloned()),
                 None => {
@@ -424,49 +465,73 @@ impl<'a> Exporter<'a> {
         ids.into_iter().collect()
     }
 
-    /// Export the plan's artifacts plus the support-POM closure referenced by
-    /// every POM of `reactor`. A failure carries the warnings found before
-    /// it.
+    /// Export the plan's artifacts, the support-POM closure referenced by
+    /// every POM of `reactor`, and `optional`: artifacts the plan does not
+    /// list, such as the classifier jars a caller fetched for locked
+    /// coordinates, with the plan's POM pins and repository ids. One pass
+    /// judges every destination before it writes any. A failure carries the
+    /// warnings found before it.
+    ///
+    /// `optional` is ordered and deduplicated by coordinate first, as the
+    /// plan's items are, so the output does not depend on the order a caller
+    /// collected them in: of two optional items, the last one written
+    /// decides shared snapshot metadata.
     pub async fn export(
         &self,
         reactor: &Reactor,
+        optional: &[LockArtifact],
     ) -> std::result::Result<ExportStats, ExportFailure> {
-        self.export_inner(&self.plan.items, &self.plan.system_scoped, reactor, true)
-            .await
+        self.run(reactor, optional, None).await
     }
 
-    /// Export `items` with the plan's POM pins and repository ids, and no
-    /// project POMs. For artifacts the plan does not list, such as the
-    /// classifier jars a caller fetched for locked coordinates.
-    ///
-    /// The items are ordered and deduplicated by coordinate first, as the
-    /// plan's are, so the output does not depend on the order a caller
-    /// collected them in: the first item's repository labels the support
-    /// POMs that no pin covers, and the last one written decides shared
-    /// snapshot metadata.
-    pub async fn export_items(
+    /// What [`Self::export`] would write into an empty local repository,
+    /// written nowhere: each file it takes from the store with the URL it
+    /// was fetched from and its SHA-256, and the text of each file it writes
+    /// itself. The store must hold every file intact, as an export needs.
+    /// Of the [`ExportOptions`], only `shared` counts, which a directory of
+    /// its own leaves off.
+    pub async fn layout(
         &self,
-        items: &[LockArtifact],
+        reactor: &Reactor,
+        optional: &[LockArtifact],
+    ) -> std::result::Result<RepositoryLayout, ExportFailure> {
+        let mut layout = RepositoryLayout::default();
+        let stats = (self.run(reactor, optional, Some(&mut layout)).await).map_err(|failure| {
+            ExportFailure {
+                error: match failure.error {
+                    error @ (ExportError::MissingBlob { .. }
+                    | ExportError::MissingPinnedPom { .. }
+                    | ExportError::UnsupportedChecksum { .. }
+                    | ExportError::CorruptBlob { .. }) => ExportError::NotStored(Box::new(error)),
+                    ExportError::CaseCollision {
+                        first,
+                        second,
+                        path,
+                    } => ExportError::PlanCaseCollision {
+                        first,
+                        second,
+                        path,
+                    },
+                    error => error,
+                },
+                warnings: failure.warnings,
+            }
+        })?;
+        layout.warnings = stats.warnings;
+        Ok(layout)
+    }
+
+    async fn run(
+        &self,
+        reactor: &Reactor,
+        optional: &[LockArtifact],
+        layout: Option<&mut RepositoryLayout>,
     ) -> std::result::Result<ExportStats, ExportFailure> {
         let mut by_coordinate = BTreeMap::new();
-        for item in items {
+        for item in optional {
             by_coordinate.entry(item.coord()).or_insert(item);
         }
-        let ordered: Vec<LockArtifact> = by_coordinate.into_values().cloned().collect();
-        self.export_inner(&ordered, &[], &Reactor::default(), false)
-            .await
-    }
-
-    /// `version_lists` writes the artifact-level metadata, which lists every
-    /// locked version and so comes from the whole plan, never from a pass
-    /// over some of its files.
-    async fn export_inner(
-        &self,
-        items: &[LockArtifact],
-        system_scoped: &[String],
-        reactor: &Reactor,
-        version_lists: bool,
-    ) -> std::result::Result<ExportStats, ExportFailure> {
+        let optional: Vec<&LockArtifact> = by_coordinate.into_values().collect();
         let mut stats = ExportStats {
             warnings: std::mem::take(
                 &mut *self
@@ -478,17 +543,17 @@ impl<'a> Exporter<'a> {
         };
         let mut queue = ExportQueue::default();
         let outcome = self
-            .export_queue(items, reactor, version_lists, &mut queue, &mut stats)
+            .export_queue(reactor, &optional, &mut queue, &mut stats, layout)
             .await;
         if outcome.is_err() {
             stats.warnings.append(&mut queue.warnings);
         }
-        if !system_scoped.is_empty() {
+        if !self.plan.system_scoped.is_empty() {
             // Reported after the export rather than before it: the point of
             // the message is that the `mvn -o` build these files were
             // written for will look for something this `~/.m2` cannot hold.
             stats.warnings.push(ExportWarning::SystemScopedSkipped {
-                coordinates: system_scoped.to_vec(),
+                coordinates: self.plan.system_scoped.clone(),
             });
         }
         match outcome {
@@ -500,28 +565,59 @@ impl<'a> Exporter<'a> {
         }
     }
 
-    /// The body of [`Self::export_inner`]. Warnings go to `queue` while
-    /// queueing and to `stats` after, so a failure can still return them.
+    /// The body of [`Self::export`], or with `layout`, of [`Self::layout`],
+    /// which takes what the queueing pass found and writes nothing. Warnings
+    /// go to `queue` while queueing and to `stats` after, so a failure can
+    /// still return them.
     async fn export_queue(
         &self,
-        items: &[LockArtifact],
         reactor: &Reactor,
-        version_lists: bool,
+        optional: &[&LockArtifact],
         queue: &mut ExportQueue,
         stats: &mut ExportStats,
+        layout: Option<&mut RepositoryLayout>,
     ) -> Result<()> {
+        // The optional items come last, so the plan's decide what both name.
+        let items: Vec<(&LockArtifact, bool)> = (self.plan.items.iter())
+            .map(|artifact| (artifact, false))
+            .chain(optional.iter().map(|artifact| (*artifact, true)))
+            .collect();
+        // A reactor POM's profiles may name repositories the build reads
+        // under other `-P` options than raeva used.
+        let (usable, unusable): (BTreeSet<String>, BTreeSet<String>) =
+            (self.plan.query_ids.iter().cloned())
+                .chain(reactor_repository_ids(reactor, &|parent| {
+                    self.stored_parent_pom(parent)
+                }))
+                .partition(|id| is_metadata_repo_id(id) && !id.contains("${"));
+        if !unusable.is_empty() && !self.options.shared {
+            queue.warnings.push(ExportWarning::UnusableRepositoryIds {
+                ids: unusable.into_iter().collect(),
+            });
+        }
+        let guessed: BTreeSet<String> = (items.iter())
+            .flat_map(|(artifact, _)| artifact.origins())
+            .filter(|origin| {
+                !self
+                    .plan
+                    .repo_ids
+                    .contains_key(&rv_lock::recorded_key(origin))
+            })
+            .map(rv_lock::redact_origin)
+            .collect();
+        if !guessed.is_empty() {
+            queue.warnings.push(ExportWarning::RepositoryIdGuessed {
+                origins: guessed.into_iter().collect(),
+            });
+        }
         let mut meta = MetadataAccumulator {
-            replaces_listings: version_lists,
             empty_list_ids: if self.options.shared {
                 BTreeSet::new()
             } else {
-                (self.plan.query_ids.iter().map(String::as_str))
-                    .chain(["local"])
-                    .filter(|id| is_metadata_repo_id(id))
-                    .map(str::to_string)
-                    .collect()
+                usable.into_iter().chain(["local".to_string()]).collect()
             },
             shared: self.options.shared,
+            mode: self.plan.mode,
             ..MetadataAccumulator::default()
         };
         let mut poms: HashSet<BlobId> = (self.plan.support_poms.values())
@@ -529,7 +625,7 @@ impl<'a> Exporter<'a> {
             .chain(self.plan.pom_digests.values().cloned())
             .collect();
         let mut others = HashSet::new();
-        for artifact in items {
+        for (artifact, _) in &items {
             if let Some(Digest::Sha256(blob)) = artifact.pin() {
                 if artifact.coordinate.extension() == "pom" {
                     poms.insert(blob.clone());
@@ -552,8 +648,7 @@ impl<'a> Exporter<'a> {
         // included. Imports are taken only from these records. The text of
         // a POM cannot say which BOM it imports: the version may come from a
         // child's property, a parent's, or `${project.*}`, which only the
-        // model `raeva sync` built interpolates as Maven does. The sources and
-        // javadocs passes re-seed idempotently.
+        // model `raeva sync` built interpolates as Maven does.
         if !self.plan.support_poms.is_empty() {
             // Sort the seeds: `support_poms` is a `HashMap`, and the walk
             // order decides which node trips the closure limit. An export that
@@ -570,7 +665,7 @@ impl<'a> Exporter<'a> {
                 continue;
             };
             let file_version = pin.build.as_ref().unwrap_or(&version);
-            if version_lists && file_version.ends_with("SNAPSHOT") {
+            if file_version.ends_with("SNAPSHOT") {
                 meta.plain_snapshots.insert((
                     group_id.clone(),
                     artifact_id.clone(),
@@ -583,7 +678,11 @@ impl<'a> Exporter<'a> {
                 if let (Some(snapshot), Some(base)) =
                     (TimestampedSnapshot::parse(file_version), &base)
                     && (pin.build.is_some()
-                        || self.is_latest_support_build(&group_id, &artifact_id, file_version))
+                        || plain_support_pom_copy(
+                            self.plan.support_poms.keys().map(String::as_str),
+                            coord,
+                        )
+                        .is_some())
                 {
                     // A SNAPSHOT pinned to a build, or a relocated SNAPSHOT
                     // dependency recorded by its build. `mvn -o` takes the build
@@ -601,9 +700,7 @@ impl<'a> Exporter<'a> {
                         .or_default();
                     let updated = compact_updated(snapshot.timestamp())
                         .unwrap_or_else(|| "00000000000000".to_string());
-                    state.timestamp = Some(snapshot.timestamp().to_string());
-                    state.build_number = snapshot.build_number();
-                    state.last_updated = Some(updated.clone());
+                    state.name_build(snapshot.timestamp(), snapshot.build_number());
                     push_snapshot_entry(
                         &mut state.entries,
                         SnapshotVersionEntry {
@@ -613,19 +710,6 @@ impl<'a> Exporter<'a> {
                             updated,
                         },
                     );
-                }
-                if version_lists {
-                    // A parent, an import or a relocated dependency may be named
-                    // by a range, which `mvn -o` resolves from these lists too.
-                    meta.artifacts
-                        .entry(ArtifactMetaKey {
-                            group_id: group_id.clone(),
-                            artifact_id: artifact_id.clone(),
-                        })
-                        .or_default()
-                        .entry(listing_id)
-                        .or_default()
-                        .add_version(base.as_deref().unwrap_or(&version));
                 }
             }
         }
@@ -639,14 +723,14 @@ impl<'a> Exporter<'a> {
         // a reactor module is no support POM: Maven takes it from the
         // reactor.
         for project_pom in &reactor.poms {
-            if project_pom.local_parent {
+            if !project_pom.local_parents.is_empty() {
                 continue;
             }
             let refs: Vec<_> = read_support_parent(&project_pom.path).into_iter().collect();
             self.enqueue_support_closure(refs, reactor, queue).await?;
         }
 
-        for artifact in items {
+        for &(artifact, optional) in &items {
             let key = artifact.coord();
             // A SNAPSHOT a repository serves without builds changes in
             // place, as Maven rewrites it.
@@ -663,6 +747,9 @@ impl<'a> Exporter<'a> {
                 .blob_id_for_package(&key, artifact, &queue.blobs)
                 .await?;
             let repo_ids = self.repo_ids_for(artifact);
+            // The POM is labelled with the repositories that served it,
+            // which may lack it where they serve the file.
+            let pom_ids = self.origin_ids(artifact.pom_origins());
             let pom_gav = artifact.pom_gav();
             let pom_coord = (
                 pom_gav.group.to_string(),
@@ -689,12 +776,15 @@ impl<'a> Exporter<'a> {
                 if queue.holds(&pom_key) {
                     if let Some(pinned) = self.plan.pom_digests.get(&pom_coord) {
                         queue.push(ExportUnit {
+                            remote: pom_key.clone(),
                             key: pom_key,
                             blob: pinned.clone(),
                             source: UnitSource::CompanionPom,
-                            repo_ids: repo_ids.clone(),
-                            repo_id_recorded: false,
-                            replace: plain_snapshot || artifact.pom_base,
+                            repo_ids: pom_ids.clone(),
+                            origin: pom_origin(artifact),
+                            plain_snapshot: plain_snapshot || artifact.pom_base,
+                            no_id: false,
+                            optional: false,
                         })?;
                     }
                 } else if !queue.enqueued_poms.contains(&pom_coord)
@@ -711,12 +801,15 @@ impl<'a> Exporter<'a> {
                         .collect();
                     self.enqueue_support_closure(refs, reactor, queue).await?;
                     queue.push(ExportUnit {
+                        remote: pom_key.clone(),
                         key: pom_key,
                         blob: pom_blob,
                         source: UnitSource::CompanionPom,
-                        repo_ids: repo_ids.clone(),
-                        repo_id_recorded: false,
-                        replace: plain_snapshot || artifact.pom_base,
+                        repo_ids: pom_ids.clone(),
+                        origin: pom_origin(artifact),
+                        plain_snapshot: plain_snapshot || artifact.pom_base,
+                        no_id: false,
+                        optional: false,
                     })?;
                 }
             } else {
@@ -757,93 +850,193 @@ impl<'a> Exporter<'a> {
                 blob,
                 source: UnitSource::Package,
                 repo_ids,
-                repo_id_recorded: false,
-                replace: plain_snapshot,
+                origin: artifact.repo_url.clone(),
+                remote: key.clone(),
+                plain_snapshot,
+                no_id: false,
+                optional,
             })?;
 
             if accumulated.insert(key) {
-                self.accumulate_metadata(artifact, version_lists, &mut meta);
+                // An optional file's version is the locked one of its row.
+                self.accumulate_metadata(artifact, !optional, &mut meta);
             }
         }
 
-        queue_plain_snapshot_copies(items, queue)?;
+        self.list_range_versions(&mut meta);
+        let losing = self.list_losing_ranges(&mut meta)?;
+        if !losing.is_empty() {
+            queue.warnings.push(ExportWarning::LosingRangeVersions {
+                coordinates: losing,
+                listed: !self.options.shared,
+            });
+        }
+        self.check_range_picks(&meta)?;
+        // Maven reads a plugin's `<release>` before its `<latest>`.
+        let unmarked = (items.iter().map(|(artifact, _)| &artifact.coordinate))
+            .map(|coordinate| {
+                let (group, artifact) = (coordinate.group_id(), coordinate.artifact_id());
+                (group.to_string(), artifact.to_string())
+            })
+            .filter(|ga| self.plan.unversioned_plugins.contains(ga))
+            .find(|ga| (self.plan.markers.get(ga)).is_none_or(|markers| markers.release.is_none()));
+        if let Some((group, artifact)) = unmarked {
+            return Err(ExportError::UnversionedPlugin {
+                coordinate: format!("{group}:{artifact}"),
+            });
+        }
+        for (key, lists) in meta.artifacts.iter_mut() {
+            let ga = (key.group_id.clone(), key.artifact_id.clone());
+            let markers = self.plan.markers.get(&ga);
+            if let Some(markers) = markers {
+                for state in lists.values_mut() {
+                    state.markers = Some(markers.clone());
+                }
+            }
+        }
+        queue_plain_snapshot_copies(items.iter().map(|(artifact, _)| *artifact), queue)?;
+        if let Some(layout) = layout {
+            *layout = self.lay_out(&queue.units, meta).await?;
+            stats.warnings.append(&mut queue.warnings);
+            return Ok(());
+        }
+        let prefixes = Some(&self.plan.group_prefixes);
         reject_destination_collisions(
             &self.options,
             &queue.units,
             &self.optional_destinations,
             &meta,
+            prefixes,
         )?;
         stats.warnings.append(&mut queue.warnings);
 
         // Exports to one local repository take turns: each judges the files
         // it finds there and merges the metadata and markers they share.
         // Every blocking writer holds the turn too, since one keeps running
-        // when an interrupt drops this future.
-        let turn = match self.options.dry_run {
-            true => None,
-            false => Some(Arc::new(
-                lock_destination(&self.options.m2_path, EXPORT_LOCK_TIMEOUT).await?,
-            )),
-        };
+        // when an interrupt drops this future. A dry run takes the turn of
+        // a repository an export has used, and creates nothing.
+        let turn = lock_destination(
+            &self.options.m2_path,
+            EXPORT_LOCK_TIMEOUT,
+            !self.options.dry_run,
+        )
+        .await?
+        .map(Arc::new);
+        // Under the turn, this file can only be one an export left when it
+        // stopped before it finished.
+        let unfinished = self.options.m2_path.join(UNFINISHED_EXPORT);
+        let found_unfinished = fs::symlink_metadata(&unfinished).is_ok();
 
-        // Second pass: fan out the actual export work. Each entry only
-        // touches the filesystem (link/copy/hash), with no shared mutable
-        // state between tasks, so we can run several concurrently. The work
-        // is mostly file I/O dispatched through `spawn_blocking`, which
-        // already throttles via the tokio blocking-thread pool, so we just
-        // need a ceiling that's high enough not to be the bottleneck on
-        // multi-core boxes. 64 keeps us well under any sensible
-        // blocking-thread count while still leaving room for fan out on big
-        // lockfiles.
+        // Each pass below only touches the filesystem, with no shared
+        // mutable state between units, so several run at once. The work is
+        // mostly file I/O on the blocking pool, so the ceiling only has to
+        // be high enough not to be the bottleneck on big lockfiles.
         let parallelism = export_parallelism();
+        let units = std::mem::take(&mut queue.units);
 
-        // Each task owns an export unit and borrows `self` immutably.
-        type UnitResult = (
-            ExportOutcome,
-            Option<ExportWarning>,
-            PathBuf,
-            Vec<String>,
-            bool,
-        );
-        let mut outcomes: Vec<(usize, Result<UnitResult>)> =
-            stream::iter(std::mem::take(&mut queue.units).into_iter().enumerate())
-                .map(|(index, item)| {
+        // Judge every destination before writing to any, so a refusal
+        // leaves the repository as it was. A dry run reports the same
+        // verdicts and writes nothing.
+        let mut judged: Vec<(usize, Result<Judged>)> = stream::iter(units.iter().enumerate())
+            .map(|(index, unit)| {
+                let turn = turn.clone();
+                async move {
+                    let judged = self.judge_async(unit, !found_unfinished, turn).await;
+                    (index, judged)
+                }
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
+        // The reported refusal follows the queue, not the order units finish.
+        judged.sort_unstable_by_key(|(index, _)| *index);
+        let judged = (judged.into_iter())
+            .map(|(_, judged)| judged)
+            .collect::<Result<Vec<_>>>()?;
+
+        if !self.options.dry_run {
+            // Entries naming the repositories that served bytes about to be
+            // replaced go first, so an export that stops halfway leaves no
+            // file labelled with a repository that did not serve it.
+            let mut stale = RemoteRepositoriesAccumulator::default();
+            for judged in &judged {
+                if let Verdict::Write { replaced: true } = judged.verdict {
+                    stale.forget(&judged.dest);
+                }
+            }
+            let turn = turn.clone();
+            let unfinished = unfinished.clone();
+            spawn_blocking(move || {
+                let _turn = turn;
+                if !found_unfinished {
+                    crate::metadata::replace_file(&unfinished, UNFINISHED_EXPORT_TEXT)?;
+                }
+                stale.write_all()
+            })
+            .await
+            .map_err(|e| ExportError::IoError(std::io::Error::other(e.to_string())))??;
+        }
+
+        let mut outcomes: Vec<(usize, Result<Written>)> = if self.options.dry_run {
+            (judged.into_iter().enumerate())
+                .map(|(index, judged)| {
+                    let outcome = match judged.verdict {
+                        Verdict::Keep => ExportOutcome::Skipped,
+                        Verdict::Write { .. } => {
+                            ExportOutcome::Exported(self.options.link_strategy)
+                        }
+                    };
+                    let written = Written {
+                        outcome,
+                        warning: None,
+                        dest: judged.dest,
+                        replaced: false,
+                    };
+                    (index, Ok(written))
+                })
+                .collect()
+        } else {
+            stream::iter(units.iter().zip(judged).enumerate())
+                .map(|(index, (unit, judged))| {
                     let turn = turn.clone();
-                    async move {
-                        let outcome = self
-                            .export_artifact_async(&item.key, &item.blob, item.replace, turn)
-                            .await
-                            .map(|(outcome, warning, dest)| {
-                                let classified = item.key.classifier().is_some();
-                                (outcome, warning, dest, item.repo_ids, classified)
-                            });
-                        (index, outcome)
-                    }
+                    async move { (index, self.write_async(unit, judged, turn).await) }
                 })
                 .buffer_unordered(parallelism)
                 .collect()
-                .await;
-        // Units finish in any order; the warnings and the reported failure
-        // follow the queue instead.
+                .await
+        };
         outcomes.sort_unstable_by_key(|(index, _)| *index);
 
         let mut markers = RemoteRepositoriesAccumulator::default();
         // Every unit has run by now; keep the warnings of the ones that
         // succeeded even when another failed.
         let mut failed = None;
-        for (_, outcome) in outcomes {
-            let (entry, warning, dest, repo_ids, classified) = match outcome {
+        for (index, outcome) in outcomes {
+            let Written {
+                outcome: entry,
+                warning,
+                dest,
+                replaced,
+            } = match outcome {
                 Ok(done) => done,
                 Err(err) => {
                     failed.get_or_insert(err);
                     continue;
                 }
             };
+            let unit = &units[index];
             stats.record(entry);
-            if classified && matches!(entry, ExportOutcome::Skipped) {
-                stats.skipped_classified_count += 1;
+            if unit.optional && matches!(entry, ExportOutcome::Exported(_)) {
+                let classifier = unit.key.classifier().unwrap_or_default();
+                *stats
+                    .optional_exported
+                    .entry(classifier.to_string())
+                    .or_default() += 1;
             }
             stats.warnings.extend(warning);
+            if replaced {
+                markers.forget(&dest);
+            }
             // Record the marker for every materialized file. Maven needs the
             // `_remote.repositories` entry whether we wrote the file just now
             // or skipped an already-identical copy.
@@ -855,7 +1048,7 @@ impl<'a> Exporter<'a> {
             if let (Some(dir), Some(filename)) =
                 (dest.parent(), dest.file_name().and_then(|n| n.to_str()))
             {
-                for repo_id in &repo_ids {
+                for repo_id in &unit.repo_ids {
                     // An empty recorded id has nowhere to put "unknown" on a
                     // marker line; leave the file unmarked.
                     if repo_id.is_empty() {
@@ -876,19 +1069,323 @@ impl<'a> Exporter<'a> {
             // the disk catches up. The `_remote.repositories` markers ride
             // along in the same blocking hop.
             let m2_path = self.options.m2_path.clone();
+            let prefixes = self.plan.group_prefixes.clone();
+            let shared = self.options.shared;
             spawn_blocking(move || {
                 let _turn = turn;
                 let mut meta = meta;
                 write_metadata_blocking(&m2_path, &mut meta)?;
+                for ((group_id, id), plugins) in &prefixes {
+                    write_group_metadata_blocking(&m2_path, group_id, id, plugins, shared)?;
+                }
                 if !markers.is_empty() {
                     markers.write_all()?;
+                }
+                match fs::remove_file(&unfinished) {
+                    Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(err.into());
+                    }
+                    _ => {}
                 }
                 Ok::<_, ExportError>(())
             })
             .await
             .map_err(|e| ExportError::IoError(std::io::Error::other(e.to_string())))??;
         }
+        if found_unfinished {
+            stats.warnings.push(ExportWarning::UnfinishedExport {
+                path: self.options.m2_path.clone(),
+                repaired: !self.options.dry_run,
+            });
+        }
 
+        Ok(())
+    }
+
+    /// The [`RepositoryLayout`] of `units` and `meta`. Names that differ only
+    /// in case are refused on every volume, since the plan's is unknown. The
+    /// sidecars, markers and metadata are what the export's own writers put
+    /// into an empty directory.
+    async fn lay_out(
+        &self,
+        units: &[ExportUnit],
+        mut meta: MetadataAccumulator,
+    ) -> Result<RepositoryLayout> {
+        let prefixes = self.plan.group_prefixes.clone();
+        for folds_case in [false, true] {
+            planned_destinations(
+                units,
+                &self.optional_destinations,
+                &meta,
+                Some(&prefixes),
+                folds_case,
+            )?;
+        }
+        let mut hashed: Vec<(usize, Result<String>)> = stream::iter(units.iter().enumerate())
+            .map(|(index, unit)| {
+                let src = self.store.get_path(&unit.blob);
+                let blob = unit.blob.clone();
+                async move {
+                    let sha1 = spawn_blocking(move || verify_and_hash(&src, &blob)).await;
+                    let sha1 = sha1.unwrap_or_else(|e| {
+                        Err(ExportError::IoError(std::io::Error::other(e.to_string())))
+                    });
+                    (index, sha1)
+                }
+            })
+            .buffer_unordered(export_parallelism())
+            .collect()
+            .await;
+        hashed.sort_unstable_by_key(|(index, _)| *index);
+        let scratch = tempfile::tempdir()?;
+        let mut markers = RemoteRepositoriesAccumulator::default();
+        let mut layout = RepositoryLayout::default();
+        for (unit, (_, sha1)) in units.iter().zip(hashed) {
+            let relative = artifact_relative_path(&unit.key)?;
+            let path = slash_path(&relative);
+            let dest = scratch.path().join(&relative);
+            if let (Some(dir), Some(name)) =
+                (dest.parent(), dest.file_name().and_then(|n| n.to_str()))
+            {
+                for id in unit.repo_ids.iter().filter(|id| !id.is_empty()) {
+                    markers.record(dir, name, id);
+                }
+            }
+            layout.generated.push((format!("{path}.sha1"), sha1?));
+            layout
+                .generated
+                .push((format!("{path}.sha256"), unit.blob.as_str().to_string()));
+            layout.files.push(RemoteFile {
+                path,
+                url: remote_url(&unit.origin, &unit.remote)?,
+                sha256: unit.blob.as_str().to_string(),
+            });
+        }
+        let root = scratch.path().to_path_buf();
+        let written = spawn_blocking(move || {
+            write_metadata_blocking(&root, &mut meta)?;
+            for ((group_id, id), plugins) in &prefixes {
+                write_group_metadata_blocking(&root, group_id, id, plugins, false)?;
+            }
+            markers.write_all()?;
+            read_tree(&root)
+        })
+        .await
+        .map_err(|e| ExportError::IoError(std::io::Error::other(e.to_string())))??;
+        layout.generated.extend(written);
+        layout.files.sort_by(|a, b| a.path.cmp(&b.path));
+        layout.generated.sort();
+        Ok(layout)
+    }
+
+    /// List each version a range took under the ids of the repository whose
+    /// list named it, so that `mvn -o` takes it where Maven did: the
+    /// export lists no version a list did not name.
+    fn list_range_versions(&self, meta: &mut MetadataAccumulator) {
+        for (group, artifact, version, origin) in &self.plan.range_versions {
+            let key = ArtifactMetaKey {
+                group_id: group.clone(),
+                artifact_id: artifact.clone(),
+            };
+            for id in self.origin_ids([origin.as_str()]) {
+                (meta.artifacts.entry(key.clone()).or_default())
+                    .entry(version_list_repo_id(&id))
+                    .or_default()
+                    .add_version(version);
+            }
+        }
+    }
+
+    /// For each repository that listed an evicted range, list the highest
+    /// version it listed in the range whose POM the export writes, as a
+    /// relocation's, whose POM names the artifact the graph holds. Where
+    /// there is none and no version the export lists for its
+    /// `group:artifact` under that repository's ids is in the range, list
+    /// the lowest version that repository listed for it there. Return the
+    /// `g:a:v` of those without a POM.
+    ///
+    /// Maven 3.9's and 3.10's collectors list a range in the POM of a
+    /// version that later loses, and a range without a listed version fails
+    /// the build. `mvn -o` reads the lists of the repositories the node
+    /// reads, so a version listed under another repository's id does not
+    /// count. A range on a relocated artifact is one too, as the graph holds
+    /// the artifact it relocates to: its version's POM is the relocation
+    /// the export writes. Where no POM is written for the version, Maven
+    /// warns that it is missing, which only a node that loses never needs.
+    /// Every list names only versions the repository listed, so a winning
+    /// range that reads it takes the version it took online. In the shared
+    /// repository such a listing would mislead other builds, so nothing is
+    /// listed there. Of listed spellings that compare equal, the one the
+    /// modules that recorded the range hold is listed, and two they hold
+    /// are refused: see [`ExportError::EqualSpellings`].
+    fn list_losing_ranges(&self, meta: &mut MetadataAccumulator) -> Result<Vec<String>> {
+        let mode = self.plan.mode;
+        let base = |version: &str| {
+            rv_maven_types::snapshot_base_version(version).unwrap_or_else(|| version.to_string())
+        };
+        let poms: HashSet<(&str, &str, String)> = (self.plan.pom_digests.keys())
+            .map(|(group, artifact, version)| (group.as_str(), artifact.as_str(), base(version)))
+            .chain(self.plan.support_poms.keys().filter_map(|coordinate| {
+                let (group, artifact, version) = rv_lock::split_support_pom_coord(coordinate)?;
+                Some((group, artifact, base(version)))
+            }))
+            .collect();
+        let order = |a: &&str, b: &&str| {
+            let parse = |version: &str| Version::parse(version).expect("parsed above");
+            parse(a).cmp_in(&parse(b), mode)
+        };
+        let mut coordinates = BTreeSet::new();
+        // What earlier ranges chose under each id, also where nothing is
+        // listed.
+        let mut chosen: HashMap<(ArtifactMetaKey, String), Vec<String>> = HashMap::new();
+        for range in &self.plan.evicted_ranges {
+            let key = ArtifactMetaKey {
+                group_id: range.group.clone(),
+                artifact_id: range.artifact.clone(),
+            };
+            let ids: Vec<String> = (self.origin_ids([range.origin.as_str()]).iter())
+                .map(|id| version_list_repo_id(id))
+                .collect();
+            let in_range = |version: &&str| {
+                Version::parse(version).is_ok_and(|version| range.range.matches_in(&version, mode))
+            };
+            let held = |version: &&str| {
+                poms.contains(&(range.group.as_str(), range.artifact.as_str(), base(version)))
+            };
+            // Of listed spellings that compare equal to `pick`, the one the
+            // modules that recorded the range hold, which Maven took for
+            // them; a losing version's POM may be pinned under the other.
+            let holds: HashSet<String> = range.held.iter().map(|version| base(version)).collect();
+            let spelling = |pick: &'_ str| -> Result<String> {
+                let same: BTreeSet<&str> = (range.versions.iter().map(String::as_str))
+                    .filter(|version| order(version, &pick).is_eq())
+                    .filter(|version| holds.contains(&base(version)))
+                    .collect();
+                match same.len() {
+                    0 => Ok(pick.to_string()),
+                    1 => Ok(same.into_iter().next().unwrap_or(pick).to_string()),
+                    _ => Err(ExportError::EqualSpellings {
+                        coordinate: format!("{}:{}", range.group, range.artifact),
+                        version: pick.to_string(),
+                        spellings: same.into_iter().map(str::to_string).collect(),
+                    }),
+                }
+            };
+            let candidates = (range.versions.iter().map(String::as_str)).filter(in_range);
+            // Every list names only versions its repository listed, so the
+            // pinned one is safe to list where another is listed already.
+            if let Some(pinned) = candidates.clone().filter(held).max_by(order) {
+                let pinned = spelling(pinned)?;
+                let pinned = pinned.as_str();
+                for id in ids {
+                    if !self.options.shared {
+                        (meta.artifacts.entry(key.clone()).or_default())
+                            .entry(id.clone())
+                            .or_default()
+                            .add_losing_version(pinned);
+                    }
+                    (chosen.entry((key.clone(), id)).or_default()).push(pinned.to_string());
+                }
+                continue;
+            }
+            let Some(listed) = candidates.min_by(order) else {
+                continue;
+            };
+            let listed = spelling(listed)?;
+            let listed = listed.as_str();
+            // A module reads the origin under one of its ids only.
+            let unlisted: Vec<String> = (ids.into_iter())
+                .filter(|id| {
+                    let lists = meta.artifacts.get(&key).and_then(|lists| lists.get(id));
+                    !(lists.into_iter().flat_map(ArtifactMetaState::versions))
+                        .chain(
+                            (chosen.get(&(key.clone(), id.clone())).into_iter().flatten())
+                                .map(String::as_str),
+                        )
+                        .any(|version| in_range(&version))
+                })
+                .collect();
+            if unlisted.is_empty() {
+                continue;
+            }
+            for id in unlisted {
+                if !self.options.shared {
+                    (meta.artifacts.entry(key.clone()).or_default())
+                        .entry(id.clone())
+                        .or_default()
+                        .add_losing_version(listed);
+                }
+                chosen
+                    .entry((key.clone(), id))
+                    .or_default()
+                    .push(listed.to_string());
+            }
+            coordinates.insert(format!("{}:{}:{listed}", range.group, range.artifact));
+        }
+        Ok(coordinates.into_iter().collect())
+    }
+
+    /// Refuse a range's pick among versions that compare equal when the
+    /// export lists more than one of them, or a module's version when the
+    /// lists of the repositories its ranges read name more than one: see
+    /// [`ExportError::EqualSpellings`].
+    fn check_range_picks(&self, meta: &MetadataAccumulator) -> Result<()> {
+        for (group, artifact, version) in &self.plan.range_picks {
+            let key = ArtifactMetaKey {
+                group_id: group.clone(),
+                artifact_id: artifact.clone(),
+            };
+            let Ok(picked) = Version::parse(version) else {
+                continue;
+            };
+            let spellings: BTreeSet<&str> = (meta.artifacts.get(&key).into_iter())
+                .flat_map(|lists| lists.values())
+                .flat_map(ArtifactMetaState::versions)
+                .filter(|listed| {
+                    Version::parse(listed)
+                        .is_ok_and(|listed| listed.cmp_in(&picked, self.plan.mode).is_eq())
+                })
+                .collect();
+            if spellings.len() > 1 {
+                return Err(ExportError::EqualSpellings {
+                    coordinate: format!("{group}:{artifact}"),
+                    version: version.clone(),
+                    spellings: spellings.into_iter().map(str::to_string).collect(),
+                });
+            }
+        }
+        for read in &self.plan.module_range_reads {
+            let key = ArtifactMetaKey {
+                group_id: read.group.clone(),
+                artifact_id: read.artifact.clone(),
+            };
+            let ids: Vec<String> = (self.origin_ids(read.origins.iter().map(String::as_str)))
+                .iter()
+                .map(|id| version_list_repo_id(id))
+                .collect();
+            let listed: BTreeSet<&str> = (ids.iter())
+                .filter_map(|id| meta.artifacts.get(&key).and_then(|lists| lists.get(id)))
+                .flat_map(ArtifactMetaState::versions)
+                .collect();
+            for version in &read.versions {
+                let Ok(held) = Version::parse(version) else {
+                    continue;
+                };
+                let spellings: BTreeSet<&str> = (listed.iter().copied())
+                    .filter(|listed| {
+                        Version::parse(listed)
+                            .is_ok_and(|listed| listed.cmp_in(&held, self.plan.mode).is_eq())
+                    })
+                    .collect();
+                if spellings.len() > 1 {
+                    return Err(ExportError::EqualSpellings {
+                        coordinate: format!("{}:{}", read.group, read.artifact),
+                        version: version.clone(),
+                        spellings: spellings.into_iter().map(str::to_string).collect(),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -902,9 +1399,17 @@ impl<'a> Exporter<'a> {
         let file_version = artifact.file_version();
         let coordinate = &artifact.coordinate;
         let repo_ids = self.repo_ids_for(artifact);
-        if version_lists {
-            // Listed under each id the files' markers name, so `mvn -o`
-            // reads the list for the repository it would fetch them from.
+        let marked = (self.plan.marker_versions).contains(&(
+            coordinate.group_id().to_string(),
+            coordinate.artifact_id().to_string(),
+            base.clone(),
+        ));
+        if version_lists && marked {
+            // A `RELEASE`, `LATEST` or plugin without a version reads the
+            // markers of a list under each id the files' markers name, the
+            // repository `mvn -o` would fetch them from. Its version is not
+            // listed: the repository that serves the files may not list it,
+            // and listing it would offer it to a range there.
             let artifact_key = ArtifactMetaKey {
                 group_id: coordinate.group_id().to_string(),
                 artifact_id: coordinate.artifact_id().to_string(),
@@ -912,7 +1417,6 @@ impl<'a> Exporter<'a> {
             let lists = meta.artifacts.entry(artifact_key).or_default();
             for repo_id in &repo_ids {
                 let artifact_state = lists.entry(version_list_repo_id(repo_id)).or_default();
-                artifact_state.add_version(&base);
                 if let Some(stamp) = artifact
                     .snapshot
                     .as_ref()
@@ -946,17 +1450,13 @@ impl<'a> Exporter<'a> {
                 TimestampedSnapshot::parse(artifact.coordinate.version())
                     .map(|snapshot| (snapshot.timestamp().to_string(), snapshot.build_number()))
             };
+            let own = stamp
+                .as_ref()
+                .and_then(|(timestamp, _)| compact_updated(timestamp));
             if let Some((timestamp, build_number)) = stamp {
-                state.timestamp = Some(timestamp.clone());
-                state.build_number = state.build_number.or(build_number);
-                if let Some(updated) = compact_updated(&timestamp) {
-                    state.last_updated = Some(updated);
-                }
+                state.name_build(&timestamp, build_number);
             }
-
-            let updated = state
-                .last_updated
-                .clone()
+            let updated = (own.or_else(|| state.last_updated.clone()))
                 .unwrap_or_else(|| "00000000000000".to_string());
 
             // Main artifact entry.
@@ -989,35 +1489,41 @@ impl<'a> Exporter<'a> {
         }
     }
 
-    /// Async wrapper that moves blocking file I/O to a background thread.
-    ///
-    /// `safe_artifact_path` itself probes the filesystem during
-    /// canonicalisation, and `export_artifact_blocking` runs the rest of
-    /// the blocking work (hash, link, sidecar writes); folding both into
-    /// the same `spawn_blocking` keeps blocking syscalls off the async
-    /// runtime thread. Returns the outcome alongside the destination path so
-    /// the caller can record the `_remote.repositories` marker for it.
-    async fn export_artifact_async(
+    /// Judge one unit's destination on the blocking pool, holding the turn.
+    async fn judge_async(
         &self,
-        key: &ArtifactCoord,
-        blob_id: &BlobId,
-        replace: bool,
+        unit: &ExportUnit,
+        trust_sidecars: bool,
         turn: Option<Arc<fs::File>>,
-    ) -> Result<(ExportOutcome, Option<ExportWarning>, PathBuf)> {
-        let src = self.store.get_path(blob_id);
+    ) -> Result<Judged> {
         let store = self.store.clone();
-        let mut options = self.options.clone();
-        options.overwrite |= replace;
-        let key_str = key.to_string();
-        let blob_id = blob_id.clone();
-        let key = key.clone();
-
+        let options = self.options.clone();
+        let replace = Replace::of(&options, unit.plain_snapshot);
+        let key = unit.key.clone();
+        let blob_id = unit.blob.clone();
         spawn_blocking(move || {
             let _turn = turn;
-            let dest = safe_artifact_path(&options, &key)?;
-            let (outcome, warning) =
-                export_artifact_blocking(&store, &src, &dest, &options, &key_str, &blob_id)?;
-            Ok((outcome, warning, dest))
+            judge_blocking(&store, &options, replace, &key, &blob_id, trust_sidecars)
+        })
+        .await
+        .map_err(|e| ExportError::IoError(std::io::Error::other(e.to_string())))?
+    }
+
+    /// Carry out one unit's verdict on the blocking pool, holding the turn.
+    async fn write_async(
+        &self,
+        unit: &ExportUnit,
+        judged: Judged,
+        turn: Option<Arc<fs::File>>,
+    ) -> Result<Written> {
+        let store = self.store.clone();
+        let options = self.options.clone();
+        let replace = Replace::of(&options, unit.plain_snapshot);
+        let key_str = unit.key.to_string();
+        let blob_id = unit.blob.clone();
+        spawn_blocking(move || {
+            let _turn = turn;
+            write_blocking(&store, judged, &options, replace, &key_str, &blob_id)
         })
         .await
         .map_err(|e| ExportError::IoError(std::io::Error::other(e.to_string())))?
@@ -1059,7 +1565,9 @@ impl<'a> Exporter<'a> {
         if let Some(pin) = self.plan.support_poms.get(&exact) {
             return Some((version.to_string(), pin));
         }
-        let req = VersionReq::parse(version).ok()?;
+        // The resolver selected a remote parent in the lock's version order.
+        let mode = self.plan.mode;
+        let req = VersionReq::parse_in(version, mode).ok()?;
         if matches!(req, VersionReq::Soft(_)) {
             return None;
         }
@@ -1073,10 +1581,23 @@ impl<'a> Exporter<'a> {
                     return None;
                 }
                 let parsed = Version::parse(&pinned).ok()?;
-                req.matches(&parsed).then_some((parsed, pinned, pin))
+                req.matches_in(&parsed, mode)
+                    .then_some((parsed, pinned, pin))
             })
-            .max_by(|a, b| a.0.cmp(&b.0))?;
+            .max_by(|a, b| a.0.cmp_in(&b.0, mode))?;
         Some((pinned, pin))
+    }
+
+    /// The remote parent `parent` names, as the store holds the bytes its
+    /// support POM pin names, with its plugin sections.
+    fn stored_parent_pom(&self, parent: &rv_maven_model::Parent) -> Option<rv_maven_model::Pom> {
+        let (_, pin) =
+            self.support_pom_for(&parent.group_id, &parent.artifact_id, &parent.version)?;
+        let bytes = self.store.read_blob(&pin.sha256).ok().flatten()?;
+        if BlobId::from_bytes(&bytes) != pin.sha256 {
+            return None;
+        }
+        rv_maven_model::Pom::parse_with_plugins(&rv_maven_model::decode_pom(&bytes).ok()?).ok()
     }
 
     async fn enqueue_support_closure(
@@ -1150,17 +1671,22 @@ impl<'a> Exporter<'a> {
                 queue
                     .enqueued_poms
                     .insert((group_id.clone(), artifact_id.clone(), build.clone()));
-                for (version, repo_ids, replace) in [
+                let remote = ArtifactCoord::new(&group_id, &artifact_id, build, "pom", None);
+                for (version, repo_ids, plain_snapshot) in [
                     (build.as_str(), recorded.repo_ids.clone(), false),
                     (version.as_str(), Vec::new(), true),
                 ] {
+                    let no_id = !plain_snapshot && recorded.repo_ids.is_empty();
                     queue.push(ExportUnit {
                         key: ArtifactCoord::new(&group_id, &artifact_id, version, "pom", None),
                         blob: support_blob.clone(),
                         source: UnitSource::SupportPom,
                         repo_ids,
-                        repo_id_recorded: true,
-                        replace,
+                        origin: recorded.repo_url.clone(),
+                        remote: remote.clone(),
+                        plain_snapshot,
+                        no_id,
+                        optional: false,
                     })?;
                 }
                 continue;
@@ -1168,25 +1694,27 @@ impl<'a> Exporter<'a> {
             // A relocated SNAPSHOT dependency is recorded by its build. With
             // no snapshot metadata, `mvn -o` reads the plain `-SNAPSHOT`
             // file, which Maven rewrites on every update.
-            let plain = TimestampedSnapshot::parse(&version)
-                .and_then(|_| rv_maven_types::snapshot_base_version(&version))
-                .filter(|_| self.is_latest_support_build(&group_id, &artifact_id, &version))
-                .filter(|base| {
-                    queue.enqueued_poms.insert((
-                        group_id.clone(),
-                        artifact_id.clone(),
-                        base.clone(),
-                    ))
-                });
+            let plain = plain_support_pom_copy(
+                self.plan.support_poms.keys().map(String::as_str),
+                &coord_key,
+            )
+            .filter(|base| {
+                queue
+                    .enqueued_poms
+                    .insert((group_id.clone(), artifact_id.clone(), base.clone()))
+            });
             let repo_ids = recorded.repo_ids.clone();
             queue.push(ExportUnit {
-                key,
+                remote: key.clone(),
+                key: key.clone(),
                 blob: support_blob.clone(),
                 source: UnitSource::SupportPom,
                 repo_ids: repo_ids.clone(),
-                repo_id_recorded: true,
+                origin: recorded.repo_url.clone(),
                 // A plain `-SNAPSHOT` parent or BOM changes with each update.
-                replace: version.ends_with("SNAPSHOT"),
+                plain_snapshot: version.ends_with("SNAPSHOT"),
+                no_id: repo_ids.is_empty(),
+                optional: false,
             })?;
             if let Some(base) = plain {
                 queue.push(ExportUnit {
@@ -1194,39 +1722,15 @@ impl<'a> Exporter<'a> {
                     blob: support_blob.clone(),
                     source: UnitSource::SupportPom,
                     repo_ids,
-                    repo_id_recorded: true,
-                    replace: true,
+                    origin: recorded.repo_url.clone(),
+                    remote: key,
+                    plain_snapshot: true,
+                    no_id: false,
+                    optional: false,
                 })?;
             }
         }
         Ok(())
-    }
-
-    /// Whether `version`, a SNAPSHOT build of a support POM, is the one a
-    /// `-SNAPSHOT` request resolves to: the latest build the lock records,
-    /// unless the lock pins the `-SNAPSHOT` POM itself, as a parent or BOM.
-    fn is_latest_support_build(&self, group_id: &str, artifact_id: &str, version: &str) -> bool {
-        let build = |version: &str| {
-            let snapshot = TimestampedSnapshot::parse(version)?;
-            let base = rv_maven_types::snapshot_base_version(version)?;
-            Some((
-                base,
-                snapshot.timestamp().to_string(),
-                snapshot.build_number(),
-            ))
-        };
-        let Some(this) = build(version) else {
-            return false;
-        };
-        let plain = format!("{group_id}:{artifact_id}:{}", this.0);
-        !self.plan.support_poms.contains_key(&plain)
-            && !self.plan.support_poms.keys().any(|coord| {
-                parse_gav(coord).is_some_and(|(group, artifact, other)| {
-                    group == group_id
-                        && artifact == artifact_id
-                        && build(&other).is_some_and(|other| other.0 == this.0 && other > this)
-                })
-            })
     }
 
     /// The companion POM the lockfile pins for one artifact coordinate. The
@@ -1313,15 +1817,24 @@ impl<'a> Exporter<'a> {
     }
 }
 
+/// The origin raeva.lock records first for the companion POM of `artifact`.
+fn pom_origin(artifact: &LockArtifact) -> String {
+    (artifact.pom_origins().next())
+        .unwrap_or(&artifact.repo_url)
+        .to_string()
+}
+
 /// Queue a plain `-SNAPSHOT` copy of each timestamped file of a row that
 /// asks for a `-SNAPSHOT` version, and of its companion POM, as Maven 3.9
 /// leaves one next to every snapshot it downloads. The copies get no
 /// `_remote.repositories` entry, so `mvn -o` accepts them whichever
 /// repository or mirror id its settings use, and needs no metadata to find
 /// them.
-fn queue_plain_snapshot_copies(items: &[LockArtifact], queue: &mut ExportQueue) -> Result<()> {
+fn queue_plain_snapshot_copies<'a>(
+    items: impl Iterator<Item = &'a LockArtifact>,
+    queue: &mut ExportQueue,
+) -> Result<()> {
     let requested: HashSet<(&str, &str, String)> = items
-        .iter()
         .filter(|artifact| {
             artifact.snapshot.is_some()
                 && rv_maven_types::is_snapshot_version(artifact.coordinate.version())
@@ -1365,8 +1878,11 @@ fn queue_plain_snapshot_copies(items: &[LockArtifact], queue: &mut ExportQueue) 
                 blob: unit.blob.clone(),
                 source: unit.source,
                 repo_ids: Vec::new(),
-                repo_id_recorded: false,
-                replace: true,
+                origin: unit.origin.clone(),
+                remote: unit.remote.clone(),
+                plain_snapshot: true,
+                no_id: false,
+                optional: unit.optional,
             })
         })
         .collect();
@@ -1419,9 +1935,8 @@ fn write_metadata_blocking(m2_path: &Path, meta: &mut MetadataAccumulator) -> Re
         }
     }
     // The other ids get an empty list, so the tail's does not stand in.
-    // Only the main pass writes them: a later pass's ids may be fewer.
     let empty_ids: HashSet<&str> = meta.empty_list_ids.iter().map(String::as_str).collect();
-    let empty_lists = meta.replaces_listings && !meta.shared;
+    let empty_lists = !meta.shared;
     if empty_lists {
         for ((group_id, artifact_id, version), ids) in &written {
             let others: Vec<&str> = empty_ids.difference(ids).copied().collect();
@@ -1450,9 +1965,54 @@ fn write_metadata_blocking(m2_path: &Path, meta: &mut MetadataAccumulator) -> Re
         }
     }
     for (key, state) in meta.artifacts.iter_mut() {
-        write_artifact_metadata_blocking(m2_path, key, state, &empty_ids, meta.shared)?;
+        write_artifact_metadata_blocking(m2_path, key, state, &empty_ids, meta.shared, meta.mode)?;
     }
     Ok(())
+}
+
+/// Write `<groupId>/maven-metadata-<id>.xml` naming the goal prefixes of
+/// `plugins`, and in a `shared` repository each other prefix the file
+/// names. An id no file can carry is skipped.
+fn write_group_metadata_blocking(
+    m2_path: &Path,
+    group_id: &str,
+    id: &str,
+    plugins: &BTreeSet<(String, String)>,
+    shared: bool,
+) -> Result<()> {
+    if !is_metadata_repo_id(id) {
+        return Ok(());
+    }
+    let dir = confined_dir(
+        m2_path,
+        m2_path.join(validate_group_prefixes(group_id, plugins)?),
+    )?;
+    let dest = dir.join(format!("maven-metadata-{id}.xml"));
+    let mut plugins = plugins.clone();
+    if shared {
+        let ours: BTreeSet<String> = plugins.iter().map(|(prefix, _)| prefix.clone()).collect();
+        plugins.extend(
+            (read_existing_prefixes(&dest).into_iter())
+                .filter(|(prefix, _)| !ours.contains(prefix)),
+        );
+    }
+    write_metadata_atomic(&dest, &render_group_metadata(&plugins))?;
+    // A checksum Maven saved with the file it downloaded may not match it.
+    remove_checksums(&dest)
+}
+
+/// The group directory of `group_id`'s plugin prefixes, once each plugin's
+/// artifact id is a path segment and each prefix is printable text.
+fn validate_group_prefixes(group_id: &str, plugins: &BTreeSet<(String, String)>) -> Result<String> {
+    for (prefix, artifact_id) in plugins {
+        validate_path_segment(CoordinateField::Artifact, artifact_id)?;
+        if prefix.is_empty() || prefix.chars().any(char::is_control) {
+            return Err(ExportError::InvalidCoordinate(format!(
+                "invalid goal prefix {prefix:?} for {group_id}:{artifact_id}"
+            )));
+        }
+    }
+    validate_group_path(group_id)
 }
 
 /// Write a `maven-metadata-<id>.xml` that lists nothing for each of `ids`,
@@ -1499,23 +2059,27 @@ fn write_empty_lists(
         {
             continue;
         }
-        if write_metadata_atomic(&dest, &xml)? {
-            remove_checksums(&dest)?;
+        write_metadata_atomic(&dest, &xml)?;
+        remove_checksums(&dest)?;
+        // Another id the volume folds onto `local` may have written the file.
+        if *id == "local" {
+            date_local_list(&dest)?;
         }
-        // An online run takes a local list's modification time as the last
-        // check of every repository for a SNAPSHOT, RELEASE or LATEST; Java
-        // reads the epoch as no time. Another id the volume folds onto
-        // `local` may have written the file. A FAT volume keeps no time
-        // before 1980; 2 January 1980 is as old to Maven.
-        let fat_epoch = UNIX_EPOCH + std::time::Duration::from_secs(315_619_200);
-        if *id == "local"
-            && (fs::symlink_metadata(&dest)?.modified()).is_ok_and(|time| time > fat_epoch)
-        {
-            let _ = (fs::File::options().write(true).open(&dest)).and_then(|file| {
-                file.set_modified(UNIX_EPOCH)
-                    .or_else(|_| file.set_modified(fat_epoch))
-            });
-        }
+    }
+    Ok(())
+}
+
+/// An online run takes a local list's modification time as the last check
+/// of every repository for a SNAPSHOT, RELEASE or LATEST; Java reads the
+/// epoch as no time. A FAT volume keeps no time before 1980; 2 January 1980
+/// is as old to Maven.
+fn date_local_list(dest: &Path) -> Result<()> {
+    let fat_epoch = UNIX_EPOCH + std::time::Duration::from_secs(315_619_200);
+    if (fs::symlink_metadata(dest)?.modified()).is_ok_and(|time| time > fat_epoch) {
+        let _ = (fs::File::options().write(true).open(dest)).and_then(|file| {
+            file.set_modified(UNIX_EPOCH)
+                .or_else(|_| file.set_modified(fat_epoch))
+        });
     }
     Ok(())
 }
@@ -1570,10 +2134,8 @@ fn write_snapshot_metadata_blocking(
                 .collect(),
         ),
     });
-    if write_metadata_atomic(&dest, &xml)? {
-        remove_checksums(&dest)?;
-    }
-    Ok(())
+    write_metadata_atomic(&dest, &xml)?;
+    remove_checksums(&dest)
 }
 
 /// Repository id used in artifact-level and snapshot version lists.
@@ -1625,6 +2187,7 @@ fn write_artifact_metadata_blocking(
     by_repo: &mut BTreeMap<String, ArtifactMetaState>,
     empty_ids: &HashSet<&str>,
     shared: bool,
+    mode: MavenMode,
 ) -> Result<()> {
     let group_path = validate_group_path(&key.group_id)?;
     validate_path_segment(CoordinateField::Artifact, &key.artifact_id)?;
@@ -1683,8 +2246,8 @@ fn write_artifact_metadata_blocking(
         // Sort in Maven version order before rendering, so
         // `<latest>` and `<release>` are not picked lexicographically, where
         // `9.0.0` sorts after `10.0.0`.
-        state.finalize();
-        let latest = state.latest().expect("non-empty");
+        state.finalize(mode);
+        let latest = state.latest();
         let release = state.release();
         let xml = render_artifact_metadata(&ArtifactMetadata {
             group_id: &key.group_id,
@@ -1694,10 +2257,11 @@ fn write_artifact_metadata_blocking(
             versions: state.versions().map(str::to_string).collect(),
             last_updated: &last_updated,
         });
-        if write_metadata_atomic(&dest, &xml)? {
-            // A checksum Maven saved with the file it downloaded no longer
-            // matches it.
-            remove_checksums(&dest)?;
+        write_metadata_atomic(&dest, &xml)?;
+        // A checksum Maven saved with the file it downloaded may not match it.
+        remove_checksums(&dest)?;
+        if repo_id == "local" && !shared {
+            date_local_list(&dest)?;
         }
     }
     let listed: Vec<&str> = listed.iter().map(String::as_str).collect();
@@ -1775,7 +2339,7 @@ fn remove_checksums(path: &Path) -> Result<()> {
 /// Returns an error if the coordinate contains path traversal sequences or
 /// if the resulting path would escape the m2 directory. Packaging and
 /// classifier are validated alongside group/artifact/version. This is pure
-/// path math: the caller (`export_artifact_blocking`) is responsible for
+/// path math: the caller (`write_blocking`) is responsible for
 /// `create_dir_all` on the artifact parent when it's actually about to
 /// write into it.
 fn safe_artifact_path(options: &ExportOptions, key: &ArtifactCoord) -> Result<PathBuf> {
@@ -1788,7 +2352,7 @@ fn safe_artifact_path(options: &ExportOptions, key: &ArtifactCoord) -> Result<Pa
         return Err(ExportError::PathTraversal(dest));
     }
 
-    // `safe_artifact_path` is path math only. `export_artifact_blocking`
+    // `safe_artifact_path` is path math only. `write_blocking`
     // is the single caller responsible for actually creating the artifact
     // parent directory (and only when we're about to write into it), so
     // doing it here too just duplicates a syscall per artifact.
@@ -2071,6 +2635,7 @@ fn planned_destinations(
     units: &[ExportUnit],
     optional: &[(ArtifactCoord, Vec<String>)],
     meta: &MetadataAccumulator,
+    prefixes: Option<&GroupPrefixes>,
     folds_case: bool,
 ) -> Result<DestinationPaths> {
     let mut paths = DestinationPaths {
@@ -2103,6 +2668,13 @@ fn planned_destinations(
                 &format!("repository markers for {}", dir.display()),
                 depth,
             )?;
+        }
+    }
+    for ((group_id, id), plugins) in prefixes.into_iter().flatten() {
+        if is_metadata_repo_id(id) {
+            let dir = PathBuf::from(validate_group_prefixes(group_id, plugins)?);
+            let owner = format!("plugin prefixes of {group_id} from repository {id:?}");
+            paths.metadata(&dir, group_id, &owner, id)?;
         }
     }
     for (key, by_repo) in &meta.artifacts {
@@ -2142,7 +2714,7 @@ fn planned_destinations(
         let dir = PathBuf::from(validate_group_path(group)?)
             .join(artifact)
             .join(version);
-        if !meta.shared && (meta.replaces_listings || ids.is_empty()) {
+        if !meta.shared {
             paths.cleanup.extend(paths.names(&dir));
         }
         paths.metadata_lists(
@@ -2150,10 +2722,10 @@ fn planned_destinations(
             group,
             &format!("{group}:{artifact}:{version}"),
             ids.into_iter(),
-            if meta.replaces_listings && !meta.shared {
-                &meta.empty_list_ids
-            } else {
+            if meta.shared {
                 &empty
+            } else {
+                &meta.empty_list_ids
             },
         )?;
     }
@@ -2192,10 +2764,11 @@ fn reject_destination_collisions(
     units: &[ExportUnit],
     optional: &[(ArtifactCoord, Vec<String>)],
     meta: &MetadataAccumulator,
+    prefixes: Option<&GroupPrefixes>,
 ) -> Result<()> {
     let check = || {
-        planned_destinations(units, optional, meta, false)?;
-        let Err(collision) = planned_destinations(units, optional, meta, true) else {
+        planned_destinations(units, optional, meta, prefixes, false)?;
+        let Err(collision) = planned_destinations(units, optional, meta, prefixes, true) else {
             return Ok(());
         };
         let root = options
@@ -2328,11 +2901,14 @@ fn lexical_normalize(path: &Path) -> PathBuf {
 /// The digests of the regular file at `path`, through a link. Anything
 /// else, such as a device, fails rather than being read without end.
 fn hash_file(path: &Path) -> Result<(String, String)> {
-    use std::io::Read;
     if !fs::metadata(path)?.is_file() {
         return Err(std::io::Error::other("not a regular file").into());
     }
-    let mut file = fs::File::open(path).map_err(ExportError::IoError)?;
+    hash_open(&mut fs::File::open(path).map_err(ExportError::IoError)?)
+}
+
+fn hash_open(file: &mut fs::File) -> Result<(String, String)> {
+    use std::io::Read;
     let mut sha256 = Sha256::new();
     let mut sha1 = Sha1::new();
     let mut buf = [0u8; 64 * 1024];
@@ -2353,7 +2929,10 @@ fn hash_file(path: &Path) -> Result<(String, String)> {
 /// on-disk tampered file cannot make it into the user's `.m2`. Returns the
 /// SHA-1 for the sidecar.
 fn verify_and_hash(src: &Path, blob_id: &BlobId) -> Result<String> {
-    let (sha256_hex, sha1_hex) = hash_file(src)?;
+    verify_and_snapshot(src, blob_id).map(|(sha1_hex, _)| sha1_hex)
+}
+
+fn check_blob(src: &Path, blob_id: &BlobId, sha256_hex: String) -> Result<()> {
     if sha256_hex != blob_id.as_str() {
         return Err(ExportError::CorruptBlob {
             path: src.to_path_buf(),
@@ -2361,7 +2940,78 @@ fn verify_and_hash(src: &Path, blob_id: &BlobId) -> Result<String> {
             expected: blob_id.to_string(),
         });
     }
-    Ok(sha1_hex)
+    Ok(())
+}
+
+/// [`verify_and_hash`], with what the file was when it was read.
+fn verify_and_snapshot(src: &Path, blob_id: &BlobId) -> Result<(String, BlobSnapshot)> {
+    let mut file = open_store_file(src)?;
+    let snapshot = BlobSnapshot::of(&file)?;
+    let (sha256_hex, sha1_hex) = hash_open(&mut file)?;
+    check_blob(src, blob_id, sha256_hex)?;
+    Ok((sha1_hex, snapshot))
+}
+
+/// The store file at `src`, opened without following a link; anything but
+/// a regular file, such as a FIFO, fails rather than block the read.
+pub(crate) fn open_store_file(src: &Path) -> std::io::Result<fs::File> {
+    rv_store::open_unfollowed_regular(src)?.ok_or_else(|| {
+        let message = format!(
+            "store file {} is missing or not a regular file",
+            src.display()
+        );
+        std::io::Error::new(std::io::ErrorKind::NotFound, message)
+    })
+}
+
+/// The file a blob was hashed from, taken before reading it: a later link
+/// or copy that finds the same file, length and modification and change
+/// times reads the bytes that were hashed.
+struct BlobSnapshot {
+    file: (u64, u64),
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    /// The inode change time, which also a write that restores the
+    /// modification time moves. Not read on Windows, where such a write is
+    /// not caught.
+    changed: Option<(i64, i64)>,
+}
+
+impl BlobSnapshot {
+    fn of(file: &fs::File) -> std::io::Result<Self> {
+        let meta = file.metadata()?;
+        #[cfg(unix)]
+        let (id, changed) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                (meta.dev(), meta.ino()),
+                Some((meta.ctime(), meta.ctime_nsec())),
+            )
+        };
+        #[cfg(windows)]
+        let (id, changed) = {
+            let info = winapi_util::file::information(file)?;
+            ((info.volume_serial_number(), info.file_index()), None)
+        };
+        #[cfg(not(any(unix, windows)))]
+        let (id, changed) = ((0, 0), None);
+        Ok(Self {
+            file: id,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            changed,
+        })
+    }
+
+    /// Whether `now` is still this file. A hard link to it moves its change
+    /// time.
+    fn holds(&self, now: &Self, hard_link: bool) -> bool {
+        self.file == now.file
+            && self.len == now.len
+            && self.modified.is_some()
+            && self.modified == now.modified
+            && (hard_link || self.changed == now.changed)
+    }
 }
 
 /// What the destination of one file holds before the export writes it.
@@ -2377,20 +3027,24 @@ enum Existing {
     Differs {
         actual: String,
     },
+    /// A directory, not a link to one.
+    Directory,
 }
 
 /// Look at `dest` without writing anything. A file that shares the store
 /// blob's inode, a hard link or a link to it, is checked by hashing the
 /// blob, which verifies the store too; a separate file is hashed itself.
-/// A shared file is not read when an earlier export left it, its sidecars
-/// name the blob, and the store's checked stamp shows no write to the blob
-/// since it last hashed right.
+/// A shared file is not read when `trust_sidecars`, its sidecars name the
+/// blob, and the store's checked stamp shows no write to the blob since it
+/// last hashed right. An export that stopped between two sidecars leaves
+/// them naming different bytes, so a repair does not trust them.
 fn existing_file(
     store: &Store,
     src: &Path,
     dest: &Path,
     blob_id: &BlobId,
     strategy: LinkStrategy,
+    trust_sidecars: bool,
 ) -> Result<Existing> {
     let linked = match fs::symlink_metadata(dest) {
         Ok(linked) => linked,
@@ -2398,6 +3052,9 @@ fn existing_file(
         Err(err) => return Err(ExportError::IoError(err)),
     };
     let is_link = linked.file_type().is_symlink();
+    if linked.is_dir() {
+        return Ok(Existing::Directory);
+    }
     if fs::metadata(dest).is_err() {
         return Ok(if is_link {
             Existing::Replace
@@ -2414,14 +3071,18 @@ fn existing_file(
     let shares_blob =
         same_file::is_same_file(src, dest).unwrap_or(false) || (is_link && same_target);
     if shares_blob {
-        if strategy == LinkStrategy::Copy {
+        // Only `--link symlink` keeps a symbolic link: an earlier export's
+        // would stay where Maven 3.10 does not read it.
+        if strategy == LinkStrategy::Copy || (is_link && strategy != LinkStrategy::Symlink) {
             return Ok(Existing::Replace);
         }
         let pin = Digest::Sha256(blob_id.clone());
-        if matches!(
-            store.check_pin_unless_unchanged(blob_id, &pin),
-            Ok(PinCheck::Match)
-        ) && let Some(sha1) = exported_sha1(dest, blob_id)
+        if trust_sidecars
+            && matches!(
+                store.check_pin_unless_unchanged(blob_id, &pin),
+                Ok(PinCheck::Match)
+            )
+            && let Some(sha1) = exported_sha1(dest, blob_id)
         {
             return Ok(Existing::UpToDate { sha1 });
         }
@@ -2491,68 +3152,179 @@ fn exported_sha1(dest: &Path, blob_id: &BlobId) -> Option<String> {
     (sha1.len() == 40 && sha1.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(sha1)
 }
 
-/// Settle a destination the export does not have to write: skip one that
-/// is up to date, refuse other bytes without `--overwrite`. `None` means
-/// write it.
-fn settle_existing(
-    existing: Existing,
+/// What an export does at one destination.
+#[derive(Clone, Copy)]
+enum Verdict {
+    /// The locked bytes are there: keep them and repair their sidecars.
+    Keep,
+    /// Put the blob there. `replaced`: other bytes are there now.
+    Write { replaced: bool },
+}
+
+/// One destination and its verdict, decided before the export writes
+/// anything.
+struct Judged {
+    dest: PathBuf,
+    verdict: Verdict,
+    /// The SHA-1 of the locked bytes, for the sidecar.
+    sha1: String,
+    /// The store blob as it was hashed, for a verdict to write it.
+    source: Option<BlobSnapshot>,
+}
+
+/// What writing one destination did.
+struct Written {
+    outcome: ExportOutcome,
+    warning: Option<ExportWarning>,
+    dest: PathBuf,
+    /// The export replaced other bytes there.
+    replaced: bool,
+}
+
+/// Which other bytes at a destination an export may replace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replace {
+    Never,
+    /// Bytes an earlier export or a download left: see
+    /// [`exported_earlier`].
+    IfRaevaWrote,
+    Always,
+}
+
+impl Replace {
+    /// `--overwrite` replaces anything, and a release nothing. Maven rewrites
+    /// a plain `-SNAPSHOT` file on every update, so in a repository of the
+    /// lock's own other bytes there are an earlier copy. The shared one also
+    /// holds `mvn install` output, which is only replaced like a release.
+    fn of(options: &ExportOptions, plain_snapshot: bool) -> Self {
+        match (options.overwrite, plain_snapshot, options.shared) {
+            (true, _, _) => Self::Always,
+            (false, false, _) => Self::Never,
+            (false, true, false) => Self::Always,
+            (false, true, true) => Self::IfRaevaWrote,
+        }
+    }
+}
+
+/// Whether the bytes at `dest`, whose SHA-256 is `actual`, came from a
+/// repository: its `.sha256` sidecar names them, as an earlier export, or
+/// a Maven download that writes SHA-256 checksums, leaves it. `mvn install`
+/// writes none and leaves the one an export wrote naming other bytes.
+fn exported_earlier(dest: &Path, actual: &str) -> bool {
+    let sidecar = format!("{}.sha256", dest.as_os_str().to_string_lossy());
+    crate::metadata::read_regular_text(Path::new(&sidecar))
+        .is_some_and(|text| text.trim().eq_ignore_ascii_case(actual))
+}
+
+/// Decide what to do with what [`existing_file`] found: keep the locked
+/// bytes, write over nothing worth keeping, and refuse other bytes that
+/// `replace` does not cover. Only `--overwrite` removes a directory.
+fn decide(
+    existing: &Existing,
     dest: &Path,
     options: &ExportOptions,
+    replace: Replace,
     key_str: &str,
     blob_id: &BlobId,
-) -> Result<Option<ExportOutcome>> {
+) -> Result<Verdict> {
     match existing {
-        Existing::Absent | Existing::Replace => Ok(None),
-        Existing::UpToDate { sha1 } => {
-            ensure_sidecars(dest, blob_id, &sha1)?;
-            Ok(Some(ExportOutcome::Skipped))
+        Existing::Absent | Existing::Replace => Ok(Verdict::Write { replaced: false }),
+        Existing::UpToDate { .. } => Ok(Verdict::Keep),
+        Existing::Directory if options.overwrite => Ok(Verdict::Write { replaced: true }),
+        Existing::Differs { actual }
+            if replace == Replace::Always
+                || (replace == Replace::IfRaevaWrote && exported_earlier(dest, actual)) =>
+        {
+            Ok(Verdict::Write { replaced: true })
         }
-        Existing::Differs { .. } if options.overwrite => Ok(None),
+        Existing::Directory => Err(ExportError::DestinationMismatch {
+            key: key_str.to_string(),
+            path: dest.to_path_buf(),
+            expected: blob_id.as_str().to_string(),
+            actual: "<directory>".to_string(),
+        }),
         Existing::Differs { actual } => Err(ExportError::DestinationMismatch {
             key: key_str.to_string(),
             path: dest.to_path_buf(),
             expected: blob_id.as_str().to_string(),
-            actual,
+            actual: actual.clone(),
         }),
     }
 }
 
-/// Standalone blocking function for exporting a single artifact.
-/// Called from spawn_blocking to avoid blocking the async runtime. Verifies
-/// blob integrity before linking/copying, and skips filesystem mutations
-/// when `dry_run` is set.
-fn export_artifact_blocking(
+/// Judge one destination without writing to it: the path is confined, the
+/// blob is there and intact if it is to be written, and the bytes there
+/// are the locked ones or may be replaced. Only the store's checked stamp
+/// may be recorded.
+fn judge_blocking(
     store: &Store,
-    src: &Path,
-    dest: &Path,
     options: &ExportOptions,
+    replace: Replace,
+    key: &ArtifactCoord,
+    blob_id: &BlobId,
+    trust_sidecars: bool,
+) -> Result<Judged> {
+    let dest = safe_artifact_path(options, key)?;
+    let src = store.get_path(blob_id);
+    let key_str = key.to_string();
+    if !src.is_file() {
+        return Err(ExportError::MissingBlob { key: key_str });
+    }
+    // A link in the store would export the file it names.
+    if !fs::symlink_metadata(&src)?.is_file() {
+        let message = format!("store file {} is not a regular file", src.display());
+        return Err(std::io::Error::other(message).into());
+    }
+    let existing = existing_file(
+        store,
+        &src,
+        &dest,
+        blob_id,
+        options.link_strategy,
+        trust_sidecars,
+    )?;
+    let verdict = decide(&existing, &dest, options, replace, &key_str, blob_id)?;
+    let (sha1, source) = match existing {
+        Existing::UpToDate { sha1 } => (sha1, None),
+        _ => {
+            let (sha1, source) = verify_and_snapshot(&src, blob_id)?;
+            (sha1, Some(source))
+        }
+    };
+    Ok(Judged {
+        dest,
+        verdict,
+        sha1,
+        source,
+    })
+}
+
+/// Carry out a verdict [`judge_blocking`] reached.
+fn write_blocking(
+    store: &Store,
+    judged: Judged,
+    options: &ExportOptions,
+    replace: Replace,
     key_str: &str,
     blob_id: &BlobId,
-) -> Result<(ExportOutcome, Option<ExportWarning>)> {
-    // Check src existence here for a useful error, but the link attempt
-    // itself is the authoritative check; if src disappears between here and
-    // the link we get a clear OS error rather than a panic or silent bad link.
-    if !src.is_file() {
-        return Err(ExportError::MissingBlob {
-            key: key_str.to_string(),
-        });
-    }
-
-    // In dry_run mode, skip all filesystem mutations entirely. We still
-    // accept the call for any source that exists.
-    if options.dry_run {
-        return Ok((ExportOutcome::Exported(options.link_strategy), None));
-    }
-
-    // A repeated export finds most files in place, so look before staging:
-    // a staged copy costs a full read and a sync even when it is thrown away.
-    let existing = existing_file(store, src, dest, blob_id, options.link_strategy)?;
-    let was_absent = matches!(existing, Existing::Absent);
-    if let Some(outcome) = settle_existing(existing, dest, options, key_str, blob_id)? {
-        return Ok((outcome, None));
-    }
-
-    let sha1_hex = verify_and_hash(src, blob_id)?;
+) -> Result<Written> {
+    let Judged {
+        dest,
+        verdict,
+        sha1,
+        source,
+    } = judged;
+    let written = |outcome, warning, replaced| Written {
+        outcome,
+        warning,
+        dest: dest.clone(),
+        replaced,
+    };
+    let Verdict::Write { .. } = verdict else {
+        ensure_sidecars(&dest, blob_id, &sha1)?;
+        return Ok(written(ExportOutcome::Skipped, None, false));
+    };
+    let src = store.get_path(blob_id);
 
     let Some(parent) = dest.parent() else {
         return Err(ExportError::IoError(std::io::Error::other(
@@ -2569,8 +3341,8 @@ fn export_artifact_blocking(
     let missing = || ExportError::MissingBlob {
         key: key_str.to_string(),
     };
-    let used_strategy =
-        link_with_fallback(src, &temp_path, options.link_strategy).map_err(|e| match e {
+    let (used_strategy, read_from) = link_with_fallback(&src, &temp_path, options.link_strategy)
+        .map_err(|e| match e {
             LinkError::SourceMissing { .. } => missing(),
             LinkError::IoError { ref source, .. }
                 if source.kind() == std::io::ErrorKind::NotFound =>
@@ -2579,15 +3351,37 @@ fn export_artifact_blocking(
             }
             e => e.into(),
         })?;
-
-    // A file that appeared while the link was staged, such as one another
-    // export wrote, is judged like one that was there before.
-    if was_absent {
-        let existing = existing_file(store, src, dest, blob_id, options.link_strategy)?;
-        if let Some(outcome) = settle_existing(existing, dest, options, key_str, blob_id)? {
-            return Ok((outcome, None));
-        }
+    // The blob may have changed since it was hashed. A link shares the file
+    // the store has now; a copy is checked on the file it read.
+    // A symbolic link shares the store file it names and a hard link is
+    // that file, each opened without following a link: something other
+    // than a regular file, such as a pipe, could wait without end.
+    let linked = match used_strategy {
+        LinkStrategy::Symlink => src.as_path(),
+        _ => temp_path.as_ref(),
+    };
+    let now = match &read_from {
+        Some(file) => BlobSnapshot::of(file),
+        None => open_store_file(linked).and_then(|file| BlobSnapshot::of(&file)),
+    };
+    let hard_link = used_strategy == LinkStrategy::Hardlink;
+    if !(source.zip(now.ok())).is_some_and(|(seen, now)| seen.holds(&now, hard_link)) {
+        let (sha256_hex, _) = hash_open(&mut open_store_file(linked)?)?;
+        check_blob(&src, blob_id, sha256_hex)?;
     }
+
+    // Something that does not take the export's turn, such as `mvn`, may
+    // have written the destination since it was judged.
+    // Only the verdict's SHA-1 is written, so this check may trust the
+    // sidecars.
+    let existing = existing_file(store, &src, &dest, blob_id, options.link_strategy, true)?;
+    let replaced = match decide(&existing, &dest, options, replace, key_str, blob_id)? {
+        Verdict::Keep => {
+            ensure_sidecars(&dest, blob_id, &sha1)?;
+            return Ok(written(ExportOutcome::Skipped, None, false));
+        }
+        Verdict::Write { replaced } => replaced,
+    };
 
     // Normalise perms on the staged tempfile (Copy only). The file came out
     // of the CAS as a read-only 0o444 blob, but Maven's offline resolver
@@ -2606,34 +3400,55 @@ fn export_artifact_blocking(
         });
     }
 
-    // Publish the sidecars before the artifact, so a crash never leaves a new
-    // artifact visible without its checksums next to it.
-    let dest_str = dest.as_os_str().to_string_lossy();
-    write_sidecar_atomic(Path::new(&format!("{dest_str}.sha256")), blob_id.as_str())?;
-    write_sidecar_atomic(Path::new(&format!("{dest_str}.sha1")), &sha1_hex)?;
     // `rename` replaces a file or symlink, not a directory. `--overwrite`
     // already chose to discard whatever occupied the path; clear a directory
     // so the staged artifact can land.
-    if options.overwrite && fs::symlink_metadata(dest).is_ok_and(|meta| meta.file_type().is_dir()) {
-        fs::remove_dir_all(dest).map_err(ExportError::IoError)?;
+    if options.overwrite && fs::symlink_metadata(&dest).is_ok_and(|meta| meta.file_type().is_dir())
+    {
+        fs::remove_dir_all(&dest).map_err(ExportError::IoError)?;
     }
     // No directory sync: an entry a crash loses is written again by the
     // next export.
     temp_path
-        .persist(dest)
+        .persist(&dest)
         .map_err(|e| ExportError::IoError(e.error))?;
+    // The sidecars follow the artifact. An export stopped in between leaves
+    // the locked bytes under stale sidecars, which the next one repairs,
+    // never the old bytes under a `.sha256` that names the new ones, which
+    // would make an earlier export's file look like someone else's.
+    let dest_str = dest.as_os_str().to_string_lossy();
+    write_sidecar_atomic(Path::new(&format!("{dest_str}.sha256")), blob_id.as_str())?;
+    write_sidecar_atomic(Path::new(&format!("{dest_str}.sha1")), &sha1)?;
 
-    Ok((ExportOutcome::Exported(used_strategy), permissions_warning))
+    Ok(written(
+        ExportOutcome::Exported(used_strategy),
+        permissions_warning,
+        replaced,
+    ))
 }
+
+/// The file an export keeps in the local repository from before its first
+/// write until after its last, so the next one knows when it stopped
+/// halfway.
+const UNFINISHED_EXPORT: &str = ".raeva-export-unfinished";
+
+const UNFINISHED_EXPORT_TEXT: &[u8] =
+    b"raeva export-m2 into this local repository did not finish. \
+Running it again repairs the repository and removes this file.\n";
 
 /// How long an export waits for another one into the same local
 /// repository, as long as the store and `raeva.lock` locks wait.
 const EXPORT_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Hold `.raeva-export.lock` in `m2`, creating both, until the file drops.
+/// Hold `.raeva-export.lock` in `m2` until the file drops, creating both
+/// when `create` says so, or else giving `None` where there is no lock file.
 /// A holder that keeps it past `timeout` fails the export instead of
 /// hanging it.
-async fn lock_destination(m2: &Path, timeout: std::time::Duration) -> Result<fs::File> {
+async fn lock_destination(
+    m2: &Path,
+    timeout: std::time::Duration,
+    create: bool,
+) -> Result<Option<fs::File>> {
     let path = m2.join(".raeva-export.lock");
     let m2 = m2.to_path_buf();
     // What the destination itself causes; disk full and the like stay I/O
@@ -2650,7 +3465,9 @@ async fn lock_destination(m2: &Path, timeout: std::time::Duration) -> Result<fs:
         }
     };
     tokio::task::spawn_blocking(move || {
-        fs::create_dir_all(path.parent().unwrap_or(&path)).map_err(&unusable)?;
+        if create {
+            fs::create_dir_all(path.parent().unwrap_or(&path)).map_err(&unusable)?;
+        }
         // A link would create or lock a file wherever it points, and
         // opening a FIFO waits for a reader past any deadline.
         if fs::symlink_metadata(&path).is_ok_and(|meta| !meta.is_file()) {
@@ -2659,14 +3476,18 @@ async fn lock_destination(m2: &Path, timeout: std::time::Duration) -> Result<fs:
                 path.display()
             ))));
         }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
+        let open = fs::OpenOptions::new()
+            .create(create)
             .truncate(false)
             .write(true)
-            .open(&path)
-            .map_err(&unusable)?;
+            .open(&path);
+        let mut file = match open {
+            Ok(file) => file,
+            Err(err) if !create && err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(unusable(err)),
+        };
         match rv_fs::lock_exclusive_until(&mut file, std::time::Instant::now() + timeout) {
-            Ok(()) => Ok(file),
+            Ok(()) => Ok(Some(file)),
             Err(fs::TryLockError::WouldBlock) => Err(ExportError::IoError(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
@@ -2766,10 +3587,183 @@ fn validate_group_path(group_id: &str) -> Result<String> {
 }
 
 /// Split a support-POM coordinate from the lockfile into owned parts.
+/// The plain `-SNAPSHOT` version export-m2 also writes the support POM
+/// `coord`, recorded by a timestamped build, under: the one a `-SNAPSHOT`
+/// request resolves to when `coord` is the latest build of its version
+/// among `coords`, unless `coords` holds the `-SNAPSHOT` POM itself, as a
+/// parent or BOM.
+pub fn plain_support_pom_copy<'a>(
+    coords: impl Iterator<Item = &'a str> + Clone,
+    coord: &str,
+) -> Option<String> {
+    type Build<'a> = ((&'a str, &'a str, String), String, Option<u32>);
+    fn build(coord: &str) -> Option<Build<'_>> {
+        let (group, artifact, version) = rv_lock::split_support_pom_coord(coord)?;
+        let snapshot = TimestampedSnapshot::parse(version)?;
+        let base = rv_maven_types::snapshot_base_version(version)?;
+        Some((
+            (group, artifact, base),
+            snapshot.timestamp().to_string(),
+            snapshot.build_number(),
+        ))
+    }
+    let this = build(coord)?;
+    let (group, artifact, base) = &this.0;
+    let plain = format!("{group}:{artifact}:{base}");
+    let superseded = coords.clone().any(|other| other == plain)
+        || coords
+            .filter_map(build)
+            .any(|other| other.0 == this.0 && other > this);
+    (!superseded).then(|| base.clone())
+}
+
 fn parse_gav(coord: &str) -> Option<(String, String, String)> {
     rv_lock::split_support_pom_coord(coord).map(|(group, artifact, version)| {
         (group.to_string(), artifact.to_string(), version.to_string())
     })
+}
+
+/// The ids of the repositories and plugin repositories each reactor POM's
+/// lineage declares, in every profile too, active or not: the parents on
+/// disk `raeva sync` read for it, then each parent Maven takes from the
+/// reactor by its coordinates or from a repository, which `remote` reads.
+/// Maven injects a POM's profiles into it before inheritance and
+/// interpolates the reactor POM's model, so an id is read with the
+/// properties of its POM and the POMs above it, then its profile's, then
+/// those of the POMs below it, then the reactor POM's coordinates.
+fn reactor_repository_ids(
+    reactor: &Reactor,
+    remote: &dyn Fn(&rv_maven_model::Parent) -> Option<rv_maven_model::Pom>,
+) -> BTreeSet<String> {
+    type Model = rv_maven_model::Pom;
+    type Coordinates = (Option<String>, Option<String>, Option<String>);
+    let read = |path: &Path| {
+        let bytes = fs::read(path).ok()?;
+        Model::parse_with_plugins(&rv_maven_model::decode_pom(&bytes).ok()?).ok()
+    };
+    let coordinates = |pom: &Model| {
+        let parent = pom.parent.as_ref();
+        let group = (pom.group_id.clone()).or_else(|| parent.map(|p| p.group_id.clone()));
+        let version = (pom.version.clone()).or_else(|| parent.map(|p| p.version.clone()));
+        (group, pom.artifact_id.clone(), version)
+    };
+    // Every POM of any lineage; the reactor's come first, in its order.
+    let mut poms: Vec<Model> = Vec::new();
+    let mut on_disk: HashMap<PathBuf, Option<usize>> = HashMap::new();
+    let mut at_path = |path: &Path, poms: &mut Vec<Model>| {
+        let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        *on_disk.entry(key).or_insert_with(|| {
+            let pom = read(path)?;
+            poms.push(pom);
+            Some(poms.len() - 1)
+        })
+    };
+    let reactor_poms: Vec<(usize, &crate::ProjectPom)> = (reactor.poms.iter())
+        .filter_map(|project_pom| Some((at_path(&project_pom.path, &mut poms)?, project_pom)))
+        .collect();
+    let by_gav: HashMap<Coordinates, usize> = (reactor_poms.iter())
+        .map(|&(index, _)| (coordinates(&poms[index]), index))
+        .collect();
+    let mut remotes: HashMap<String, Option<usize>> = HashMap::new();
+    let mut ids = BTreeSet::new();
+    for &(start, project_pom) in &reactor_poms {
+        let mut lineage = vec![start];
+        for path in &project_pom.local_parents {
+            match at_path(path, &mut poms) {
+                Some(index) if !lineage.contains(&index) => lineage.push(index),
+                _ => break,
+            }
+        }
+        while let Some(parent) = poms[*lineage.last().expect("not empty")].parent.clone() {
+            let key = (
+                Some(parent.group_id.clone()),
+                Some(parent.artifact_id.clone()),
+                Some(parent.version.clone()),
+            );
+            let next = match by_gav.get(&key) {
+                Some(&index) => Some(index),
+                None => *remotes
+                    .entry(format!(
+                        "{}:{}:{}",
+                        parent.group_id, parent.artifact_id, parent.version
+                    ))
+                    .or_insert_with(|| {
+                        let pom = remote(&parent)?;
+                        poms.push(pom);
+                        Some(poms.len() - 1)
+                    }),
+            };
+            match next {
+                Some(index) if !lineage.contains(&index) => lineage.push(index),
+                _ => break,
+            }
+        }
+        let lineage: Vec<&Model> = lineage.iter().map(|&index| &poms[index]).collect();
+        let merged = |poms: &[&Model], properties: &mut rv_maven_model::PropertyMap| {
+            for pom in poms.iter().rev() {
+                properties.extend(&pom.properties);
+            }
+        };
+        // A POM that writes no groupId or version inherits its parent's.
+        let (mut group, mut version) = (None, None);
+        for pom in lineage.iter().rev() {
+            group = pom.group_id.clone().or(group);
+            version = pom.version.clone().or(version);
+        }
+        let artifact = lineage[0].artifact_id.clone();
+        let finish = |mut properties: rv_maven_model::PropertyMap| {
+            let fields = [
+                ("groupId", &group),
+                ("artifactId", &artifact),
+                ("version", &version),
+            ];
+            for (name, value) in fields {
+                let Some(value) = value else {
+                    continue;
+                };
+                if properties.get(name).is_none() {
+                    properties.insert(name, value.clone());
+                }
+                for prefix in ["project", "pom"] {
+                    properties.insert(format!("{prefix}.{name}"), value.clone());
+                }
+            }
+            properties
+        };
+        let mut model = rv_maven_model::PropertyMap::new();
+        merged(&lineage, &mut model);
+        let model = finish(model);
+        for (at, declaring) in lineage.iter().enumerate() {
+            let (plugin_own, plugin_profiles) =
+                (declaring.plugin_repository_lists().ok().flatten()).unwrap_or_default();
+            let mut lists = vec![
+                (&declaring.repositories, model.clone()),
+                (&plugin_own, model.clone()),
+            ];
+            for (index, profile) in declaring.profiles.iter().enumerate() {
+                let mut properties = rv_maven_model::PropertyMap::new();
+                merged(&lineage[at..], &mut properties);
+                properties.extend(&profile.properties);
+                merged(&lineage[..at], &mut properties);
+                let properties = finish(properties);
+                lists.push((&profile.repositories, properties.clone()));
+                if let Some(plugin) = plugin_profiles.get(index) {
+                    lists.push((plugin, properties));
+                }
+            }
+            for (repositories, properties) in lists {
+                ids.extend(repositories.iter().filter_map(|repo| {
+                    let id = repo.id.as_deref()?;
+                    Some(
+                        properties
+                            .interpolate_str_no_project(id)
+                            .unwrap_or_else(|_| id.to_string()),
+                    )
+                }));
+            }
+        }
+    }
+    ids
 }
 
 /// The literal `<parent>` coordinates of the POM at `path`. A POM that
@@ -2814,6 +3808,60 @@ fn push_snapshot_entry(entries: &mut Vec<SnapshotVersionEntry>, entry: SnapshotV
     } else {
         entries.push(entry);
     }
+}
+
+/// `relative`, a path below the local repository, with `/` separators.
+fn slash_path(relative: &Path) -> String {
+    (relative.components())
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The URL of `remote` in the repository raeva.lock records as `origin`,
+/// which is never a mirror's: a mirror's URL may hold a token. A
+/// project-relative origin gives a path relative to raeva.lock's directory,
+/// and the empty origin none.
+fn remote_url(origin: &str, remote: &ArtifactCoord) -> Result<Option<String>> {
+    let path = slash_path(&artifact_relative_path(remote)?);
+    if origin.is_empty() {
+        return Ok(None);
+    }
+    if rv_lock::is_project_relative_origin(origin) {
+        return Ok(Some(format!("{origin}{path}")));
+    }
+    // raeva.lock refuses such an origin when it is read.
+    if let Some(part) = rv_config::secret_url_part(origin) {
+        return Err(ExportError::SecretOrigin {
+            coordinate: remote.to_string(),
+            part,
+        });
+    }
+    let base = url::Url::parse(&rv_lock::normalize_repo_url(origin))
+        .map_err(|_| ExportError::InvalidCoordinate(format!("unusable origin for {remote}")))?;
+    let url = base
+        .join(&path)
+        .map_err(|_| ExportError::InvalidCoordinate(format!("unusable origin for {remote}")))?;
+    Ok(Some(url.into()))
+}
+
+/// Every file below `root`, by its path there with `/` separators, with its
+/// text.
+fn read_tree(root: &Path) -> Result<Vec<(String, String)>> {
+    let mut files = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                files.push((slash_path(relative), fs::read_to_string(&path)?));
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// Make the exported artifact writable-by-owner and world-readable. On Unix

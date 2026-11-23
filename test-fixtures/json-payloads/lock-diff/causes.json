@@ -1,0 +1,101 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "causes": [
+        {
+          "cause": "property",
+          "changes": [
+            0,
+            1
+          ],
+          "property": "golden.version",
+          "sources": [
+            {
+              "kind": "import",
+              "new_versions": [
+                "1.1"
+              ],
+              "old_versions": [
+                "1.0"
+              ],
+              "pom": "org.golden:golden-bom"
+            }
+          ]
+        }
+      ],
+      "changed": true,
+      "changed_inputs": [
+        "pom.xml"
+      ],
+      "changes": [
+        {
+          "change": "version",
+          "coordinate": "org.golden:api:jar",
+          "kind": "external",
+          "module": "pom.xml",
+          "new": null,
+          "new_version": "1.1",
+          "old": null,
+          "old_version": "1.0",
+          "platform": "<host-platform>",
+          "via": [
+            [
+              "org.golden:api:1.1:jar"
+            ]
+          ],
+          "via_truncated": false
+        },
+        {
+          "change": "version",
+          "coordinate": "org.golden:core:jar",
+          "kind": "external",
+          "module": "pom.xml",
+          "new": null,
+          "new_version": "1.1",
+          "old": null,
+          "old_version": "1.0",
+          "platform": "<host-platform>",
+          "via": [
+            [
+              "org.golden:core:1.1:jar"
+            ]
+          ],
+          "via_truncated": false
+        }
+      ],
+      "checksum_markers": [],
+      "edge_changes": [],
+      "module_changes": [],
+      "new": "<tmp>/project/raeva.lock",
+      "old": "<tmp>/project/old.lock",
+      "platforms_added": [],
+      "platforms_removed": [],
+      "plugin_changes": [],
+      "pom_changes": [
+        {
+          "change": "support_pom_removed",
+          "coordinate": "org.golden:golden-bom:1.0",
+          "new": null,
+          "new_snapshot": null,
+          "old": "1789252deffee6957497ef5fdb6a8c0a0f81b6e1fd10facac1b822a043f7d114",
+          "old_snapshot": null,
+          "platform": "<host-platform>"
+        },
+        {
+          "change": "support_pom",
+          "coordinate": "org.golden:golden-bom:1.1",
+          "new": "0e885e3a11859576bdc46ca1c9bee2d954f1d52e38ffbe1dd11cdbc329e072d1",
+          "new_snapshot": null,
+          "old": null,
+          "old_snapshot": null,
+          "platform": "<host-platform>"
+        }
+      ],
+      "profile_changes": [],
+      "via_limited": false,
+      "warnings": []
+    },
+    "success": true
+  }
+}

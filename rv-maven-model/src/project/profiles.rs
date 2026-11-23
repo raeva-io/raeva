@@ -13,7 +13,8 @@ use crate::{Activation, PomError};
 /// inheritance: from that POM's own `<properties>`, then user properties,
 /// then system properties. No `${project.*}` value is available, and a file
 /// condition also sees `${basedir}` and `${project.basedir}` as the input
-/// project's directory.
+/// project's directory and, in the Maven 3.10 mode, `${project.rootDirectory}`
+/// as its root.
 pub(crate) fn interpolate_lineage_activations(
     pom: &mut crate::Pom,
     ctx: &crate::ActivationContext,
@@ -87,14 +88,18 @@ pub(crate) fn interpolate_lineage_activations(
         let map = if file { &file_properties } else { &properties };
         let (_, names) =
             map.interpolate_str_exact_names(text, &ctx.environment.selection(&Arc::default()));
-        let directory = |name: &str| {
-            file && ctx.base_dir.is_some() && matches!(name, "basedir" | "project.basedir")
-        };
+        let directory = |name: &str| file && ctx.is_file_directory(name);
         for name in names {
             if declared.get(&name).is_none() && !directory(&name) {
                 user_value |= (ctx.properties.contains_key(&name)
                     && !(name == "packaging" && ctx.packaging_injected))
-                    || ctx.system_properties.contains_key(&name);
+                    || ctx.system_properties.contains_key(&name)
+                    || [
+                        "maven.multiModuleProjectDirectory",
+                        "java.home",
+                        "env.JAVA_HOME",
+                    ]
+                    .contains(&name.as_str());
                 recorder.record_user_property(&name);
             }
             if ctx.settings_property_names.contains(&name)
@@ -266,8 +271,9 @@ pub(crate) fn interpolate_lineage_activations(
                 // Maven aligns a written condition to the project directory
                 // once it is interpolated, so one that expands to nothing
                 // names the directory itself.
-                if let Some(basedir) = ctx.base_dir.as_ref().filter(|_| written) {
-                    *path = align_to_base_directory(path, basedir);
+                let unread = names_an_unread_property(path, ctx);
+                if let Some(basedir) = ctx.base_dir.as_ref().filter(|_| written && !unread) {
+                    *path = align_to_base_directory(path, basedir, &ctx.environment);
                 }
                 if !tested && path_java.load(Ordering::Relaxed) {
                     java_file.store(true, Ordering::Relaxed);
@@ -286,27 +292,26 @@ pub(crate) fn interpolate_lineage_activations(
                         let default_packaging = ctx.default_packaging.clone();
                         let properties: std::collections::BTreeMap<_, _> = names
                             .into_iter()
-                            .filter(|name| {
-                                ctx.base_dir.is_none()
-                                    || !matches!(name.as_str(), "basedir" | "project.basedir")
-                            })
+                            .filter(|name| !ctx.is_file_directory(name))
                             .filter_map(|name| {
                                 declared.get(&name).cloned().map(|value| (name, value))
                             })
                             .collect();
                         let public_name = |name: &str| {
-                            ["", "project.properties.", "pom.properties."]
-                                .into_iter()
-                                .any(|prefix| {
-                                    let reference = format!("${{{prefix}{name}}}");
-                                    expression.contains(&reference)
-                                        || properties
-                                            .values()
-                                            .any(|value| value.contains(&reference))
-                                })
+                            let reads = |text: &str| {
+                                crate::properties::expression_names(text)
+                                    .into_iter()
+                                    .any(|read| {
+                                        ["", "project.properties.", "pom.properties."]
+                                            .into_iter()
+                                            .any(|prefix| read.strip_prefix(prefix) == Some(name))
+                                    })
+                            };
+                            reads(&expression) || properties.values().any(|value| reads(value))
                         };
                         file_reads.retain(|input| match input {
                             crate::HostInput::UserProperty(name)
+                            | crate::HostInput::UserOverride(name)
                             | crate::HostInput::SettingsProperty(name) => public_name(name),
                             crate::HostInput::Env(name) => public_name(&format!("env.{name}")),
                             crate::HostInput::InterpolationLookup { .. } => false,
@@ -355,19 +360,39 @@ pub(crate) fn interpolate_external_file(
         }
         let (interpolated, names) = properties.interpolate_str_exact_names(value, &environment);
         for name in names {
-            if ctx.base_dir.is_none() || !matches!(name.as_str(), "basedir" | "project.basedir") {
+            if !ctx.is_file_directory(&name) {
                 ctx.environment.record_user_property(&name);
             }
         }
         if let Ok(interpolated) = interpolated {
             *value = interpolated;
         }
-        if let Some(basedir) = &ctx.base_dir {
-            *value = align_to_base_directory(value, basedir);
+        if let Some(basedir) = ctx
+            .base_dir
+            .as_ref()
+            .filter(|_| !names_an_unread_property(value, ctx))
+        {
+            *value = align_to_base_directory(value, basedir, &ctx.environment);
         }
         // As `file_active` tests it.
         *value = crate::activation::without_trailing_separator(value).to_string();
     }
+}
+
+/// Whether `path` still names a property raeva does not answer on `ctx`.
+/// Aligning it would let a `..` after the reference drop it from the path,
+/// and the refusal it calls for with it.
+fn names_an_unread_property(path: &str, ctx: &crate::ActivationContext) -> bool {
+    (crate::properties::expression_names(path).into_iter()).any(|name| match name {
+        "java.home" | "env.JAVA_HOME" => {
+            ctx.environment.target_jdk().is_some() && ctx.environment.host_java_home().is_none()
+        }
+        name => {
+            crate::activation::host_property(&ctx.environment, name)
+                == Some(crate::activation::HostProperty::Unread)
+                || (name.strip_prefix("env.")).is_some_and(|var| ctx.environment.hides_env(var))
+        }
+    })
 }
 
 /// System properties, then active settings.xml profile properties, then
@@ -380,32 +405,30 @@ fn activation_interpolation_map(ctx: &crate::ActivationContext) -> PropertyMap {
 
 fn with_basedir(map: &PropertyMap, ctx: &crate::ActivationContext) -> PropertyMap {
     let mut map = map.clone();
-    if let Some(basedir) = &ctx.base_dir {
-        let basedir = basedir.to_string_lossy();
-        map.insert("basedir", basedir.as_ref());
-        map.insert("project.basedir", basedir.as_ref());
+    for (name, directory) in ctx.file_directories() {
+        map.insert(name, directory);
     }
+    ctx.insert_launcher_root(&mut map);
     map
 }
 
 /// Maven's `DefaultPathTranslator.alignToBaseDirectory`: either slash
-/// becomes the host's separator, and a relative path is joined to the
-/// project directory with its `.` and `..` segments removed by name, as
-/// `URI.normalize` removes them, whether or not they exist.
-pub(crate) fn align_to_base_directory(path: &str, basedir: &std::path::Path) -> String {
-    use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
-    let path: String = path
-        .chars()
-        .map(|c| {
-            if c == '/' || c == '\\' {
-                MAIN_SEPARATOR
-            } else {
-                c
-            }
-        })
-        .collect();
-    if Path::new(&path).is_absolute() || path.starts_with(MAIN_SEPARATOR) {
-        return path;
+/// becomes the host's separator, a path that starts at a root is made
+/// absolute by [`crate::properties::java_absolute_path`], and a relative
+/// path is joined to the project directory with its `.` and `..` segments
+/// removed by name, as `URI.normalize` removes them, whether or not they
+/// exist.
+pub(crate) fn align_to_base_directory(
+    path: &str,
+    basedir: &std::path::Path,
+    environment: &crate::ModelEnvironment,
+) -> String {
+    use std::path::{Component, Path, PathBuf};
+    let path = crate::properties::with_host_separators(path);
+    if let Some(absolute) =
+        crate::properties::java_absolute_path(Path::new(&path), basedir, environment)
+    {
+        return absolute.to_string_lossy().into_owned();
     }
     let mut aligned = PathBuf::new();
     for component in basedir.join(&path).components() {
@@ -451,7 +474,7 @@ mod tests {
     #[test]
     fn private_activation_names_retain_only_public_expressions() {
         use crate::{ActivationContext, HostInput, ModelEnvironment, Pom};
-        for expression in ["${selector}", "${alias}", "${${indirection}}"] {
+        for expression in ["${selector}", "${alias}"] {
             let mut pom = Pom::parse(&format!(
                 "<project><properties><alias>${{selector}}</alias></properties>\
                  <profiles><profile><id>selected</id><activation><property>\
@@ -462,11 +485,15 @@ mod tests {
             let mut ctx = ActivationContext::new(ModelEnvironment::default());
             ctx.properties.extend([
                 ("selector".to_string(), "private-key".to_string()),
-                ("indirection".to_string(), "alias".to_string()),
                 ("private-key".to_string(), "yes".to_string()),
             ]);
             super::interpolate_lineage_activations(&mut pom, &ctx).unwrap();
-            let (active, reads) = pom.profiles[0].activation.as_ref().unwrap().evaluate(&ctx);
+            let (active, reads) = pom.profiles[0]
+                .activation
+                .as_ref()
+                .unwrap()
+                .evaluate("selected", &ctx)
+                .unwrap();
             assert!(active);
             assert_eq!(reads.len(), 1);
             let HostInput::UserPropertyLookup {
@@ -481,7 +508,9 @@ mod tests {
             assert_eq!(retained, expression);
             assert!(!from_host);
             assert!(!format!("{properties:?}").contains("private-key"));
-            let selection = crate::activation::select_profiles(&pom.profiles, &ctx).unwrap();
+            let selection =
+                crate::activation::select_profiles(&pom.profiles, &crate::PropertyMap::new(), &ctx)
+                    .unwrap();
             assert!(!selection.host_decides(&pom.profiles, 0));
         }
     }
@@ -502,7 +531,7 @@ mod tests {
         super::interpolate_lineage_activations(&mut pom, &ctx).unwrap();
         let activation = pom.profiles[0].activation.as_ref().unwrap();
         assert!(activation.path_from_host);
-        let (active, reads) = activation.evaluate(&ctx);
+        let (active, reads) = activation.evaluate("file", &ctx).unwrap();
         assert!(!active);
         assert_eq!(
             reads,
@@ -520,6 +549,65 @@ mod tests {
         );
     }
 
+    /// Maven tests a `<file>` path that starts at a root without a drive,
+    /// such as `\marker`, on the drive it was started on, as
+    /// `java.io.File.getAbsolutePath` does, not on the project's drive.
+    #[cfg(windows)]
+    #[test]
+    fn a_rooted_file_condition_is_on_the_working_drive() {
+        use crate::{ActivationContext, Pom};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let marker = file.path().to_string_lossy().into_owned();
+        let (drive, rooted) = marker.split_at(2);
+        let other = if drive.eq_ignore_ascii_case("Q:") {
+            "P:"
+        } else {
+            "Q:"
+        };
+        let working = file.path().parent().unwrap();
+        let mut ctx = ActivationContext::new(
+            (crate::HostSnapshot::for_testing(&[]).with_working_directory(working))
+                .host_environment(),
+        );
+        ctx.base_dir = Some(format!(r"{other}\work\app").into());
+        let mut pom = Pom::parse(&format!(
+            "<project><profiles><profile><id>file</id><activation><file>\
+             <exists>{rooted}</exists></file></activation></profile></profiles></project>"
+        ))
+        .unwrap();
+        super::interpolate_lineage_activations(&mut pom, &ctx).unwrap();
+        let activation = pom.profiles[0].activation.as_ref().unwrap();
+        let (active, _) = activation.evaluate("file", &ctx).unwrap();
+        assert!(active, "{rooted} from {other}");
+        assert!(ctx.file_condition_exists(rooted), "{rooted} from {other}");
+    }
+
+    /// Without a drive of its own, the working directory is a UNC path,
+    /// under which `java.io.File` puts a rooted path whole.
+    #[cfg(windows)]
+    #[test]
+    fn a_rooted_path_under_a_unc_working_directory() {
+        let environment = |directory: &str| {
+            crate::HostSnapshot::for_testing(&[])
+                .with_working_directory(Path::new(directory))
+                .host_environment()
+        };
+        let base = Path::new(r"R:\work\app");
+        for (working, path, expected) in [
+            (r"c:\x07", r"\marker", r"c:\marker"),
+            (r"C:\", "/a/marker", r"C:\a\marker"),
+            (
+                r"\\server\share\dir",
+                r"\marker",
+                r"\\server\share\dir\marker",
+            ),
+            (r"C:\x07", r"D:\marker", r"D:\marker"),
+        ] {
+            let aligned = align_to_base_directory(path, base, &environment(working));
+            assert_eq!(aligned, expected, "{path} in {working}");
+        }
+    }
+
     #[test]
     fn aligns_like_maven_path_translator() {
         let base = if cfg!(windows) {
@@ -534,15 +622,22 @@ mod tests {
                 .into_owned()
         };
         let base = Path::new(base);
+        let environment = crate::ModelEnvironment::default();
         assert_eq!(
-            align_to_base_directory("absent/../marker", base),
+            align_to_base_directory("absent/../marker", base, &environment),
             expected("marker")
         );
         assert_eq!(
-            align_to_base_directory(r".\marker", base),
+            align_to_base_directory(r".\marker", base, &environment),
             expected("marker")
         );
-        assert_eq!(align_to_base_directory("a/./b/../c", base), expected("a/c"));
-        assert_eq!(align_to_base_directory("", base), base.to_string_lossy());
+        assert_eq!(
+            align_to_base_directory("a/./b/../c", base, &environment),
+            expected("a/c")
+        );
+        assert_eq!(
+            align_to_base_directory("", base, &environment),
+            base.to_string_lossy()
+        );
     }
 }

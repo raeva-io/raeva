@@ -1,6 +1,6 @@
 use super::{
     ExportPlan, authorize_classifier_candidates, classifier_candidates, declared_repositories,
-    lock_pom_digests, marker_ids, query_ids,
+    external_artifacts, lock_poms, lock_support_poms, marker_ids, query_ids,
 };
 use crate::error::ExportError;
 use crate::warning::ExportWarning;
@@ -62,7 +62,7 @@ fn mirror(id: Option<&str>, url: &str, mirror_of: &str) -> rv_config::MirrorConf
 fn query_ids_cover_recorded_configured_and_mirror_ids() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 8\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
+        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
     )
     .expect("well-formed lines decode");
     let config =
@@ -92,7 +92,7 @@ fn stored_files_stand_in_for_the_repositories_the_project_trusts() {
     const M: &str = "https://m.example/";
     let root = tempfile::tempdir().unwrap();
     let mut lock = Lockfile::from_toml(&format!(
-        "schema_version = 8\n\n[metadata]\nrepo_ids = \"{R}\\tgood\\n{R}\\tevil\"\n"
+        "schema_version = 9\n\n[metadata]\nrepo_ids = \"{R}\\tgood\\n{R}\\tevil\"\n"
     ))
     .unwrap();
     let mut row = package("org.example", "lib", "1.0", "jar", None);
@@ -147,13 +147,14 @@ fn stored_files_stand_in_for_the_repositories_the_project_trusts() {
 
 /// Export-m2 must recover POM-declared repo ids from the lockfile
 /// metadata that `raeva sync` writes, so markers aren't mislabelled `central`.
-/// A mirror configured now relabels what it serves with its own id, as
-/// Maven records it, whatever served the files when the lock was written.
+/// A mirror configured now adds its own id, as Maven records it, whatever
+/// served the files when the lock was written, and the declared id stays
+/// for a `mvn -o` that does not use the mirror.
 #[test]
 fn marker_ids_follow_the_mirror_configured_now() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 8\n\n[metadata]\nrepo_ids = \"https://repo1.maven.org/maven2/\\tcentral\\nhttps://nexus.corp/repo/\\tcorp\"\n",
+        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://repo1.maven.org/maven2/\\tcentral\\nhttps://nexus.corp/repo/\\tcorp\"\n",
     )
     .expect("well-formed lines decode");
     let config = config_with_repos(root.path(), &["https://configured.example/"]);
@@ -182,7 +183,7 @@ fn marker_ids_follow_the_mirror_configured_now() {
     assert_eq!(
         ids.get("https://repo1.maven.org/maven2/")
             .map(|ids| ids.join(",")),
-        Some("corp-mirror".to_string())
+        Some("central,corp-mirror".to_string())
     );
     assert_eq!(
         ids.get("https://nexus.corp/repo/").map(|ids| ids.join(",")),
@@ -199,12 +200,12 @@ fn marker_ids_follow_the_mirror_configured_now() {
 /// A configured repository without an id is labelled with the id of the
 /// mirror that serves it, as Maven labels what the mirror supplied, and
 /// with `central` (no entry) without one; it does not hide the id another
-/// declaration of its origin gives.
+/// declaration of its origin gives, which stays next to the mirror's.
 #[test]
 fn an_id_less_configured_repository_takes_its_mirror_id() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 8\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
+        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
     )
     .expect("well-formed lines decode");
     let config = |mirrors| {
@@ -228,10 +229,13 @@ fn an_id_less_configured_repository_takes_its_mirror_id() {
         Some("corp".to_string())
     );
     let mirrored = config(vec![mirror(Some("nexus"), "https://mirror.corp/", "*")]);
-    for origin in ["https://plain.example/", "https://nexus.corp/repo/"] {
+    for (origin, labels) in [
+        ("https://plain.example/", "nexus"),
+        ("https://nexus.corp/repo/", "corp,nexus"),
+    ] {
         assert_eq!(
             ids(&mirrored).get(origin).map(|ids| ids.join(",")),
-            Some("nexus".to_string()),
+            Some(labels.to_string()),
             "{origin}"
         );
     }
@@ -243,7 +247,7 @@ fn an_id_less_configured_repository_takes_its_mirror_id() {
 fn a_configured_id_joins_the_ids_recorded_for_its_url() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 8\n\n[metadata]\nrepo_ids = \"https://configured.example/\\trepo\\nhttps://configured.example/\\tsnapshots\"\n",
+        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://configured.example/\\trepo\\nhttps://configured.example/\\tsnapshots\"\n",
     )
     .expect("well-formed lines decode");
     let config = config_with_repos(root.path(), &["https://configured.example/"]);
@@ -260,7 +264,7 @@ fn a_configured_id_joins_the_ids_recorded_for_its_url() {
 /// Rows that share a companion POM, across classifiers and platforms, must
 /// pin it to one digest; a row without one has no POM to export.
 #[test]
-fn lock_pom_digests_need_one_pin_per_pom() {
+fn lock_poms_need_one_pin_per_pom() {
     let platforms = [
         Platform::new("linux", "x86_64").expect("platform"),
         Platform::new("darwin", "aarch64").expect("platform"),
@@ -278,14 +282,15 @@ fn lock_pom_digests_need_one_pin_per_pom() {
         lock
     };
 
-    let agreeing = lock_pom_digests(&lock([Some("b"), Some("b")])).expect("agreeing pins");
+    let (agreeing, origins) = lock_poms(&lock([Some("b"), Some("b")])).expect("agreeing pins");
     assert_eq!(agreeing.len(), 1);
-    let err = lock_pom_digests(&lock([Some("b"), Some("c")])).expect_err("conflicting pins");
+    assert_eq!(origins.len(), 1);
+    let err = lock_poms(&lock([Some("b"), Some("c")])).expect_err("conflicting pins");
     let ExportError::ConflictingPinnedPom { coordinate, .. } = &err else {
         panic!("{err}");
     };
     assert_eq!(coordinate, "com.example:app:1.0");
-    let unpinned = lock_pom_digests(&lock([None, None])).expect("no POM in any repository");
+    let (unpinned, _) = lock_poms(&lock([None, None])).expect("no POM in any repository");
     assert!(unpinned.is_empty());
 }
 
@@ -360,4 +365,186 @@ fn classifier_origins_are_authorized_per_platform_before_dedup() {
             origin: "https://corp.example/maven/".to_string(),
         }]
     );
+}
+
+/// A support POM platforms read with the same bytes from other
+/// repositories carries the ids of each, so every platform's offline build
+/// finds it under the id it reads.
+#[test]
+fn a_support_pom_takes_the_ids_of_every_platform() {
+    let mut lock = Lockfile::new();
+    for (platform, url) in [
+        (
+            Platform::new("linux", "x86_64").unwrap(),
+            "https://linux.example/m2/",
+        ),
+        (
+            Platform::new("darwin", "aarch64").unwrap(),
+            "https://mac.example/m2/",
+        ),
+    ] {
+        let mut entry = test_platform(platform, Vec::new());
+        entry.support_poms.insert(
+            "g:bom:1".to_string(),
+            rv_lock::SupportPom::new(url, "b".repeat(64).parse().unwrap()),
+        );
+        lock.platforms.push(entry);
+    }
+    let repo_ids: HashMap<String, Vec<String>> = [
+        ("https://linux.example/m2/", "linux-repo"),
+        ("https://mac.example/m2/", "mac-repo"),
+    ]
+    .into_iter()
+    .map(|(url, id)| (rv_lock::recorded_key(url), vec![id.to_string()]))
+    .collect();
+    let poms = lock_support_poms(&lock, &repo_ids);
+    assert_eq!(poms["g:bom:1"].repo_ids, ["linux-repo", "mac-repo"]);
+}
+
+/// A companion POM two platforms read from other repositories than their
+/// jar keeps the repositories of both, and only those.
+#[test]
+fn a_companion_pom_keeps_the_origins_of_every_platform() {
+    let mut lock = Lockfile::new();
+    for (platform, pom) in [
+        (
+            Platform::new("linux", "x86_64").unwrap(),
+            "https://a.example/",
+        ),
+        (
+            Platform::new("darwin", "aarch64").unwrap(),
+            "https://b.example/",
+        ),
+    ] {
+        let mut row = package("g", "a", "1", "jar", None);
+        row.pom_sha256 = Some("c".repeat(64).parse().unwrap());
+        row.pom_repo_urls = vec![pom.to_string()];
+        lock.platforms.push(test_platform(platform, vec![row]));
+    }
+    let rows = external_artifacts(&lock);
+    let poms: Vec<&str> = rows[0].pom_origins().collect();
+    assert_eq!(poms, ["https://a.example/", "https://b.example/"]);
+}
+
+/// A plugin without a version that two JDKs took at other versions from
+/// the same repositories is written at the highest, which Maven tries
+/// first and the older JDK passes over. Other repositories, or two versions
+/// for one JDK, are refused.
+#[test]
+fn a_plugin_release_of_each_jdk_takes_the_highest() {
+    use rv_lock::{MetadataVersion, MetadataVersionKind, PluginFiles, PluginRole, PluginSet};
+    let read = |jdk: &str, os: &str, version: &str, repo: &str, plugin: &str| {
+        let platform = Platform::new(os, "x86_64")
+            .unwrap()
+            .with_jdk(jdk.to_string());
+        let mut entry = test_platform(platform, Vec::new());
+        let mut files = PluginFiles::new(rv_maven_types::Sha256::from_bytes(b"inputs"));
+        let mut set = PluginSet::new(&format!("sha256:{}", "a".repeat(64)), PluginRole::Plugin);
+        set.coordinates = vec![format!("{plugin}:{version}")];
+        set.repo_urls = vec![repo.to_string()];
+        files.tables.sets.push(set);
+        files.tables.metadata_versions.push(MetadataVersion {
+            group: "g".to_string(),
+            artifact: "p".to_string(),
+            kind: MetadataVersionKind::Release,
+            version: version.to_string(),
+        });
+        entry.set_plugins(files, &rv_lock::RepoIds::new()).unwrap();
+        entry
+    };
+    let entry =
+        |jdk: &str, os: &str, version: &str, repo: &str| read(jdk, os, version, repo, "g:p");
+    let release = |platforms: Vec<LockPlatform>| {
+        let mut lock = Lockfile::new();
+        lock.platforms = platforms;
+        super::markers(&lock).map(|markers| markers[&("g".into(), "p".into())].release.clone())
+    };
+    let central = "https://repo.example/";
+    let both = vec![
+        entry("11", "linux", "1.9", central),
+        entry("17", "linux", "2.0", central),
+        entry("11", "macos", "1.9", central),
+        entry("17", "macos", "2.0", central),
+    ];
+    assert_eq!(release(both).unwrap().as_deref(), Some("2.0"));
+    let elsewhere = vec![
+        entry("17", "linux", "2.0", central),
+        entry("11", "linux", "1.9", "https://other.example/"),
+    ];
+    assert!(matches!(
+        release(elsewhere),
+        Err(ExportError::ConflictingMarkers { .. })
+    ));
+    let one_jdk = vec![
+        entry("11", "linux", "1.9", central),
+        entry("17", "linux", "2.0", central),
+        entry("17", "macos", "2.1", central),
+    ];
+    assert!(matches!(
+        release(one_jdk),
+        Err(ExportError::ConflictingMarkers { .. })
+    ));
+    let mixed = vec![
+        entry("11", "linux", "1.9", central),
+        entry("17", "linux", "2.0", central),
+        entry("11", "macos", "1.9", "https://other.example/"),
+    ];
+    assert!(matches!(
+        release(mixed),
+        Err(ExportError::ConflictingMarkers { .. })
+    ));
+    // A release no plugin set resolves, as a dependency's, is one value.
+    let dependency = vec![
+        read("11", "linux", "1.9", central, "g:q"),
+        read("17", "linux", "2.0", central, "g:q"),
+    ];
+    assert!(matches!(
+        release(dependency),
+        Err(ExportError::ConflictingMarkers { .. })
+    ));
+}
+
+/// A recorded repository is labelled with the ids of the mirror its own
+/// declaration picks: an `external:*` one for a `symlink+file:` URL as
+/// written, which the lock records as the directory it names, even when a
+/// later declaration of that directory spells it as a plain `file:` URL,
+/// as plugin tables give one back, and none for a plain project directory.
+#[test]
+fn a_recorded_directory_takes_the_mirror_its_spelled_declaration_picks() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = dunce::canonicalize(temp.path()).unwrap();
+    let project = base.join("project");
+    std::fs::create_dir_all(project.join("repo")).unwrap();
+    let plain = url::Url::from_directory_path(base.join("plugins"))
+        .unwrap()
+        .to_string();
+    let mut repo = rv_config::RepoConfig::new(Some("p"), &plain);
+    repo.declared_url = Some(format!("symlink+{plain}"));
+    let config = rv_config::Config::for_testing_with_repos(
+        project.clone(),
+        rv_config::ResolvedPaths::from_raeva_home(base.join("raeva-home")),
+        vec![repo],
+    )
+    .with_mirrors(vec![mirror(
+        Some("ext"),
+        "https://mirror.example/",
+        "external:*,!central",
+    )]);
+    let lock = Lockfile::from_toml(
+        "schema_version = 9\n\n[metadata]\nrepo_ids = \"../plugins/\\tp\\n./repo/\\tlocal-repo\"\n",
+    )
+    .unwrap();
+    let in_project = url::Url::from_directory_path(project.join("repo"))
+        .unwrap()
+        .to_string();
+    let declared = HashMap::from([(
+        Platform::current().unwrap(),
+        vec![
+            Repository::new(Some("p".into()), plain.as_str(), true, false),
+            Repository::new(Some("local-repo".into()), in_project.as_str(), true, false),
+        ],
+    )]);
+    let plan = ExportPlan::from_lock(&config, &lock, &declared).unwrap();
+    assert_eq!(plan.repo_ids["../plugins/"], ["ext", "p"]);
+    assert_eq!(plan.repo_ids["./repo/"], ["local-repo"]);
 }

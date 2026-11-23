@@ -5,10 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-use crate::common::{assert_success, raeva_command, sha256_hex};
+use crate::common::{assert_success, run_raeva, sha256_hex, write_with_sha256};
 
-/// A project that depends on `org.test:lib:1.0` from its own `repository/`,
-/// locked offline. The Maven home is `home`, whose settings.xml names
+/// A project whose range `[1.0,2)` on `org.test:lib` takes `1.0` from its
+/// own `repository/`, locked offline. The Maven home is `home`, whose settings.xml names
 /// `home/shared` as the local repository, the one `mvn` writes.
 struct Project {
     root: tempfile::TempDir,
@@ -26,9 +26,15 @@ impl Project {
         let pom = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
                    <artifactId>lib</artifactId><version>1.0</version></project>";
         for (name, bytes) in [("lib-1.0.pom", pom.as_bytes()), ("lib-1.0.jar", b"jar")] {
-            fs::write(dir.join(name), bytes).expect("write file");
-            fs::write(dir.join(format!("{name}.sha256")), sha256_hex(bytes)).expect("sidecar");
+            write_with_sha256(&dir.join(name), bytes);
         }
+        fs::write(
+            project
+                .path()
+                .join("repository/org/test/lib/maven-metadata.xml"),
+            listing(&["1.0"]),
+        )
+        .expect("write the listing");
         fs::write(
             project.path().join("pom.xml"),
             "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
@@ -36,7 +42,7 @@ impl Project {
              <repositories><repository><id>project-local</id>\
              <url>file://${project.basedir}/repository/</url></repository></repositories>\
              <dependencies><dependency><groupId>org.test</groupId><artifactId>lib</artifactId>\
-             <version>1.0</version></dependency></dependencies></project>",
+             <version>[1.0,2)</version></dependency></dependencies></project>",
         )
         .expect("write pom.xml");
         let m2 = project.home.path().join(".m2");
@@ -61,10 +67,7 @@ impl Project {
     }
 
     fn raeva(&self, args: &[&str]) -> Output {
-        raeva_command(self.path(), self.home.path())
-            .args(args)
-            .output()
-            .expect("run raeva")
+        run_raeva(self.path(), self.home.path(), args)
     }
 
     fn sync(&self) {
@@ -217,6 +220,95 @@ fn the_command_line_local_repository_is_the_destination() {
     );
 }
 
+/// Maven 3.10 rejects a local repository file that is a symbolic link, so
+/// with a Maven 3.10 lock `--link symlink` is a usage error that names a
+/// copy and writes nothing. The Maven 3.9 line reads the links.
+#[cfg(unix)]
+#[test]
+fn a_maven_310_lock_refuses_a_symlink_export() {
+    let project = Project::new();
+    project.sync();
+    let m2 = project.path().join("m2");
+    let symlink = [
+        "export-m2",
+        "--link",
+        "symlink",
+        "--m2-path",
+        m2.to_str().unwrap(),
+    ];
+    assert_success(&project.raeva(&symlink), "3.9 symlink export");
+    let jar = m2.join("org/test/lib/1.0/lib-1.0.jar");
+    assert!(fs::symlink_metadata(&jar).unwrap().is_symlink());
+
+    fs::write(
+        project.path().join("raeva.toml"),
+        "[lock]\nmaven = \"3.10\"\n",
+    )
+    .unwrap();
+    project.sync();
+    let refused = project.path().join("refused");
+    for dry_run in [false, true] {
+        let mut args = vec!["export-m2", "--link", "symlink", "--m2-path"];
+        args.push(refused.to_str().unwrap());
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = project.raeva(&args);
+        crate::common::assert_status(&output, 2, "3.10 symlink export");
+        assert!(
+            crate::common::stderr(&output).contains("--link copy"),
+            "{}",
+            crate::common::stderr(&output)
+        );
+        assert!(!refused.exists());
+    }
+    // A hard-linking export replaces the links the earlier one made.
+    let hardlink = [
+        "export-m2",
+        "--link",
+        "hardlink",
+        "--m2-path",
+        m2.to_str().unwrap(),
+    ];
+    assert_success(&project.raeva(&hardlink), "3.10 hardlink export");
+    assert!(fs::symlink_metadata(&jar).unwrap().is_file());
+}
+
+/// A hard link that cannot be made, here from a store on another file
+/// system, is a copy: a symbolic link is a file Maven 3.10 does not read.
+#[cfg(unix)]
+#[test]
+fn a_hard_link_across_file_systems_is_a_copy() {
+    use std::os::unix::fs::MetadataExt;
+    let project = Project::new();
+    fs::write(
+        project.path().join("raeva.toml"),
+        "[lock]\nmaven = \"3.10\"\n",
+    )
+    .unwrap();
+    project.sync();
+    let device = |path: &Path| fs::metadata(path).unwrap().dev();
+    let Some(other) = (tempfile::TempDir::new_in("/dev/shm").ok())
+        .filter(|other| device(other.path()) != device(project.home.path()))
+    else {
+        eprintln!("skipped: no second file system at /dev/shm");
+        return;
+    };
+    let m2 = other.path().join("m2");
+    let hardlink = [
+        "export-m2",
+        "--link",
+        "hardlink",
+        "--m2-path",
+        m2.to_str().unwrap(),
+    ];
+    assert_success(&project.raeva(&hardlink), "hardlink export");
+    for name in ["lib-1.0.jar", "lib-1.0.pom"] {
+        let path = m2.join("org/test/lib/1.0").join(name);
+        assert!(fs::symlink_metadata(&path).unwrap().is_file(), "{name}");
+    }
+}
+
 /// A local repository that cannot be created names its path and is a
 /// configuration error, not a bare I/O error.
 #[test]
@@ -235,7 +327,11 @@ fn an_unusable_local_repository_names_its_path() {
     assert!(error.contains(&expected), "{error}");
 }
 
-fn collision_project(coordinates: [(&str, &str, &str, &str, &str); 2]) -> Project {
+/// A project that depends on each of `coordinates`, `(group, artifact,
+/// version, extension, repository id)`, each from a repository of its own.
+/// Where `ranged`, it asks the second by the range `[0,version]`, which
+/// reads the version list its repository holds (`[version]` reads none).
+fn collision_project(coordinates: [(&str, &str, &str, &str, &str); 2], ranged: bool) -> Project {
     let project = Project::new();
     let mut repositories = String::new();
     let mut dependencies = String::new();
@@ -254,15 +350,24 @@ fn collision_project(coordinates: [(&str, &str, &str, &str, &str); 2]) -> Projec
         );
         for (extension, bytes) in [("pom", pom.as_bytes()), (extension, b"payload")] {
             let name = format!("{artifact}-{version}.{extension}");
-            fs::write(dir.join(&name), bytes).expect("write artifact");
-            fs::write(dir.join(format!("{name}.sha256")), sha256_hex(bytes)).expect("sidecar");
+            write_with_sha256(&dir.join(name), bytes);
         }
+        let declared = if ranged && index == 1 {
+            fs::write(
+                dir.parent().unwrap().join("maven-metadata.xml"),
+                listing(&[version]),
+            )
+            .expect("write the listing");
+            format!("[0,{version}]")
+        } else {
+            version.to_string()
+        };
         repositories.push_str(&format!(
             "<repository><id>{id}</id><url>file://${{project.basedir}}/{repository}/</url></repository>"
         ));
         dependencies.push_str(&format!(
             "<dependency><groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
-             <version>{version}</version><type>{extension}</type></dependency>"
+             <version>{declared}</version><type>{extension}</type></dependency>"
         ));
     }
     fs::write(
@@ -306,10 +411,13 @@ fn assert_collision_refused(project: &Project, relative: &str) {
 #[test]
 fn export_refuses_metadata_colliding_with_an_artifact() {
     for extension in ["xml", "xml.sha1", "xml.sha256", "xml.md5", "xml.sha512"] {
-        let project = collision_project([
-            ("g", "maven-metadata", "repo", extension, "other"),
-            ("g.maven-metadata", "repo", "1", "jar", "repo"),
-        ]);
+        let project = collision_project(
+            [
+                ("g", "maven-metadata", "repo", extension, "other"),
+                ("g.maven-metadata", "repo", "1", "jar", "repo"),
+            ],
+            true,
+        );
         assert_collision_refused(&project, "maven-metadata-repo.xml");
     }
 }
@@ -317,26 +425,32 @@ fn export_refuses_metadata_colliding_with_an_artifact() {
 #[test]
 fn export_refuses_a_sidecar_colliding_with_an_artifact() {
     for extension in ["jar.sha1", "jar.sha256"] {
-        let project = collision_project([
-            ("org.test", "lib", "1", "jar", "first"),
-            ("org.test", "lib", "1", extension, "second"),
-        ]);
+        let project = collision_project(
+            [
+                ("org.test", "lib", "1", "jar", "first"),
+                ("org.test", "lib", "1", extension, "second"),
+            ],
+            false,
+        );
         assert_collision_refused(&project, &format!("lib-1.{extension}"));
     }
 }
 
 #[test]
 fn export_refuses_a_file_colliding_with_a_directory() {
-    let project = collision_project([
-        ("org.example", "foo", "1.0-SNAPSHOT", "jar", "first"),
-        (
-            "org.example.foo",
-            "1.0-SNAPSHOT",
-            "foo-1.0-SNAPSHOT.jar",
-            "jar",
-            "second",
-        ),
-    ]);
+    let project = collision_project(
+        [
+            ("org.example", "foo", "1.0-SNAPSHOT", "jar", "first"),
+            (
+                "org.example.foo",
+                "1.0-SNAPSHOT",
+                "foo-1.0-SNAPSHOT.jar",
+                "jar",
+                "second",
+            ),
+        ],
+        false,
+    );
     assert_collision_refused(&project, "foo-1.0-SNAPSHOT.jar");
 }
 
@@ -345,10 +459,13 @@ fn export_refuses_a_file_colliding_with_a_directory() {
 /// way.
 #[test]
 fn an_empty_list_gives_way_to_a_populated_one_on_a_folding_volume() {
-    let project = collision_project([
-        ("org.test", "lib", "1", "jar", "Repo"),
-        ("org.test", "lib", "2", "jar", "repo"),
-    ]);
+    let project = collision_project(
+        [
+            ("org.test", "lib", "1", "jar", "Repo"),
+            ("org.test", "lib", "2", "jar", "repo"),
+        ],
+        true,
+    );
     let probe = project.path().join("CaseProbe");
     fs::write(&probe, b"").expect("write case probe");
     if !project.path().join("caseprobe").exists() {
@@ -364,19 +481,25 @@ fn an_empty_list_gives_way_to_a_populated_one_on_a_folding_volume() {
 
 #[test]
 fn export_refuses_metadata_cleanup_colliding_with_an_artifact() {
-    let project = collision_project([
-        ("g", "maven-metadata", "repo", "xml", "other"),
-        ("g.maven-metadata", "repo", "1", "jar", "second"),
-    ]);
+    let project = collision_project(
+        [
+            ("g", "maven-metadata", "repo", "xml", "other"),
+            ("g.maven-metadata", "repo", "1", "jar", "second"),
+        ],
+        true,
+    );
     assert_collision_refused(&project, "maven-metadata-repo.xml");
 }
 
 #[test]
 fn export_refuses_version_metadata_colliding_with_an_artifact() {
-    let project = collision_project([
-        ("g", "maven-metadata", "1-SNAPSHOT", "xml", "1-SNAPSHOT"),
-        ("org.test", "lib", "1", "jar", "other"),
-    ]);
+    let project = collision_project(
+        [
+            ("g", "maven-metadata", "1-SNAPSHOT", "xml", "1-SNAPSHOT"),
+            ("org.test", "lib", "1", "jar", "other"),
+        ],
+        false,
+    );
     assert_collision_refused(&project, "maven-metadata-1-SNAPSHOT.xml");
 }
 

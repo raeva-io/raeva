@@ -140,6 +140,13 @@ impl DbFailure {
             ErrorCode::CannotOpen => DbFailure::CannotOpen,
             ErrorCode::ReadOnly | ErrorCode::PermissionDenied => DbFailure::ReadOnly,
             ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => DbFailure::Corrupt,
+            // A read past the end of a file cut short inside a page, not a
+            // failed read (`SQLITE_IOERR_READ`).
+            ErrorCode::SystemIoFailure
+                if error.extended_code == rusqlite::ffi::SQLITE_IOERR_SHORT_READ =>
+            {
+                DbFailure::Corrupt
+            }
             _ => DbFailure::Other,
         }
     }
@@ -203,6 +210,8 @@ mod tests {
             (ffi::SQLITE_BUSY, DbFailure::Other),
             (ffi::SQLITE_IOERR_SHMSIZE, DbFailure::SharedMemory),
             (ffi::SQLITE_IOERR_WRITE, DbFailure::Other),
+            (ffi::SQLITE_IOERR_READ, DbFailure::Other),
+            (ffi::SQLITE_IOERR_SHORT_READ, DbFailure::Corrupt),
         ] {
             let err = Err::<(), _>(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None))
                 .db_context(|| "failed to upsert artifact")

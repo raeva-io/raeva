@@ -12,12 +12,15 @@ use sha1::{Digest as _, Sha1};
 use tempfile::{TempDir, tempdir};
 
 use super::{
-    ExportOptions, ExportStats, ExportUnit, Exporter, UnitSource, artifact_relative_path,
-    folds_case, folds_case_without_writing, lexical_normalize, planned_destinations,
+    ExportOptions, ExportStats, ExportUnit, Exporter, Replace, UnitSource, artifact_relative_path,
+    folds_case, folds_case_without_writing, judge_blocking, lexical_normalize,
+    planned_destinations, write_blocking,
 };
 use crate::error::{ExportError, ExportFailure};
 use crate::link::LinkStrategy;
-use crate::metadata::{SnapshotVersionEntry, parse_remote_repositories, read_existing_metadata};
+use crate::metadata::{
+    SnapshotVersionEntry, parse_remote_repositories, read_existing_metadata, read_existing_prefixes,
+};
 use crate::plan::{ExportPlan, ProjectPom, Reactor};
 use crate::warning::ExportWarning;
 
@@ -106,6 +109,21 @@ impl Fixture {
             .insert(gav.to_string(), SupportPom::new(repo_url, blob));
     }
 
+    /// Record that a range took `gav`'s version from the list of `origin`.
+    fn ranged(&mut self, gav: &str, origin: &str) {
+        let [group, artifact, version] = gav.splitn(3, ':').collect::<Vec<_>>()[..] else {
+            panic!("{gav}");
+        };
+        let module = &mut self.lock.platforms[0].modules[0];
+        module.range_versions.push(rv_lock::RangeVersion {
+            group: group.to_string(),
+            artifact: artifact.to_string(),
+            version: version.to_string(),
+            origin: origin.to_string(),
+        });
+        module.range_versions.sort();
+    }
+
     fn options(&self) -> ExportOptions {
         ExportOptions {
             dry_run: false,
@@ -126,8 +144,12 @@ impl Fixture {
     }
 
     async fn export(&self) -> Result<ExportStats, ExportFailure> {
-        self.exporter(self.options())
-            .export(&Reactor::default())
+        self.export_with(&self.options()).await
+    }
+
+    async fn export_with(&self, options: &ExportOptions) -> Result<ExportStats, ExportFailure> {
+        self.exporter(options.clone())
+            .export(&Reactor::default(), &[])
             .await
     }
 
@@ -170,6 +192,25 @@ fn support_key(artifact_id: &str) -> ArtifactCoord {
     ArtifactCoord::new("com.example", artifact_id, "1", "pom", None)
 }
 
+/// A checksum file beside a version list the export leaves as it was is
+/// removed too: nothing says it matches the list.
+#[tokio::test]
+async fn an_unchanged_version_list_keeps_no_checksum_file() {
+    let mut f = Fixture::new();
+    (f.lock.repo_ids).insert(REPO.to_string(), ["corp".to_string()].into());
+    f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+        .await;
+    f.ranged("com.example:demo:1.0.0", REPO);
+    f.export().await.expect("export");
+    let list = f.m2().join("com/example/demo/maven-metadata-corp.xml");
+    let before = fs::read(&list).unwrap();
+    let sidecar = f.m2().join("com/example/demo/maven-metadata-corp.xml.sha1");
+    fs::write(&sidecar, "0").unwrap();
+    f.export().await.expect("export again");
+    assert_eq!(fs::read(&list).unwrap(), before);
+    assert!(!sidecar.exists());
+}
+
 #[tokio::test]
 async fn a_release_exports_with_sidecars_markers_and_metadata() {
     let mut f = Fixture::new();
@@ -179,6 +220,7 @@ async fn a_release_exports_with_sidecars_markers_and_metadata() {
     );
     f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
         .await;
+    f.ranged("com.example:demo:1.0.0", REPO);
 
     let stats = f.export().await.expect("export");
     assert_eq!(
@@ -249,7 +291,7 @@ async fn a_release_exports_with_sidecars_markers_and_metadata() {
     let mut options = f.options();
     options.overwrite = true;
     f.exporter(options)
-        .export(&Reactor::default())
+        .export(&Reactor::default(), &[])
         .await
         .expect("overwrite");
     assert_eq!(f.read(&jar_path), "jar");
@@ -336,6 +378,106 @@ async fn a_support_pom_a_package_also_names_keeps_both_ids() {
     for id in ["boms", "other"] {
         assert!(markers.contains(&format!("bom-1.pom>{id}=")), "{markers}");
     }
+}
+
+/// The same for a BOM another module depends on as a jar, so the second
+/// repository's id reaches the BOM's POM as the jar row's companion POM.
+#[tokio::test]
+async fn a_support_pom_a_jar_row_shares_keeps_both_ids() {
+    const OTHER: &str = "https://other.example/maven2/";
+    let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(OTHER).to_string(),
+        ["other".to_string()].into(),
+    );
+    let bom = pom_text("bom", None);
+    f.support("com.example:bom:1", "boms", &bom).await;
+    let mut row = jar("com.example", "bom", "1");
+    row.repo_url = OTHER.to_string();
+    f.row(row, b"jar", &bom).await;
+
+    f.export().await.expect("export");
+    let markers = f.read("com/example/bom/1/_remote.repositories");
+    assert!(markers.contains("bom-1.jar>other="), "{markers}");
+    assert!(!markers.contains("bom-1.jar>boms="), "{markers}");
+    for id in ["boms", "other"] {
+        assert!(markers.contains(&format!("bom-1.pom>{id}=")), "{markers}");
+    }
+}
+
+/// A jar row whose repository the lock records no id for is labelled
+/// `central`, and so is the POM Maven reads it with, beside the id its
+/// support pin records.
+#[tokio::test]
+async fn a_guessed_id_joins_a_recorded_support_pom_id() {
+    const OTHER: &str = "https://other.example/maven2/";
+    let mut f = Fixture::new();
+    let bom = pom_text("bom", None);
+    f.support("com.example:bom:1", "boms", &bom).await;
+    let mut row = jar("com.example", "bom", "1");
+    row.repo_url = OTHER.to_string();
+    f.row(row, b"jar", &bom).await;
+
+    f.export().await.expect("export");
+    let markers = f.read("com/example/bom/1/_remote.repositories");
+    for marker in [
+        "bom-1.jar>central=",
+        "bom-1.pom>boms=",
+        "bom-1.pom>central=",
+    ] {
+        assert!(markers.contains(marker), "{markers}");
+    }
+}
+
+/// A support POM from a repository without an id is unlabelled, which Maven
+/// reads from every repository, so another module's id must not label it,
+/// whether that module depends on the BOM's jar or on the BOM itself.
+#[tokio::test]
+async fn an_unlabelled_support_pom_stays_unlabelled() {
+    const OTHER: &str = "https://other.example/maven2/";
+    const NO_ID: &str = "https://no-id.example/";
+    for extension in ["jar", "pom"] {
+        let mut f = Fixture::new();
+        f.lock.repo_ids.insert(
+            rv_lock::recorded_key(OTHER).to_string(),
+            ["other".to_string()].into(),
+        );
+        let bom = pom_text("bom", None);
+        let blob = f.put_from(&support_key("bom"), &bom, NO_ID).await;
+        f.lock.platforms[0].support_poms.insert(
+            "com.example:bom:1".to_string(),
+            SupportPom::new(NO_ID, blob),
+        );
+        let row = LockArtifact::new(
+            ArtifactCoord::new("com.example", "bom", "1", extension, None),
+            OTHER,
+        );
+        let payload = if extension == "pom" { &bom[..] } else { b"jar" };
+        f.row(row, payload, &bom).await;
+
+        f.export().await.expect("export");
+        let markers = fs::read_to_string(f.m2().join("com/example/bom/1/_remote.repositories"))
+            .unwrap_or_default();
+        assert!(!markers.contains("bom-1.pom>"), "{extension}: {markers}");
+    }
+}
+
+/// The companion POM of a timestamped snapshot is the base `-SNAPSHOT.pom`
+/// when the metadata names no build for it, and Maven labels that file
+/// with the repository that served it.
+#[tokio::test]
+async fn a_base_snapshot_pom_keeps_its_id() {
+    let mut f = Fixture::new();
+    f.lock
+        .repo_ids
+        .insert(REPO.to_string(), ["snaps".to_string()].into());
+    let mut row = jar("p", "nat", "1.0-SNAPSHOT");
+    row.snapshot = SnapshotStamp::of_version("1.0-20261012.010101-1");
+    row.pom_base = true;
+    f.row(row, b"main", b"pom").await;
+    f.export().await.expect("export");
+    let markers = f.read("p/nat/1.0-SNAPSHOT/_remote.repositories");
+    assert!(markers.contains("nat-1.0-SNAPSHOT.pom>snaps="), "{markers}");
 }
 
 #[tokio::test]
@@ -427,6 +569,62 @@ async fn a_parent_pinned_to_a_snapshot_build_exports_as_maven_downloads_it() {
     assert_eq!(values, [("pom", "1.0-20240101.010101-7")]);
 }
 
+/// A repository's SNAPSHOT metadata names its latest build: the timestamp
+/// and the build number of one build, whichever order the lock holds the
+/// rows of older builds in.
+#[tokio::test]
+async fn snapshot_metadata_names_the_timestamp_and_number_of_the_latest_build() {
+    let row = |classifier, build| {
+        let mut row = LockArtifact::new(
+            ArtifactCoord::new("com.example", "snap", "1.0-SNAPSHOT", "jar", classifier),
+            REPO,
+        );
+        row.snapshot = SnapshotStamp::of_version(build);
+        row
+    };
+    let latest = (None, "1.0-20261002.120000-5");
+    let older = (Some("tests"), "1.0-20261001.100000-1");
+    for builds in [[latest, older], [older, latest]] {
+        let mut f = Fixture::new();
+        (f.lock.repo_ids).insert(REPO.to_string(), ["corp".to_string()].into());
+        for (classifier, build) in builds {
+            f.row(row(classifier, build), build.as_bytes(), b"pom")
+                .await;
+        }
+        f.export().await.expect("export");
+        let path = "com/example/snap/1.0-SNAPSHOT/maven-metadata-corp.xml";
+        let text = f.read(path);
+        for tag in [
+            "<timestamp>20261002.120000</timestamp>",
+            "<buildNumber>5</buildNumber>",
+            "<lastUpdated>20261002120000</lastUpdated>",
+        ] {
+            assert!(text.contains(tag), "{tag}: {text}");
+        }
+        // Each file keeps the time of its own build.
+        let mut entries: Vec<_> = (read_existing_metadata(&f.m2().join(path)).snapshot_versions)
+            .into_iter()
+            .map(|entry| (entry.classifier, entry.extension, entry.updated))
+            .collect();
+        entries.sort();
+        let entry = |classifier: Option<&str>, extension: &str, updated: &str| {
+            (
+                classifier.map(str::to_string),
+                extension.to_string(),
+                updated.to_string(),
+            )
+        };
+        assert_eq!(
+            entries,
+            [
+                entry(None, "jar", "20261002120000"),
+                entry(None, "pom", "20261002120000"),
+                entry(Some("tests"), "jar", "20261001100000"),
+            ]
+        );
+    }
+}
+
 /// Maven merges every repository's SNAPSHOT metadata, so an entry an earlier
 /// run left in one repository's file must not outrank the build the lock
 /// takes from another repository.
@@ -507,9 +705,8 @@ fn every_maven_snapshot_layout_directory_is_used() {
 /// The files, `_remote.repositories` entries and version metadata of a
 /// snapshot match what Maven 3.9 leaves after downloading it
 /// (`test-fixtures/maven-snapshot-layout/`), under the id of the repository
-/// or of the mirror in front of it. The sources jar goes through a second
-/// pass, as `raeva export-m2 --with-sources` writes it, and the metadata keeps
-/// the entries of the first.
+/// or of the mirror in front of it. The sources jar is an optional item, as
+/// `raeva export-m2 --with-sources` passes it.
 #[tokio::test]
 async fn a_snapshot_exports_as_maven_downloads_it() {
     let fixture = fixtures::path("maven-snapshot-layout");
@@ -534,18 +731,16 @@ async fn a_snapshot_exports_as_maven_downloads_it() {
         f.put_from(&sources.coord(), b"sources", url).await;
 
         let exporter = f.exporter(f.options());
-        exporter.export(&Reactor::default()).await.expect("export");
-        exporter
-            .export_items(std::slice::from_ref(&sources))
+        let optional = std::slice::from_ref(&sources);
+        let stats = (exporter.export(&Reactor::default(), optional))
             .await
-            .expect("sources");
+            .expect("export");
         // The timestamped jar and its plain `-SNAPSHOT` copy, not the POM.
-        let again = exporter.export_items(&[sources]).await.expect("again");
-        assert_eq!(
-            (again.exported_count, again.skipped_classified_count),
-            (0, 2),
-            "{case}"
-        );
+        assert_eq!(stats.optional_exported["sources"], 2, "{case}");
+        let again = (exporter.export(&Reactor::default(), optional))
+            .await
+            .expect("again");
+        assert_eq!(again.exported_count, 0, "{case}");
 
         let dir = f.m2().join("com/example/snaplib/1.0-SNAPSHOT");
         let maven = fixture.join(case);
@@ -614,6 +809,10 @@ async fn a_snapshot_exports_as_maven_downloads_it() {
 #[tokio::test]
 async fn support_poms_around_the_locked_artifacts_are_exported() {
     let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(REPO).to_string(),
+        ["central".to_string()].into(),
+    );
     f.row(
         jar("com.example", "demo", "1.0.0"),
         b"jar",
@@ -637,22 +836,22 @@ async fn support_poms_around_the_locked_artifacts_are_exported() {
         poms: vec![
             ProjectPom {
                 path: project_pom("app", "reactor-parent"),
-                local_parent: false,
+                local_parents: Vec::new(),
             },
             ProjectPom {
                 path: project_pom("lib", "local-parent"),
-                local_parent: true,
+                local_parents: vec![project.path().join("pom.xml")],
             },
             ProjectPom {
                 path: project_pom("tool", "remote-parent"),
-                local_parent: false,
+                local_parents: Vec::new(),
             },
         ],
         modules: BTreeSet::from([Gav::new("com.example", "reactor-parent", "1")]),
     };
     let stats = f
         .exporter(f.options())
-        .export(&reactor)
+        .export(&reactor, &[])
         .await
         .expect("export");
 
@@ -744,18 +943,29 @@ async fn a_parent_version_range_exports_the_pinned_parent() {
             .await;
         f.support("com.example:parent:1", repo_id, &pom_text("parent", None))
             .await;
+        f.lock.platforms[0].modules[0]
+            .parent_ranges
+            .push(rv_lock::ParentRange {
+                model: "com.example:demo:1".to_string(),
+                parent: "com.example:parent:[1,2)".to_string(),
+                selected: "com.example:parent:1".to_string(),
+            });
+        f.ranged(
+            "com.example:parent:1",
+            &format!("https://{repo_id}.example/"),
+        );
         let project = tempdir().expect("project");
         let path = project.path().join("app");
         fs::write(&path, ranged("app")).unwrap();
         let reactor = Reactor {
             poms: vec![ProjectPom {
                 path,
-                local_parent: false,
+                local_parents: Vec::new(),
             }],
             ..Reactor::default()
         };
         f.exporter(f.options())
-            .export(&reactor)
+            .export(&reactor, &[])
             .await
             .expect("export");
         assert_eq!(
@@ -767,9 +977,37 @@ async fn a_parent_version_range_exports_the_pinned_parent() {
     }
 }
 
-/// A lock row whose repository recorded no id still gets a version list
-/// under `maven-metadata-local.xml`, so an offline range that names the
-/// artifact can resolve. The `_remote.repositories` marker is omitted.
+/// Under `maven = "3.10"` the parent a range names is the one the lock's
+/// version order selects: 3.10 orders `ga` below `0`, 3.9 the same.
+#[tokio::test]
+async fn a_parent_version_range_matches_in_the_lock_mode() {
+    let mut f = Fixture::new();
+    f.lock.maven = rv_maven_types::MavenMode::Maven310;
+    let ranged = String::from_utf8(pom_text("demo", Some("parent")))
+        .unwrap()
+        .replace(
+            "<version>1</version></parent>",
+            "<version>(,0)</version></parent>",
+        )
+        .into_bytes();
+    f.row(jar("com.example", "demo", "1"), b"jar", &ranged)
+        .await;
+    f.support(
+        "com.example:parent:ga",
+        "central",
+        &pom_text("parent", None),
+    )
+    .await;
+    f.export().await.expect("export");
+    assert_eq!(
+        f.read("com/example/parent/ga/parent-ga.pom"),
+        String::from_utf8(pom_text("parent", None)).unwrap()
+    );
+}
+
+/// A version a range took from a repository with no recorded id still gets
+/// a version list under `maven-metadata-local.xml`, so the range resolves
+/// offline. The `_remote.repositories` marker is omitted.
 #[tokio::test]
 async fn an_empty_repository_id_lists_the_version_locally() {
     let mut f = Fixture::new();
@@ -779,6 +1017,7 @@ async fn an_empty_repository_id_lists_the_version_locally() {
     );
     f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
         .await;
+    f.ranged("com.example:demo:1.0.0", REPO);
     f.export().await.expect("export");
     let metadata = f.read("com/example/demo/maven-metadata-local.xml");
     assert!(metadata.contains("<version>1.0.0</version>"), "{metadata}");
@@ -818,7 +1057,7 @@ async fn downloaded_poms_can_have_an_unpinned_reactor_parent() {
     };
     let stats = f
         .exporter(f.options())
-        .export(&reactor)
+        .export(&reactor, &[])
         .await
         .expect("export");
     assert_eq!(stats.exported_count, 4);
@@ -854,7 +1093,7 @@ async fn a_pinned_parent_with_a_reactor_coordinate_is_exported() {
         ..Reactor::default()
     };
     f.exporter(f.options())
-        .export(&reactor)
+        .export(&reactor, &[])
         .await
         .expect("export");
     assert_eq!(
@@ -863,12 +1102,13 @@ async fn a_pinned_parent_with_a_reactor_coordinate_is_exported() {
     );
 }
 
-/// The artifact-level metadata of each repository id lists the versions the
-/// lock takes from it and nothing else, and the artifact's other lists,
-/// from an online Maven run, `mvn install` or an earlier export, are
-/// removed or list nothing: `mvn -o` resolves a range from them.
+/// The artifact-level metadata of each repository id lists the versions
+/// ranges took from its list and nothing else, not a version the lock pins
+/// exactly, and the artifact's other lists, from an online Maven run, `mvn
+/// install` or an earlier export, are removed or list nothing: `mvn -o`
+/// resolves a range from them.
 #[tokio::test]
-async fn version_lists_hold_only_the_locked_versions() {
+async fn version_lists_hold_only_the_versions_ranges_took() {
     let other = "https://other.example/maven2/";
     let mut f = Fixture::new();
     // Maven bans only the characters file systems reject from an id.
@@ -880,13 +1120,20 @@ async fn version_lists_hold_only_the_locked_versions() {
     }
     f.row(jar("com.example", "demo", "1.5"), b"jar", b"<project/>")
         .await;
-    // A support POM is listed too: a range may name a parent, an import or
-    // a relocated dependency.
+    f.ranged("com.example:demo:1.5", REPO);
+    // A version pinned exactly is not listed: a range would take it.
+    f.row(jar("com.example", "demo", "1.7"), b"jar 1.7", b"<project/>")
+        .await;
+    // A parent a range selected is listed too, one named exactly is not.
     f.support("com.example:parent:1", "corp", b"<project/>")
         .await;
+    f.support("com.example:parent:2", "corp", b"<project/>")
+        .await;
+    f.ranged("com.example:parent:1", "https://corp.example/");
     let mut from_other = jar("com.example", "demo", "2.0");
     from_other.repo_url = other.to_string();
     f.row(from_other, b"jar 2", b"<project/>").await;
+    f.ranged("com.example:demo:2.0", other);
     let dir = f.m2().join("com/example/demo");
     fs::create_dir_all(&dir).unwrap();
     let listing = |versions: &[&str]| {
@@ -924,6 +1171,7 @@ async fn version_lists_hold_only_the_locked_versions() {
         BTreeSet::from(
             [
                 "1.5",
+                "1.7",
                 "2.0",
                 "maven-metadata-central.xml",
                 "maven-metadata-corp.xml",
@@ -954,9 +1202,11 @@ async fn every_id_the_build_reads_has_a_list() {
     );
     f.row(jar("com.example", "demo", "1.5"), b"jar", b"<project/>")
         .await;
+    f.ranged("com.example:demo:1.5", REPO);
     let mut snapshot = jar("com.example", "snap", "1.0-SNAPSHOT");
     snapshot.snapshot = SnapshotStamp::of_version("1.0-20240101.010101-1");
     f.row(snapshot, b"snap", b"<project/>").await;
+    f.ranged("com.example:snap:1.0-SNAPSHOT", REPO);
     let snapshot_dir = f.m2().join("com/example/snap/1.0-SNAPSHOT");
     fs::create_dir_all(&snapshot_dir).unwrap();
     fs::write(snapshot_dir.join("maven-metadata-corp2.xml"), "<metadata/>").unwrap();
@@ -1016,6 +1266,7 @@ async fn an_empty_list_does_not_replace_a_list_that_differs_in_case() {
     );
     f.row(jar("com.example", "demo", "1.5"), b"jar", b"<project/>")
         .await;
+    f.ranged("com.example:demo:1.5", REPO);
     f.export().await.expect("export");
     let dir = f.m2().join("com/example/demo");
     let versions =
@@ -1028,8 +1279,8 @@ async fn an_empty_list_does_not_replace_a_list_that_differs_in_case() {
     }
 }
 
-/// Into the shared Maven local repository, the locked versions are added to
-/// each list, and the listings and SNAPSHOT metadata of `mvn install`, an
+/// Into the shared Maven local repository, the versions ranges took are
+/// added to each list, and the listings and SNAPSHOT metadata of `mvn install`, an
 /// online run or another repository stay.
 #[tokio::test]
 async fn a_shared_repository_keeps_other_metadata() {
@@ -1040,6 +1291,7 @@ async fn a_shared_repository_keeps_other_metadata() {
     );
     f.row(jar("com.example", "demo", "1.5"), b"jar", b"<project/>")
         .await;
+    f.ranged("com.example:demo:1.5", REPO);
     f.row(
         jar("com.example", "snap", "1.0-SNAPSHOT"),
         b"snap",
@@ -1073,7 +1325,7 @@ async fn a_shared_repository_keeps_other_metadata() {
         ..f.options()
     };
     f.exporter(options)
-        .export(&Reactor::default())
+        .export(&Reactor::default(), &[])
         .await
         .expect("export");
     let versions =
@@ -1091,7 +1343,9 @@ async fn a_shared_repository_keeps_other_metadata() {
 
 /// A relocated SNAPSHOT dependency's POM, recorded by its build, is also
 /// exported as the plain `-SNAPSHOT` file `mvn -o` reads without snapshot
-/// metadata, and its version is listed for a range.
+/// metadata, and its version is listed for the range that took it, which
+/// the lock records as evicted: the graph holds the artifact it relocates
+/// to.
 #[tokio::test]
 async fn a_timestamped_support_pom_gets_its_plain_file() {
     let mut f = Fixture::new();
@@ -1099,6 +1353,15 @@ async fn a_timestamped_support_pom_gets_its_plain_file() {
         .await;
     f.support("com.example:moved:1.0-20240101.010101-1", "corp", b"stub")
         .await;
+    f.lock.platforms[0].modules[0]
+        .evicted_ranges
+        .push(rv_lock::EvictedRange {
+            group: "com.example".to_string(),
+            artifact: "moved".to_string(),
+            range: "[0.9,2)".to_string(),
+            origin: "https://corp.example/".to_string(),
+            versions: vec!["0.9".to_string(), "1.0-SNAPSHOT".to_string()],
+        });
     // An earlier build's metadata would name its own POM, and Maven takes
     // the latest build any repository's metadata names.
     let dir = "com/example/moved/1.0-SNAPSHOT";
@@ -1355,7 +1618,7 @@ async fn a_write_through_a_link_fails_the_repeated_export() {
     options.link_strategy = LinkStrategy::Hardlink;
     let export = || async {
         f.exporter(options.clone())
-            .export(&Reactor::default())
+            .export(&Reactor::default(), &[])
             .await
     };
     export().await.expect("export");
@@ -1372,6 +1635,142 @@ async fn a_write_through_a_link_fails_the_repeated_export() {
         "{}",
         failure.error
     );
+}
+
+/// A store blob that changes after the export hashed it and before it
+/// links or copies it, rewritten or replaced, is refused, and nothing is
+/// put at the destination. On Unix and without a hard link, which moves
+/// the change time itself, so is a rewrite that keeps the length and
+/// restores the modification time.
+#[tokio::test]
+async fn a_blob_changed_after_its_hash_is_not_written() {
+    for strategy in [
+        LinkStrategy::Hardlink,
+        LinkStrategy::Symlink,
+        LinkStrategy::Copy,
+    ] {
+        let changes: &[&str] = match strategy {
+            LinkStrategy::Copy | LinkStrategy::Symlink if cfg!(unix) => {
+                &["rewritten", "replaced", "restored"]
+            }
+            _ => &["rewritten", "replaced"],
+        };
+        for &change in changes {
+            let mut f = Fixture::new();
+            f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+                .await;
+            let mut options = f.options();
+            options.link_strategy = strategy;
+            let key = ArtifactCoord::new("com.example", "demo", "1.0.0", "jar", None);
+            let blob = BlobId::from_bytes(b"jar");
+            let judged = judge_blocking(&f.store, &options, Replace::Never, &key, &blob, false)
+                .unwrap_or_else(|err| panic!("{err}"));
+            let src = f.store.get_path(&blob);
+            if change == "replaced" {
+                let other = src.with_extension("other");
+                fs::write(&other, b"JAR!").unwrap();
+                fs::rename(&other, &src).unwrap();
+            } else {
+                let modified = fs::metadata(&src).unwrap().modified().unwrap();
+                let mut writable = fs::metadata(&src).unwrap().permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                writable.set_readonly(false);
+                fs::set_permissions(&src, writable).unwrap();
+                if change == "restored" {
+                    let file = fs::File::options().write(true).open(&src).unwrap();
+                    std::io::Write::write_all(&mut &file, b"JAR").unwrap();
+                    file.set_modified(modified).unwrap();
+                } else {
+                    fs::write(&src, b"JAR!").unwrap();
+                }
+            }
+            let error = write_blocking(
+                &f.store,
+                judged,
+                &options,
+                Replace::Never,
+                &key.to_string(),
+                &blob,
+            )
+            .err()
+            .expect("a changed blob is refused");
+            assert!(
+                matches!(error, ExportError::CorruptBlob { .. }),
+                "{strategy} {change}: {error}"
+            );
+            let jar_path = f.m2().join("com/example/demo/1.0.0/demo-1.0.0.jar");
+            assert!(!jar_path.exists(), "{strategy} {change}");
+        }
+    }
+}
+
+/// A store blob replaced by a pipe after its hash fails the link's check
+/// rather than waiting on the pipe.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_blob_replaced_by_a_pipe_is_refused() {
+    for strategy in [LinkStrategy::Hardlink, LinkStrategy::Symlink] {
+        let mut f = Fixture::new();
+        f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+            .await;
+        let mut options = f.options();
+        options.link_strategy = strategy;
+        let key = ArtifactCoord::new("com.example", "demo", "1.0.0", "jar", None);
+        let blob = BlobId::from_bytes(b"jar");
+        let judged = judge_blocking(&f.store, &options, Replace::Never, &key, &blob, false)
+            .unwrap_or_else(|err| panic!("{err}"));
+        let src = f.store.get_path(&blob);
+        fs::remove_file(&src).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let refused = write_blocking(
+            &f.store,
+            judged,
+            &options,
+            Replace::Never,
+            &key.to_string(),
+            &blob,
+        );
+        assert!(refused.is_err(), "{strategy}");
+        let jar_path = f.m2().join("com/example/demo/1.0.0/demo-1.0.0.jar");
+        assert!(!jar_path.exists(), "{strategy}");
+    }
+}
+
+/// A store blob that is a symlink, even to the right bytes, is refused: a
+/// link to it would follow a file outside the store.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_blob_that_is_a_symlink_is_refused() {
+    for strategy in [
+        LinkStrategy::Hardlink,
+        LinkStrategy::Symlink,
+        LinkStrategy::Copy,
+    ] {
+        let mut f = Fixture::new();
+        f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+            .await;
+        let src = f.store.get_path(&BlobId::from_bytes(b"jar"));
+        let outside = f.m2_dir.path().join("outside");
+        fs::write(&outside, b"jar").unwrap();
+        fs::remove_file(&src).unwrap();
+        std::os::unix::fs::symlink(&outside, &src).unwrap();
+        let mut options = f.options();
+        options.link_strategy = strategy;
+        let error = f.export_with(&options).await.expect_err("export");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "{strategy}: {error}"
+        );
+        assert!(
+            !f.m2()
+                .join("com/example/demo/1.0.0/demo-1.0.0.jar")
+                .exists()
+        );
+    }
 }
 
 /// `--overwrite` must clear a directory that occupies the artifact path.
@@ -1393,7 +1792,7 @@ async fn overwrite_replaces_a_directory_at_the_artifact_path() {
     let mut options = f.options();
     options.overwrite = true;
     f.exporter(options)
-        .export(&Reactor::default())
+        .export(&Reactor::default(), &[])
         .await
         .expect("overwrite directory");
     assert!(
@@ -1430,7 +1829,7 @@ async fn a_foreign_symlink_with_matching_bytes_is_replaced() {
         let mut options = f.options();
         options.link_strategy = strategy;
         f.exporter(options)
-            .export(&Reactor::default())
+            .export(&Reactor::default(), &[])
             .await
             .unwrap_or_else(|err| panic!("{strategy}: {err}"));
         let meta = fs::symlink_metadata(&jar_path).unwrap();
@@ -1473,7 +1872,7 @@ async fn a_foreign_hardlink_with_matching_bytes_is_replaced() {
         let mut options = f.options();
         options.link_strategy = strategy;
         f.exporter(options)
-            .export(&Reactor::default())
+            .export(&Reactor::default(), &[])
             .await
             .unwrap_or_else(|err| panic!("{strategy}: {err}"));
         assert!(
@@ -1504,7 +1903,7 @@ async fn links_an_earlier_export_left_are_kept_or_replaced() {
         options.link_strategy = strategy;
         async move {
             f.exporter(options)
-                .export(&Reactor::default())
+                .export(&Reactor::default(), &[])
                 .await
                 .expect("export")
         }
@@ -1535,6 +1934,37 @@ async fn links_an_earlier_export_left_are_kept_or_replaced() {
         );
         assert_eq!(f.read("com/example/demo/1.0.0/demo-1.0.0.jar"), "jar");
     }
+}
+
+/// A hard-linking export replaces the symbolic links an earlier export
+/// left, which Maven 3.10 does not read, with hard links to the blob.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hard_linking_export_replaces_symbolic_links() {
+    let mut f = Fixture::new();
+    f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+        .await;
+    let f = &f;
+    let export = |strategy| {
+        let mut options = f.options();
+        options.link_strategy = strategy;
+        async move {
+            f.exporter(options)
+                .export(&Reactor::default(), &[])
+                .await
+                .expect("export")
+        }
+    };
+    export(LinkStrategy::Symlink).await;
+    let stats = export(LinkStrategy::Hardlink).await;
+    assert_eq!(stats.skipped_count, 0);
+    for name in ["demo-1.0.0.jar", "demo-1.0.0.pom"] {
+        let path = f.m2().join("com/example/demo/1.0.0").join(name);
+        assert!(fs::symlink_metadata(&path).unwrap().is_file(), "{name}");
+    }
+    let jar_path = f.m2().join("com/example/demo/1.0.0/demo-1.0.0.jar");
+    let blob = f.store.get_path(&BlobId::from_bytes(b"jar"));
+    assert!(same_file::is_same_file(&jar_path, &blob).unwrap());
 }
 
 #[tokio::test]
@@ -1756,7 +2186,7 @@ async fn the_support_pom_limit_counts_unique_poms() {
     let mut exporter = f.exporter(f.options());
     exporter.max_support_pom_nodes = 1;
     exporter
-        .export(&Reactor::default())
+        .export(&Reactor::default(), &[])
         .await
         .expect("one unique support POM");
 
@@ -1770,7 +2200,7 @@ async fn the_support_pom_limit_counts_unique_poms() {
     let mut exporter = f.exporter(f.options());
     exporter.max_support_pom_nodes = 1;
     let failure = exporter
-        .export(&Reactor::default())
+        .export(&Reactor::default(), &[])
         .await
         .expect_err("two unique support POMs");
     assert!(
@@ -1783,6 +2213,8 @@ async fn the_support_pom_limit_counts_unique_poms() {
 
     let mut options = f.options();
     options.dry_run = true;
+    // The first export left other bytes for `shared`, which a dry run refuses.
+    options.m2_path = f.m2_dir.path().join("dry");
     let exporter = f.exporter(options).with_support_pom_limit(Some("0"));
     assert_eq!(exporter.max_support_pom_nodes, super::MAX_SUPPORT_POM_NODES);
     let limit_warnings = |stats: ExportStats| {
@@ -1792,15 +2224,25 @@ async fn the_support_pom_limit_counts_unique_poms() {
             .filter(|warning| matches!(warning, ExportWarning::SupportPomLimitIgnored { .. }))
             .count()
     };
-    let first = exporter.export(&Reactor::default()).await.expect("export");
+    let first = exporter
+        .export(&Reactor::default(), &[])
+        .await
+        .expect("export");
     assert_eq!(limit_warnings(first), 1);
-    let second = exporter.export(&Reactor::default()).await.expect("export");
+    let second = exporter
+        .export(&Reactor::default(), &[])
+        .await
+        .expect("export");
     assert_eq!(limit_warnings(second), 0);
 }
 
 #[tokio::test]
 async fn a_failure_returns_the_warnings_found_before_it() {
     let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(REPO).to_string(),
+        ["central".to_string()].into(),
+    );
     f.row(
         jar("com.example", "demo", "1.0.0"),
         b"jar",
@@ -1843,7 +2285,7 @@ async fn a_dry_run_writes_nothing() {
     options.link_strategy = LinkStrategy::Hardlink;
     let stats = f
         .exporter(options)
-        .export(&Reactor::default())
+        .export(&Reactor::default(), &[])
         .await
         .expect("dry run");
     assert_eq!((stats.exported_count, stats.linked_count), (2, 2));
@@ -1948,6 +2390,7 @@ fn metadata_is_not_written_or_removed_through_a_link_out_of_the_destination() {
         &mut by_repo,
         &std::collections::HashSet::new(),
         false,
+        rv_maven_types::MavenMode::Maven39,
     )
     .expect_err("escapes the destination");
     assert!(matches!(err, ExportError::PathTraversal(_)), "{err}");
@@ -1976,13 +2419,17 @@ fn case_collisions_cover_files_and_shared_directories() {
         blob: BlobId::from_bytes(version.as_bytes()),
         source: UnitSource::Package,
         repo_ids: vec!["central".to_string()],
-        repo_id_recorded: false,
-        replace: false,
+        origin: String::new(),
+        remote: ArtifactCoord::new(group, artifact, version, "jar", None),
+        plain_snapshot: false,
+        no_id: false,
+        optional: false,
     };
     let collision = |units: &[ExportUnit]| match planned_destinations(
         units,
         &[],
         &crate::metadata::MetadataAccumulator::default(),
+        None,
         true,
     ) {
         Err(ExportError::CaseCollision { path, .. }) => Some(path),
@@ -2019,6 +2466,25 @@ fn case_collisions_cover_files_and_shared_directories() {
             unit("com.example", "lib", "2")
         ]),
         None
+    );
+}
+
+#[tokio::test]
+async fn a_plan_refuses_a_case_only_collision_on_every_volume() {
+    let mut f = Fixture::new();
+    for name in ["Foo", "foo"] {
+        f.row(jar("com.example", name, "1.0"), name.as_bytes(), b"pom")
+            .await;
+    }
+    let failure = (f
+        .exporter(f.options())
+        .layout(&Reactor::default(), &[])
+        .await)
+        .expect_err("the plan must fail");
+    assert!(
+        matches!(failure.error, ExportError::PlanCaseCollision { .. }),
+        "{}",
+        failure.error
     );
 }
 
@@ -2081,7 +2547,7 @@ fn equivalent_repository_ids_collide_where_the_volume_merges_them() {
                         .or_default()
                         .add_version(version);
                 }
-                let planned = planned_destinations(&[], &[], &meta, folds_case);
+                let planned = planned_destinations(&[], &[], &meta, None, folds_case);
                 // An empty list gives way to a list its id lowercases alike.
                 let gives_way = populated < 2 && pair[0].to_lowercase() == pair[1].to_lowercase();
                 if !(folds_case || merged_on_macos && cfg!(target_os = "macos"))
@@ -2128,7 +2594,7 @@ fn an_artifact_list_and_snapshot_metadata_in_one_directory_collide() {
     };
     meta.snapshots.entry(snapshot).or_default().timestamp = Some("20240101.010101".to_string());
     for folds_case in [false, true] {
-        let error = planned_destinations(&[], &[], &meta, folds_case)
+        let error = planned_destinations(&[], &[], &meta, None, folds_case)
             .err()
             .expect("one file for two lists");
         assert!(
@@ -2161,7 +2627,7 @@ async fn optional_snapshot_classifiers_claim_timestamped_and_plain_sidecars() {
                     ..f.options()
                 })
                 .with_optional_classifiers(&[sources]);
-            let failure = exporter.export(&Reactor::default()).await.unwrap_err();
+            let failure = exporter.export(&Reactor::default(), &[]).await.unwrap_err();
             let version = if timestamped {
                 "1-20240101.010101-1"
             } else {
@@ -2217,7 +2683,7 @@ async fn concurrent_exports_keep_one_file_with_its_checksums() {
         };
         let (first, second) = (first.exporter(shared()), second.exporter(shared()));
         let reactor = Reactor::default();
-        let (a, b) = tokio::join!(first.export(&reactor), second.export(&reactor));
+        let (a, b) = tokio::join!(first.export(&reactor, &[]), second.export(&reactor, &[]));
         assert!(a.is_ok() != b.is_ok(), "round {round}: {a:?} {b:?}");
         let jar = fixtures[0].m2().join("g/a/1/a-1.jar");
         let written = BlobId::from_bytes(&fs::read(&jar).unwrap());
@@ -2244,7 +2710,7 @@ async fn links_to_devices_in_the_destination_are_not_read() {
     options.overwrite = true;
     let exported = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        f.exporter(options).export(&Reactor::default()),
+        f.exporter(options).export(&Reactor::default(), &[]),
     )
     .await
     .expect("the export reads no device");
@@ -2290,7 +2756,7 @@ async fn a_link_or_fifo_at_the_export_lock_is_refused() {
     let outside = tempdir().expect("outside");
     let target = outside.path().join("created");
     std::os::unix::fs::symlink(&target, &lock).unwrap();
-    super::lock_destination(m2.path(), std::time::Duration::from_secs(1))
+    super::lock_destination(m2.path(), std::time::Duration::from_secs(1), true)
         .await
         .expect_err("refused");
     assert!(!target.exists());
@@ -2302,7 +2768,7 @@ async fn a_link_or_fifo_at_the_export_lock_is_refused() {
     }
     tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        super::lock_destination(m2.path(), std::time::Duration::from_secs(1)),
+        super::lock_destination(m2.path(), std::time::Duration::from_secs(1), true),
     )
     .await
     .expect("no hang")
@@ -2315,10 +2781,10 @@ async fn a_link_or_fifo_at_the_export_lock_is_refused() {
 async fn a_held_export_lock_times_out() {
     let m2 = tempdir().expect("m2");
     let wait = std::time::Duration::from_secs(5);
-    let held = super::lock_destination(m2.path(), wait)
+    let held = super::lock_destination(m2.path(), wait, true)
         .await
         .expect("free");
-    let err = super::lock_destination(m2.path(), std::time::Duration::from_millis(100))
+    let err = super::lock_destination(m2.path(), std::time::Duration::from_millis(100), true)
         .await
         .expect_err("held");
     assert!(
@@ -2327,7 +2793,7 @@ async fn a_held_export_lock_times_out() {
     );
     assert!(err.to_string().contains(".raeva-export.lock"), "{err}");
     drop(held);
-    super::lock_destination(m2.path(), wait)
+    super::lock_destination(m2.path(), wait, true)
         .await
         .expect("free after drop");
 }
@@ -2341,6 +2807,10 @@ async fn a_dry_run_refuses_populated_repository_ids_that_fold_to_one_path() {
             row.snapshot = SnapshotStamp::of_version("1-20240101.010101-1");
         }
         f.row(row, b"jar", b"pom").await;
+        f.ranged(
+            &format!("g:a:{}", if snapshot { "1-SNAPSHOT" } else { "1" }),
+            REPO,
+        );
         f.lock
             .repo_ids
             .insert(REPO.to_string(), ["Repo".into(), "repo".into()].into());
@@ -2349,22 +2819,590 @@ async fn a_dry_run_refuses_populated_repository_ids_that_fold_to_one_path() {
             ..f.options()
         };
         let exporter = f.exporter(options);
-        let result = if snapshot {
-            exporter.export_items(&f.lock.platforms[0].artifacts).await
-        } else {
-            exporter.export(&Reactor::default()).await
-        };
+        let result = exporter.export(&Reactor::default(), &[]).await;
         let err =
             result.expect_err("an empty destination is assumed to fold case during a dry run");
-        let relative = if snapshot {
-            "g/a/1-SNAPSHOT/maven-metadata-repo.xml"
-        } else {
-            "g/a/maven-metadata-repo.xml"
-        };
+        let relative = "g/a/maven-metadata-repo.xml";
         assert!(
             matches!(&err.error, ExportError::CaseCollision { path, .. } if *path == f.m2().join(relative)),
             "{err}"
         );
         assert!(!f.m2().exists());
     }
+}
+
+/// Every file below `m2` with its text, the export lock's included.
+fn tree(m2: &Path) -> std::collections::BTreeMap<PathBuf, String> {
+    fn walk(dir: &Path, found: &mut std::collections::BTreeMap<PathBuf, String>) {
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else {
+                let bytes = fs::read(&path).unwrap_or_default();
+                found.insert(path, String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+    }
+    let mut found = std::collections::BTreeMap::new();
+    walk(m2, &mut found);
+    found
+}
+
+/// Other bytes at one destination fail the export before it writes any
+/// file, sidecar, marker or metadata, so a SNAPSHOT update does not leave
+/// the new plain file next to metadata naming the old build.
+#[tokio::test]
+async fn a_refused_destination_leaves_the_repository_untouched() {
+    let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(REPO).to_string(),
+        ["corp".to_string()].into(),
+    );
+    for (build, bytes) in [
+        ("1.0-20240101.010101-1", "build-one"),
+        ("1.0-20240102.010101-2", "build-two"),
+    ] {
+        f.lock.platforms[0].artifacts.clear();
+        let mut row = jar("com.example", "snap", "1.0-SNAPSHOT");
+        row.snapshot = SnapshotStamp::of_version(build);
+        f.row(row, bytes.as_bytes(), b"<project/>").await;
+        f.row(jar("com.example", "other", "2.0"), b"other", b"<project/>")
+            .await;
+        if bytes == "build-one" {
+            f.export().await.expect("export");
+            fs::write(
+                f.m2().join("com/example/other/2.0/other-2.0.jar"),
+                "foreign",
+            )
+            .unwrap();
+        }
+    }
+    let before = tree(&f.m2());
+    let failure = f.export().await.expect_err("foreign bytes");
+    assert!(
+        matches!(failure.error, ExportError::DestinationMismatch { .. }),
+        "{failure}"
+    );
+    assert_eq!(tree(&f.m2()), before);
+}
+
+/// A dry run judges the destinations as the export does: it refuses what
+/// the export refuses and counts what is already there.
+#[tokio::test]
+async fn a_dry_run_refuses_what_the_export_refuses() {
+    let mut f = Fixture::new();
+    f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+        .await;
+    let mut options = f.options();
+    options.dry_run = true;
+    f.export().await.expect("export");
+    let stats = f.export_with(&options).await.expect("dry run");
+    assert_eq!((stats.exported_count, stats.skipped_count), (0, 2));
+
+    let jar_path = f.m2().join("com/example/demo/1.0.0/demo-1.0.0.jar");
+    fs::write(&jar_path, "foreign").unwrap();
+    let before = tree(&f.m2());
+    let failure = f.export_with(&options).await.expect_err("foreign bytes");
+    assert!(
+        matches!(failure.error, ExportError::DestinationMismatch { .. }),
+        "{failure}"
+    );
+    assert_eq!(tree(&f.m2()), before);
+}
+
+/// In the shared repository a plain `-SNAPSHOT` file is replaced without
+/// `overwrite` only when its `.sha256` names its bytes, as an earlier export
+/// or a download leaves it. `mvn install` output is refused like a release.
+/// In a repository of its own, every plain `-SNAPSHOT` file is the lock's,
+/// as Maven rewrites it on every update, but a directory there is removed
+/// only with `overwrite`.
+#[tokio::test]
+async fn a_shared_repository_keeps_a_snapshot_raeva_did_not_write() {
+    let mut f = Fixture::new();
+    let path = "com/example/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+    let shared = ExportOptions {
+        shared: true,
+        ..f.options()
+    };
+    for bytes in ["one", "two"] {
+        f.lock.platforms[0].artifacts.clear();
+        f.row(
+            jar("com.example", "snap", "1.0-SNAPSHOT"),
+            bytes.as_bytes(),
+            b"<project/>",
+        )
+        .await;
+        f.export_with(&shared)
+            .await
+            .expect("repeated shared export");
+        assert_eq!(f.read(path), bytes);
+    }
+
+    // `mvn install` replaced the jar and left raeva's sidecars.
+    fs::write(f.m2().join(path), "installed").unwrap();
+    f.lock.platforms[0].artifacts.clear();
+    f.row(
+        jar("com.example", "snap", "1.0-SNAPSHOT"),
+        b"three",
+        b"<project/>",
+    )
+    .await;
+    let before = tree(&f.m2());
+    let failure = f.export_with(&shared).await.expect_err("installed bytes");
+    assert!(
+        matches!(failure.error, ExportError::DestinationMismatch { .. }),
+        "{failure}"
+    );
+    assert_eq!(tree(&f.m2()), before);
+    let overwrite = ExportOptions {
+        overwrite: true,
+        ..shared.clone()
+    };
+    f.export_with(&overwrite).await.expect("overwrite");
+    assert_eq!(f.read(path), "three");
+
+    fs::write(f.m2().join(path), "downloaded").unwrap();
+    fs::write(
+        f.m2().join(format!("{path}.sha256")),
+        BlobId::from_bytes(b"downloaded").as_str(),
+    )
+    .unwrap();
+    f.export_with(&shared).await.expect("a download");
+    assert_eq!(f.read(path), "three");
+
+    fs::write(f.m2().join(path), "installed").unwrap();
+    f.export_with(&f.options()).await.expect("own repository");
+    assert_eq!(f.read(path), "three");
+
+    fs::remove_file(f.m2().join(path)).unwrap();
+    fs::create_dir_all(f.m2().join(path).join("inside")).unwrap();
+    let before = tree(&f.m2());
+    let failure = f.export().await.expect_err("a directory");
+    assert!(
+        matches!(failure.error, ExportError::DestinationMismatch { .. }),
+        "{failure}"
+    );
+    assert_eq!(tree(&f.m2()), before);
+}
+
+/// A file whose bytes the export replaces keeps no repository entry an
+/// earlier export left: that repository did not serve the new bytes.
+#[tokio::test]
+async fn replaced_bytes_drop_the_repository_markers_of_the_old_ones() {
+    const OTHER: &str = "https://other.example/maven2/";
+    let mut f = Fixture::new();
+    for (url, id) in [(REPO, "corp"), (OTHER, "other")] {
+        f.lock.repo_ids.insert(
+            rv_lock::recorded_key(url).to_string(),
+            [id.to_string()].into(),
+        );
+    }
+    f.row(
+        jar("com.example", "demo", "1.0"),
+        b"from-corp",
+        b"<project/>",
+    )
+    .await;
+    f.row(jar("com.example", "kept", "1.0"), b"kept", b"<project/>")
+        .await;
+    f.export().await.expect("export");
+
+    f.lock.platforms[0].artifacts.remove(0);
+    let mut moved = jar("com.example", "demo", "1.0");
+    moved.repo_url = OTHER.to_string();
+    f.row(moved, b"from-other", b"<project/>").await;
+    let mut kept = f.lock.platforms[0].artifacts[0].clone();
+    kept.repo_url = OTHER.to_string();
+    f.put_from(&kept.coord(), b"kept", OTHER).await;
+    f.put_from(
+        &ArtifactCoord::of(kept.pom_gav(), "pom", None),
+        b"<project/>",
+        OTHER,
+    )
+    .await;
+    f.lock.platforms[0].artifacts[0] = kept;
+    let mut options = f.options();
+    options.overwrite = true;
+    f.exporter(options)
+        .export(&Reactor::default(), &[])
+        .await
+        .expect("overwrite");
+    assert_eq!(f.read("com/example/demo/1.0/demo-1.0.jar"), "from-other");
+    let markers = parse_remote_repositories(&f.read("com/example/demo/1.0/_remote.repositories"));
+    let entries = |file: &str| {
+        (markers.iter())
+            .filter(|(name, _)| name == file)
+            .map(|(_, id)| id.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(entries("demo-1.0.jar"), ["other"]);
+    // The POM's bytes did not change, so the repository that served them
+    // is still named.
+    assert_eq!(entries("demo-1.0.pom"), ["corp", "other"]);
+    let markers = parse_remote_repositories(&f.read("com/example/kept/1.0/_remote.repositories"));
+    assert!(markers.contains(&("kept-1.0.jar".to_string(), "corp".to_string())));
+    assert!(markers.contains(&("kept-1.0.jar".to_string(), "other".to_string())));
+}
+
+/// The entries of bytes about to be replaced go before the bytes do, so an
+/// export that stops partway leaves none for the next export to keep.
+#[tokio::test]
+async fn an_export_that_stops_leaves_no_entry_for_replaced_bytes() {
+    const OTHER: &str = "https://other.example/maven2/";
+    let mut f = Fixture::new();
+    for (url, id) in [(REPO, "corp"), (OTHER, "other")] {
+        f.lock.repo_ids.insert(
+            rv_lock::recorded_key(url).to_string(),
+            [id.to_string()].into(),
+        );
+    }
+    f.row(
+        jar("com.example", "demo", "1.0"),
+        b"from-corp",
+        b"<project/>",
+    )
+    .await;
+    f.export().await.expect("export");
+
+    f.lock.platforms[0].artifacts.clear();
+    let mut moved = jar("com.example", "demo", "1.0");
+    moved.repo_url = OTHER.to_string();
+    f.row(moved, b"from-other", b"<project/>").await;
+    f.row(jar("com.example", "late", "1.0"), b"late", b"<project/>")
+        .await;
+    // A directory where a checksum goes fails the export as it writes.
+    let blocked = f.m2().join("com/example/late/1.0/late-1.0.jar.sha256");
+    fs::create_dir_all(&blocked).unwrap();
+    let mut options = f.options();
+    options.overwrite = true;
+    f.export_with(&options).await.expect_err("blocked checksum");
+    let entries = |f: &Fixture| {
+        parse_remote_repositories(&f.read("com/example/demo/1.0/_remote.repositories"))
+            .into_iter()
+            .filter(|(name, _)| name == "demo-1.0.jar")
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(f.read("com/example/demo/1.0/demo-1.0.jar"), "from-other");
+    assert!(entries(&f).is_empty(), "{:?}", entries(&f));
+
+    fs::remove_dir(&blocked).unwrap();
+    f.export().await.expect("rerun");
+    assert_eq!(entries(&f), ["other"]);
+}
+
+/// An export that stops before it finishes leaves a record in the local
+/// repository, which a dry run reports and keeps, and the next export
+/// reports, repairs and clears.
+#[tokio::test]
+async fn an_unfinished_export_is_reported_until_one_repairs_it() {
+    let mut f = Fixture::new();
+    f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+        .await;
+    let record = f.m2().join(".raeva-export-unfinished");
+    let unfinished = |stats: &ExportStats| {
+        (stats.warnings.iter()).find_map(|warning| match warning {
+            ExportWarning::UnfinishedExport { repaired, .. } => Some(*repaired),
+            _ => None,
+        })
+    };
+    // A directory where a checksum goes fails the export as it writes.
+    let blocked = f.m2().join("com/example/demo/1.0.0/demo-1.0.0.jar.sha256");
+    fs::create_dir_all(&blocked).unwrap();
+    f.export().await.expect_err("blocked checksum");
+    assert!(record.is_file());
+    fs::remove_dir(&blocked).unwrap();
+
+    let mut dry_run = f.options();
+    dry_run.dry_run = true;
+    let stats = f.export_with(&dry_run).await.expect("dry run");
+    assert_eq!(unfinished(&stats), Some(false));
+    assert!(record.is_file());
+
+    let stats = f.export().await.expect("repair");
+    assert_eq!(unfinished(&stats), Some(true));
+    assert!(!record.exists());
+    let stats = f.export().await.expect("export");
+    assert_eq!(unfinished(&stats), None);
+    assert!(!record.exists());
+}
+
+/// The sidecars follow the bytes they name, so a SNAPSHOT update in the
+/// shared repository that stops between them is finished by a plain rerun:
+/// the file never holds the old bytes under a `.sha256` naming the new ones.
+#[tokio::test]
+async fn a_stopped_shared_snapshot_update_finishes_without_overwrite() {
+    let mut f = Fixture::new();
+    let path = "com/example/snap/1.0-SNAPSHOT/snap-1.0-SNAPSHOT.jar";
+    let shared = ExportOptions {
+        shared: true,
+        ..f.options()
+    };
+    for bytes in ["one", "two"] {
+        f.lock.platforms[0].artifacts.clear();
+        let row = jar("com.example", "snap", "1.0-SNAPSHOT");
+        f.row(row, bytes.as_bytes(), b"<project/>").await;
+        if bytes == "one" {
+            f.export_with(&shared).await.expect("export");
+        }
+    }
+    let sha1 = f.m2().join(format!("{path}.sha1"));
+    fs::remove_file(&sha1).unwrap();
+    fs::create_dir(&sha1).unwrap();
+    f.export_with(&shared).await.expect_err("blocked checksum");
+    fs::remove_dir(&sha1).unwrap();
+    f.export_with(&shared).await.expect("rerun");
+    assert_eq!(f.read(path), "two");
+}
+
+/// A repair hashes a linked file rather than trust its sidecars, which an
+/// export stopped between the two leaves naming different bytes.
+#[tokio::test]
+async fn a_repair_rewrites_a_stale_checksum_of_a_linked_file() {
+    let mut f = Fixture::new();
+    f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+        .await;
+    let mut options = f.options();
+    options.link_strategy = LinkStrategy::Hardlink;
+    f.export_with(&options).await.expect("export");
+    let sha1 = "com/example/demo/1.0.0/demo-1.0.0.jar.sha1";
+    fs::write(f.m2().join(sha1), "0".repeat(40)).unwrap();
+    fs::write(f.m2().join(".raeva-export-unfinished"), "").unwrap();
+    f.export_with(&options).await.expect("repair");
+    assert_eq!(f.read(sha1), hex::encode(Sha1::digest(b"jar")));
+}
+
+/// A goal prefix resolves offline from the group metadata of the
+/// repository that named it, under the id its files are labelled with.
+#[tokio::test]
+async fn plugin_prefixes_are_written_as_group_metadata() {
+    let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(REPO).to_string(),
+        ["corp".to_string()].into(),
+    );
+    f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+        .await;
+    let config = rv_config::Config::for_testing(
+        f.m2_dir.path().to_path_buf(),
+        rv_config::ResolvedPaths::from_raeva_home(f.m2_dir.path().join("home")),
+    );
+    let prefix = |prefix: &str, artifact: &str| {
+        let row = ("org.example.plugins", REPO, prefix, artifact);
+        (
+            row.0.to_string(),
+            row.1.to_string(),
+            row.2.to_string(),
+            row.3.to_string(),
+        )
+    };
+    // A checksum Maven saved beside an earlier list no longer matches.
+    let stale = f
+        .m2()
+        .join("org/example/plugins/maven-metadata-corp.xml.sha1");
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, "0000").unwrap();
+    let plan = ExportPlan::from_lock(&config, &f.lock, &HashMap::new())
+        .expect("plan")
+        .with_plugin_prefixes([prefix("tidy", "tidy-maven-plugin"), prefix("a", "a-plugin")]);
+    Exporter::new(f.options(), &f.store, plan)
+        .export(&Reactor::default(), &[])
+        .await
+        .expect("export");
+    assert_eq!(
+        f.read("org/example/plugins/maven-metadata-corp.xml"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n  <plugins>\n    <plugin>\n      \
+         <prefix>a</prefix>\n      <artifactId>a-plugin</artifactId>\n    </plugin>\n    \
+         <plugin>\n      <prefix>tidy</prefix>\n      <artifactId>tidy-maven-plugin</artifactId>\n    \
+         </plugin>\n  </plugins>\n</metadata>\n"
+    );
+    assert!(!stale.exists());
+
+    // The repository other builds share keeps each prefix the list names
+    // that the lock does not.
+    let list = f.m2().join("org/example/plugins/maven-metadata-corp.xml");
+    std::fs::write(
+        &list,
+        "<metadata><plugins><plugin><name>Old</name><prefix>tidy</prefix>\
+         <artifactId>old-tidy-plugin</artifactId></plugin><plugin><prefix>b</prefix>\
+         <artifactId>b-plugin</artifactId></plugin></plugins></metadata>",
+    )
+    .unwrap();
+    let plan = ExportPlan::from_lock(&config, &f.lock, &HashMap::new())
+        .expect("plan")
+        .with_plugin_prefixes([prefix("tidy", "tidy-maven-plugin")]);
+    let options = ExportOptions {
+        shared: true,
+        overwrite: true,
+        ..f.options()
+    };
+    Exporter::new(options, &f.store, plan)
+        .export(&Reactor::default(), &[])
+        .await
+        .expect("export");
+    assert_eq!(
+        read_existing_prefixes(&list),
+        [
+            ("b".to_string(), "b-plugin".to_string()),
+            ("tidy".to_string(), "tidy-maven-plugin".to_string()),
+        ]
+        .into()
+    );
+
+    let plan = ExportPlan::from_lock(&config, &f.lock, &HashMap::new())
+        .expect("plan")
+        .with_plugin_prefixes([prefix("x", "../escape")]);
+    let failure = Exporter::new(f.options(), &f.store, plan)
+        .export(&Reactor::default(), &[])
+        .await
+        .expect_err("an artifactId that names a path");
+    assert!(
+        matches!(failure.error, ExportError::InvalidCoordinate(_)),
+        "{failure}"
+    );
+}
+
+/// `x.g`'s plugin prefixes and `x:g`'s version list are both
+/// `x/g/maven-metadata-repo.xml`, and a prefix list is checked before
+/// anything is written.
+#[test]
+fn plugin_prefixes_are_planned_destinations() {
+    let mut meta = crate::metadata::MetadataAccumulator::default();
+    let key = crate::metadata::ArtifactMetaKey {
+        group_id: "x".to_string(),
+        artifact_id: "g".to_string(),
+    };
+    (meta.artifacts.entry(key).or_default())
+        .entry("repo".to_string())
+        .or_default()
+        .add_version("1");
+    let prefixes = |artifact: &str| {
+        let mut prefixes = crate::plan::GroupPrefixes::new();
+        prefixes.insert(
+            ("x.g".to_string(), "repo".to_string()),
+            [("demo".to_string(), artifact.to_string())].into(),
+        );
+        prefixes
+    };
+    let error = planned_destinations(&[], &[], &meta, Some(&prefixes("demo-plugin")), false)
+        .err()
+        .expect("one file for two lists");
+    assert!(
+        matches!(error, ExportError::DestinationCollision { .. }),
+        "{error}"
+    );
+    let empty = crate::metadata::MetadataAccumulator::default();
+    assert!(planned_destinations(&[], &[], &empty, Some(&prefixes("demo-plugin")), false).is_ok());
+    assert!(planned_destinations(&[], &[], &empty, Some(&prefixes("../up")), false).is_err());
+}
+
+/// Two repositories' lists may give ranges spellings of one version that
+/// compare equal. raeva.lock does not record the order of a whole list, so
+/// `mvn -o` might take either where one list names both: the export
+/// refuses.
+#[tokio::test]
+async fn equal_spellings_ranges_took_are_refused() {
+    let other = "https://other.example/maven2/";
+    let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(REPO).to_string(),
+        ["corp".to_string()].into(),
+    );
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(other).to_string(),
+        ["corp".to_string()].into(),
+    );
+    f.row(jar("com.example", "demo", "1.0"), b"jar", b"<project/>")
+        .await;
+    f.row(
+        jar("com.example", "demo", "1.0-ga"),
+        b"jar ga",
+        b"<project/>",
+    )
+    .await;
+    f.ranged("com.example:demo:1.0", REPO);
+    f.ranged("com.example:demo:1.0-ga", other);
+    f.lock.platforms[0].modules[0]
+        .metadata_versions
+        .push(rv_lock::MetadataVersion {
+            group: "com.example".to_string(),
+            artifact: "demo".to_string(),
+            kind: rv_lock::MetadataVersionKind::Range,
+            version: "1.0".to_string(),
+        });
+    let err = f.export().await.expect_err("equal spellings");
+    assert!(
+        matches!(&err.error, ExportError::EqualSpellings { spellings, .. } if spellings.len() == 2),
+        "{err}"
+    );
+    assert!(!f.m2().join("com/example/demo").exists());
+}
+
+/// A range on a relocated artifact took `old:2`, whose POM is the
+/// relocation; the graph holds `new:2`, so raeva.lock records the range as
+/// evicted. Another range took `old:1`, which the list already names: the
+/// export still lists `2`, which Maven took, so `mvn -o` follows the
+/// relocation.
+#[tokio::test]
+async fn a_relocated_range_lists_the_version_maven_took() {
+    let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(REPO).to_string(),
+        ["corp".to_string()].into(),
+    );
+    f.row(jar("com.example", "old", "1"), b"old jar", b"<project/>")
+        .await;
+    f.support("com.example:old:2", "corp", b"<project/>").await;
+    f.ranged("com.example:old:1", REPO);
+    f.lock.platforms[0].modules[0]
+        .evicted_ranges
+        .push(rv_lock::EvictedRange {
+            group: "com.example".to_string(),
+            artifact: "old".to_string(),
+            range: "[1,3)".to_string(),
+            origin: REPO.to_string(),
+            versions: vec!["1".to_string(), "2".to_string()],
+        });
+    f.export().await.expect("export");
+    let listed = f.m2().join("com/example/old/maven-metadata-corp.xml");
+    assert_eq!(read_existing_metadata(&listed).versions, ["1", "2"]);
+}
+
+/// Each repository's relocated pick is listed where a range through it took
+/// a lower version: `a` lists 1 and 2 for `[1,4)`, whose 2 relocates, `b`
+/// lists 1 and 3, whose 3 relocates, and a `[1,2)` took 1 from `a`. `mvn -o`
+/// reads `[1,4)` through `a` as 2, as online.
+#[tokio::test]
+async fn each_repository_lists_its_relocated_pick() {
+    let mut f = Fixture::new();
+    f.lock.repo_ids.insert(
+        rv_lock::recorded_key(REPO).to_string(),
+        ["corp".to_string()].into(),
+    );
+    f.row(jar("com.example", "old", "1"), b"old jar", b"<project/>")
+        .await;
+    f.support("com.example:old:2", "a", b"<project/>").await;
+    f.support("com.example:old:3", "b", b"<project/>").await;
+    f.ranged("com.example:old:1", "https://a.example/");
+    for (origin, top) in [("https://a.example/", "2"), ("https://b.example/", "3")] {
+        f.lock.platforms[0].modules[0]
+            .evicted_ranges
+            .push(rv_lock::EvictedRange {
+                group: "com.example".to_string(),
+                artifact: "old".to_string(),
+                range: "[1,4)".to_string(),
+                origin: origin.to_string(),
+                versions: vec!["1".to_string(), top.to_string()],
+            });
+    }
+    f.export().await.expect("export");
+    let listed = |id: &str| {
+        let path = f
+            .m2()
+            .join(format!("com/example/old/maven-metadata-{id}.xml"));
+        read_existing_metadata(&path).versions
+    };
+    assert_eq!(listed("a"), ["1", "2"]);
+    assert_eq!(listed("b"), ["3"]);
 }

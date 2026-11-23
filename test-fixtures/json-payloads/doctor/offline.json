@@ -1,0 +1,60 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "checks": [
+        {
+          "check": "TLS trust roots",
+          "class": null,
+          "code": null,
+          "details": "operating system trust store",
+          "status": "info"
+        },
+        {
+          "check": "store directory",
+          "class": null,
+          "code": null,
+          "details": "<tmp>/home/store",
+          "status": "info"
+        },
+        {
+          "check": "Maven mode",
+          "class": null,
+          "code": null,
+          "details": "Maven 3.9, neither [lock] maven nor a Maven wrapper names one",
+          "status": "info"
+        },
+        {
+          "check": "plugins",
+          "class": null,
+          "code": "PLUGINS_NOT_LOCKED",
+          "details": "raeva.lock holds no plugin tables, so it pins no Maven plugins, and build extensions only for a module that resolves a dependency type Maven's core does not define: '[plugins] lock = true' in raeva.toml locks the plugins and build extensions, and '[plugins] trace' the artifacts they fetch while they run (https://github.com/raeva-io/raeva/blob/main/docs/offline-builds.md)",
+          "status": "info"
+        },
+        {
+          "check": "CI check",
+          "class": null,
+          "code": "CI_CHECK_MISSING",
+          "details": "no CI file runs raeva sync --frozen, so nothing checks raeva.lock against the POMs; a job to add is below (https://github.com/raeva-io/raeva/blob/main/docs/ci.md)",
+          "status": "warn"
+        },
+        {
+          "check": "repositories",
+          "class": null,
+          "code": null,
+          "details": "not probed offline",
+          "status": "info"
+        }
+      ],
+      "issues": 0,
+      "snippets": [
+        {
+          "file": "CI",
+          "text": "# With raeva <raeva-version> installed (https://github.com/raeva-io/raeva/blob/main/docs/ci.md); on GitHub Actions,\n# raeva-io/setup-raeva with `check: true` runs this.\nraeva -C project sync --frozen\n"
+        }
+      ],
+      "warnings": []
+    },
+    "success": true
+  }
+}

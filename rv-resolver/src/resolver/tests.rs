@@ -44,9 +44,9 @@ async fn load_root(
     fs::write(&pom_path, pom).unwrap();
     let resolver = offline_resolver(dir.path(), &dir.path().join("store"));
     let loaded = resolver
-        .load_root_project(&pom_path, &[], lone_module(&pom_path), None, None)
+        .load_root_project(&pom_path, &[], lone_module(&pom_path), None, None, None)
         .await
-        .map(|(coord, project, repos, _)| (coord, project, repos));
+        .map(|root| (root.coord, root.project, root.observed_repos));
     (dir, loaded)
 }
 
@@ -234,6 +234,7 @@ mod workspace_resolution {
             .resolve_graph_internal(
                 &workspace.root().join(pom_path),
                 Arc::new(workspace.clone()),
+                None,
                 None,
             )
             .await
@@ -643,12 +644,12 @@ mod workspace_resolution {
             ("m2/pom.xml", m2.as_str()),
         ]);
         let workspace = Arc::new(workspace);
-        for (scope, builds, warnings) in [("test", 1, 0), ("weird", 3, 3)] {
+        // Refusing a repository the BOM declares logs.
+        for (url, builds) in [("https://r.example/", 1), ("ftp://r.example/", 3)] {
             let bom = format!(
                 "<project><groupId>t</groupId><artifactId>bom</artifactId><version>1</version>\
-                 <packaging>pom</packaging><dependencies><dependency><groupId>t</groupId>\
-                 <artifactId>x</artifactId><version>1</version><scope>{scope}</scope>\
-                 </dependency></dependencies></project>"
+                 <packaging>pom</packaging><repositories><repository><id>r</id><url>{url}</url>\
+                 </repository></repositories></project>"
             );
             let files = HashMap::from([("t/bom/1/bom-1.pom".to_string(), bom.into_bytes())]);
             let host = rv_maven_model::HostSnapshot::for_testing(&[])
@@ -670,16 +671,14 @@ mod workspace_resolution {
             let context = ResolveContext::new(config, repos, store, platform, None)
                 .with_pom_source(source.clone());
             let resolver = PlatformResolver::new(context);
-            let log = rv_test_support::capture_warnings(|| {
+            rv_test_support::capture_warnings(|| {
                 let likes = runtime.block_on(likes_of(&resolver, &workspace));
                 assert_eq!(likes.as_deref(), Some("root"));
             });
             let bom_reads = (source.requests().iter())
                 .filter(|request| request.ends_with("bom-1.pom"))
                 .count();
-            assert_eq!(bom_reads, builds, "scope {scope}");
-            let warned = log.matches("unknown dependency scope").count();
-            assert_eq!(warned, warnings, "scope {scope}");
+            assert_eq!(bom_reads, builds, "{url}");
         }
     }
 
@@ -826,6 +825,55 @@ mod workspace_resolution {
         }
     }
 
+    /// Whether a module's dependency check runs depends on download timing,
+    /// so it reads the classifier likes and notes the reactor apart from the
+    /// pass; the module's graph records both.
+    #[tokio::test]
+    async fn a_dependency_check_leaves_the_likes_and_the_reactor_flag_alone() {
+        let native = "<dependencies><dependency><groupId>g</groupId><artifactId>n1</artifactId>\
+                      <version>1</version><classifier>${os.detected.classifier}</classifier>\
+                      </dependency></dependencies>";
+        let files = [
+            (
+                "pom.xml",
+                likes_pom("root", None, &["m1"], Some("fedora, debian"), ""),
+            ),
+            (
+                "m1/pom.xml",
+                likes_pom("m1", Some("root"), &[], None, native),
+            ),
+        ];
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, text)| (*path, text.as_str()))
+            .collect();
+        let (_dir, workspace) = reactor(&files);
+        let routes = HashMap::from([("/g/n1/1/n1-1.pom".to_string(), pom("g", "n1", "1", ""))]);
+        let workspace = Arc::new(workspace);
+        let (resolver, _store) = ubuntu_resolver(&workspace, &routes, "linux-x86_64", None);
+        let likes = (resolver.classifier_likes(&workspace, &Arc::default()).await)
+            .expect("likes")
+            .likes;
+        assert!(!likes.read());
+        let ctx = resolver
+            .ctx
+            .clone()
+            .with_classifier_likes(Some(likes.clone()));
+        let check = PlatformResolver::new(ctx.apart());
+        let path = workspace.root().join("m1/pom.xml");
+        let imports = Arc::default();
+        (check.check_own_dependencies(&path, Arc::clone(&workspace), &Arc::default(), &imports))
+            .await
+            .expect("check");
+        check.ctx.note_reactor_through_dependencies();
+        assert!(!likes.read());
+        assert!(!ctx.reactor_through_dependencies());
+        resolve_graph(&PlatformResolver::new(ctx), &workspace, "m1/pom.xml")
+            .await
+            .expect("graph");
+        assert!(likes.read());
+    }
+
     /// Maven 3.9 reads a reactor project's parents before it indexes the
     /// reactor, so a `<parent>` with an empty `<relativePath/>` is looked up
     /// in a repository even when another module has its coordinates. With no
@@ -956,6 +1004,646 @@ mod workspace_resolution {
             error.to_string(),
             "workspace dependency cycle detected: com.example:a -> com.example:b -> com.example:a"
         );
+    }
+
+    /// Routes for `g:{artifact}` at each of `versions`, whose POMs hold
+    /// `body`, listed in this order.
+    fn listed(
+        routes: &mut HashMap<String, Vec<u8>>,
+        artifact: &str,
+        versions: &[&str],
+        body: &str,
+    ) {
+        for version in versions {
+            routes.insert(
+                format!("/g/{artifact}/{version}/{artifact}-{version}.pom"),
+                pom("g", artifact, version, body),
+            );
+        }
+        let versions: String = (versions.iter())
+            .map(|version| format!("<version>{version}</version>"))
+            .collect();
+        routes.insert(
+            format!("/g/{artifact}/maven-metadata.xml"),
+            format!(
+                "<metadata><groupId>g</groupId><artifactId>{artifact}</artifactId>\
+                 <versioning><versions>{versions}</versions></versioning></metadata>"
+            )
+            .into_bytes(),
+        );
+    }
+
+    fn depends_on(artifact: &str, version: &str) -> String {
+        format!(
+            "<dependencies><dependency><groupId>g</groupId><artifactId>{artifact}</artifactId>\
+             <version>{version}</version></dependency></dependencies>"
+        )
+    }
+
+    /// The collectors of each Maven line, as `.mvn/maven.config` picks
+    /// them: the line's own, then the other.
+    const COLLECTORS: [(rv_maven_types::MavenMode, Option<&str>); 4] = [
+        (rv_maven_types::MavenMode::Maven39, None),
+        (rv_maven_types::MavenMode::Maven39, Some("bf")),
+        (rv_maven_types::MavenMode::Maven310, None),
+        (rv_maven_types::MavenMode::Maven310, Some("df")),
+    ];
+
+    fn with_collector(
+        files: &[(&str, String)],
+        collector: Option<&str>,
+    ) -> (tempfile::TempDir, Workspace) {
+        let mut files = files.to_vec();
+        if let Some(collector) = collector {
+            let line = format!("-Daether.dependencyCollector.impl={collector}\n");
+            files.push((".mvn/maven.config", line));
+        }
+        let files: Vec<_> = (files.iter())
+            .map(|(path, body)| (*path, &**body))
+            .collect();
+        reactor(&files)
+    }
+
+    /// The depth-first collectors of Maven 3.9.12 and 3.10.0 take
+    /// `1-ga-ga.0.0-ga-0.ga` from `[1,2)` over these eleven spellings of
+    /// one version, listed in this order: they share a bin of the range
+    /// resolver's `HashMap`, which turns into a tree and iterates its root
+    /// first. The breadth-first collectors read the descriptors of a
+    /// range's versions in parallel, and which spelling they take varies
+    /// from run to run.
+    #[tokio::test]
+    async fn a_range_takes_the_tie_mavens_hash_map_iterates_first() {
+        let versions = [
+            "1-ga-ga.ga.0-0.ga.ga",
+            "1-ga-ga-0.ga-0.ga-0",
+            "1-ga-ga-0.ga-0-0-0",
+            "1-ga-ga-0-0-0.ga-0",
+            "1-ga-ga-0-ga.ga.ga.ga",
+            "1-ga-ga.0.ga.0.ga-ga",
+            "1-ga-ga.0.0-ga-0.ga",
+            "1-ga-ga.0-ga.ga.ga-ga",
+            "1-ga-ga.0-ga.0-ga-0",
+            "1-ga-ga-ga.ga-0-ga-ga",
+            "1-ga-ga-ga.ga-ga.ga.ga",
+        ];
+        let mut routes = HashMap::new();
+        listed(&mut routes, "ties", &versions, "");
+        let app = String::from_utf8(pom("g", "app", "1", &depends_on("ties", "[1,2)"))).unwrap();
+        let depth_first = [COLLECTORS[0], COLLECTORS[3]];
+        for (mode, collector) in depth_first {
+            let (_dir, workspace) = with_collector(&[("pom.xml", app.clone())], collector);
+            let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+            resolver.ctx.config.lock.maven.mode = mode;
+            let graph = resolve_graph(&resolver, &workspace, "pom.xml")
+                .await
+                .unwrap_or_else(|error| panic!("{mode} {collector:?}: {error}"));
+            let (_, node) = node_by_artifact(&graph, "ties");
+            assert_eq!(
+                node.coord.version.as_str(),
+                "1-ga-ga.0.0-ga-0.ga",
+                "{mode} {collector:?}"
+            );
+        }
+    }
+
+    /// The map also holds a blank `<version>`, as the empty version. Maven
+    /// 3.9.12 and 3.10.0 take `1.ga` with the blank entry, which grows the
+    /// map to 32, and `1` without it.
+    #[tokio::test]
+    async fn a_range_tie_counts_blank_versions() {
+        let versions: Vec<String> = ["1", "1.ga"]
+            .into_iter()
+            .map(str::to_string)
+            .chain((2..12).map(|version| version.to_string()))
+            .collect();
+        let versions: Vec<&str> = versions.iter().map(String::as_str).collect();
+        let mut routes = HashMap::new();
+        listed(&mut routes, "plain", &versions, "");
+        listed(&mut routes, "blank", &versions, "");
+        let blank = String::from_utf8(routes["/g/blank/maven-metadata.xml"].clone()).unwrap();
+        routes.insert(
+            "/g/blank/maven-metadata.xml".to_string(),
+            blank
+                .replace("</versions>", "<version/></versions>")
+                .into_bytes(),
+        );
+        let module = |artifact: &str, version: &str| {
+            String::from_utf8(pom("g", artifact, version, "<packaging>pom</packaging>")).unwrap()
+        };
+        let mut app = String::from_utf8(pom("g", "app", "1", "")).unwrap();
+        app = app.replace(
+            "</project>",
+            "<dependencies><dependency><groupId>g</groupId><artifactId>plain</artifactId>\
+             <version>[1,2)</version></dependency><dependency><groupId>g</groupId>\
+             <artifactId>blank</artifactId><version>[1,2)</version></dependency>\
+             </dependencies></project>",
+        );
+        let root = module("root", "1").replace(
+            "</project>",
+            "<modules><module>app</module></modules></project>",
+        );
+        let files = [("pom.xml", root), ("app/pom.xml", app)];
+        let depth_first = [COLLECTORS[0], COLLECTORS[3]];
+        for (mode, collector) in depth_first {
+            let (_dir, workspace) = with_collector(&files, collector);
+            let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+            resolver.ctx.config.lock.maven.mode = mode;
+            let graph = resolve_graph(&resolver, &workspace, "app/pom.xml")
+                .await
+                .unwrap_or_else(|error| panic!("{mode} {collector:?}: {error}"));
+            for (artifact, expected) in [("plain", "1"), ("blank", "1.ga")] {
+                let (_, node) = node_by_artifact(&graph, artifact);
+                assert_eq!(
+                    node.coord.version.as_str(),
+                    expected,
+                    "{artifact} {mode} {collector:?}"
+                );
+            }
+        }
+    }
+
+    /// Maven puts the reactor's modules into its range map in the order it
+    /// builds them, which raeva knows only once every module is built, so a
+    /// range among modules of one artifact whose versions compare equal but
+    /// are spelled apart is refused, also when a higher version from a
+    /// repository is listed, which mediation may pass over. Spellings that
+    /// differ in value, or one module, resolve.
+    #[tokio::test]
+    async fn a_range_among_equal_reactor_spellings_is_refused() {
+        let module = |artifact: &str, version: &str, body: &str| {
+            String::from_utf8(pom(
+                "g",
+                artifact,
+                version,
+                &format!("<packaging>pom</packaging>{body}"),
+            ))
+            .unwrap()
+        };
+        let pom_dependency = |version: &str| {
+            depends_on("a", version).replace("</version>", "</version><type>pom</type>")
+        };
+        let mut routes = HashMap::new();
+        listed(&mut routes, "a", &["2"], "<packaging>pom</packaging>");
+        for (second, range, expected) in [
+            (Some("1-0-final"), "[1,2)", None),
+            (Some("1-0-final"), "[1,3)", None),
+            (Some("1.1"), "[1,2)", Some("1.1")),
+            (None, "[1,2)", Some("1.0-final")),
+        ] {
+            let mut modules = String::from("<module>a-first</module>");
+            let mut files = vec![("a-first/pom.xml", module("a", "1.0-final", ""))];
+            if let Some(second) = second {
+                modules.push_str("<module>a-second</module>");
+                files.push(("a-second/pom.xml", module("a", second, "")));
+            }
+            modules.push_str("<module>app</module>");
+            let root = format!("<modules>{modules}</modules>");
+            files.push(("pom.xml", module("root", "1", &root)));
+            files.push(("app/pom.xml", module("app", "1", &pom_dependency(range))));
+            for (mode, collector) in COLLECTORS {
+                let case = format!("{second:?} {range} {mode} {collector:?}");
+                let (_dir, workspace) = with_collector(&files, collector);
+                let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                resolver.ctx.config.lock.maven.mode = mode;
+                let result = resolve_graph(&resolver, &workspace, "app/pom.xml").await;
+                match expected {
+                    Some(version) => {
+                        let graph = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+                        let (_, node) = node_by_artifact(&graph, "a");
+                        assert_eq!(node.coord.version.as_str(), version, "{case}");
+                    }
+                    None => {
+                        let error = result.map(drop).expect_err(&case).to_string();
+                        assert!(
+                            error.contains(&format!(
+                                "g:a {range} resolves among reactor modules \
+                                 a-first/pom.xml, a-second/pom.xml, and raeva cannot match"
+                            )),
+                            "{case}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A dependency's parent range over the reactor is refused alike.
+    #[tokio::test]
+    async fn a_parent_range_among_equal_reactor_spellings_is_refused() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/g/ext/1/ext-1.pom".to_string(),
+            b"<project><modelVersion>4.0.0</modelVersion><parent><groupId>g</groupId>\
+              <artifactId>p</artifactId><version>[1,2)</version><relativePath/></parent>\
+              <artifactId>ext</artifactId><version>1</version></project>"
+                .to_vec(),
+        );
+        routes.insert("/g/ext/1/ext-1.jar".to_string(), b"ext".to_vec());
+        let module = |artifact: &str, version: &str, body: &str| {
+            String::from_utf8(pom(
+                "g",
+                artifact,
+                version,
+                &format!("<packaging>pom</packaging>{body}"),
+            ))
+            .unwrap()
+        };
+        for (second, refused) in [("1-0-final", true), ("1.1", false)] {
+            let files = [
+                (
+                    "pom.xml",
+                    module(
+                        "root",
+                        "1",
+                        "<modules><module>p-first</module><module>p-second</module>\
+                         <module>app</module></modules>",
+                    ),
+                ),
+                ("p-first/pom.xml", module("p", "1.0-final", "")),
+                ("p-second/pom.xml", module("p", second, "")),
+                ("app/pom.xml", module("app", "1", &depends_on("ext", "1"))),
+            ];
+            for (mode, collector) in COLLECTORS {
+                let case = format!("{second} {mode} {collector:?}");
+                let (_dir, workspace) = with_collector(&files, collector);
+                let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                resolver.ctx.config.lock.maven.mode = mode;
+                let result = resolve_graph(&resolver, &workspace, "app/pom.xml").await;
+                match refused {
+                    true => {
+                        let error = result.map(drop).expect_err(&case).to_string();
+                        assert!(
+                            error.contains(
+                                "g:p [1,2) resolves among reactor modules \
+                                 p-first/pom.xml, p-second/pom.xml, and raeva cannot match"
+                            ),
+                            "{case}: {error}"
+                        );
+                    }
+                    false => {
+                        result.unwrap_or_else(|error| panic!("{case}: {error}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Maven lists a reactor module in a range only when the module has the
+    /// artifact asked for, which for any but its main artifact depends on
+    /// what its build has run, so such a range is refused. A range for the
+    /// main artifact, or for the POM, resolves to the module, and in Maven
+    /// 3.9 also one for a POM with a classifier. A packaging named through a
+    /// property, or one the consumer has no handler for, makes the main
+    /// artifact a plain request asks for.
+    #[tokio::test]
+    async fn a_range_for_a_reactor_modules_other_artifact_is_refused() {
+        let mut routes = HashMap::new();
+        listed(&mut routes, "lib", &["1"], "");
+        routes.insert("/g/lib/1/lib-1-tests.jar".to_string(), b"tests".to_vec());
+        routes.insert("/g/lib/1/lib-1.jar".to_string(), b"main".to_vec());
+        let classified_pom = "<type>pom</type><classifier>tests</classifier>";
+        for (packaging, request, refused) in [
+            ("pom", "<classifier>tests</classifier>", [true, true]),
+            ("jar", "<classifier>tests</classifier>", [true, true]),
+            ("jar", "<type>test-jar</type>", [true, true]),
+            ("pom", "", [true, true]),
+            ("pom", classified_pom, [false, true]),
+            ("jar", "", [false, false]),
+            ("pom", "<type>pom</type>", [false, false]),
+            ("${kind}", "", [false, false]),
+            ("bundle", "", [false, false]),
+        ] {
+            let lib = pom(
+                "g",
+                "lib",
+                "2",
+                &format!(
+                    "<packaging>{packaging}</packaging><properties><kind>jar</kind></properties>"
+                ),
+            );
+            let app =
+                depends_on("lib", "[1,3)").replace("</version>", &format!("</version>{request}"));
+            let files = [
+                (
+                    "pom.xml",
+                    String::from_utf8(pom(
+                        "g",
+                        "root",
+                        "1",
+                        "<packaging>pom</packaging><modules><module>lib</module>\
+                         <module>app</module></modules>",
+                    ))
+                    .unwrap(),
+                ),
+                ("lib/pom.xml", String::from_utf8(lib).unwrap()),
+                (
+                    "app/pom.xml",
+                    String::from_utf8(pom("g", "app", "1", &app)).unwrap(),
+                ),
+            ];
+            for (mode, collector) in COLLECTORS {
+                let case = format!("{packaging} {request:?} {mode} {collector:?}");
+                let (_dir, workspace) = with_collector(&files, collector);
+                let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                resolver.ctx.config.lock.maven.mode = mode;
+                let result = resolve_graph(&resolver, &workspace, "app/pom.xml").await;
+                let refused = refused[usize::from(mode == rv_maven_types::MavenMode::Maven310)];
+                if refused {
+                    let error = result.map(drop).expect_err(&case).to_string();
+                    assert!(
+                        error.contains(
+                            "g:lib [1,3) resolves among reactor modules lib/pom.xml, \
+                             and raeva cannot match"
+                        ),
+                        "{case}: {error}"
+                    );
+                } else {
+                    let graph = result.unwrap_or_else(|error| panic!("{case}: {error}"));
+                    let (_, node) = node_by_artifact(&graph, "lib");
+                    assert_eq!(node.coord.version.as_str(), "2", "{case}");
+                }
+            }
+        }
+    }
+
+    /// A module whose own range, or a range below it, takes a version from
+    /// a repository over the module is no cycle: maven-resolver collects
+    /// every version in the range and mediates after, and `ProjectSorter`
+    /// drops a module's link to itself. Maven 3.9.12 and 3.10.0 resolve
+    /// these, with either collector.
+    #[tokio::test]
+    async fn a_module_that_loses_a_range_over_itself_is_no_cycle() {
+        let mut routes = HashMap::new();
+        listed(&mut routes, "self-lib", &["1", "2"], "");
+        listed(&mut routes, "looped", &["1", "2"], "");
+        listed(&mut routes, "ext", &["1"], &depends_on("looped", "[1,)"));
+        for (module, dependency, version, artifact, expected) in [
+            ("self-lib", "self-lib", "[1,)", "self-lib", ("2", false)),
+            ("self-lib", "self-lib", "[2,)", "self-lib", ("2", false)),
+            ("self-lib", "self-lib", "2", "self-lib", ("2", false)),
+            ("looped", "ext", "1", "looped", ("2", false)),
+        ] {
+            let body = depends_on(dependency, version);
+            let project = String::from_utf8(pom("g", module, "1", &body)).unwrap();
+            for (mode, collector) in COLLECTORS {
+                let (_dir, workspace) = with_collector(&[("pom.xml", project.clone())], collector);
+                let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                resolver.ctx.config.lock.maven.mode = mode;
+                let case = format!("{module} -> {dependency}:{version} {mode} {collector:?}");
+                let graph = resolve_graph(&resolver, &workspace, "pom.xml")
+                    .await
+                    .unwrap_or_else(|error| panic!("{case}: {error}"));
+                let resolved: Vec<_> = (graph.node_indices())
+                    .filter(|&index| index != graph.root())
+                    .filter_map(|index| graph.node(index))
+                    .filter(|node| node.coord.artifact_id.as_str() == artifact)
+                    .map(|node| (node.coord.version.as_str(), node.workspace_module.is_some()))
+                    .collect();
+                assert_eq!(resolved, [expected], "{case}");
+            }
+        }
+    }
+
+    /// A module has built nothing when Maven resolves its own dependencies,
+    /// so its reactor reader serves only the module's POM (in Maven 3.10
+    /// one without a classifier). Another artifact of the module's own
+    /// coordinates comes from a repository, and a range over them lists
+    /// only what the repositories list. Maven 3.9.12 and 3.10.0 resolve
+    /// these, with either collector.
+    #[tokio::test]
+    async fn a_module_takes_its_own_artifact_from_a_repository() {
+        let mut routes = HashMap::new();
+        listed(&mut routes, "self-lib", &["1"], "");
+        listed(&mut routes, "ext", &["1"], &depends_on("self-lib", "2"));
+        let typed = |version: &str, extra: &str| {
+            format!(
+                "<dependencies><dependency><groupId>g</groupId><artifactId>self-lib</artifactId>\
+                 <version>{version}</version>{extra}</dependency></dependencies>"
+            )
+        };
+        let pom_type = "<type>pom</type>";
+        let classified_pom = "<type>pom</type><classifier>c</classifier>";
+        for (version, body, expected) in [
+            ("1", typed("[1,1]", ""), [("1", false); 2]),
+            ("1", typed("[1]", ""), [("1", false); 2]),
+            (
+                "1",
+                typed("[1,1]", "<scope>test</scope>"),
+                [("1", false); 2],
+            ),
+            (
+                "1",
+                typed("[1,1]", "<classifier>tests</classifier>"),
+                [("1", false); 2],
+            ),
+            ("1", typed("[1,1]", pom_type), [("1", true); 2]),
+            (
+                "1",
+                typed("[1,1]", classified_pom),
+                [("1", true), ("1", false)],
+            ),
+            ("2", depends_on("ext", "1"), [("2", false); 2]),
+            ("2", typed("[1,3)", ""), [("1", false); 2]),
+            (
+                "1",
+                typed("[1,3)", "<classifier>tests</classifier>"),
+                [("1", false); 2],
+            ),
+            ("2", typed("[1,3)", pom_type), [("2", true); 2]),
+        ] {
+            let project = String::from_utf8(pom("g", "self-lib", version, &body)).unwrap();
+            for (mode, collector) in COLLECTORS {
+                let (_dir, workspace) = with_collector(&[("pom.xml", project.clone())], collector);
+                let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                resolver.ctx.config.lock.maven.mode = mode;
+                let case = format!("self-lib:{version} {body} {mode} {collector:?}");
+                let graph = resolve_graph(&resolver, &workspace, "pom.xml")
+                    .await
+                    .unwrap_or_else(|error| panic!("{case}: {error}"));
+                let resolved: Vec<_> = (graph.node_indices())
+                    .filter(|&index| index != graph.root())
+                    .filter_map(|index| graph.node(index))
+                    .filter(|node| node.coord.artifact_id.as_str() == "self-lib")
+                    .map(|node| (node.coord.version.as_str(), node.workspace_module.is_some()))
+                    .collect();
+                let expected = expected[usize::from(mode == rv_maven_types::MavenMode::Maven310)];
+                assert_eq!(resolved, [expected], "{case}");
+            }
+        }
+    }
+
+    /// Maven refuses a project that declares a dependency on its own
+    /// groupId, artifactId and version, whichever version mediation would
+    /// keep, as written or once its model is built.
+    #[tokio::test]
+    async fn a_project_that_depends_on_its_own_version_fails() {
+        let mut routes = HashMap::new();
+        listed(&mut routes, "a", &["2"], "");
+        listed(&mut routes, "b", &["1"], &depends_on("a", "[2,)"));
+        let dependencies = |entries: &[(&str, &str)]| {
+            let entries: String = (entries.iter())
+                .map(|(artifact, version)| {
+                    format!(
+                        "<dependency><groupId>g</groupId><artifactId>{artifact}</artifactId>\
+                         <version>{version}</version></dependency>"
+                    )
+                })
+                .collect();
+            format!("<dependencies>{entries}</dependencies>")
+        };
+        let managed = "<properties><v>1</v></properties><dependencyManagement><dependencies>\
+                       <dependency><groupId>g</groupId><artifactId>a</artifactId>\
+                       <version>1</version></dependency></dependencies></dependencyManagement>\
+                       <dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId>\
+                       </dependency></dependencies>";
+        for (body, field) in [
+            (dependencies(&[("a", "1")]), "dependencies.dependency"),
+            (
+                dependencies(&[("b", "1"), ("a", "1")]),
+                "dependencies.dependency",
+            ),
+            (
+                dependencies(&[("a", "${v}")]).replace(
+                    "<dependencies>",
+                    "<properties><v>1</v></properties><dependencies>",
+                ),
+                "dependencies.dependency.",
+            ),
+            (managed.to_string(), "dependencies.dependency."),
+        ] {
+            let project = String::from_utf8(pom("g", "a", "1", &body)).unwrap();
+            for (mode, collector) in COLLECTORS {
+                let case = format!("{body} {mode} {collector:?}");
+                let dir = tempfile::tempdir().expect("tempdir");
+                std::fs::write(dir.path().join("pom.xml"), &project).expect("write pom");
+                if let Some(collector) = collector {
+                    std::fs::create_dir(dir.path().join(".mvn")).expect("mkdir");
+                    let line = format!("-Daether.dependencyCollector.impl={collector}\n");
+                    std::fs::write(dir.path().join(".mvn/maven.config"), line).expect("write");
+                }
+                // The POM as written fails discovery, the built model the
+                // resolution.
+                let error = match Workspace::discover(dir.path()) {
+                    Err(error) => error.to_string(),
+                    Ok(workspace) => {
+                        let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                        resolver.ctx.config.lock.maven.mode = mode;
+                        let result = resolve_graph(&resolver, &workspace, "pom.xml").await;
+                        result.map(drop).expect_err(&case).to_string()
+                    }
+                };
+                let expected = format!("'{field}[g:a:1]' for g:a:1 is referencing itself.");
+                assert!(error.contains(&expected), "{case}: {error}");
+            }
+        }
+    }
+
+    /// A project's parent is validated as written too, from a repository or
+    /// a local path, and Maven 3.9.12 and 3.10.0 refuse one that declares
+    /// itself, though the project declares another version over it.
+    #[tokio::test]
+    async fn a_parent_that_depends_on_its_own_version_fails() {
+        let self_pom = "<type>pom</type></dependency></dependencies>";
+        let parent = String::from_utf8(pom(
+            "g",
+            "p",
+            "1",
+            &format!("<packaging>pom</packaging>{}", depends_on("p", "1")),
+        ))
+        .unwrap()
+        .replace("</dependency></dependencies>", self_pom);
+        let mut routes = HashMap::new();
+        routes.insert("/g/p/1/p-1.pom".to_string(), parent.clone().into_bytes());
+        routes.insert(
+            "/g/p/2/p-2.pom".to_string(),
+            pom("g", "p", "2", "<packaging>pom</packaging>"),
+        );
+        for relative in ["", "parent/pom.xml"] {
+            let child = String::from_utf8(pom("g", "child", "1", &depends_on("p", "2")))
+                .unwrap()
+                .replace("</dependency></dependencies>", self_pom)
+                .replace(
+                    "<groupId>g</groupId><artifactId>child</artifactId>",
+                    &format!(
+                        "<parent><groupId>g</groupId><artifactId>p</artifactId>\
+                         <version>1</version><relativePath>{relative}</relativePath></parent>\
+                         <groupId>g</groupId><artifactId>child</artifactId>"
+                    ),
+                );
+            let mut files = vec![("pom.xml", child)];
+            if !relative.is_empty() {
+                files.push((relative, parent.clone()));
+            }
+            for (mode, collector) in COLLECTORS {
+                let case = format!("{relative:?} {mode} {collector:?}");
+                let dir = tempfile::tempdir().expect("tempdir");
+                let mut files = files.clone();
+                if let Some(collector) = collector {
+                    let line = format!("-Daether.dependencyCollector.impl={collector}\n");
+                    files.push((".mvn/maven.config", line));
+                }
+                for (path, contents) in &files {
+                    let path = dir.path().join(path);
+                    std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+                    std::fs::write(path, contents).expect("write file");
+                }
+                // Discovery reads a local parent, the resolution one from a
+                // repository.
+                let error = match Workspace::discover(dir.path()) {
+                    Err(error) => error.to_string(),
+                    Ok(workspace) => {
+                        let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                        resolver.ctx.config.lock.maven.mode = mode;
+                        let result = resolve_graph(&resolver, &workspace, "pom.xml").await;
+                        result.map(drop).expect_err(&case).to_string()
+                    }
+                };
+                let expected = "'dependencies.dependency[g:p:1]' for g:p:1 is referencing itself.";
+                assert!(error.contains(expected), "{case}: {error}");
+            }
+        }
+    }
+
+    /// Two modules that depend on each other fail with either collector,
+    /// also through ranges that a repository's higher versions win:
+    /// `ProjectSorter` links a range to every module in it.
+    #[tokio::test]
+    async fn modules_that_depend_on_each_other_fail_with_either_collector() {
+        let mut routes = HashMap::new();
+        listed(&mut routes, "a", &["1", "2"], "");
+        listed(&mut routes, "b", &["1", "2"], "");
+        let root = String::from_utf8(pom(
+            "g",
+            "root",
+            "1",
+            "<packaging>pom</packaging><modules><module>a</module><module>b</module></modules>",
+        ))
+        .unwrap();
+        for version in ["1", "[1,)"] {
+            let files = [
+                ("pom.xml", root.clone()),
+                (
+                    "a/pom.xml",
+                    String::from_utf8(pom("g", "a", "1", &depends_on("b", version))).unwrap(),
+                ),
+                (
+                    "b/pom.xml",
+                    String::from_utf8(pom("g", "b", "1", &depends_on("a", version))).unwrap(),
+                ),
+            ];
+            for (mode, collector) in COLLECTORS {
+                let (_dir, workspace) = with_collector(&files, collector);
+                let (mut resolver, _store) = memory_resolver(workspace.root(), &routes);
+                resolver.ctx.config.lock.maven.mode = mode;
+                let case = format!("{version} {mode} {collector:?}");
+                match resolver.resolve_workspace(&workspace).await {
+                    Err(ResolveError::WorkspaceDependencyCycle { cycle }) => {
+                        assert_eq!(cycle, "g:a -> g:b -> g:a", "{case}")
+                    }
+                    other => panic!("{case}: {:?}", other.map(|_| ())),
+                }
+            }
+        }
     }
 
     /// Resolution reads module POMs through `\\?\` paths on Windows but must
@@ -1784,6 +2472,67 @@ mod workspace_resolution {
         );
     }
 
+    /// An imported BOM, built as Maven builds one, imports another without
+    /// the classifier written on it, as Maven 3.9.12 and 3.10.0 look it up.
+    #[tokio::test]
+    async fn an_import_from_a_bom_is_looked_up_without_its_classifier() {
+        let app = pom(
+            "com.example",
+            "app",
+            "1",
+            "<dependencyManagement><dependencies><dependency><groupId>g</groupId>\
+             <artifactId>bom</artifactId><version>1</version><type>pom</type>\
+             <scope>import</scope></dependency></dependencies></dependencyManagement>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>leaf</artifactId>\
+             </dependency></dependencies>",
+        );
+        let (_dir, workspace) = reactor(&[("pom.xml", std::str::from_utf8(&app).unwrap())]);
+        let management = |body: &str| {
+            format!(
+                "<packaging>pom</packaging><dependencyManagement><dependencies>{body}</dependencies></dependencyManagement>"
+            )
+        };
+        let routes = HashMap::from([
+            (
+                "/g/bom/1/bom-1.pom".to_string(),
+                pom(
+                    "g",
+                    "bom",
+                    "1",
+                    &management(
+                        "<dependency><groupId>g</groupId><artifactId>inner</artifactId>\
+                         <version>1</version><type>pom</type><scope>import</scope>\
+                         <classifier>tests</classifier></dependency>",
+                    ),
+                ),
+            ),
+            (
+                "/g/inner/1/inner-1.pom".to_string(),
+                pom(
+                    "g",
+                    "inner",
+                    "1",
+                    &management(
+                        "<dependency><groupId>g</groupId><artifactId>leaf</artifactId>\
+                         <version>2</version></dependency>",
+                    ),
+                ),
+            ),
+            (
+                "/g/leaf/2/leaf-2.pom".to_string(),
+                pom("g", "leaf", "2", ""),
+            ),
+        ]);
+        let (resolver, _store) = memory_resolver(workspace.root(), &routes);
+        let graph = resolve_graph(&resolver, &workspace, "pom.xml")
+            .await
+            .unwrap();
+        assert_eq!(
+            node_by_artifact(&graph, "leaf").1.coord.version.as_str(),
+            "2"
+        );
+    }
+
     /// A dependency's parent is asked for as soon as the dependency's POM
     /// arrives, before its `.sha256` answers: a repository may take far
     /// longer for that 404 than for the POM. Here the 404s of the dependency
@@ -1886,6 +2635,138 @@ mod workspace_resolution {
             state.0.lock().unwrap().1,
             [true, true],
             "the grandparent was not asked for before the .sha256 files answered"
+        );
+    }
+
+    /// A `-SNAPSHOT` dependency's jar downloads beside the graph, as a
+    /// released one's does: spring-cloud-gateway downloaded its 78 only
+    /// once every graph was in.
+    #[tokio::test]
+    async fn a_snapshot_jar_downloads_beside_the_graph() {
+        const BUILD: &str = "/s/a/1.0-SNAPSHOT/a-1.0-20240101.010101-1";
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/s/a/1.0-SNAPSHOT/maven-metadata.xml".to_string(),
+            b"<metadata><versioning><snapshotVersions><snapshotVersion><extension>pom\
+              </extension><value>1.0-20240101.010101-1</value></snapshotVersion>\
+              <snapshotVersion><extension>jar</extension><value>1.0-20240101.010101-1\
+              </value></snapshotVersion></snapshotVersions></versioning></metadata>"
+                .to_vec(),
+        );
+        routes.insert(format!("{BUILD}.pom"), pom("s", "a", "1.0-SNAPSHOT", ""));
+        routes.insert(format!("{BUILD}.jar"), b"snapshot jar".to_vec());
+        let (url, server) = spawn_repository_with_routes(routes);
+        let (_dir, workspace) = reactor(&[(
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+             <artifactId>root</artifactId><version>1</version><dependencies><dependency>\
+             <groupId>s</groupId><artifactId>a</artifactId><version>1.0-SNAPSHOT</version>\
+             </dependency></dependencies></project>",
+        )]);
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        resolve_graph(&resolver, &workspace, "pom.xml")
+            .await
+            .unwrap();
+        let jar = format!("{BUILD}.jar");
+        let asked = || (server.requests().iter()).any(|request| request.path == jar);
+        for _ in 0..100 {
+            if asked() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("{jar} was not downloaded beside the graph");
+    }
+
+    /// Imported `-SNAPSHOT` BOMs are fetched at once, each through its
+    /// `maven-metadata.xml`, as released ones are: spring-cloud-gateway
+    /// read its six one after another, two round trips each. Here the first
+    /// BOM's metadata waits up to five seconds for the second's to be asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn snapshot_imports_are_fetched_at_once() {
+        use std::io::Write;
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+
+        let (_dir, workspace) = reactor(&[(
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+             <artifactId>root</artifactId><version>1</version><dependencyManagement>\
+             <dependencies><dependency><groupId>s</groupId><artifactId>a</artifactId>\
+             <version>1.0-SNAPSHOT</version><type>pom</type><scope>import</scope>\
+             </dependency><dependency><groupId>s</groupId><artifactId>b</artifactId>\
+             <version>1.0-SNAPSHOT</version><type>pom</type><scope>import</scope>\
+             </dependency></dependencies></dependencyManagement></project>",
+        )]);
+        let metadata = b"<metadata><versioning><snapshotVersions><snapshotVersion>\
+            <extension>pom</extension><value>1.0-20240101.010101-1</value>\
+            </snapshotVersion></snapshotVersions></versioning></metadata>"
+            .to_vec();
+        // Whether b's metadata was asked for, and whether a's saw that.
+        let state = Arc::new((Mutex::new((false, Vec::new())), Condvar::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("addr"));
+        let serving = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (state, metadata) = (Arc::clone(&serving), metadata.clone());
+                std::thread::spawn(move || {
+                    let Some(head) = rv_test_support::http::read_request_head_blocking(&mut stream)
+                    else {
+                        return;
+                    };
+                    let head = String::from_utf8_lossy(&head);
+                    let path = head.split_whitespace().nth(1).unwrap_or_default();
+                    let (lock, asked) = &*state;
+                    let body = match path {
+                        "/s/a/1.0-SNAPSHOT/maven-metadata.xml" => {
+                            let guard = lock.lock().unwrap();
+                            let (mut guard, _) = asked
+                                .wait_timeout_while(guard, Duration::from_secs(5), |seen| !seen.0)
+                                .unwrap();
+                            let seen = guard.0;
+                            guard.1.push(seen);
+                            Some(metadata)
+                        }
+                        "/s/b/1.0-SNAPSHOT/maven-metadata.xml" => {
+                            lock.lock().unwrap().0 = true;
+                            asked.notify_all();
+                            Some(metadata)
+                        }
+                        "/s/a/1.0-SNAPSHOT/a-1.0-20240101.010101-1.pom" => {
+                            Some(pom("s", "a", "1.0-SNAPSHOT", "<packaging>pom</packaging>"))
+                        }
+                        "/s/b/1.0-SNAPSHOT/b-1.0-20240101.010101-1.pom" => {
+                            Some(pom("s", "b", "1.0-SNAPSHOT", "<packaging>pom</packaging>"))
+                        }
+                        _ => None,
+                    };
+                    let response = match body {
+                        Some(body) => {
+                            let mut response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            response.extend(body);
+                            response
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    };
+                    let _ = stream.write_all(&response);
+                });
+            }
+        });
+        let (resolver, _store) = resolver(workspace.root(), Some(&url), false, true).await;
+        resolve_graph(&resolver, &workspace, "pom.xml")
+            .await
+            .expect("resolves");
+        assert_eq!(
+            state.0.lock().unwrap().1,
+            [true],
+            "the second BOM was not asked for while the first's metadata was pending"
         );
     }
 
@@ -2279,6 +3160,158 @@ mod workspace_resolution {
             "1"
         );
         assert_eq!(a.workspace_module.as_deref(), Some("a/pom.xml"));
+    }
+
+    /// Maven 3.9 collects depth first and 3.10 breadth first, each unless
+    /// `aether.dependencyCollector.impl` names the other; another name
+    /// fails, as Maven fails.
+    #[test]
+    fn the_collector_follows_the_maven_line_and_its_property() {
+        use rv_maven_types::MavenMode::{Maven39, Maven310};
+        let pom = "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+                   <artifactId>a</artifactId><version>1</version></project>";
+        for (config, v39, v310) in [
+            (None, Some(true), Some(false)),
+            (Some("bf"), Some(false), Some(false)),
+            (Some("df"), Some(true), Some(true)),
+            (Some("dfs"), None, None),
+        ] {
+            let mut files = vec![("pom.xml", pom.to_string())];
+            if let Some(collector) = config {
+                let line = format!("-Daether.dependencyCollector.impl={collector}\n");
+                files.push((".mvn/maven.config", line));
+            }
+            let files: Vec<_> = (files.iter())
+                .map(|(path, body)| (*path, &**body))
+                .collect();
+            let (_dir, workspace) = reactor(&files);
+            for (mode, expected) in [(Maven39, v39), (Maven310, v310)] {
+                let (mut resolver, _store) = memory_resolver(workspace.root(), &HashMap::new());
+                resolver.ctx.config.lock.maven.mode = mode;
+                let depth_first = resolver.collects_depth_first(&workspace).ok();
+                assert_eq!(depth_first, expected, "{config:?} {mode}");
+            }
+        }
+    }
+
+    /// Maven's `ProjectSorter` refuses a reactor whose links form a cycle:
+    /// through a dependency of any scope, a parent link taken after the
+    /// parent's own link back, and in the 3.10 mode an import. Maven 3.9.12
+    /// and 3.10.0 sort `p` before its child `c` when `p` is taken first.
+    #[tokio::test]
+    async fn a_reactor_whose_sorter_links_cycle_fails() {
+        let project = |artifact: &str, body: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+                 <artifactId>{artifact}</artifactId><version>1</version>{body}</project>"
+            )
+        };
+        let depends = |artifact: &str, scope: &str| {
+            format!(
+                "<dependencies><dependency><groupId>g</groupId><artifactId>{artifact}\
+                 </artifactId><version>1</version><scope>{scope}</scope></dependency>\
+                 </dependencies>"
+            )
+        };
+        let (a, b) = (
+            project("a", &depends("b", "test")),
+            project("b", &depends("a", "test")),
+        );
+        let p = project(
+            "p",
+            &format!(
+                "<packaging>pom</packaging><profiles><profile><id>x</id><activation><file>\
+                 <exists>${{basedir}}/marker</exists></file></activation>{}</profile>\
+                 </profiles>",
+                depends("c", "compile")
+            ),
+        );
+        let c = "<project><modelVersion>4.0.0</modelVersion><parent><groupId>g</groupId>\
+                 <artifactId>p</artifactId><version>1</version><relativePath>../p</relativePath>\
+                 </parent><artifactId>c</artifactId></project>";
+        let app = project(
+            "app",
+            "<dependencyManagement><dependencies><dependency><groupId>g</groupId>\
+             <artifactId>bom</artifactId><version>${project.version}</version><type>pom</type>\
+             <scope>import</scope></dependency></dependencies></dependencyManagement>",
+        );
+        let bom = project(
+            "bom",
+            &format!("<packaging>pom</packaging>{}", depends("app", "compile")),
+        );
+        // A plugin or extension link closing a cycle is left out, but one
+        // added first fails the link that closes the cycle after it.
+        let build = |build: &str| project("user", &format!("<build>{build}</build>"));
+        let plugin = build(
+            "<plugins><plugin><groupId>g</groupId><artifactId>tool</artifactId>\
+             <version>1</version></plugin></plugins>",
+        );
+        let extension = build(
+            "<extensions><extension><groupId>g</groupId><artifactId>tool</artifactId>\
+             <version>1</version></extension></extensions>",
+        );
+        let tool = project("tool", &depends("user", "compile"));
+        use rv_maven_types::MavenMode::{Maven39 as v39, Maven310 as v310};
+        for (mode, modules, cycle) in [
+            (
+                v39,
+                [("user", &plugin), ("tool", &tool)],
+                Some("g:user -> g:tool -> g:user"),
+            ),
+            (
+                v310,
+                [("user", &extension), ("tool", &tool)],
+                Some("g:user -> g:tool -> g:user"),
+            ),
+            (v39, [("tool", &tool), ("user", &plugin)], None),
+            (v39, [("a", &a), ("b", &b)], Some("g:a -> g:b -> g:a")),
+            (v39, [("p", &p), ("c", &c.to_string())], None),
+            (
+                v39,
+                [("c", &c.to_string()), ("p", &p)],
+                Some("g:c -> g:p -> g:c"),
+            ),
+            (v39, [("app", &app), ("bom", &bom)], None),
+            (
+                v310,
+                [("app", &app), ("bom", &bom)],
+                Some("g:app -> g:bom -> g:app"),
+            ),
+        ] {
+            let root = project(
+                "root",
+                &format!(
+                    "<packaging>pom</packaging><modules><module>{}</module><module>{}</module>\
+                     </modules>",
+                    modules[0].0, modules[1].0
+                ),
+            );
+            let files: Vec<_> = (modules.iter())
+                .map(|(name, pom)| (format!("{name}/pom.xml"), pom.to_string()))
+                .chain([
+                    ("pom.xml".to_string(), root),
+                    ("p/marker".to_string(), String::new()),
+                ])
+                .collect();
+            let files: Vec<_> = (files.iter())
+                .map(|(path, body)| (&**path, &**body))
+                .collect();
+            let (_dir, workspace) = reactor(&files);
+            let (mut resolver, _store) = memory_resolver(workspace.root(), &HashMap::new());
+            resolver.ctx.config.lock.maven.mode = mode;
+            let result = resolver.resolve_workspace(&workspace).await;
+            match cycle {
+                Some(expected) => match result {
+                    Err(ResolveError::WorkspaceDependencyCycle { cycle }) => {
+                        assert_eq!(cycle, expected)
+                    }
+                    other => panic!("{expected}: {:?}", other.map(|_| ())),
+                },
+                None => {
+                    result.unwrap_or_else(|error| panic!("{modules:?}: {error}"));
+                }
+            }
+        }
     }
 
     /// Two modules that discovery sees with the same `${revision}` are told
@@ -3093,6 +4126,61 @@ mod workspace_resolution {
         assert!(jars.is_empty(), "{jars:?}");
     }
 
+    /// The model a module's build extensions are read from writes its
+    /// parents and BOMs with the module's at the end of the pass, not one
+    /// synced store write each on the way: on spring-cloud-gateway, whose
+    /// management names `klib`, every module spent 1.5 s on them before its
+    /// graph started. A failed graph leaves none of them indexed.
+    #[tokio::test]
+    async fn extension_types_write_their_parents_with_the_pass() {
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/p/parent/1/parent-1.pom".to_string(),
+            pom(
+                "p",
+                "parent",
+                "1",
+                "<packaging>pom</packaging><dependencyManagement><dependencies>\
+                 <dependency><groupId>lib</groupId><artifactId>native</artifactId>\
+                 <version>1</version><type>klib</type></dependency></dependencies>\
+                 </dependencyManagement>",
+            ),
+        );
+        let (url, _server) = spawn_repository_with_routes(routes);
+        let module = String::from_utf8(pom(
+            "t",
+            "a",
+            "1",
+            "<parent><groupId>p</groupId><artifactId>parent</artifactId><version>1</version>\
+             <relativePath/></parent><dependencies><dependency><groupId>lib</groupId>\
+             <artifactId>ok</artifactId><version>1</version>\
+             <classifier>${undefined.classifier}</classifier></dependency></dependencies>",
+        ))
+        .unwrap();
+        let (_dir, workspace) = reactor(&[
+            (
+                "pom.xml",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                 <modules><module>a</module></modules></project>",
+            ),
+            ("a/pom.xml", &module),
+        ]);
+        let (resolver, store_dir) = resolver(workspace.root(), Some(&url), false, true).await;
+
+        let error = resolver
+            .resolve_workspace(&workspace)
+            .await
+            .expect_err("a's classifier is undefined");
+        assert!(
+            error.to_string().contains("undefined.classifier"),
+            "{error}"
+        );
+        let store = Store::open(store_dir.path()).expect("store");
+        let parent = rv_maven_types::ArtifactCoord::new("p", "parent", "1", "pom", None);
+        assert!(store.lookup_artifact(&parent).await.unwrap().is_none());
+    }
+
     /// A pom-packaged dependency's artifact is the POM its model was read
     /// from, so it is not downloaded again beside the resolution.
     #[tokio::test]
@@ -3476,11 +4564,16 @@ async fn root_project_reads_its_local_parent() {
     let workspace = Workspace::discover(&child_dir).expect("single-module workspace");
     assert_eq!(workspace.len(), 1);
     let resolver = offline_resolver(&child_dir, &checkout.path().join("store"));
-    let (_, project, observed, _) = resolver
+    let super::RootProject {
+        project,
+        observed_repos: observed,
+        ..
+    } = resolver
         .load_root_project(
             &child_dir.join("pom.xml"),
             &[],
             Arc::new(workspace),
+            None,
             None,
             None,
         )
@@ -3501,10 +4594,10 @@ async fn root_project_reads_its_local_parent() {
 }
 
 /// Root `file://${project.basedir}` repositories reach the solver after
-/// interpolation. Unsupported schemes fail before resolution, and the error
-/// does not show the URL's credentials.
-#[tokio::test]
-async fn root_repository_urls_are_interpolated_and_bad_schemes_fail_fast() {
+/// interpolation. A repository of a scheme raeva has no transport for is
+/// skipped with a warning, as Maven skips it, which does not show the URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn root_repository_urls_are_interpolated_and_bad_schemes_are_skipped() {
     let pom_for = |url: &str| {
         format!(
             "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
@@ -3523,12 +4616,20 @@ async fn root_repository_urls_are_interpolated_and_bad_schemes_fail_fast() {
     );
     assert!(observed.iter().all(|repo| !repo.url.contains("${")));
 
-    let (_dir, loaded) = load_root(&pom_for("ftp://alice:s3cret@files.example/m2/"), &[]).await;
-    let err = loaded.expect_err("ftp repositories are unsupported");
+    let ftp = pom_for("ftp://alice:s3cret@files.example/m2/");
+    let mut loaded = None;
+    let log = rv_test_support::capture_warnings(|| {
+        let runtime = tokio::runtime::Handle::current();
+        loaded = Some(tokio::task::block_in_place(|| {
+            runtime.block_on(load_root(&ftp, &[]))
+        }));
+    });
+    let (_dir, loaded) = loaded.unwrap();
+    loaded.expect("an ftp repository is skipped");
+    assert!(log.contains("REPOSITORY_IGNORED"), "{log}");
     assert!(
-        err.to_string()
-            .contains("unsupported URL 'ftp://files.example/m2/'"),
-        "{err}"
+        !log.contains("s3cret") && !log.contains("files.example"),
+        "{log}"
     );
 }
 
@@ -3676,4 +4777,139 @@ mod stall_watchdog {
         assert!(fired.is_err(), "{fired:?}");
         ticker.abort();
     }
+}
+
+/// A range is evicted when no node of its `group:artifact` holds its
+/// highest listed version: a SNAPSHOT node holds its base version, and a
+/// node holds every spelling that compares equal to its own.
+#[test]
+fn an_evicted_range_is_one_whose_highest_version_no_node_holds() {
+    use crate::graph::{Edge, Graph, Node};
+    let node = |coord: &str| Node {
+        coord: Coord::parse(coord).unwrap(),
+        scope: rv_maven_model::Scope::Compile,
+        repo_url: None,
+        build_repo: None,
+        repos: crate::context::RepoContext::default(),
+        checksum: None,
+        workspace_module: None,
+        local: false,
+        system_path: None,
+        winner_parent: None,
+        version_origin: Default::default(),
+    };
+    let mut graph = Graph::new(node("g:root:1"));
+    for coord in [
+        "g:snap:1.0-20260101.010101-1",
+        "g:eq:3.0",
+        "g:won:2",
+        "g:lost:1",
+        "g:both:1",
+        "g:both:2",
+        "g:fewer:3",
+    ] {
+        let index = graph.insert_node(node(coord));
+        let edge = Edge {
+            scope: rv_maven_model::Scope::Compile,
+            managed_scope: false,
+            declared: None,
+            optional: false,
+            exclusions: Vec::new(),
+            requested: None,
+        };
+        graph.add_edge(graph.root(), index, edge);
+    }
+    let mut listings = super::backend::RangeListings::new();
+    for (artifact, range, versions) in [
+        ("snap", "[0.9,2)", &["0.9", "1.0-SNAPSHOT"][..]),
+        ("eq", "[3,4)", &["3.0", "3.0.0"]),
+        ("won", "[1,3)", &["1", "2"]),
+        ("lost", "[1,3)", &["1", "2"]),
+        ("absent", "[1,2)", &["1"]),
+    ] {
+        listings
+            .entry(("g".into(), artifact.into(), range.into()))
+            .or_default()
+            .insert(
+                format!("https://{artifact}.example/"),
+                versions.iter().map(|v| v.to_string()).collect(),
+            );
+    }
+    // A second repository's list makes a line of its own, with its versions.
+    (listings
+        .get_mut(&("g".into(), "lost".into(), "[1,3)".into()))
+        .unwrap())
+    .insert("https://other.example/".into(), ["2".to_string()].into());
+    // `won` is listed by two repositories, one without the version taken.
+    (listings
+        .get_mut(&("g".into(), "won".into(), "[1,3)".into()))
+        .unwrap())
+    .insert("https://behind.example/".into(), ["1".to_string()].into());
+    // `both` is read through two repositories, each node of it through
+    // one: each took the highest version its own list names.
+    let both = (listings.entry(("g".into(), "both".into(), "[1,3)".into()))).or_default();
+    both.insert("https://one.example/".into(), ["1".to_string()].into());
+    both.insert("https://two.example/".into(), ["2".to_string()].into());
+    // `fewer` is read once through a repository whose highest version lost
+    // and once through it and another. `won` is read once through both of
+    // its repositories, so the one behind is no read of its own.
+    let fewer = (listings.entry(("g".into(), "fewer".into(), "[1,4)".into()))).or_default();
+    fewer.insert(
+        "https://fewer.example/".into(),
+        ["1", "2"].map(String::from).into(),
+    );
+    fewer.insert("https://ahead.example/".into(), ["3".to_string()].into());
+    let mut reads = super::backend::RangeReads::new();
+    for (artifact, range, origins) in [
+        ("fewer", "[1,4)", &["fewer"][..]),
+        ("fewer", "[1,4)", &["fewer", "ahead"]),
+        ("won", "[1,3)", &["won", "behind"]),
+    ] {
+        let origins = origins.iter().map(|o| format!("https://{o}.example/"));
+        (reads.entry(("g".into(), artifact.into(), range.into())))
+            .or_default()
+            .insert(origins.collect());
+    }
+    let (evicted, taken) = super::range_outcomes(
+        &graph,
+        &listings,
+        &reads,
+        rv_maven_types::MavenMode::Maven39,
+    );
+    let taken: Vec<_> = (taken.iter())
+        .map(|read| format!("{} {} {}", read.artifact, read.version, read.origin))
+        .collect();
+    // The spelling the graph holds of two that compare equal, a SNAPSHOT by
+    // the version its list names, each by the repositories that listed it.
+    assert_eq!(
+        taken,
+        [
+            "both 1 https://one.example/",
+            "both 2 https://two.example/",
+            "eq 3.0 https://eq.example/",
+            "fewer 3 https://ahead.example/",
+            "snap 1.0-SNAPSHOT https://snap.example/",
+            "won 2 https://won.example/"
+        ]
+    );
+    let names: Vec<_> = (evicted.iter())
+        .map(|range| {
+            format!(
+                "{} {} {} {}",
+                range.artifact,
+                range.range,
+                range.versions.join(" "),
+                range.origin
+            )
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "absent [1,2) 1 https://absent.example/",
+            "fewer [1,4) 1 2 https://fewer.example/",
+            "lost [1,3) 1 2 https://lost.example/",
+            "lost [1,3) 2 https://other.example/"
+        ]
+    );
 }

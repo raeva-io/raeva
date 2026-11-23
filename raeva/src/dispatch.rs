@@ -135,7 +135,7 @@ pub(crate) enum Commands {
     Tree(commands::TreeArgs),
     /// Explain why raeva.lock includes a dependency
     Why(commands::WhyArgs),
-    /// Check repository connectivity, TLS and authentication
+    /// Check the project setup, the store and repository access
     Doctor(commands::DoctorArgs),
     /// Inspect, compare or verify raeva.lock
     Lock(commands::LockArgs),
@@ -145,6 +145,8 @@ pub(crate) enum Commands {
     Vuln(Box<commands::VulnArgs>),
     /// Generate a software bill of materials from raeva.lock
     Sbom(commands::SbomArgs),
+    /// Save the locked files for a CI cache, or restore them checked against their pins
+    Seed(commands::SeedArgs),
 }
 
 pub(crate) fn command() -> clap::Command {
@@ -153,15 +155,26 @@ pub(crate) fn command() -> clap::Command {
          parent and BOM by SHA-256. Maven still runs the build.\n\n\
          Quick start:\n  \
          raeva sync           Resolve dependencies and write raeva.lock\n  \
-         raeva sync --frozen  Fail when raeva.lock is out of date, as in CI\n\n\
-         Offline build in a POSIX shell: export the locked dependencies to a repository of their \
-         own, and fill another with Maven's plugins (plugins are not locked):\n  \
+         raeva sync --frozen  Fail when raeva.lock is out of date, as in CI\n  \
+         raeva doctor         Check the platforms, the CI check and the plugins\n\n\
+         Plugin locking is opt-in. With this in raeva.toml, raeva sync also locks Maven's \
+         plugins and extensions, and what they download while they run, so one export holds \
+         an offline build (POSIX shell):\n  \
+         [plugins]\n  \
+         lock = true\n  \
+         trace = [\"verify\"]\n\n  \
+         raeva sync\n  \
+         offline=\"$(mktemp -d \"${TMPDIR:-/tmp}/raeva-offline.XXXXXX\")\"\n  \
+         raeva export-m2 --m2-path \"$offline/m2\"\n  \
+         mvn -o \"-Dmaven.repo.local=$offline/m2\" verify\n\n\
+         Without [plugins], export the locked dependencies to a repository of their own and \
+         fill another with Maven's plugins:\n  \
          offline=\"$(mktemp -d \"${TMPDIR:-/tmp}/raeva-offline.XXXXXX\")\"\n  \
          raeva export-m2 --m2-path \"$offline/deps\"\n  \
          mvn \"-Dmaven.repo.local=$offline/plugins\" -DskipTests package\n  \
          mvn -o \"-Dmaven.repo.local=$offline/deps\" \
          \"-Dmaven.repo.local.tail=$offline/plugins\" -DskipTests package\n\n\
-         Run them at the project root. Keep both repositories outside the checkout, which build \
+         Run them at the project root. Keep the repositories outside the checkout, which build \
          checks may scan, and use them for this checkout alone. PowerShell and CI: \
          https://github.com/raeva-io/raeva/blob/main/docs/offline-builds.md",
     )
@@ -204,6 +217,12 @@ pub(crate) async fn raeva() -> (Result<Report>, Output, Option<Session>) {
     let mut matches = command()
         .try_get_matches()
         .unwrap_or_else(|err| with_reactor_selection_tip(err).exit());
+    if let Err(err) = commands::vuln::refuse_scan_options(&matches) {
+        let mut command = command();
+        command.build();
+        err.format(command.find_subcommand_mut("vuln").expect("vuln"))
+            .exit();
+    }
     let maven_options = maven_options(&matches);
     let default_root =
         matches.value_source("project_root") == Some(clap::parser::ValueSource::DefaultValue);
@@ -291,6 +310,7 @@ async fn run_command(command: Commands, session: &Session) -> Result<Report> {
         }
         Commands::Vuln(args) => commands::vuln::run(&args, session).await,
         Commands::Sbom(args) => blocking(session, "sbom", args, commands::sbom::run).await,
+        Commands::Seed(args) => commands::seed::run(&args, session).await,
     }
 }
 
@@ -321,8 +341,11 @@ fn init_tracing(verbosity: u8, output: &Output) {
             // level; the command's own error already names the TLS cause.
             (_, 0) => "warn,rustls_platform_verifier=off",
             (_, 1) => "info",
-            (_, 2) => "debug",
-            _ => "trace",
+            // Libraries log the hosts and URLs they connect to, which a
+            // mirror's URL may take a secret into, unmasked; raeva's own
+            // crates mask them. The libraries stay at info.
+            (_, 2) => "info,raeva=debug,rv_=debug",
+            _ => "info,raeva=trace,rv_=trace",
         };
         EnvFilter::new(level)
     });

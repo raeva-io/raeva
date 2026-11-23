@@ -79,10 +79,10 @@ async fn losing_range_reads_every_version() {
     assert_eq!(find_version(&graph, "test", "a"), Some("1".into()));
     assert_eq!(graph.edge_count(), 3);
     // Maven reads the losing range's versions too, so a relocation there
-    // can join the group.
-    let fetches = backend.fetches.lock().unwrap();
-    assert_eq!(fetches.len(), 32, "{fetches:?}");
-    assert!(fetches.ends_with(&ascending(30)), "{fetches:?}");
+    // can join the group; a:1's descriptor is the one read for the direct a:1.
+    let mut expected = vec!["test:a:1".to_string(), "test:b:1".to_string()];
+    expected.extend(ascending(30).into_iter().skip(1));
+    assert_eq!(*backend.fetches.lock().unwrap(), expected);
 }
 
 /// Maven reads no version of a range above the first that relocates.
@@ -143,8 +143,9 @@ async fn visited_range_relocation_stops_source_alternatives() {
     // version below it wins over the relocation's soft target.
     assert_eq!(find_version(&graph, "test", "a"), Some("29".into()));
     assert_eq!(find_version(&graph, "test", "new"), None);
+    // Maven reads the relocation's target again when it requests it.
     let mut expected = ascending(30);
-    expected.extend(["test:new:1".to_string(), "test:new:2".to_string()]);
+    expected.extend(["test:new:1", "test:new:1", "test:new:2"].map(String::from));
     assert_eq!(*backend.fetches.lock().unwrap(), expected);
 }
 
@@ -324,6 +325,7 @@ async fn a_retired_subtree_is_read() {
     assert_eq!(find_version(&graph, "t", "target"), None);
     let mut fetches = backend.fetches.lock().unwrap().clone();
     fetches.sort();
+    // The target is read on the relocation and again when requested.
     assert_eq!(
         fetches,
         [
@@ -332,6 +334,7 @@ async fn a_retired_subtree_is_read() {
             "t:b:1",
             "t:c:1",
             "t:filler:1",
+            "t:target:1",
             "t:target:1",
             "t:z:1"
         ]

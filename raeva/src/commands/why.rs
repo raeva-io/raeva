@@ -6,10 +6,11 @@ use std::io;
 
 use clap::Args;
 use rv_lock::{LockModule, LockModulePackage};
-use rv_maven_types::PartialCoord;
+use rv_maven_types::{MavenMode, PartialCoord};
 use serde::Serialize;
 
 use crate::commands::module_selector::{LockModuleExt, ModuleSelector};
+use crate::commands::report_selector::TargetSelector;
 use crate::error::{CliError, Result};
 use crate::output::{CommandOutput, Human, Report};
 use crate::session::Session;
@@ -31,6 +32,7 @@ const MAX_SEARCH_NODES: usize = 2_000_000;
         ("why org.slf4j:slf4j-api --module app/pom.xml", ""),
         ("why org.slf4j:slf4j-api --module com.acme:app", ""),
         ("why org.slf4j:slf4j-api --all", ""),
+        ("why org.slf4j:slf4j-api --platform linux-x86_64 --jdk 21", ""),
     ])
 )]
 pub(crate) struct WhyArgs {
@@ -42,6 +44,8 @@ pub(crate) struct WhyArgs {
     pub coord: PartialCoord,
     #[command(flatten)]
     module: ModuleSelector,
+    #[command(flatten)]
+    target: TargetSelector,
     #[arg(
         long,
         help = "Show every path, up to 10000, instead of the 10 shortest"
@@ -80,12 +84,14 @@ struct WhyOutput {
 pub(crate) fn run(args: &WhyArgs, session: &Session) -> Result<Report> {
     let config = session.lock_config()?;
     let lock = crate::commands::read_lockfile(&config)?;
-    let platform = crate::commands::select_platform(&lock, config.host().java_version())?;
+    let platform = args
+        .target
+        .select(&lock, config.host().named_java_version())?;
     let selection = args.module.select(platform)?;
     let mut modules = Vec::with_capacity(selection.modules().len());
     let limit = if args.all { MAX_DEP_PATHS } else { SHOWN_PATHS };
     for module in selection.modules() {
-        modules.push(explain_module(module, &args.coord, limit)?);
+        modules.push(explain_module(module, &args.coord, lock.maven, limit)?);
     }
 
     let found = modules.iter().any(|module| module.found);
@@ -203,6 +209,7 @@ fn wrap_path(path: &[String], width: usize) -> Vec<String> {
 fn explain_module(
     module: &LockModule,
     target: &PartialCoord,
+    maven: MavenMode,
     limit: usize,
 ) -> Result<WhyModuleOutput> {
     let (graph, roots) = build_graph(module)?;
@@ -210,7 +217,7 @@ fn explain_module(
         .packages
         .iter()
         .enumerate()
-        .filter(|(_, package)| matches_target(package, target))
+        .filter(|(_, package)| matches_target(package, target, maven))
         .map(|(index, _)| index)
         .collect();
     let (paths, truncated) = collect_paths(&graph, &roots, &targets, limit);
@@ -389,13 +396,13 @@ pub(super) fn build_graph(module: &LockModule) -> Result<(Vec<Vec<usize>>, Vec<u
     Ok((children, roots))
 }
 
-fn matches_target(package: &LockModulePackage, target: &PartialCoord) -> bool {
+fn matches_target(package: &LockModulePackage, target: &PartialCoord, maven: MavenMode) -> bool {
     let coordinate = &package.coordinate;
     coordinate.artifact_id() == target.artifact_id.as_str()
         && (target.group_id.as_ref()).is_none_or(|group| coordinate.group_id() == group.as_str())
         && (target.version.as_ref()).is_none_or(|version| {
             rv_maven_types::Version::parse(coordinate.version())
-                .is_ok_and(|locked| locked == *version)
+                .is_ok_and(|locked| locked.cmp_in(version, maven).is_eq())
         })
         && (target.packaging.as_ref()).is_none_or(|packaging| coordinate.extension() == *packaging)
         && (target.classifier.as_ref())
@@ -405,6 +412,7 @@ fn matches_target(package: &LockModulePackage, target: &PartialCoord) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{MAX_DEP_PATHS, collect_paths, matches_target};
+    use rv_maven_types::MavenMode;
 
     /// Paths are numbered, a wrapped one is indented past its number, and a
     /// direct dependency says so.
@@ -514,8 +522,35 @@ mod tests {
         );
         let target = PartialCoord::parse("com.example:lib:1.0.0").unwrap();
         assert!(
-            matches_target(&package, &target),
+            matches_target(&package, &target, MavenMode::Maven39),
             "1.0 and 1.0.0 are the same Maven version; why should find the lock row"
         );
+    }
+
+    /// The versions are equal as the lock's Maven line orders them: `alpha`
+    /// is `0` in Maven 3.9 and older than it in 3.10.
+    #[test]
+    fn why_compares_versions_as_the_locks_maven_line() {
+        use rv_lock::LockModulePackage;
+        use rv_maven_types::{ArtifactCoord, PartialCoord};
+
+        let package =
+            LockModulePackage::new(ArtifactCoord::new("t", "v", "alpha", "jar", None), None);
+        for (target, maven_39, maven_310) in [
+            ("t:v:0", true, false),
+            ("t:v:0.0", true, false),
+            ("t:v:alpha", true, true),
+            ("t:v:ALPHA", true, true),
+        ] {
+            let target = PartialCoord::parse(target).unwrap();
+            assert_eq!(
+                matches_target(&package, &target, MavenMode::Maven39),
+                maven_39
+            );
+            assert_eq!(
+                matches_target(&package, &target, MavenMode::Maven310),
+                maven_310
+            );
+        }
     }
 }

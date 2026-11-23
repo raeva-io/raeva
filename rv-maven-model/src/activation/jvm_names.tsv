@@ -1,0 +1,101 @@
+# The system properties Maven's JVM holds, measured on 2026-11-19 by
+# running Maven 3.9.12 and 3.10.0 through bin/mvn (MAVEN_SKIP_RC=1, -B, -o,
+# output redirected) with maven-help-plugin 3.5.1: help:system for the names
+# and values, and help:active-profiles over one <property> profile per name
+# for the names a model sees. Then help:system on a terminal (script -qfc),
+# on the Linux JDK 8 and 17. The JVMs:
+#   linux-x86_64-temurin-8     Temurin 1.8.0_512-b09
+#   linux-x86_64-temurin-11    Temurin 11.0.33+10
+#   linux-x86_64-arch-17       Arch Linux OpenJDK 17.0.21.1+2
+#   linux-x86_64-arch-21       Arch Linux OpenJDK 21.0.13.1+2
+#   linux-x86_64-arch-27       Arch Linux OpenJDK 27.0.1.1
+#   macos-aarch64-temurin-21   Temurin 21.0.13.1+2-LTS, macOS
+#   windows-x86_64-temurin-17  Temurin 17.0.21+9, Windows 11
+# Columns, tab-separated: the name; the Maven lines whose run sets it; the
+# JVMs that set it to a non-empty value, `all` for every one; `=value` when
+# more than one sets it and all give that value, else `*`; notes: `late` for
+# a name Maven sets after MavenCli copies the system properties, which no
+# model sees; `empty:` for the JVMs that set it to the empty string; `tty`
+# for a name only a run on a terminal has; `mavencli` for one MavenCli adds,
+# which help:system does not list. The -D the runs passed is left out.
+# jvm_names.rs classifies each name.
+apple.awt.application.name	3.9,3.10	macos-aarch64-temurin-21	*
+awt.toolkit	3.9,3.10	linux-x86_64-temurin-11,linux-x86_64-temurin-8	=sun.awt.X11.XToolkit
+classworlds.conf	3.9,3.10	all	*
+file.encoding	3.9,3.10	all	*
+file.encoding.pkg	3.9,3.10	linux-x86_64-temurin-8	*
+file.separator	3.9,3.10	all	*
+ftp.nonProxyHosts	3.9,3.10	macos-aarch64-temurin-21	*
+guice.disable.misplaced.annotation.check	3.9,3.10	all	=true	late
+guice_custom_class_loading	3.9,3.10	all	=CHILD	late
+http.nonProxyHosts	3.9,3.10	macos-aarch64-temurin-21	*
+jansi.mode	3.9	all	=strip	late
+java.awt.graphicsenv	3.9,3.10	linux-x86_64-temurin-11,linux-x86_64-temurin-8	=sun.awt.X11GraphicsEnvironment
+java.awt.printerjob	3.9,3.10	linux-x86_64-temurin-11,linux-x86_64-temurin-8	=sun.print.PSPrinterJob
+java.class.path	3.9,3.10	all	*
+java.class.version	3.9,3.10	all	*
+java.endorsed.dirs	3.9,3.10	linux-x86_64-temurin-8	*
+java.ext.dirs	3.9,3.10	linux-x86_64-temurin-8	*
+java.home	3.9,3.10	all	*
+java.io.tmpdir	3.9,3.10	all	*
+java.library.path	3.9,3.10	all	*
+java.runtime.name	3.9,3.10	all	=OpenJDK Runtime Environment
+java.runtime.version	3.9,3.10	all	*
+java.specification.maintenance.version	3.9,3.10	linux-x86_64-arch-17,linux-x86_64-temurin-11,linux-x86_64-temurin-8,windows-x86_64-temurin-17	*
+java.specification.name	3.9,3.10	all	=Java Platform API Specification
+java.specification.vendor	3.9,3.10	all	=Oracle Corporation
+java.specification.version	3.9,3.10	all	*
+java.vendor	3.9,3.10	all	*
+java.vendor.url	3.9,3.10	all	*
+java.vendor.url.bug	3.9,3.10	all	*
+java.vendor.version	3.9,3.10	linux-x86_64-temurin-11,macos-aarch64-temurin-21,windows-x86_64-temurin-17	*
+java.version	3.9,3.10	all	*
+java.version.date	3.9,3.10	linux-x86_64-arch-17,linux-x86_64-arch-21,linux-x86_64-arch-27,linux-x86_64-temurin-11,macos-aarch64-temurin-21,windows-x86_64-temurin-17	*
+java.vm.compressedOopsMode	3.9,3.10	linux-x86_64-arch-17,linux-x86_64-arch-21,linux-x86_64-arch-27,linux-x86_64-temurin-11,macos-aarch64-temurin-21,windows-x86_64-temurin-17	*
+java.vm.info	3.9,3.10	all	*
+java.vm.name	3.9,3.10	all	=OpenJDK 64-Bit Server VM
+java.vm.specification.name	3.9,3.10	all	=Java Virtual Machine Specification
+java.vm.specification.vendor	3.9,3.10	all	=Oracle Corporation
+java.vm.specification.version	3.9,3.10	all	*
+java.vm.vendor	3.9,3.10	all	*
+java.vm.version	3.9,3.10	all	*
+jdk.debug	3.9,3.10	linux-x86_64-arch-17,linux-x86_64-arch-21,linux-x86_64-arch-27,linux-x86_64-temurin-11,macos-aarch64-temurin-21,windows-x86_64-temurin-17	=release
+library.jansi.path	3.9	all	*
+library.jline.path	3.10	all	*
+line.separator	3.9,3.10	all	*
+maven.build.version	3.9,3.10	all	*	mavencli
+maven.conf	3.9,3.10	all	*
+maven.home	3.9,3.10	all	*
+maven.multiModuleProjectDirectory	3.9,3.10	all	*
+maven.version	3.9,3.10	all	*	mavencli
+native.encoding	3.9,3.10	linux-x86_64-arch-17,linux-x86_64-arch-21,linux-x86_64-arch-27,macos-aarch64-temurin-21,windows-x86_64-temurin-17	*
+org.jline.terminal.exec.redirectPipeCreationMode	3.10	all	=native,reflection
+os.arch	3.9,3.10	all	*
+os.name	3.9,3.10	all	*
+os.version	3.9,3.10	all	*
+path.separator	3.9,3.10	all	*
+socksNonProxyHosts	3.9,3.10	macos-aarch64-temurin-21	*
+stderr.encoding	3.9,3.10	linux-x86_64-arch-21,linux-x86_64-arch-27,macos-aarch64-temurin-21	=UTF-8
+stdin.encoding	3.9,3.10	linux-x86_64-arch-27	*
+stdout.encoding	3.9,3.10	linux-x86_64-arch-21,linux-x86_64-arch-27,macos-aarch64-temurin-21	=UTF-8
+sun.arch.data.model	3.9,3.10	all	=64
+sun.boot.class.path	3.9,3.10	linux-x86_64-temurin-8	*
+sun.boot.library.path	3.9,3.10	all	*
+sun.cpu.endian	3.9,3.10	all	=little
+sun.cpu.isalist	3.9,3.10	windows-x86_64-temurin-17	*	empty:linux-x86_64-temurin-11,linux-x86_64-temurin-8
+sun.io.unicode.encoding	3.9,3.10	all	*
+sun.java.command	3.9,3.10	all	*
+sun.java.launcher	3.9,3.10	all	=SUN_STANDARD
+sun.jnu.encoding	3.9,3.10	all	*
+sun.management.compiler	3.9,3.10	all	=HotSpot 64-Bit Tiered Compilers
+sun.os.patch.level	3.9,3.10	linux-x86_64-temurin-11,linux-x86_64-temurin-8	=unknown	empty:windows-x86_64-temurin-17
+sun.stderr.encoding	3.9,3.10	linux-x86_64-arch-17	*	tty
+sun.stdout.encoding	3.9,3.10	linux-x86_64-arch-17	*	tty
+user.country	3.9,3.10	all	*
+user.dir	3.9,3.10	all	*
+user.home	3.9,3.10	all	*
+user.language	3.9,3.10	all	=en
+user.name	3.9,3.10	all	*
+user.script	3.9,3.10	-	*	empty:windows-x86_64-temurin-17
+user.timezone	3.9,3.10	all	*	late
+user.variant	3.9,3.10	-	*	empty:windows-x86_64-temurin-17

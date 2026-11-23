@@ -13,7 +13,14 @@
           }
         ],
         "name": "api-spec",
+        "properties": [
+          {
+            "name": "raeva:maven:scope",
+            "value": "provided"
+          }
+        ],
         "purl": "pkg:maven/org.golden/api-spec@1.0",
+        "scope": "required",
         "type": "library",
         "version": "1.0"
       },
@@ -27,7 +34,14 @@
           }
         ],
         "name": "core",
+        "properties": [
+          {
+            "name": "raeva:maven:scope",
+            "value": "compile"
+          }
+        ],
         "purl": "pkg:maven/org.golden/core@1.1",
+        "scope": "required",
         "type": "library",
         "version": "1.1"
       },
@@ -41,7 +55,14 @@
           }
         ],
         "name": "lib",
+        "properties": [
+          {
+            "name": "raeva:maven:scope",
+            "value": "compile"
+          }
+        ],
         "purl": "pkg:maven/org.golden/lib@1.0",
+        "scope": "required",
         "type": "library",
         "version": "1.0"
       },
@@ -55,7 +76,14 @@
           }
         ],
         "name": "lib",
+        "properties": [
+          {
+            "name": "raeva:maven:scope",
+            "value": "compile"
+          }
+        ],
         "purl": "pkg:maven/org.golden/lib@1.0?classifier=jdk11",
+        "scope": "required",
         "type": "library",
         "version": "1.0"
       },
@@ -69,7 +97,18 @@
           }
         ],
         "name": "lib",
+        "properties": [
+          {
+            "name": "cdx:maven:package:test",
+            "value": "true"
+          },
+          {
+            "name": "raeva:maven:scope",
+            "value": "test"
+          }
+        ],
         "purl": "pkg:maven/org.golden/lib@1.0?classifier=tests",
+        "scope": "excluded",
         "type": "library",
         "version": "1.0"
       },
@@ -83,7 +122,14 @@
           }
         ],
         "name": "runtime-only",
+        "properties": [
+          {
+            "name": "raeva:maven:scope",
+            "value": "runtime"
+          }
+        ],
         "purl": "pkg:maven/org.golden/runtime-only@1.0",
+        "scope": "required",
         "type": "library",
         "version": "1.0"
       },
@@ -97,7 +143,18 @@
           }
         ],
         "name": "testlib",
+        "properties": [
+          {
+            "name": "cdx:maven:package:test",
+            "value": "true"
+          },
+          {
+            "name": "raeva:maven:scope",
+            "value": "test"
+          }
+        ],
         "purl": "pkg:maven/org.golden/testlib@1.0",
+        "scope": "excluded",
         "type": "library",
         "version": "1.0"
       },
@@ -111,7 +168,14 @@
           }
         ],
         "name": "util",
+        "properties": [
+          {
+            "name": "raeva:maven:scope",
+            "value": "compile"
+          }
+        ],
         "purl": "pkg:maven/org.golden/util@1.0",
+        "scope": "required",
         "type": "library",
         "version": "1.0"
       },
@@ -125,7 +189,14 @@
           }
         ],
         "name": "vendored",
+        "properties": [
+          {
+            "name": "raeva:maven:scope",
+            "value": "system"
+          }
+        ],
         "purl": "pkg:maven/org.golden/vendored@0.9",
+        "scope": "required",
         "type": "library",
         "version": "0.9"
       }

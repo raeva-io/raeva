@@ -17,11 +17,13 @@ exclude = ["tests/", "benches/"]
 workspace = true
 
 [dependencies]
+rv-config.workspace = true
 rv-fs.workspace = true
 rv-maven-types.workspace = true
 
 anyhow.workspace = true
 bytes.workspace = true
+chrono.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true

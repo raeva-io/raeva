@@ -1,19 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raeva.io/schemas/raeva-lock.json",
-  "title": "raeva.lock schema 8",
-  "description": "The canonical Raeva lock format. raeva reads and writes schema 8 only; it refuses a lockfile with any other schema version or with a key this schema does not list, in any table, and a plain raeva sync (without --frozen) regenerates it.",
+  "title": "raeva.lock schema 9",
+  "description": "The canonical Raeva lock format. raeva reads and writes schema 9 only; it refuses a lockfile with any other schema version or with a key this schema does not list, in any table, and a plain raeva sync (without --frozen) regenerates it.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version"],
   "properties": {
     "schema_version": {
-      "const": 8,
+      "const": 9,
       "description": "On-disk schema version."
     },
     "config_hash": {
       "$ref": "#/$defs/text",
-      "description": "Hash of the configuration that can change resolution: repositories, profiles, security settings, effective -P selections, and consulted values and outcomes in resolution.ambient_inputs. Network settings, mirrors, proxies, credentials, and the local repository are excluded."
+      "description": "Hash of the configuration that can change resolution: repositories, profiles, security settings, effective -P selections, the Maven line, and consulted values and outcomes in resolution.ambient_inputs. Network settings, mirrors, proxies, credentials, and the local repository are excluded."
+    },
+    "maven": {
+      "const": "3.10",
+      "description": "The Maven line the lock was resolved as, from [lock] maven in raeva.toml or the Maven wrapper. Absent means Maven 3.9, which is never written. config_hash and every graph digest cover it."
     },
     "resolution": {
       "type": "object",
@@ -35,10 +39,10 @@
           "type": "array",
           "uniqueItems": true,
           "minItems": 1,
-          "description": "What the resolution consulted on the host, sorted as text: java.version, java.home, env.NAME, settings-property:NAME and os-release (the Linux release os-maven-plugin reads) for a value that reached the model, and jdk:SPEC, property:NAME[=VALUE], file:PATH or settings:KEY followed by \" is true\" or \" is false\" for a profile activation condition and its outcome. A condition holds the POM's text, never the host value: file: names a path inside the project relative to raeva.lock, where .. never climbs above it (true when it exists), and settings: a settings.xml condition by a key derived from its text. config_hash covers the current values and outcomes, and the graph digests of each target that lists no host_inputs cover the conditions and host values. Absent when the resolution consulted none. user-property:NAME records a consulted -D lookup, including absent overrides. Its value is covered only by config_hash. user-property-lookup: holds an authored expression and its public POM context, so model interpolation and activation lookups can be repeated with their original property precedence without publishing expanded external names or values. For a private file activation it also records the relative local POM directory, when present, and config_hash covers file existence.",
+          "description": "What the resolution consulted on the host, sorted as text: java.version, java.home, env.NAME, settings-property:NAME and os-release (the Linux release os-maven-plugin reads) for a value that reached the model, and jdk:SPEC, property:NAME[=VALUE], file:PATH or settings:KEY followed by \" is true\" or \" is false\" for a profile activation condition and its outcome. A condition holds the POM's text, never the host value: file: names a path inside the project relative to raeva.lock, where .. never climbs above it (true when it exists), and settings: a settings.xml condition by a key derived from its text. config_hash covers the current values and outcomes, and the graph digests of each target that lists no host_inputs cover the conditions and host values. Absent when the resolution consulted none. user-property:NAME records a consulted -D lookup, including absent overrides, and user-override:NAME one of a name the model defines, whose value only a -D, not a JVM option, overrides. Its value is covered only by config_hash. user-property-lookup: holds an authored expression and its public POM context, so model interpolation and activation lookups can be repeated with their original property precedence without publishing expanded external names or values. For a private file activation it also records the relative local POM directory, when present, and config_hash covers file existence.",
           "items": {
             "type": "string",
-            "pattern": "^(java\\.version|java\\.home|os-release|env\\.[A-Za-z_][A-Za-z0-9_]{0,254}|user-property:[!-<>-~]{1,256}|user-property-lookup:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+|settings-property:[A-Za-z0-9._-]{1,128}|jdk:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)|property:!?(java\\.version|java\\.home|env\\.[A-Za-z_][A-Za-z0-9_]{0,254})(=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256})? is (true|false)|file:(?=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)$)(?!\\.\\.?(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+(/(?!\\.(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+)* is (true|false)|settings:[0-9a-f]{16} is (true|false))$"
+            "pattern": "^(java\\.version|java\\.home|os-release|env\\.[A-Za-z_][A-Za-z0-9_]{0,254}|user-(property|override):[!-<>-~]{1,256}|user-property-lookup:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+|settings-property:[A-Za-z0-9._-]{1,128}|jdk:[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)|property:!?(java\\.version|java\\.home|env\\.[A-Za-z_][A-Za-z0-9_]{0,254})(=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256})? is (true|false)|file:(?=[^\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]{1,256} is (true|false)$)(?!\\.\\.?(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+(/(?!\\.(/| is (true|false)$))[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+)* is (true|false)|settings:[0-9a-f]{16} is (true|false))$"
           }
         }
       }
@@ -100,6 +104,9 @@
             "$ref": "#/$defs/module"
           }
         },
+        "plugins": {
+          "$ref": "#/$defs/plugins"
+        },
         "support_poms": {
           "type": "array",
           "description": "The parent POMs and imported BOMs this platform's resolution read from a repository, one row per coordinate. Export ships these exact bytes so an offline Maven build finds every parent and BOM. Rows of two platforms naming one coordinate must pin the same file and bytes, and a row naming the same .pom file as an artifact row's pom_sha256 must pin the same bytes: Maven has one local-repository path per file.",
@@ -115,6 +122,117 @@
             "$ref": "#/$defs/target"
           },
           "description": "Targets sharing these exact artifacts, module graphs, and support POM pins. Each has one separate input record."
+        }
+      }
+    },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputs"
+      ],
+      "description": "The build's plugins, build and core extensions, annotation processor paths and test providers, as Maven 3.9 resolves them for the platform, written when [plugins] lock = true in raeva.toml asks for them. Their files are rows of the platform's artifacts and support_poms, which the dependency resolution neither reads nor writes; a row only the sets name is no orphan.",
+      "properties": {
+        "inputs": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of what the tables were resolved from besides the platform's graph: the Maven version they follow, config_hash, the Maven line, the target's model_hash, .mvn/extensions.xml, .mvn/maven.config, the command line's -D values, the goals, each module's packages, and the values and outcomes of host_inputs. Another value means they are stale, which sync --frozen refuses."
+        },
+        "prefixes": {
+          "type": "string",
+          "description": "The plugin prefixes a group's maven-metadata lists, which export-m2 writes for mvn -o, one per line in tab-separated columns: the group, the prefix, the plugin's artifactId, and the origin whose metadata was read. Lines are sorted.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{1,255}\\t[^\\t\\n]+(?:\\n[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{1,255}\\t[^\\t\\n]+)*)?$"
+        },
+        "repo_ids": {
+          "type": "string",
+          "description": "The ids of the repositories the sets resolved from, in the format of metadata.repo_ids. They are labels for export-m2's markers and grant no repository access: a sync fetches from an origin only the configuration or the project's POMs declare as those declare it, and from any other as a repository a fetched POM declares."
+        },
+        "host_inputs": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "description": "What the plugin resolution read from the host, sorted as text, in the format of resolution.ambient_inputs: a value that reached a plugin coordinate, dependency, extension, repository or the default goal, and a profile condition with its outcome. A plugin's configuration is left out. inputs covers the current values and outcomes. Absent when the resolution read none.",
+          "items": { "$ref": "#/properties/resolution/properties/ambient_inputs/items" }
+        },
+        "metadata_versions": {
+          "type": "string",
+          "description": "The versions plugins, build extensions and their dependencies took from repository metadata, in the format of a module's metadata_versions: the version a plugin or build extension without a version took, as 'release', and the markers their collections read. Omitted when there is none.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t(?:release|latest|range)\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t(?:release|latest|range)\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})*)?$"
+        },
+        "range_versions": {
+          "type": "string",
+          "description": "The version each version range of the plugins', build extensions' and their dependencies' collections took, in the format of a module's range_versions: of a range the collection's graph holds, of one that lost mediation, and of a remote parent's range. Omitted when there is none.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}\\t[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}\\t[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]+)*)?$"
+        },
+        "shared_origins": {
+          "type": "string",
+          "description": "For a row the modules also use, the origins a set read its file from that the row does not record, which export-m2 adds to the file's markers: mvn -o takes a plugin's file only under the id of a repository the plugin searches. One origin per line: the row as a set's artifacts line, a tab, and the origin. Lines are sorted. Omitted when there is none.",
+          "pattern": "^(?:[^\\t\\n]+\\t[^\\t\\n]+\\t[^\\t\\n]+(?:\\n[^\\t\\n]+\\t[^\\t\\n]+\\t[^\\t\\n]+)*)?$"
+        },
+        "shared_without_pom": {
+          "type": "string",
+          "description": "Of shared_origins, those that served a set the file without the POM the row pins, as Maven 3.10 reads it there: export-m2 labels the file with them and the POM only with the row's origins. In the format of shared_origins. Omitted when there is none.",
+          "pattern": "^(?:[^\\t\\n]+\\t[^\\t\\n]+\\t[^\\t\\n]+(?:\\n[^\\t\\n]+\\t[^\\t\\n]+\\t[^\\t\\n]+)*)?$"
+        },
+        "sets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/pluginSet"
+          },
+          "description": "One row per distinct set, sorted by key, then role."
+        }
+      }
+    },
+    "pluginSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "role"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "SHA-256 of what decides the set's files. A trace set's key covers the traced build's arguments and the other sets' keys, and the set records no coordinates, since the arguments may hold a secret."
+        },
+        "role": {
+          "enum": [
+            "plugin",
+            "build-extension",
+            "core-extension",
+            "processor-path",
+            "test-provider",
+            "trace"
+          ]
+        },
+        "coordinates": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "The plugin's or extension's group:artifact:version, or each processor path entry's."
+        },
+        "repo_urls": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/repoUrl"
+          },
+          "description": "The repositories the set resolves from, in Maven's order."
+        },
+        "artifacts": {
+          "type": "string",
+          "description": "The artifacts rows on the set's class path, in order, one per line: group:artifact:version, a tab, and the type with :classifier when it has one. Each names an artifacts row of the platform.",
+          "pattern": "^(?:[^\\t\\n:]+:[^\\t\\n:]+:[^\\t\\n:]+\\t[^\\t\\n:]+(?::[^\\t\\n:]+)?(?:\\n[^\\t\\n:]+:[^\\t\\n:]+:[^\\t\\n:]+\\t[^\\t\\n:]+(?::[^\\t\\n:]+)?)*)?$"
+        },
+        "support_poms": {
+          "type": "string",
+          "description": "The coordinates of the parents and BOMs the set's POMs read, one per line, sorted. Each names a support_poms row of the platform."
+        },
+        "modules": {
+          "type": "string",
+          "description": "The POM paths of the modules that build with the set, one per line, sorted."
         }
       }
     },
@@ -215,7 +333,7 @@
               "graph": {
                 "type": "string",
                 "pattern": "^[0-9a-f]{64}$",
-                "description": "A module's graph digest: the lock's config_hash, its sha256 record, its module row, the names in ambient_inputs here and in the target's ambient_inputs, the repository ids and the conditions and host values the target read (its repo_ids and host_inputs, or all of metadata.repo_ids and of those in resolution.ambient_inputs where it lists none), the pin of each support POM the row names, the POM pin of each external package, and every module's path and coordinates. A lock whose graph digests do not match its rows is not trusted."
+                "description": "A module's graph digest: the lock's config_hash, the Maven line, its sha256 record, its path, coordinates and module row, the names in ambient_inputs here and in the target's ambient_inputs, the repository ids and the conditions and host values the target read (its repo_ids and host_inputs, or all of metadata.repo_ids and of those in resolution.ambient_inputs where it lists none), the pin of each support POM the row names, the POM pin of each external package, the path and version of each reactor module whose group:artifact the module, a package, a support POM, a parent range or an evicted range of the row names, and the packages and edges of each reactor module the row depends on. Other modules are not covered, so adding a module no graph names leaves the other digests unchanged. A lock whose graph digests do not match its rows is not trusted."
               },
               "ambient_inputs": {
                 "$ref": "#/$defs/read_names",
@@ -239,7 +357,7 @@
       "description": "Property and variable names, sorted as text.",
       "items": {
         "type": "string",
-        "pattern": "^(env\\.[A-Za-z_][A-Za-z0-9_]{0,254}|user-property:[!-<>-~]{1,256}|settings-property:[A-Za-z0-9._-]{1,128})$"
+        "pattern": "^(env\\.[A-Za-z_][A-Za-z0-9_]{0,254}|user-(property|override):[!-<>-~]{1,256}|settings-property:[A-Za-z0-9._-]{1,128})$"
       }
     },
     "coordinate": {
@@ -301,15 +419,23 @@
         "pom_base": {
           "const": true,
           "description": "The companion POM is the base -SNAPSHOT.pom: the repository's snapshot metadata names this file's build but no build of its POM, so Maven reads the base file. Only on a row with a snapshot build and no pom_snapshot; pom_sha256 is then that file's digest, or absent when the repository has no base POM."
+        },
+        "missing_checksum": {
+          "const": true,
+          "description": "The file was accepted under --allow-missing-checksums: its repository published no checksum file for it. The pin still checks the bytes. A later run that downloads the file and finds a checksum file matching the pinned bytes drops the marker, and sync --frozen warns CHECKSUM_MISSING_LOCKED for a marked row unless --allow-missing-checksums is passed again."
+        },
+        "pom_missing_checksum": {
+          "const": true,
+          "description": "As missing_checksum, for the companion POM that pom_sha256 pins."
         }
       },
-      "dependentRequired": { "pom_base": ["snapshot"] },
+      "dependentRequired": { "pom_base": ["snapshot"], "pom_missing_checksum": ["pom_sha256"] },
       "not": { "required": ["pom_base", "pom_snapshot"] }
     },
     "repoUrl": {
       "type": "string",
       "pattern": "^[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*$",
-      "description": "The repository the artifact was resolved from, as the configuration or a POM declares it, never the mirror that served it: its URL, which raeva never writes with userinfo, a query or a fragment, or, for a file: repository inside the directory that holds raeva.lock, a project-relative origin './' followed by '/'-terminated directory names. raeva refuses an absolute file: URL that names a directory inside that one. A project-relative origin is a key, not a location: it names whichever repository the current configuration or project POMs declare at that path, and grants nothing when none does."
+      "description": "The repository the artifact was resolved from, as the configuration or a POM declares it, never the mirror that served it: its URL, which raeva never writes with userinfo, a query or a fragment, or, for a file: repository inside the directory that holds raeva.lock or sharing a directory below the filesystem root with it, a project-relative origin: './' or one '../' per level up from that directory with links resolved, followed by '/'-terminated directory names, in which '%', '\\', '#', '?', whitespace and invisible characters are percent-encoded as in a URL, in uppercase. raeva refuses an absolute file: URL that names a directory inside that one. A project-relative origin is a key, not a location: it names whichever repository the current configuration or project POMs declare at that path, and grants nothing when none does. The empty origin names the one repository whose URL raeva.lock cannot record, such as one that does not parse, which a mirror serves."
     },
     "supportPom": {
       "type": "object",
@@ -329,6 +455,10 @@
           "type": "string",
           "pattern": "^[0-9a-f]{64}$",
           "description": "SHA-256 of the exact POM bytes resolution parsed."
+        },
+        "missing_checksum": {
+          "const": true,
+          "description": "As an artifact row's missing_checksum, for this POM."
         },
         "snapshot": {
           "$ref": "#/$defs/snapshot",
@@ -362,8 +492,8 @@
         "packaging": { "$ref": "#/$defs/component" },
         "packages": {
           "type": "string",
-          "description": "The module's graph nodes, one per line in tab-separated columns: group:artifact:version, packaging[:classifier], the direct scope (empty for a node reached only through another), the scope the node resolves to as Maven's JavaScopeSelector picks it (empty when it is the direct scope or, for a node reached only through another, compile), the workspace module's POM path for another reactor module, and for a system-scoped file its project-relative path and SHA-256. Empty trailing columns are left out. Lines are sorted; edges refer to them by index from 0. An external package must match its artifact row, which uses the full coordinate rule.",
-          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}:[^\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t[0-9a-f]{64})?)?)?)?)?(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}:[^\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:compile|provided|runtime|test|system|import)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t[0-9a-f]{64})?)?)?)?)?)*)?$"
+          "description": "The module's graph nodes, one per line in tab-separated columns: group:artifact:version, packaging[:classifier], the direct scope (empty for a node reached only through another), the scope the node resolves to as Maven's JavaScopeSelector picks it (empty when it is the direct scope or, for a node reached only through another, compile; '?' for the empty scope Maven gives a node reached only in scopes it does not know). A scope Maven does not know is written as the POM declares it, the workspace module's POM path for another reactor module, and for a system-scoped file its project-relative path and SHA-256. Empty trailing columns are left out. Lines are sorted; edges refer to them by index from 0. An external package must match its artifact row, which uses the full coordinate rule.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}:[^\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?(?:\\t(?:(?!\\?(?:\\t|\\n|$))[^\\s\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255})?(?:\\t(?:(?!\\?(?:\\t|\\n|$))[^\\s\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}|\\?)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t[0-9a-f]{64})?)?)?)?)?(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}:[^\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?(?:\\t(?:(?!\\?(?:\\t|\\n|$))[^\\s\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255})?(?:\\t(?:(?!\\?(?:\\t|\\n|$))[^\\s\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}|\\?)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t(?:[^:\\\\\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]+)?(?:\\t[0-9a-f]{64})?)?)?)?)?)*)?$"
         },
         "parent_ranges": {
           "type": "array",
@@ -382,20 +512,50 @@
         },
         "edges": {
           "type": "string",
-          "description": "The dependencies between packages, one per line: the depending package's index, the index depended on, then the scope and 'optional', each only when set. The scope is the one the dependency has below the depending package: the scope dependency management gives it, else the one Maven derives from its declared scope and the scope the depending package resolves to. Lines are sorted.",
-          "pattern": "^(?:(?:0|[1-9][0-9]*) (?:0|[1-9][0-9]*)(?: (?:compile|provided|runtime|test|system|import))?(?: optional)?(?:\\n(?:0|[1-9][0-9]*) (?:0|[1-9][0-9]*)(?: (?:compile|provided|runtime|test|system|import))?(?: optional)?)*)?$"
+          "description": "The dependencies between packages, one per line: the depending package's index, the index depended on, then the scope, and 'optional' when the dependency is optional. The scope is the one the dependency has below the depending package: the scope dependency management gives it, else the one Maven derives from its declared scope and the scope the depending package resolves to. Lines are sorted.",
+          "pattern": "^(?:(?:0|[1-9][0-9]*) (?:0|[1-9][0-9]*) (?!\\?(?: |\\n|$))[^\\s\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}(?: optional)?(?:\\n(?:0|[1-9][0-9]*) (?:0|[1-9][0-9]*) (?!\\?(?: |\\n|$))[^\\s\\u0000-\\u001f\\u007f-\\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufffb]{1,255}(?: optional)?)*)?$"
         },
         "support_poms": {
           "type": "string",
           "description": "The coordinates of every parent and BOM this module's resolution read, one per line, sorted. Each names a support_poms row of the platform, whose pin the module's graph digest covers.",
           "pattern": "^(?:(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?:\\n(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})*)?$"
+        },
+        "parents": {
+          "type": "string",
+          "description": "The parents of the module's lineage that came from a repository, one coordinate per line, nearest first. Each is one of the module's support_poms, named once. Omitted when there is none.",
+          "pattern": "^(?:(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?:\\n(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})*)?$"
+        },
+        "managed": {
+          "type": "string",
+          "description": "Where the module's dependency management declared the versions it supplied, one source per line in tab-separated columns: 'pom' for a dependencyManagement entry of the module's POM or of a parent in its lineage, 'import' for an entry of a BOM the lineage imports (the BOM the lineage names, through any BOMs it imports), or 'property' for a version written as exactly one ${name} that a parent from a repository sets; that POM's, BOM's or parent's group:artifact; the property the version is written as when it is exactly one ${name} (for an import, the import's version; always set for 'property'), else empty; and the ascending indexes of the packages whose version it supplied. Lines are sorted by kind ('pom', 'import', then 'property'), then POM, then property, and a package is on at most one line. A package declared with its own version, or whose version only a dependency's POM chose, is on none. Omitted when there is none.",
+          "pattern": "^(?:(?:(?:pom|import)\\t[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{0,255}|property\\t[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{1,255})\\t(?:0|[1-9][0-9]*)(?: (?:0|[1-9][0-9]*))*(?:\\n(?:(?:pom|import)\\t[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{0,255}|property\\t[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[A-Za-z0-9_.-]{1,255})\\t(?:0|[1-9][0-9]*)(?: (?:0|[1-9][0-9]*))*)*)?$"
+        },
+        "evicted_ranges": {
+          "type": "string",
+          "description": "The version ranges the module's resolution listed whose highest listed version the module's graph does not hold, such as a range that lost to a nearer declaration or one in the POM of a version that lost, one per line in tab-separated columns: the ranged dependency's group:artifact; the range as raeva writes a parsed range; the origin of a repository whose list named versions within the range, spelled as repo_url; and those versions, separated by spaces, lowest first in the lock's Maven order, two that compare equal by their text. An export lists one of the versions under that repository's ids when no version it lists there is in the range. Lines are sorted by group:artifact, then range, then origin, one per range and origin. A frozen check offers such a range no version above those it lists. Omitted when there is none.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[\\[(][^\\t\\n]*[\\])]\\t[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*\\t[!-~]{1,255}(?: [!-~]{1,255})*(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[\\[(][^\\t\\n]*[\\])]\\t[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*\\t[!-~]{1,255}(?: [!-~]{1,255})*)*)?$"
+        },
+        "metadata_versions": {
+          "type": "string",
+          "description": "The versions the module's resolution took from repository metadata that its pins alone do not give mvn -o, one per line in tab-separated columns: the artifact's group:artifact; 'release' for the version a RELEASE took, 'latest' for the version a LATEST took from <latest> or else <release>, or 'range' for the spelling a version range took among listed versions that compare equal; and the version. export-m2 writes a recorded release or latest as that artifact's <release> or <latest> in every version list it writes for it, and refuses to list two spellings that compare equal to a range's pick. Lines are sorted, each once. Omitted when there is none.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t(?:release|latest|range)\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t(?:release|latest|range)\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})*)?$"
+        },
+        "range_versions": {
+          "type": "string",
+          "description": "The versions version ranges took: for each repository a range read, the highest version it listed that the module's graph holds, and for a remote parent's range, each listed version whose POM the module read. One per line and repository in tab-separated columns: the ranged artifact's group:artifact; the version as the repository's list spells it, a SNAPSHOT by its base version; and the origin of a repository whose list named it, spelled as repo_url. export-m2 lists these versions and the evicted ranges' under the ids of their repositories, with the markers, and no version the lock pins exactly, so that mvn -o takes a range's version from the versions Maven saw. Lines are sorted, each once. Omitted when there is none.",
+          "pattern": "^(?:[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}\\t[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*(?:\\n[A-Za-z0-9_.-]{1,255}:[A-Za-z0-9_.-]{1,255}\\t[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}\\t[^\\s\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb]*)*)?$"
+        },
+        "extensions": {
+          "type": "string",
+          "description": "The jars of the build extensions whose artifact handlers gave the module's resolution a dependency type, such as maven-hpi-plugin's executable-war, one per line: each extension's own and those of its dependencies that Maven loads with it, as group:artifact:version, then :classifier for a classified jar, a tab and the SHA-256 of the jar. Lines are sorted. The module's graph digest covers them, and a frozen check refuses other bytes for a jar. Omitted when there is none.",
+          "pattern": "^(?:(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::(?![^\\t]*\\.\\t)[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?\\t[0-9a-f]{64}(?:\\n(?!\\.)(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?![^:]*\\.\\.)(?![^:]*\\.:)[A-Za-z0-9_.-]{1,255}:(?!.*\\.\\.)(?!.*\\.(?:\\n|$))[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255}(?::(?![^\\t]*\\.\\t)[!$&'()+,.0-9=A-Z\\[\\]^_`a-z{}~-]{1,255})?\\t[0-9a-f]{64})*)?$"
         }
       }
     },
     "pomPath": {
       "type": "string",
-      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*:)(?![\\s\\S]*[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb])(?:[^/]+/)*pom\\.xml$",
-      "description": "Normalized workspace-root-relative POM path using forward slashes, without a drive or other colon, and without control, separator or default-ignorable characters."
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)(?!.*:)(?![\\s\\S]*[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u115f\\u1160\\u17b4\\u17b5\\u180b-\\u180f\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\u3164\\ufe00-\\ufe0f\\ufeff\\uffa0\\ufff0-\\ufffb])(?:[^/]+/)*(?!\\.\\.?$)[^/]+$",
+      "description": "Normalized workspace-root-relative POM path using forward slashes, without a drive or other colon, and without control, separator or default-ignorable characters. A module's POM file may have any name, as a <module> entry may name it."
     },
     "checksum": {
       "type": "object",

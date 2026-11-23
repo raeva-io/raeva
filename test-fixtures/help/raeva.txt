@@ -3,14 +3,25 @@ Raeva reads your existing pom.xml and writes raeva.lock, which pins every artifa
 Quick start:
   raeva sync           Resolve dependencies and write raeva.lock
   raeva sync --frozen  Fail when raeva.lock is out of date, as in CI
+  raeva doctor         Check the platforms, the CI check and the plugins
 
-Offline build in a POSIX shell: export the locked dependencies to a repository of their own, and fill another with Maven's plugins (plugins are not locked):
+Plugin locking is opt-in. With this in raeva.toml, raeva sync also locks Maven's plugins and extensions, and what they download while they run, so one export holds an offline build (POSIX shell):
+  [plugins]
+  lock = true
+  trace = ["verify"]
+
+  raeva sync
+  offline="$(mktemp -d "${TMPDIR:-/tmp}/raeva-offline.XXXXXX")"
+  raeva export-m2 --m2-path "$offline/m2"
+  mvn -o "-Dmaven.repo.local=$offline/m2" verify
+
+Without [plugins], export the locked dependencies to a repository of their own and fill another with Maven's plugins:
   offline="$(mktemp -d "${TMPDIR:-/tmp}/raeva-offline.XXXXXX")"
   raeva export-m2 --m2-path "$offline/deps"
   mvn "-Dmaven.repo.local=$offline/plugins" -DskipTests package
   mvn -o "-Dmaven.repo.local=$offline/deps" "-Dmaven.repo.local.tail=$offline/plugins" -DskipTests package
 
-Run them at the project root. Keep both repositories outside the checkout, which build checks may scan, and use them for this checkout alone. PowerShell and CI: https://github.com/raeva-io/raeva/blob/main/docs/offline-builds.md
+Run them at the project root. Keep the repositories outside the checkout, which build checks may scan, and use them for this checkout alone. PowerShell and CI: https://github.com/raeva-io/raeva/blob/main/docs/offline-builds.md
 
 Usage: raeva [OPTIONS] <COMMAND>
 
@@ -19,11 +30,12 @@ Commands:
   export-m2         Export lockfile artifacts to the Maven local repository
   tree              Show the dependency tree from raeva.lock
   why               Explain why raeva.lock includes a dependency
-  doctor            Check repository connectivity, TLS and authentication
+  doctor            Check the project setup, the store and repository access
   lock              Inspect, compare or verify raeva.lock
   export-checksums  Export the locked checksums to .mvn/checksums/ for Maven's Trusted Checksums
   vuln              Scan locked dependencies for known vulnerabilities
   sbom              Generate a software bill of materials from raeva.lock
+  seed              Save the locked files for a CI cache, or restore them checked against their pins
   help              Print this message or the help of the given subcommand(s)
 
 Options:

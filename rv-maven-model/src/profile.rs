@@ -32,6 +32,19 @@ pub struct Profile {
     pub properties: PropertyMap,
     #[serde(default)]
     pub(crate) build: Box<crate::pom::Build>,
+    #[serde(default)]
+    pub(crate) reporting: crate::pom::Reporting,
+    /// Read for the deployment repository ids Maven validates.
+    #[serde(default)]
+    pub(crate) distribution_management: Option<crate::pom::DistributionManagement>,
+    /// The plugins and managed plugins of the profile's `<build>`, empty
+    /// until [`crate::Pom::load_plugins`] reads them.
+    #[serde(skip)]
+    pub(crate) plugins: Option<Box<crate::plugin::BuildPlugins>>,
+    /// The `<pluginRepositories>` the profile puts before the POM's, read
+    /// with [`Self::plugins`].
+    #[serde(skip)]
+    pub(crate) plugin_repositories: Vec<Repository>,
 }
 
 /// Maven's `Profile` model gives a profile without `<id>` the id `default`,

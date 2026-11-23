@@ -34,8 +34,9 @@ in .mvn/maven.config, with the project's absolute path:
   -Daether.trustedChecksumsSource.summaryFile.originAware=false
 
 Without the snapshots property, Maven checks no SNAPSHOT file. Use \
-SHA-256,SHA-1 as the algorithms when checksums.sha1 is written. Build \
-plugins are not in raeva.lock, so \
+SHA-256,SHA-1 as the algorithms when checksums.sha1 is written. Unless \
+[plugins] lock = true in raeva.toml locks them, build plugins are not in \
+raeva.lock, nor without [plugins] trace what they download while they run, so \
 -Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=true \
 also refuses every plugin file Maven resolves. In a reactor, run package or a \
 later phase: before package, Maven resolves a sibling module to its \
@@ -44,17 +45,19 @@ target/classes directory, and the check fails with \
 pub(crate) struct ExportChecksumsArgs {}
 
 pub(crate) fn run(_args: &ExportChecksumsArgs, session: &Session) -> Result<Report> {
-    let project_root = session.project_root();
     let config = session.config()?;
-    let lock = session.fresh_lockfile(&config)?.0;
+    let lock = session.fresh_lockfile(&config, false)?.0;
 
     let split = build_checksums_files(&lock)?;
-    let (sha256_path, sha1_path) = write_checksums_files(project_root, &split)?;
+    // In the `.mvn` that `mvn` reads: one made in the project would move
+    // its project directory there from a `.mvn` above.
+    let mvn_dir = config.mvn_dir();
+    let (sha256_path, sha1_path) = write_checksums_files(&mvn_dir, &split)?;
     let mut paths = vec![sha256_path];
     if split.sha1_count > 0 {
         paths.push(sha1_path);
     }
-    let maven_properties = maven_properties(&project_root.join(".mvn").join("checksums"), &split);
+    let maven_properties = maven_properties(&mvn_dir.join("checksums"), &split);
     Ok(Report::data(ExportChecksumsReport {
         sha256_count: split.sha256_count,
         sha1_count: split.sha1_count,
@@ -179,7 +182,8 @@ impl SummaryLines {
 /// every parent or imported BOM under their SHA-256 pins, and for a
 /// `SNAPSHOT` also the plain `-SNAPSHOT` copies, which Maven resolves when its
 /// settings name another repository id than the export's labels. Without the
-/// POMs, `failIfMissing` fails on the first one Maven reads. Each entry routes
+/// POMs, `failIfMissing` fails on the first one Maven reads. They also cover
+/// the build extension jars the modules pin. Each entry routes
 /// to the file matching its pin's algorithm, so a SHA-1-only repository keeps
 /// a complete checksum file rather than losing its SHA-1-pinned packages.
 fn build_checksums_files(lock: &Lockfile) -> Result<ChecksumFiles> {
@@ -239,16 +243,29 @@ fn build_checksums_files(lock: &Lockfile) -> Result<ChecksumFiles> {
         }
     }
 
+    // Maven checks a build extension's jar as it loads it.
+    for (path, jar) in (lock.platforms.iter()).flat_map(rv_lock::LockPlatform::extension_jars) {
+        sha256.add(path, jar.sha256.as_str().to_string())?;
+    }
+
     // export-m2 writes a parent or BOM under the version its POM text
-    // names; Maven online reads the timestamped build.
-    for (coordinate, pom) in lock.support_poms() {
+    // names, and the latest build the lock records only by its timestamp
+    // also under the plain `-SNAPSHOT` version; Maven online reads the
+    // timestamped build.
+    let support_poms = lock.support_poms();
+    for (coordinate, pom) in &support_poms {
         let (Some(file), Some((group, artifact, version))) = (
-            pom.file_gav(&coordinate),
-            rv_lock::split_support_pom_coord(&coordinate),
+            pom.file_gav(coordinate),
+            rv_lock::split_support_pom_coord(coordinate),
         ) else {
             continue;
         };
-        let files = BTreeSet::from([version, file.version()]);
+        let plain =
+            rv_export::plain_support_pom_copy(support_poms.keys().map(String::as_str), coordinate);
+        let files: BTreeSet<&str> = [version, file.version()]
+            .into_iter()
+            .chain(plain.as_deref())
+            .collect();
         for file_version in files {
             let directory = rv_maven_types::snapshot_base_version(file_version)
                 .unwrap_or_else(|| file_version.to_string());
@@ -265,18 +282,17 @@ fn build_checksums_files(lock: &Lockfile) -> Result<ChecksumFiles> {
     })
 }
 
-/// Write the checksum files into `<project_root>/.mvn/checksums/`, creating
-/// the directories, and return the paths of the SHA-256 and SHA-1 files.
+/// Write the checksum files into `<mvn_dir>/checksums/`, creating the
+/// directories, and return the paths of the SHA-256 and SHA-1 files.
 ///
 /// A cloned repository decides what `.mvn` holds, so a symbolic link (on
 /// Windows also a junction) at `.mvn`, `.mvn/checksums` or either file is
 /// refused: following it would let the repository point this write at any
 /// directory or file the user can write. Each file is replaced by an atomic
 /// rename, which never writes through a link at the file's own name.
-fn write_checksums_files(project_root: &Path, split: &ChecksumFiles) -> Result<(PathBuf, PathBuf)> {
-    let mvn_dir = project_root.join(".mvn");
+fn write_checksums_files(mvn_dir: &Path, split: &ChecksumFiles) -> Result<(PathBuf, PathBuf)> {
     let checksums_dir = mvn_dir.join("checksums");
-    real_directory(&mvn_dir)?;
+    real_directory(mvn_dir)?;
     real_directory(&checksums_dir)?;
 
     // Maven Resolver expects `checksums.<algorithm>` (dot, not dash).
@@ -517,6 +533,48 @@ mod tests {
         assert_eq!(split.sha256_count, 12);
     }
 
+    /// A parent the lock records only by its timestamped builds is written
+    /// by export-m2 also as the plain `-SNAPSHOT` POM, from its latest build,
+    /// unless the lock pins the plain POM itself; the checksums list that
+    /// copy too.
+    #[test]
+    fn a_parent_recorded_by_its_build_lists_its_plain_copy() {
+        let mut lock = Lockfile::new();
+        lock.platforms = vec![test_platform(
+            Platform::new("linux", "x86_64").unwrap(),
+            Vec::new(),
+        )];
+        for (coord, digest) in [
+            ("com.example:p:1-20240101.010101-1", "11"),
+            ("com.example:p:1-20240102.010101-2", "22"),
+            ("com.example:q:2-20240101.010101-1", "33"),
+            ("com.example:q:2-SNAPSHOT", "44"),
+        ] {
+            lock.platforms[0].support_poms.insert(
+                coord.to_string(),
+                rv_lock::SupportPom::new(
+                    "https://repo.example/",
+                    format!("{digest:0<64}").parse().unwrap(),
+                ),
+            );
+        }
+        let split = build_checksums_files(&lock).unwrap();
+        let lines: Vec<(&str, &str)> = (split.sha256.lines())
+            .map(|line| line.split_once("  ").unwrap())
+            .map(|(digest, path)| (&digest[..2], path))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                ("11", "com/example/p/1-SNAPSHOT/p-1-20240101.010101-1.pom"),
+                ("22", "com/example/p/1-SNAPSHOT/p-1-20240102.010101-2.pom"),
+                ("22", "com/example/p/1-SNAPSHOT/p-1-SNAPSHOT.pom"),
+                ("33", "com/example/q/2-SNAPSHOT/q-2-20240101.010101-1.pom"),
+                ("44", "com/example/q/2-SNAPSHOT/q-2-SNAPSHOT.pom"),
+            ]
+        );
+    }
+
     fn sha256_split(line_count: usize) -> ChecksumFiles {
         ChecksumFiles {
             sha256: "0".repeat(64) + "  g/a/1/a-1.jar\n",
@@ -568,7 +626,8 @@ mod tests {
         // `.mvn` links outside the project.
         let project = tempfile::tempdir().unwrap();
         symlink(outside.path(), project.path().join(".mvn")).unwrap();
-        let err = write_checksums_files(project.path(), &sha256_split(1)).unwrap_err();
+        let err =
+            write_checksums_files(&project.path().join(".mvn"), &sha256_split(1)).unwrap_err();
         assert!(err.to_string().contains("symbolic link"), "{err}");
 
         // `.mvn/checksums` links outside the project.
@@ -579,13 +638,14 @@ mod tests {
             project.path().join(".mvn").join("checksums"),
         )
         .unwrap();
-        let err = write_checksums_files(project.path(), &sha256_split(1)).unwrap_err();
+        let err =
+            write_checksums_files(&project.path().join(".mvn"), &sha256_split(1)).unwrap_err();
         assert!(err.to_string().contains("symbolic link"), "{err}");
 
         // A dangling `.mvn` link would otherwise be created through.
         let project = tempfile::tempdir().unwrap();
         symlink(outside.path().join("gone"), project.path().join(".mvn")).unwrap();
-        write_checksums_files(project.path(), &sha256_split(1)).unwrap_err();
+        write_checksums_files(&project.path().join(".mvn"), &sha256_split(1)).unwrap_err();
         assert!(!outside.path().join("gone").exists());
 
         // The target file itself links outside the project.
@@ -593,13 +653,14 @@ mod tests {
         let checksums = project.path().join(".mvn").join("checksums");
         fs::create_dir_all(&checksums).unwrap();
         symlink(&victim, checksums.join("checksums.sha256")).unwrap();
-        let err = write_checksums_files(project.path(), &sha256_split(1)).unwrap_err();
+        let err =
+            write_checksums_files(&project.path().join(".mvn"), &sha256_split(1)).unwrap_err();
         assert!(err.to_string().contains("symbolic link"), "{err}");
 
         // A stale sha1 link is refused before anything is written.
         fs::remove_file(checksums.join("checksums.sha256")).unwrap();
         symlink(&victim, checksums.join("checksums.sha1")).unwrap();
-        write_checksums_files(project.path(), &sha256_split(1)).unwrap_err();
+        write_checksums_files(&project.path().join(".mvn"), &sha256_split(1)).unwrap_err();
         assert!(!checksums.join("checksums.sha256").exists());
 
         assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
@@ -617,7 +678,8 @@ mod tests {
 
         let project = tempfile::tempdir().unwrap();
         junction(&project.path().join(".mvn"), outside.path());
-        let err = write_checksums_files(project.path(), &sha256_split(1)).unwrap_err();
+        let err =
+            write_checksums_files(&project.path().join(".mvn"), &sha256_split(1)).unwrap_err();
         assert!(err.to_string().contains("junction"), "{err}");
 
         let project = tempfile::tempdir().unwrap();
@@ -626,7 +688,8 @@ mod tests {
             &project.path().join(".mvn").join("checksums"),
             outside.path(),
         );
-        let err = write_checksums_files(project.path(), &sha256_split(1)).unwrap_err();
+        let err =
+            write_checksums_files(&project.path().join(".mvn"), &sha256_split(1)).unwrap_err();
         assert!(err.to_string().contains("junction"), "{err}");
 
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);

@@ -10,12 +10,15 @@
 //! The crate does no network or repository access. Parents and imported
 //! BOMs come from a [`ModelSource`] the caller implements, and it does not
 //! resolve the dependency graph, mediate versions or write a lockfile.
-//! Of `<build>`, only the single values `${project.build.*}` reads are
-//! parsed; plugins and resources are not part of the effective model.
+//! Of `<build>`, the single values `${project.build.*}` reads and the
+//! plugin sections are parsed; resources are not. A project build's
+//! [`Project::plugins`] gives its effective plugin model, which plugin
+//! locking reads and dependency resolution does not.
 //!
 //! Host reads are deliberate and few. [`HostSnapshot::capture`] reads the
 //! environment variables `JAVA_HOME` and `JAVA_VERSION`, the `release`
-//! file under `JAVA_HOME`, and the variables in the caller's `${env.*}`
+//! file of the JDK Maven runs (`JAVA_HOME`, else the `java` on `PATH`), and
+//! the variables in the caller's `${env.*}`
 //! allowlist, once, and model builds see only that snapshot through a
 //! [`ModelEnvironment`]. Profile activation reads the filesystem for
 //! `<file>` conditions, relative to [`ActivationContext::base_dir`].
@@ -46,10 +49,14 @@ mod document;
 mod effective;
 mod environment;
 mod error;
+pub mod file_transport;
+mod handler;
 pub mod held;
 mod inheritance;
+pub mod mavenrc;
 mod metadata;
 mod model;
+mod plugin;
 mod pom;
 mod profile;
 mod project;
@@ -57,38 +64,57 @@ mod properties;
 mod provenance;
 mod relevance;
 mod repository;
-mod scope;
 mod source;
+mod strict;
 mod xml;
 
 pub use activation::{
-    Activation, ActivationContext, ActivationFile, ActivationOs, ActivationProperty, PropertySource,
+    Activation, ActivationContext, ActivationFile, ActivationOs, ActivationProperty, HostProperty,
+    PLATFORM_PROPERTIES, PropertySource, answered_host_properties, expand_host_properties,
+    fixed_over_jvm_config, host_property, jvm_config_by_jdk, jvm_owned, unread_host_reference,
+    unread_property_fix,
 };
-pub use dependency::{Dependency, DependencyManagement, Exclusion};
+pub use dependency::{
+    Dependency, DependencyManagement, Exclusion, ManagedOrigin, ProjectDirectory,
+};
 pub use effective::{EffectiveDescriptor, Gav};
 #[cfg(any(test, feature = "testing"))]
-pub use environment::OS_RELEASE_TEST_ENV;
+pub use environment::{AVX512_VBMI_TEST_ENV, JAVA_PATH_TEST_ENV, OS_RELEASE_TEST_ENV};
 pub use environment::{
-    ClassifierLikes, HostInput, HostReads, HostSnapshot, ModelEnvironment, ModelEnvironmentBuilder,
+    ClassifierLikes, HostInput, HostReads, HostSnapshot, JdkRelease, ModelEnvironment,
+    ModelEnvironmentBuilder, avx512_vbmi_cpu, launcher_root,
 };
 pub use error::{ParentCoordMismatch, PomError};
+pub use handler::{
+    ArtifactHandler, ArtifactTypes, ClassFiles, DefinedType, is_core_type, merge_realm_handlers,
+    read_artifact_handlers,
+};
 pub use inheritance::{
     MAX_PARENT_CHAIN_DEPTH, local_parent_in_range, parent_has_expression, parent_version_range,
 };
+pub use mavenrc::mavenrc_paths;
 pub use metadata::EffectiveMetadata;
+pub use plugin::{
+    ConfigNode, CoreExtension, DEFAULT_PLUGIN_GROUP, EffectivePlugins, Extension, MappedMojo,
+    Plugin, PluginDescriptor, PluginExecution, ProcessorPath, ProcessorPaths,
+    parse_core_extensions, parse_exported_artifacts, parse_lifecycle_mappings,
+    parse_plugin_descriptor,
+};
 pub use pom::{License, Parent, Pom, Relocation};
 pub use profile::Profile;
 pub use project::{ImportedBom, Project};
 pub use provenance::Provenance;
 pub use repository::Repository;
-pub use scope::Scope;
+pub use rv_maven_types::Scope;
 pub use source::{
-    ImportCoord, MAX_IMPORT_DEPTH, MissingParent, ModelPolicy, ModelSource, ParentLookup, ready,
+    ImportCoord, MAX_IMPORT_DEPTH, MissingParent, ModelPolicy, ModelSource, ParentLookup,
+    PluginModel, ready,
 };
 #[cfg(test)]
 pub(crate) use source::{MemorySource, MemorySourceError};
+pub use strict::check_project_pom;
 pub use xml::{MavenEntities, decode_pom};
 
 // PropertyMap is exposed as a public primitive so downstream crates and the
 // benchmark suite can exercise Maven-style ${...} interpolation directly.
-pub use properties::{ModelLookup, PropertyMap};
+pub use properties::{ModelLookup, PropertyMap, directory_uri};

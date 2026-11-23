@@ -6,29 +6,71 @@
         {
           "check": "TLS trust roots",
           "class": null,
+          "code": null,
           "details": "operating system trust store",
           "status": "info"
         },
         {
           "check": "store directory",
           "class": null,
+          "code": null,
           "details": "<tmp>/home/store",
+          "status": "info"
+        },
+        {
+          "check": "Maven mode",
+          "class": null,
+          "code": null,
+          "details": "Maven 3.9, neither [lock] maven nor a Maven wrapper names one",
+          "status": "info"
+        },
+        {
+          "check": "plugins",
+          "class": null,
+          "code": "PLUGINS_NOT_LOCKED",
+          "details": "raeva.lock holds no plugin tables, so it pins no Maven plugins, and build extensions only for a module that resolves a dependency type Maven's core does not define: '[plugins] lock = true' in raeva.toml locks the plugins and build extensions, and '[plugins] trace' the artifacts they fetch while they run (https://github.com/raeva-io/raeva/blob/main/docs/offline-builds.md)",
+          "status": "info"
+        },
+        {
+          "check": "CI check",
+          "class": null,
+          "code": "CI_CHECK_MISSING",
+          "details": "no CI file runs raeva sync --frozen, so nothing checks raeva.lock against the POMs; a job to add is below (https://github.com/raeva-io/raeva/blob/main/docs/ci.md)",
+          "status": "warn"
+        },
+        {
+          "check": ".gitattributes",
+          "class": null,
+          "code": "LOCK_NOT_MARKED_GENERATED",
+          "details": "raeva.lock is not marked as generated, so pull request diffs show it in full; the line to add is below (https://github.com/raeva-io/raeva/blob/main/docs/ci.md)",
           "status": "info"
         },
         {
           "check": "stub",
           "class": null,
+          "code": null,
           "details": "served org/apache/maven/maven-metadata.xml",
           "status": "ok"
         },
         {
           "check": "central",
           "class": null,
+          "code": null,
           "details": "served org/apache/maven/maven-metadata.xml",
           "status": "ok"
         }
       ],
       "issues": 0,
+      "snippets": [
+        {
+          "file": "CI",
+          "text": "# With raeva <raeva-version> installed (https://github.com/raeva-io/raeva/blob/main/docs/ci.md); on GitHub Actions,\n# raeva-io/setup-raeva with `check: true` runs this.\nraeva -C project sync --frozen\n"
+        },
+        {
+          "file": ".gitattributes",
+          "text": "raeva.lock linguist-generated=true\n"
+        }
+      ],
       "warnings": []
     },
     "success": true

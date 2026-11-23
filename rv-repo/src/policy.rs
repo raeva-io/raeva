@@ -39,8 +39,14 @@ pub enum Declaration {
     /// over HTTP or HTTPS.
     RemoteParent,
     /// A dependency or imported BOM, admitted only when the
-    /// `[security]` transitive repository policy allows it.
+    /// `[security]` transitive repository policy allows it. Maven 3.10
+    /// collects that POM's dependencies through it as a descriptor
+    /// repository, which gets no settings.xml password.
     Transitive,
+    /// [`Self::Transitive`] for the parent and imported BOMs of that POM's
+    /// own model, which Maven's model resolver fetches with the session's
+    /// credentials.
+    TransitiveModel,
 }
 
 /// The repositories [`RepositoryPolicy::admit`] accepted and refused, in
@@ -54,8 +60,8 @@ pub struct Admission {
     /// transitive URL the `[security]` policy does not allow.
     pub dropped: Vec<Repository>,
     /// The repositories refused whatever the policy allows, because their
-    /// URL may hold a secret ([`secret_url_refusal`]), which raeva.lock
-    /// would record.
+    /// URL or id may hold a secret ([`secret_url_refusal`],
+    /// [`secret_id_refusal`]).
     pub secret_urls: Vec<Repository>,
     /// External HTTP repositories refused by the built-in blocker.
     pub blocked_http: Vec<Repository>,
@@ -66,7 +72,7 @@ pub struct Admission {
 /// | Provenance | Used | Private address | Redirect authority |
 /// |---|---|---|---|
 /// | `Caller`, `Configured`, `LocalPom` | yes | yes | yes |
-/// | `FetchedPom` from a remote parent | over HTTP(S) | if the transitive policy allows its URL | no |
+/// | `FetchedPom` from a remote parent | over HTTP(S), or through a mirror that matches it | if the transitive policy allows its URL | no |
 /// | `FetchedPom` from a dependency or BOM | if the transitive policy allows its URL | yes, when used | no |
 ///
 /// POM repositories using external HTTP are refused unless configuration
@@ -85,6 +91,8 @@ pub struct RepositoryPolicy {
     named_origins: Option<NamedOrigins>,
     /// [`Config::secret_named_inputs`], which a URL path may not hold.
     secrets: Arc<[(String, String)]>,
+    /// [`Config::secret_input_names`].
+    secret_names: Arc<[(String, String)]>,
 }
 
 impl RepositoryPolicy {
@@ -98,6 +106,7 @@ impl RepositoryPolicy {
             grants,
             named_origins,
             secrets: config.secret_named_inputs().into(),
+            secret_names: config.secret_input_names().into(),
         }
     }
 
@@ -108,7 +117,8 @@ impl RepositoryPolicy {
         repos: impl IntoIterator<Item = Repository>,
         from: Declaration,
     ) -> Admission {
-        let admission = Self::screen_with(&self.config, &self.secrets, repos, from);
+        let admission =
+            Self::screen_with(&self.config, &self.secrets, &self.secret_names, repos, from);
         for repo in &admission.admitted {
             self.grant(repo);
         }
@@ -122,12 +132,17 @@ impl RepositoryPolicy {
         repos: impl IntoIterator<Item = Repository>,
         from: Declaration,
     ) -> Admission {
-        Self::screen_with(config, &config.secret_named_inputs(), repos, from)
+        let (secrets, names) = config.secret_inputs();
+        Self::screen_with(config, &secrets, &names, repos, from)
     }
 
-    fn screen_with(
+    /// [`Self::screen`] with the configuration's
+    /// [`Config::secret_inputs`] already read, for a caller that screens
+    /// many declarations.
+    pub fn screen_with(
         config: &Config,
         secrets: &[(String, String)],
+        names: &[(String, String)],
         repos: impl IntoIterator<Item = Repository>,
         from: Declaration,
     ) -> Admission {
@@ -135,23 +150,57 @@ impl RepositoryPolicy {
         for mut repo in repos {
             let provenance = match from {
                 Declaration::LocalPom => Provenance::LocalPom,
-                Declaration::RemoteParent | Declaration::Transitive => Provenance::FetchedPom,
+                Declaration::RemoteParent
+                | Declaration::Transitive
+                | Declaration::TransitiveModel => Provenance::FetchedPom,
             };
+            let transitive = matches!(from, Declaration::Transitive | Declaration::TransitiveModel);
             repo.set_provenance(provenance);
-            if secret_url_refusal(&repo.url, secrets).is_some() {
+            repo.set_descriptor(from == Declaration::Transitive);
+            if secret_part_refusal(&repo.url, repo.url_reads(), secrets, names).is_some()
+                || secret_id_refusal(repo.id.as_deref(), repo.id_reads(), secrets, names).is_some()
+            {
                 admission.secret_urls.push(repo);
                 continue;
             }
-            if http_repository_blocked(config, &repo, from != Declaration::Transitive) {
+            if http_repository_blocked(config, &repo, !transitive) {
                 admission.blocked_http.push(repo);
+                continue;
+            }
+            // The transitive policy drops a dependency's repository before
+            // anything else about it counts.
+            if transitive && !config.security.allows_transitive_repo_url(&repo.url) {
+                admission.dropped.push(repo);
+                continue;
+            }
+            // Maven 3.9 keeps such a repository and fails the build once it
+            // searches it, as `crate::routing::Route::auth` fails the sync.
+            let maven_39 = config.lock.maven.mode == rv_maven_types::MavenMode::Maven39;
+            let url = match transitive && maven_39 && backslash_in_port(&repo.url) {
+                true => repo.url.replace('\\', "/"),
+                false => repo.url.clone(),
+            };
+            if secret_url_refusal(&url, repo.url_reads(), secrets, names).is_some()
+                || (from != Declaration::LocalPom && expression_id_refusal(config, &repo).is_some())
+                || layout_refusal(config, &repo).is_some()
+            {
+                admission.secret_urls.push(repo);
                 continue;
             }
             let admitted = match from {
                 Declaration::LocalPom => true,
-                // A fetched POM never points raeva at the local file system.
-                Declaration::RemoteParent => url::Url::parse(&repo.url)
-                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https")),
-                Declaration::Transitive => config.security.allows_transitive_repo_url(&repo.url),
+                // A fetched POM never points raeva at the local file system:
+                // its repository is HTTP or HTTPS, or one a mirror serves,
+                // as Maven's parent lookup takes one such as
+                // `${repo.url}/releases` through the mirror.
+                Declaration::RemoteParent => {
+                    url::Url::parse(&repo.url)
+                        .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+                        || mirror_serves(config, &repo)
+                }
+                Declaration::Transitive | Declaration::TransitiveModel => {
+                    config.security.allows_transitive_repo_url(&repo.url)
+                }
             };
             if admitted {
                 admission.admitted.push(repo);
@@ -160,6 +209,12 @@ impl RepositoryPolicy {
             }
         }
         admission
+    }
+
+    /// Give `repos`, which another client's [`Self::admit`] accepted, what
+    /// their provenance allows on this one.
+    pub fn grant_admitted(&self, repos: &[Repository]) {
+        repos.iter().for_each(|repo| self.grant(repo));
     }
 
     /// Give `repo` what its provenance allows.
@@ -177,51 +232,195 @@ impl RepositoryPolicy {
     }
 }
 
+/// Whether a mirror that does not block `repo` serves it.
+pub fn mirror_serves(config: &Config, repo: &Repository) -> bool {
+    matched_mirror(config, repo).is_some_and(|mirror| !mirror.blocked)
+}
+
+/// The mirror `repo` goes to, blocking it or not.
+pub fn matched_mirror<'a>(
+    config: &'a Config,
+    repo: &Repository,
+) -> Option<&'a rv_config::MirrorConfig> {
+    crate::mirror::resolve_mirror(config.mirrors(), repo).1
+}
+
+/// Whether the `http` or `https` URL `url` has a `\` after its port
+/// separator, which Maven 3.9 reads as part of the port, failing the build
+/// on a request to it, where Maven 3.10, as for a `\` elsewhere, fails only
+/// the request. A `file://C:\dir` on Windows names a directory.
+pub(crate) fn backslash_in_port(url: &str) -> bool {
+    (url.split_once("://"))
+        .filter(|(scheme, _)| {
+            let scheme = scheme.trim_start().to_ascii_lowercase();
+            scheme == "http" || scheme == "https"
+        })
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|authority| authority.rsplit('@').next())
+        .and_then(|host_port| host_port.split_once(':'))
+        .is_some_and(|(_, port)| port.contains('\\'))
+}
+
 /// Why `url` may not be used, as a clause after "its URL", or `None` when
-/// it may: it has a part [`rv_config::secret_url_part`] names, or the value
-/// of one of `secrets` ([`Config::secret_named_inputs`]) makes up whole
-/// segments of its path. The clause names the input, never its value, and
-/// says what to do instead.
-pub fn secret_url_refusal(url: &str, secrets: &[(String, String)]) -> Option<String> {
+/// it may: [`rv_config::url_refusal`] refuses it, it has a part
+/// [`rv_config::secret_url_part`] names, its model looked up a name among
+/// `reads` that is a secret's or takes one ([`rv_config::secret_read`], with
+/// `names` from [`Config::secret_input_names`]), or the value of one of
+/// `secrets` ([`Config::secret_named_inputs`]) is in its path
+/// ([`rv_config::url_path_holds`]). The clause names the input, never its
+/// value, and says what to do instead.
+pub fn secret_url_refusal(
+    url: &str,
+    reads: &[String],
+    secrets: &[(String, String)],
+    names: &[(String, String)],
+) -> Option<String> {
+    rv_config::url_refusal(url).or_else(|| secret_part_refusal(url, reads, secrets, names))
+}
+
+/// [`secret_url_refusal`] for the parts of `url` that may hold a secret
+/// alone, leaving out [`rv_config::url_refusal`].
+pub fn secret_part_refusal(
+    url: &str,
+    reads: &[String],
+    secrets: &[(String, String)],
+    names: &[(String, String)],
+) -> Option<String> {
+    let refused = rv_config::secret_part_refusal(url, false);
     if let Some(part) = rv_config::secret_url_part(url) {
         return Some(format!(
-            "has {part}, which raeva.lock would record; put credentials in an [[auth]] entry \
-             in config.toml or a <server> in settings.xml with the repository's id, not in the \
-             URL"
+            "has {part}, which {refused}; put credentials in an [[auth]] entry in config.toml \
+             or a <server> in settings.xml with the repository's id, not in the URL"
         ));
     }
-    rv_config::secret_input_in_path(url, secrets).map(|input| {
+    let remedy = |input: &str| {
         format!(
-            "has the value of {input} as one or more whole path segments, which raeva.lock \
-             would record, and that name looks like a secret's; if the value is a token, give \
-             the URL with it to a settings.xml <mirror> of the repository, whose URL \
+            "which {refused}, and that name looks like a secret's; if the value is a token, \
+             give the URL with it to a settings.xml <mirror> of the repository, whose URL \
              raeva.lock does not record, or put the credential in a <server> with the \
              repository's id; if it is not a secret, rename {input}"
         )
+    };
+    if let Some(input) = rv_config::secret_read(reads, names) {
+        return Some(format!("takes {input}, {}", remedy(&input)));
+    }
+    rv_config::secret_input_in_path(url, secrets)
+        .map(|input| format!("has the value of {input} in its path, {}", remedy(input)))
+}
+
+/// Why a repository id may not be used, as a clause after "its id", or
+/// `None` when it may: it takes an input named like a secret, by `reads`
+/// and `names` ([`rv_config::secret_read`]), or holds the value of one of
+/// `secrets` ([`rv_config::Config::secret_named_inputs`]), as
+/// [`rv_config::without_secret_values`] reads it. raeva.lock records an id
+/// and messages show it.
+pub fn secret_id_refusal(
+    id: Option<&str>,
+    reads: &[String],
+    secrets: &[(String, String)],
+    names: &[(String, String)],
+) -> Option<String> {
+    let id = id?;
+    let remedy = |input: &str| {
+        format!(
+            "which raeva.lock would record and messages show, and that name looks like a \
+             secret's; write the id out, or if the value is not a secret, rename {input}"
+        )
+    };
+    if let Some(input) = rv_config::secret_read(reads, names) {
+        return Some(format!("takes {input}, {}", remedy(&input)));
+    }
+    let (input, _) = (secrets.iter())
+        .find(|secret| rv_config::without_secret_values(id, std::slice::from_ref(secret)) != id)?;
+    Some(format!("has the value of {input}, {}", remedy(input)))
+}
+
+/// Why raeva does not read a POM's repository for its `<layout>`,
+/// or `None` when the layout is `default` or a mirror serves it: Maven
+/// reaches no other layout but through a mirror, as a mirror's
+/// `<mirrorOfLayouts>` of `*` serves even one that still holds a `${...}`.
+pub fn layout_refusal(config: &Config, repo: &Repository) -> Option<String> {
+    let refusal = repo.layout_refusal()?;
+    if mirror_serves(config, repo) {
+        return None;
+    }
+    Some(match repo.layout().contains("${") {
+        true => format!("<layout> {refusal}, which names no layout Maven reads"),
+        false => format!(
+            "<layout> {refusal}, which Maven reaches only through a mirror, and none serves it"
+        ),
     })
+}
+
+/// Why raeva does not follow a POM repository whose `<id>` takes a
+/// `${...}`, or `None` when it follows it. Maven matches mirrors and
+/// `<server>`s against the id as written while it looks a model's parents
+/// up and against the id once interpolated otherwise, as raeva does, so an
+/// id raeva fills in as Maven does is followed, one that keeps an undefined
+/// property as written too. One that takes an environment variable
+/// `[security] allow_env_substitution` does not name, which raeva treats as
+/// unset, may take a value in Maven that raeva does not know, and is
+/// followed only where no mirror's `<mirrorOf>` names an id and, unless a
+/// mirror serves it, no credential does.
+pub fn expression_id_refusal(config: &Config, repo: &Repository) -> Option<&'static str> {
+    let allowed = &config.security.allow_env_substitution;
+    let hidden = (repo.id_reads().iter())
+        .filter_map(|read| read.strip_prefix("env."))
+        .any(|name| !allowed.iter().any(|allowed| allowed == name));
+    if !hidden || !repo.id.as_deref().is_some_and(|id| id.contains("${")) {
+        return None;
+    }
+    let names_ids = (config.mirrors().iter())
+        .flat_map(|mirror| &mirror.mirror_of)
+        .flat_map(|pattern| pattern.split(','))
+        .map(|entry| entry.strip_prefix('!').unwrap_or(entry))
+        .any(|entry| !entry.is_empty() && !matches!(entry, "*" | "external:*" | "external:http:*"));
+    // Through a mirror, the mirror's id picks the credentials.
+    let direct = matched_mirror(config, repo).is_none();
+    (names_ids || direct && config.credential_ids().next().is_some()).then_some(
+        "takes an environment variable raeva treats as unset, which Maven fills in, while a \
+         mirror's <mirrorOf> or a credential names an id; write the id out, or add the \
+         variable to [security] allow_env_substitution",
+    )
+}
+
+/// How messages show a repository `id`: `***` when it takes an input named
+/// like a secret, else with each value of `secrets` in it masked.
+pub fn shown_id(
+    id: &str,
+    reads: &[String],
+    secrets: &[(String, String)],
+    names: &[(String, String)],
+) -> String {
+    match rv_config::secret_read(reads, names) {
+        Some(_) => "***".to_string(),
+        None => rv_config::without_secret_values(id, secrets).to_string(),
+    }
 }
 
 static HTTP_REPO_WARNED: LazyLock<Mutex<HashSet<(String, bool)>>> = LazyLock::new(Mutex::default);
 
-/// Refuse external HTTP declared by a POM unless the user configured the URL
-/// or a matching mirror, as with Maven's default HTTP blocker. `project`
-/// tells whether the project or its parents declared it, which raeva reports
-/// without `-v`.
+/// Refuse external HTTP declared by a POM unless `raeva.toml` or
+/// `config.toml` names the URL as a repository, or the mirror that matches
+/// it is not blocked, or, with none, replaced Maven's default HTTP blocker,
+/// as with that blocker, which blocks a settings.xml repository too.
+/// `project` tells whether the project or its parents declared it, which
+/// raeva reports without `-v`.
 pub(crate) fn http_repository_blocked(config: &Config, repo: &Repository, project: bool) -> bool {
     if !url::Url::parse(&repo.url).is_ok_and(|url| url.scheme() == "http")
         || !crate::mirror::is_external_http_repo(&repo.url)
-        || config.repositories().iter().any(|configured| {
-            crate::repository::normalize_repo_url(&configured.url)
-                == crate::repository::normalize_repo_url(&repo.url)
-        })
-        || crate::mirror::resolve_mirror(config.mirrors(), repo)
-            .1
-            .is_some()
+        || crate::mirror::own_urls(config)
+            .contains(&crate::repository::normalize_repo_url(&repo.url))
+        || match crate::mirror::resolve_mirror(config.mirrors(), repo).1 {
+            Some(mirror) => !mirror.blocked,
+            None => !crate::mirror::http_blocker_applies(config.mirrors()),
+        }
     {
         return false;
     }
     let key = (crate::repository::normalize_repo_url(&repo.url), project);
-    let url = rv_config::redact_url(&repo.url);
+    let url = rv_config::redact_repository_url(&repo.url);
     rv_maven_model::held::when_shown(move || {
         if HTTP_REPO_WARNED
             .lock()
@@ -234,7 +433,7 @@ pub(crate) fn http_repository_blocked(config: &Config, repo: &Repository, projec
                 project,
                 "ignoring repository {url} that a POM declares: plain HTTP to a host that is \
                  not loopback, which Maven's default HTTP blocker refuses; mirror it or declare \
-                 the URL in raeva.toml, config.toml or settings.xml"
+                 the URL in raeva.toml or config.toml"
             );
         }
     });
@@ -253,7 +452,7 @@ impl std::fmt::Debug for RepositoryPolicy {
 mod tests {
     use rv_config::{Config, ResolvedPaths, SecurityConfig};
 
-    use super::{Declaration, Provenance, RepositoryPolicy};
+    use super::{Declaration, Provenance, RepositoryPolicy, secret_id_refusal};
     use crate::error::RepoError;
     use crate::repository::Repository;
     use crate::transport::ClientSet;
@@ -288,6 +487,24 @@ mod tests {
 
     fn trusts(transport: &ClientSet, origin: &str) -> bool {
         transport.trusts_origin(&url::Url::parse(origin).unwrap())
+    }
+
+    /// Repositories one client admitted get the same trust on another.
+    #[test]
+    fn admitted_repositories_carry_their_trust_to_another_client() {
+        let (first, _) = policy(&["https://allowed.example/"]);
+        let (second, transport) = policy(&["https://allowed.example/"]);
+        let local = first.admit(repos(&["https://nexus.corp/m2/"]), Declaration::LocalPom);
+        let fetched = first.admit(
+            repos(&["https://allowed.example/m2/", "https://other.example/m2/"]),
+            Declaration::RemoteParent,
+        );
+        second.grant_admitted(&[local.admitted, fetched.admitted].concat());
+        assert!(trusts(&transport, "https://nexus.corp/"));
+        assert!(transport.authorizes_issuer("https://nexus.corp/"));
+        assert!(trusts(&transport, "https://allowed.example/"));
+        assert!(!transport.authorizes_issuer("https://allowed.example/"));
+        assert!(!trusts(&transport, "https://other.example/"));
     }
 
     /// Maven uses a remote parent's repositories, so raeva does too, but a
@@ -378,6 +595,20 @@ mod tests {
     }
 
     #[test]
+    fn an_id_holding_a_secret_named_value_is_refused() {
+        let secrets = [("-Dcs.token".to_string(), "s3cretpass".to_string())];
+        let refusal = secret_id_refusal(Some("s3cretpass"), &[], &secrets, &[]).expect("refused");
+        assert!(
+            refusal.starts_with("has the value of -Dcs.token,"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("s3cretpass"), "{refusal}");
+        for id in [None, Some("corp"), Some("")] {
+            assert_eq!(secret_id_refusal(id, &[], &secrets, &[]), None, "{id:?}");
+        }
+    }
+
+    #[test]
     fn a_private_ip_literal_needs_a_local_declaration() {
         let (policy, transport) = policy(&[]);
         let public = url::Url::parse("https://93.184.215.14/maven/a.pom").unwrap();
@@ -440,10 +671,17 @@ mod tests {
                 assert!(admission.admitted.is_empty(), "{from:?}");
                 assert!(admission.dropped.is_empty(), "{from:?}");
                 assert_eq!(admission.blocked_http, [repo("http://repo.example/")]);
-                // Maven's blocker spares `localhost` and `127.0.0.1` only.
-                let loopback = repo("http://[::1]:8080/");
-                let admission = policy.admit([loopback.clone()], from);
-                assert_eq!(admission.blocked_http, [loopback]);
+                // Maven's blocker spares `localhost` and `127.0.0.1` only,
+                // as the URL spells them.
+                for url in [
+                    "http://[::1]:8080/",
+                    "http://LOCALHOST:8080/",
+                    "http://127.1:8080/",
+                    "http://0x7f.0.0.1/",
+                ] {
+                    let admission = policy.admit([repo(url)], from);
+                    assert_eq!(admission.blocked_http, [repo(url)], "{url}");
+                }
                 for url in [
                     "http://127.0.0.1:8080/",
                     "http://localhost:8080/",
@@ -453,10 +691,10 @@ mod tests {
                 }
             }
         });
-        // Once for the project and its parents, and once for dependencies,
-        // which raeva shows only at -v.
-        assert_eq!(output.matches("HTTP_REPO_BLOCKED").count(), 4, "{output}");
-        assert_eq!(output.matches("project=true").count(), 2, "{output}");
+        // Once per URL for the project and its parents, and once for
+        // dependencies, which raeva shows only at -v.
+        assert_eq!(output.matches("HTTP_REPO_BLOCKED").count(), 10, "{output}");
+        assert_eq!(output.matches("project=true").count(), 5, "{output}");
         assert!(output.contains("http://repo.example/"), "{output}");
         assert!(!trusts(&transport, "http://repo.example/"));
 
@@ -471,20 +709,102 @@ mod tests {
         let mut mirror = rv_config::MirrorConfig::new(Some("safe"), "https://mirror.example/");
         mirror.mirror_of = vec!["external:http:*".into()];
         let mirrored = config.clone().with_mirrors(vec![mirror]);
+        // A user mirror that takes the blocker's id replaces it, as in
+        // Maven's settings merge, whatever it mirrors.
+        let mut unblocked =
+            rv_config::MirrorConfig::new(Some("maven-default-http-blocker"), "http://0.0.0.0/");
+        unblocked.mirror_of = vec!["none".into()];
+        let unblocked = config.clone().with_mirrors(vec![unblocked]);
         let mut excluded = rv_config::MirrorConfig::new(Some("safe"), "https://mirror.example/");
         excluded.mirror_of = vec!["external:http:*,!legacy".into()];
-        let excluded = config.with_mirrors(vec![excluded]);
+        let excluded = config.clone().with_mirrors(vec![excluded]);
+        // A blocked mirror with the blocker's id blocks what it mirrors.
+        let mut own_blocker =
+            rv_config::MirrorConfig::new(Some("maven-default-http-blocker"), "http://0.0.0.0/");
+        own_blocker.mirror_of = vec!["external:http:*,!legacy".into()];
+        own_blocker.blocked = true;
+        let own_blocker = config.clone().with_mirrors(vec![own_blocker]);
+        // A blocked mirror of the user's blocks it as Maven's blocker does:
+        // admitted, a `central` would replace the default Central.
+        let mut blocked = rv_config::MirrorConfig::new(Some("no-http"), "http://0.0.0.0/");
+        blocked.mirror_of = vec!["external:http:*".into()];
+        blocked.blocked = true;
+        let blocked = config.with_mirrors(vec![blocked]);
         let legacy = Repository::new(Some("legacy".into()), "http://repo.example/", true, false);
-        for config in [configured, mirrored] {
+        for config in [configured, mirrored, unblocked, own_blocker.clone()] {
             assert_eq!(
                 RepositoryPolicy::screen(&config, [legacy.clone()], Declaration::LocalPom).admitted,
                 std::slice::from_ref(&legacy)
             );
         }
-        assert!(
-            RepositoryPolicy::screen(&excluded, [legacy], Declaration::LocalPom)
-                .admitted
-                .is_empty()
+        let other = Repository::new(Some("other".into()), "http://repo.example/", true, false);
+        for (config, repo) in [
+            (excluded, &legacy),
+            (blocked, &legacy),
+            (own_blocker, &other),
+        ] {
+            assert!(
+                RepositoryPolicy::screen(&config, [repo.clone()], Declaration::LocalPom)
+                    .admitted
+                    .is_empty()
+            );
+        }
+    }
+
+    /// Maven's default HTTP blocker blocks the plugin repositories of
+    /// settings.xml on plain HTTP too: of a profile active by
+    /// `<activeProfiles>` and of one active by `<activation>`.
+    #[test]
+    fn a_settings_plugin_repository_url_stays_blocked() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join("project");
+        let raeva_home = home.path().join("raeva");
+        for dir in [&project, &raeva_home, &home.path().join(".m2")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let profile = |id: &str, activation: &str| {
+            format!(
+                "<profile><id>{id}</id>{activation}<pluginRepositories><pluginRepository>\
+                 <id>{id}</id><url>http://{id}.example/</url></pluginRepository>\
+                 </pluginRepositories></profile>"
+            )
+        };
+        std::fs::write(
+            home.path().join(".m2/settings.xml"),
+            format!(
+                "<settings><profiles>{}{}</profiles><activeProfiles>\
+                 <activeProfile>named</activeProfile></activeProfiles></settings>",
+                profile("named", ""),
+                profile(
+                    "activated",
+                    "<activation><activeByDefault>true</activeByDefault></activation>"
+                ),
+            ),
+        )
+        .unwrap();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home.path().as_os_str())),
+                ("USERPROFILE", Some(home.path().as_os_str())),
+                (
+                    rv_config::MAVEN_USER_HOME_TEST_ENV,
+                    Some(home.path().as_os_str()),
+                ),
+                ("RAEVA_HOME", Some(raeva_home.as_os_str())),
+            ],
+            || {
+                let config = Config::load(&project).unwrap();
+                for url in [
+                    "http://named.example/",
+                    "http://activated.example/",
+                    "http://other.example/",
+                ] {
+                    assert!(
+                        super::http_repository_blocked(&config, &repo(url), true),
+                        "{url}"
+                    );
+                }
+            },
         );
     }
 

@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 /// Why a lockfile could not be read, written or used.
 ///
-/// Every variant but [`LockError::Io`] says the file is not a lockfile this
-/// raeva can use ([`LockError::is_incompatible_lockfile`]); a plain `raeva sync`
-/// replaces such a file instead of failing on it. No message quotes text
+/// Every variant but [`LockError::Io`] and [`LockError::UnrecordableOrigin`]
+/// says the file is not a lockfile this raeva can use
+/// ([`LockError::is_incompatible_lockfile`]); a plain `raeva sync` replaces
+/// such a file instead of failing on it. No message quotes text
 /// from the file unescaped.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -59,13 +60,17 @@ pub enum LockError {
     /// The lockfile breaks a rule of the schema.
     #[error("invalid lockfile: {0}")]
     Invalid(String),
+    /// A resolution read through a repository whose URL a lock cannot
+    /// record: the configuration is at fault, not a lockfile.
+    #[error("{0}")]
+    UnrecordableOrigin(String),
 }
 
 impl LockError {
     /// Whether this error means the file is not a lockfile this raeva can use,
     /// as opposed to one it could not read or write.
     pub fn is_incompatible_lockfile(&self) -> bool {
-        !matches!(self, Self::Io { .. })
+        !matches!(self, Self::Io { .. } | Self::UnrecordableOrigin(_))
     }
 
     pub(crate) fn io(context: impl Into<String>, source: io::Error) -> Self {

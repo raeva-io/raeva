@@ -1,6 +1,6 @@
 //! BOM (`import` scope) resolution in one pass against the importer's properties.
 
-use crate::dependency::{Dependency, DependencyManagement};
+use crate::dependency::{Dependency, DependencyManagement, ManagedOrigin};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -66,6 +66,14 @@ impl std::fmt::Debug for ImportedBom {
 }
 
 impl ImportedBom {
+    /// The coordinates of the BOM and of every import its build went
+    /// through.
+    pub fn boms(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        (self.imports.iter()).map(|(group, artifact, version, ..)| {
+            (group.as_str(), artifact.as_str(), version.as_str())
+        })
+    }
+
     /// Whether a build in `ctx` and `project` at nesting level `depth`,
     /// with `stack` open, would build this contribution again.
     fn rebuilds_alike(
@@ -145,7 +153,12 @@ fn import_key(dep: &Dependency, version: &str) -> BomImportKey {
 /// Maven's importer keys the management once a BOM is imported: a later
 /// local replaces an earlier one with the same key in its place, and an
 /// imported entry joins only under a key no local or earlier BOM holds.
-fn merge_imports(locals: Vec<Dependency>, imports: &[Arc<[Dependency]>]) -> Vec<Dependency> {
+/// An imported entry takes the origin of its import, when it has one.
+fn merge_imports(
+    locals: Vec<Dependency>,
+    imports: &[Arc<[Dependency]>],
+    origins: &[ManagedOrigin],
+) -> Vec<Dependency> {
     enum Slot {
         Local(usize),
         Imported(usize, usize),
@@ -154,7 +167,7 @@ fn merge_imports(locals: Vec<Dependency>, imports: &[Arc<[Dependency]>]) -> Vec<
     let mut positions = foldhash::HashMap::with_capacity_and_hasher(capacity, Default::default());
     let mut slots = Vec::with_capacity(capacity);
     for (at, dep) in locals.iter().enumerate() {
-        match positions.entry(dep.management_key()) {
+        match positions.entry(dep.maven_key()) {
             Entry::Occupied(slot) => slots[*slot.get()] = Slot::Local(at),
             Entry::Vacant(slot) => {
                 slot.insert(slots.len());
@@ -164,7 +177,7 @@ fn merge_imports(locals: Vec<Dependency>, imports: &[Arc<[Dependency]>]) -> Vec<
     }
     for (from, import) in imports.iter().enumerate() {
         for (at, dep) in import.iter().enumerate() {
-            if let Entry::Vacant(slot) = positions.entry(dep.management_key()) {
+            if let Entry::Vacant(slot) = positions.entry(dep.maven_key()) {
                 slot.insert(slots.len());
                 slots.push(Slot::Imported(from, at));
             }
@@ -176,7 +189,13 @@ fn merge_imports(locals: Vec<Dependency>, imports: &[Arc<[Dependency]>]) -> Vec<
         .into_iter()
         .filter_map(|slot| match slot {
             Slot::Local(at) => locals[at].take(),
-            Slot::Imported(from, at) => Some(imports[from][at].clone()),
+            Slot::Imported(from, at) => {
+                let mut dep = imports[from][at].clone();
+                if origins[from].0.is_some() {
+                    dep.origin.clone_from(&origins[from]);
+                }
+                Some(dep)
+            }
         })
         .collect()
 }
@@ -219,19 +238,13 @@ pub(super) async fn resolve_bom_imports_blamed<S: ModelSource>(
         system_properties: ctx.system_properties.clone(),
         ..ActivationContext::default()
     };
-    // An imported BOM is built at Maven's minimal validation level, not as
-    // the project.
-    let import_policy = ModelPolicy {
-        root: false,
-        ..policy
-    };
     let mut stack: IndexSet<BomImportKey> = IndexSet::new();
     let imports = resolve_bom_imports_inner(
         management,
         properties,
         project,
         source,
-        import_policy,
+        policy,
         &import_ctx,
         &mut stack,
         0,
@@ -261,19 +274,21 @@ pub(super) async fn resolve_bom_imports_blamed<S: ModelSource>(
 ///
 /// Maven removes an import from the model before it validates the
 /// managed dependencies, so only the coordinates it looks up are checked.
+/// It looks up no classifier.
 fn prepare_import(
     dependency: &Dependency,
     properties: &PropertyMap,
     project: &ProjectInfo,
     blame: &(dyn Fn(PomError) -> PomError + Send + Sync),
 ) -> Result<Option<(Dependency, String)>, PomError> {
-    let dep =
+    let mut dep =
         interpolate_dependency(dependency.clone(), properties, project, None).map_err(blame)?;
     // Scope may still hold `${...}` until this pass; a literal non-import
     // never reaches here because [`maybe_bom_import`] filtered it out.
     if !dep.is_import_scope() || dep.type_.as_deref() != Some("pom") {
         return Ok(None);
     }
+    dep.classifier = None;
     for (field, value) in [("groupId", &dep.group_id), ("artifactId", &dep.artifact_id)] {
         if value.is_empty() {
             return Err(blame(dep.missing(true, field)));
@@ -291,6 +306,18 @@ fn prepare_import(
             ))
         })?;
     Ok(Some((dep, version)))
+}
+
+/// The origin the entries of import `dep` take: the BOM, with the property
+/// the import's version is written as in `pending`.
+fn import_origin(pending: &Dependency, dep: &Dependency) -> ManagedOrigin {
+    let source = rv_maven_types::ManagedSource::new(
+        rv_maven_types::ManagedKind::Import,
+        &dep.group_id,
+        &dep.artifact_id,
+        pending.version.as_deref(),
+    );
+    ManagedOrigin(source.map(Arc::new))
 }
 
 /// Whether an import's interpolated coordinates keep a `${...}`.
@@ -326,40 +353,45 @@ fn resolve_bom_imports_inner<'a, S: ModelSource>(
     blame: &'a (dyn Fn(PomError) -> PomError + Send + Sync),
 ) -> BomImportFuture<'a, S::Error> {
     Box::pin(async move {
+        // Only a project build names the import behind each entry.
+        let tag_imports = policy.root;
+        // An imported BOM is built at Maven's minimal validation level, not
+        // as the project.
+        let policy = ModelPolicy {
+            root: false,
+            plugins: crate::PluginModel::Off,
+            ..policy
+        };
         if depth >= MAX_BOM_DEPTH {
             return Err(PomError::InvalidModel(format!(
                 "BOM nesting too deep (limit {MAX_BOM_DEPTH})"
             ))
             .into());
         }
-        // Keep literal `import` scopes and scopes that still hold `${...}`
-        // so property-interpolated import scopes become imports after
-        // [`prepare_import`], as Maven does.
-        let mut pending_imports = Vec::new();
+        // Maven decides on the interpolated model which entries are
+        // imports, and every other entry keeps its place. Each import
+        // coordinate takes the importer's own properties only, so one pass
+        // suffices.
         let mut locals = Vec::new();
+        let mut prepared = Vec::new();
         for dep in management.dependencies {
-            if maybe_bom_import(&dep) {
-                pending_imports.push(dep);
-            } else {
+            if !maybe_bom_import(&dep) {
                 locals.push(dep);
+                continue;
+            }
+            match prepare_import(&dep, properties, project, blame) {
+                Ok(None) => locals.push(dep),
+                Ok(Some(import)) => prepared.push((dep, Ok(import))),
+                Err(error) => prepared.push((dep, Err(error))),
             }
         }
 
         // The management of each import, in declaration order.
         let mut resolved_imports: Vec<Arc<[Dependency]>> = Vec::new();
+        // For each, the import as its entries' origin, in a project build.
+        let mut import_origins: Vec<ManagedOrigin> = Vec::new();
         let mut imports_seen: Vec<BomImportKey> = Vec::new();
         let mut reached = depth;
-
-        // Maven resolves each import coordinate with the importer's own
-        // properties only, so one pass suffices.
-        let mut prepared = Vec::new();
-        for pending in pending_imports {
-            match prepare_import(&pending, properties, project, blame) {
-                Ok(None) => locals.push(pending),
-                Ok(Some(import)) => prepared.push((pending, Ok(import))),
-                Err(error) => prepared.push((pending, Err(error))),
-            }
-        }
         // The source may start fetching every import this loop will ask for,
         // in order.
         let upcoming: Vec<ImportCoord<'_>> = prepared
@@ -429,13 +461,22 @@ fn resolve_bom_imports_inner<'a, S: ModelSource>(
                 classifier: dep.classifier.as_deref(),
             };
             let usable = |kept: &ImportedBom| kept.rebuilds_alike(ctx, project, stack, depth);
-            if let Some(kept) = source.reuse_import(coord, policy, &usable) {
+            let fits = |kept: &ImportedBom| depth + kept.height < MAX_BOM_DEPTH;
+            let kept = match source.cached_import(coord, &fits).await {
+                Some(kept) => Some(kept),
+                None => source.reuse_import(coord, policy, ctx, &usable).await,
+            };
+            if let Some(kept) = kept {
                 source.reused_import()?;
                 ctx.environment.record_reads(&kept.activation_reads);
                 project.environment.record_reads(&kept.project_reads);
                 reached = reached.max(depth + kept.height);
                 imports_seen.extend(kept.imports.iter().cloned());
                 resolved_imports.push(Arc::clone(&kept.management_dependencies));
+                import_origins.push(match tag_imports {
+                    true => import_origin(&pending, &dep),
+                    false => ManagedOrigin::default(),
+                });
                 continue;
             }
 
@@ -497,7 +538,7 @@ fn resolve_bom_imports_inner<'a, S: ModelSource>(
                 };
                 let importer = ctx;
                 let ctx = &bom_ctx;
-                observe_lineage_repositories(source, &bom_pom, Some(ctx))?;
+                observe_lineage_repositories(source, &bom_pom, Some(ctx), false, &[])?;
                 let mut bom_effective = apply_inheritance_in_context(
                     bom_pom,
                     source,
@@ -511,28 +552,39 @@ fn resolve_bom_imports_inner<'a, S: ModelSource>(
                 }
                 // User properties win over the BOM's own, as in any model.
                 for (key, value) in &ctx.properties {
-                    bom_effective
-                        .properties
-                        .insert_external(key.as_str(), value.as_str());
+                    if !ctx.restricts_interpolation()
+                        || crate::activation::is_safe_external_property(key)
+                    {
+                        bom_effective
+                            .properties
+                            .insert_external(key.as_str(), value.as_str());
+                    }
                 }
                 // Maven builds an imported BOM with the importing build's
                 // system properties.
                 let bom_info = crate::model::project_info_in(
                     &bom_effective,
                     &bom_effective.properties,
-                    None,
+                    (None, None),
                     project.system_properties.clone(),
-                    &project_reads.detached,
+                    &match ctx.restricts_interpolation() {
+                        true => project_reads.detached.restricted(),
+                        false => project_reads.detached.clone(),
+                    },
                 )
                 .map_err(bom_own);
                 let bom_info = match bom_info {
                     Ok(bom_info) => bom_info,
                     Err(error) => break 'build Err(error),
                 };
+                // As for a parent: a coordinate the BOM's lineage leaves
+                // unresolved is not one raeva knows is another.
+                let differs =
+                    |actual: &str, requested: &str| actual != requested && !actual.contains("${");
                 if let Some(error) = unverified
-                    && (bom_info.group_id != dep.group_id
-                        || bom_info.artifact_id != dep.artifact_id
-                        || bom_info.version != *version)
+                    && (differs(&bom_info.group_id, &dep.group_id)
+                        || differs(&bom_info.artifact_id, &dep.artifact_id)
+                        || differs(&bom_info.version, version))
                 {
                     return Err(error.into());
                 }
@@ -545,7 +597,7 @@ fn resolve_bom_imports_inner<'a, S: ModelSource>(
                     &bom_info,
                 ) && !repositories.is_empty()
                 {
-                    source.observe_effective_repositories(&repositories);
+                    source.observe_effective_repositories(&repositories)?;
                 }
                 let bom_result = resolve_bom_imports_inner(
                     bom_effective.dependency_management.unwrap_or_default(),
@@ -599,6 +651,10 @@ fn resolve_bom_imports_inner<'a, S: ModelSource>(
                 );
                 imports_seen.extend(subtree);
                 resolved_imports.push(managed_deps);
+                import_origins.push(match tag_imports {
+                    true => import_origin(&pending, &dep),
+                    false => ManagedOrigin::default(),
+                });
                 Ok(())
             };
             // Remove this iteration's guard precisely by key. `IndexSet::pop`
@@ -626,7 +682,7 @@ fn resolve_bom_imports_inner<'a, S: ModelSource>(
             }
         }
         if !resolved_imports.is_empty() {
-            dependencies = merge_imports(dependencies, &resolved_imports);
+            dependencies = merge_imports(dependencies, &resolved_imports, &import_origins);
         }
 
         imports_seen.sort_unstable();
@@ -908,11 +964,12 @@ mod tests {
             Ok(Some(bom(name, &(entries + &own))))
         }
 
-        fn reuse_import(
+        async fn reuse_import(
             &self,
             bom: ImportCoord<'_>,
             _: ModelPolicy,
-            usable: &dyn Fn(&ImportedBom) -> bool,
+            _: &ActivationContext,
+            usable: &(dyn Fn(&ImportedBom) -> bool + Sync),
         ) -> Option<Arc<ImportedBom>> {
             let kept = self.kept.lock().unwrap().get(bom.artifact_id).cloned();
             kept.filter(|kept| usable(kept))
@@ -972,6 +1029,18 @@ mod tests {
     /// nest past [`MAX_BOM_DEPTH`].
     #[test]
     fn a_kept_import_is_built_again_where_it_would_close_a_cycle_or_nest_too_deep() {
+        // raeva resolves on threads with an 8 MiB stack (raeva/src/main.rs);
+        // fifty nested imports in a debug build pass the test thread's 2 MiB
+        // on Windows.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(a_kept_import_is_built_again_on_raevas_stack)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn a_kept_import_is_built_again_on_raevas_stack() {
         let source = Keeper::default()
             .with("outer", &["inner"])
             .with("inner", &[]);

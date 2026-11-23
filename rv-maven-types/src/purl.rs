@@ -115,11 +115,14 @@ fn canonical_purl_string(purl: &PackageUrl<'_>) -> String {
     } else {
         base.to_string()
     };
-    if purl.qualifiers().is_empty() {
+    // `jar` is the Maven type a purl without one names.
+    let default = |key: &str, value: &str| purl.ty() == "maven" && key == "type" && value == "jar";
+    let mut qualifiers = (purl.qualifiers().iter())
+        .filter(|(key, value)| !default(key, value))
+        .collect::<Vec<_>>();
+    if qualifiers.is_empty() {
         return base;
     }
-
-    let mut qualifiers = purl.qualifiers().iter().collect::<Vec<_>>();
     qualifiers.sort();
     let qualifiers = qualifiers
         .into_iter()
@@ -129,8 +132,9 @@ fn canonical_purl_string(purl: &PackageUrl<'_>) -> String {
     format!("{base}?{qualifiers}")
 }
 
-/// Re-renders a purl in the form [`maven_purl_with_qualifiers`] produces, or
-/// `None` when it does not parse.
+/// Re-renders a purl in the form [`maven_purl_with_qualifiers`] produces,
+/// without a Maven `type=jar`, which purl-spec makes the default, or `None`
+/// when it does not parse.
 pub fn canonicalize_purl(purl: &str) -> Option<String> {
     let parsed: PackageUrl<'_> = purl.parse().ok()?;
     Some(canonical_purl_string(&parsed))
@@ -145,6 +149,33 @@ pub fn maven_purl_name_version(purl: &str) -> Option<(String, String)> {
     }
     let name = format!("{}:{}", parsed.namespace()?, parsed.name());
     Some((name, parsed.version()?.to_string()))
+}
+
+/// The `group:artifact:version` a Maven purl names, then its type, `jar`
+/// when it names only a classifier, and its classifier, percent-decoded, or
+/// `None` when it does not parse as one.
+pub fn maven_purl_coordinate(purl: &str) -> Option<String> {
+    let parsed: PackageUrl<'_> = purl.parse().ok()?;
+    if parsed.ty() != "maven" {
+        return None;
+    }
+    let qualifier = |key: &str| (parsed.qualifiers().get(key)).map(|value| value.as_ref());
+    let mut coordinate = format!(
+        "{}:{}:{}",
+        parsed.namespace()?,
+        parsed.name(),
+        parsed.version()?
+    );
+    let classifier = qualifier("classifier");
+    if let Some(kind) = qualifier("type").or(classifier.map(|_| "jar")) {
+        coordinate.push(':');
+        coordinate.push_str(kind);
+    }
+    if let Some(classifier) = classifier {
+        coordinate.push(':');
+        coordinate.push_str(classifier);
+    }
+    Some(coordinate)
 }
 
 fn encode_qualifier_value(value: &str) -> String {
@@ -167,12 +198,44 @@ mod tests {
     use super::{maven_purl, maven_purl_with_qualifiers};
 
     #[test]
+    fn the_default_maven_type_is_dropped() {
+        for (purl, canonical) in [
+            ("pkg:maven/g/a@1.0?type=jar", "pkg:maven/g/a@1.0"),
+            (
+                "pkg:maven/g/a@1.0?type=jar&classifier=tests",
+                "pkg:maven/g/a@1.0?classifier=tests",
+            ),
+            ("pkg:maven/g/a@1.0?type=JAR", "pkg:maven/g/a@1.0?type=JAR"),
+            ("pkg:maven/g/a@1.0?type=pom", "pkg:maven/g/a@1.0?type=pom"),
+            ("pkg:generic/a@1.0?type=jar", "pkg:generic/a@1.0?type=jar"),
+        ] {
+            assert_eq!(super::canonicalize_purl(purl).as_deref(), Some(canonical));
+        }
+    }
+
+    #[test]
     fn name_and_version_are_decoded() {
         let purl = maven_purl("org.example", "lib", "1.0+2").unwrap();
         assert_eq!(
             super::maven_purl_name_version(&purl),
             Some(("org.example:lib".to_string(), "1.0+2".to_string()))
         );
+        assert_eq!(
+            super::maven_purl_coordinate(&purl).as_deref(),
+            Some("org.example:lib:1.0+2")
+        );
+        for (packaging, classifier, coordinate) in [
+            ("pom", None, "g:a:1+2:pom"),
+            ("jar", Some("te st"), "g:a:1+2:jar:te st"),
+            ("zip", Some("x"), "g:a:1+2:zip:x"),
+        ] {
+            let purl = maven_purl_with_qualifiers("g", "a", "1+2", packaging, classifier).unwrap();
+            assert_eq!(
+                super::maven_purl_coordinate(&purl).as_deref(),
+                Some(coordinate)
+            );
+        }
+        assert_eq!(super::maven_purl_coordinate("pkg:npm/lib@1"), None);
         assert_eq!(super::maven_purl_name_version("pkg:npm/lib@1"), None);
     }
 

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use crate::common::{assert_status, assert_success};
+use crate::common::{assert_status, assert_success, write_with_sha256};
 use crate::offline_project::Project;
 
 fn git_output(root: &Path, args: &[&str]) -> Output {
@@ -68,12 +68,7 @@ fn reactor_bom_through_remote_project(parent: bool) -> Project {
     let path = root.join("repository/org/test/base/1/base-1.pom");
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let remote = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId><artifactId>base</artifactId><version>1</version><packaging>pom</packaging><dependencyManagement><dependencies><dependency><groupId>org.test</groupId><artifactId>a</artifactId><version>1</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement></project>";
-    fs::write(&path, remote).unwrap();
-    fs::write(
-        path.with_extension("pom.sha256"),
-        crate::common::sha256_hex(remote.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&path, remote.as_bytes());
     fs::write(
         root.join("raeva.toml"),
         format!(
@@ -162,7 +157,21 @@ fn assert_bom_merge_requires_relock(project: Project) {
     );
     let right = rv_lock::Lockfile::read(&path).unwrap();
     assert_eq!(base.platforms[0].artifacts, right.platforms[0].artifacts);
-    assert_eq!(base.platforms[0].modules, right.platforms[0].modules);
+    // Only the source of the version changes: an imported BOM supplies it.
+    let unmanaged = |lock: &rv_lock::Lockfile| {
+        let mut modules = lock.platforms[0].modules.clone();
+        for package in modules.iter_mut().flat_map(|module| &mut module.packages) {
+            package.managed = None;
+        }
+        modules
+    };
+    assert_eq!(unmanaged(&base), unmanaged(&right));
+    let consumer = right.platforms[0]
+        .modules
+        .iter()
+        .find(|module| module.path == "b/pom.xml");
+    let source = consumer.unwrap().packages[0].managed.as_deref().unwrap();
+    assert_eq!(source.kind, rv_maven_types::ManagedKind::Import);
     git(&root, &["add", "b/pom.xml", "raeva.lock"]);
     git(&root, &["commit", "-m", "test: use BOM management"]);
     let merged = git_output(&root, &["merge", "--no-edit", "left"]);
@@ -192,12 +201,7 @@ fn assert_bom_merge_requires_relock(project: Project) {
         ("lib-2.0.pom", pom.as_bytes()),
         ("lib-2.0.jar", b"lib 2 jar".as_slice()),
     ] {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
     assert_success(
         &project.raeva(&["sync", "--offline"]),
@@ -278,12 +282,7 @@ fn an_unread_ancestor_keeps_lock_inputs_portable_between_checkouts() {
     let parent = repository.path().join("org/test/parent/1/parent-1.pom");
     fs::create_dir_all(parent.parent().unwrap()).unwrap();
     let text = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId><artifactId>parent</artifactId><version>1</version><packaging>pom</packaging></project>";
-    fs::write(&parent, text).unwrap();
-    fs::write(
-        parent.with_extension("pom.sha256"),
-        crate::common::sha256_hex(text.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&parent, text.as_bytes());
     for project in [&first, &second] {
         let root = project.root();
         fs::write(
@@ -380,12 +379,7 @@ fn assert_reactor_dependency_merge_requires_relock(left_edit: &str, dependency: 
         ("ext-1.0.pom", pom.as_bytes()),
         ("ext-1.0.jar", b"ext jar".as_slice()),
     ] {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
     git(&root, &["init", "-b", "main"]);
     git(&root, &["add", "."]);
@@ -621,6 +615,65 @@ fn a_whole_reactor_record_change_names_no_untouched_module() {
     assert!(!stderr.contains("a/pom.xml"), "{stderr}");
 }
 
+/// `b` reads module `a` first as its own dependency, then meets it again
+/// below the external `ext`, which takes that read. The records still cover
+/// the whole reactor, so an edit to `c` changes `b`'s.
+#[test]
+fn a_reactor_module_met_again_below_an_external_pom_covers_the_reactor() {
+    for mode in ["3.9", "3.10"] {
+        let project = reactor_dependency_project();
+        let root = project.root();
+        fs::write(
+            root.join("raeva.toml"),
+            format!("[lock]\nmaven = \"{mode}\"\n"),
+        )
+        .unwrap();
+        // 3.10 reserves the id `local`.
+        let c = root.join("c/pom.xml");
+        let text = fs::read_to_string(&c).unwrap();
+        fs::write(&c, text.replace("<id>local</id>", "<id>files</id>")).unwrap();
+        let ext = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+            <artifactId>ext</artifactId><version>1</version><dependencies><dependency>\
+            <groupId>org.test</groupId><artifactId>a</artifactId><version>1</version>\
+            </dependency></dependencies></project>";
+        publish(
+            &root,
+            "ext",
+            &[("ext-1.pom", ext.as_bytes()), ("ext-1.jar", b"ext jar")],
+        );
+        let b = root.join("b/pom.xml");
+        fs::write(
+            &b,
+            fs::read_to_string(&b).unwrap().replace(
+                "</project>",
+                "<repositories><repository><id>files</id>\
+                 <url>file://${project.basedir}/../repository/</url></repository>\
+                 </repositories><dependencies><dependency><groupId>org.test</groupId>\
+                 <artifactId>a</artifactId><version>1</version></dependency><dependency>\
+                 <groupId>org.test</groupId><artifactId>ext</artifactId><version>1</version>\
+                 </dependency></dependencies></project>",
+            ),
+        )
+        .unwrap();
+        let record = || {
+            assert_success(&project.raeva(&["sync", "--offline"]), mode);
+            let lock = rv_lock::Lockfile::read(&root.join("raeva.lock")).unwrap();
+            let inputs = lock.platforms[0].model_inputs.as_ref().unwrap();
+            inputs.pom_hashes["b/pom.xml"].clone()
+        };
+        let before = record();
+        fs::write(
+            &c,
+            fs::read_to_string(&c).unwrap().replace(
+                "<version>1.0</version>",
+                "<version>1.0</version><optional>false</optional>",
+            ),
+        )
+        .unwrap();
+        assert_ne!(record(), before, "{mode}");
+    }
+}
+
 /// `b` reaches a reactor module `a:1` that loses to the external `a:2`,
 /// which `x` brings first. One branch makes `a` depend on `x:[2]`, renaming
 /// it from `first` to `a`; the other makes `b` reach `a:1`: through the
@@ -701,24 +754,14 @@ fn assert_loser_merge_requires_relock(first: &str, relocating: bool) {
             (format!("{artifact}-{version}.pom"), text.as_bytes()),
             (format!("{artifact}-{version}.jar"), b"jar".as_slice()),
         ] {
-            fs::write(dir.join(&name), bytes).unwrap();
-            fs::write(
-                dir.join(format!("{name}.sha256")),
-                crate::common::sha256_hex(bytes),
-            )
-            .unwrap();
+            write_with_sha256(&dir.join(name), bytes);
         }
     }
     let metadata = "<metadata><groupId>org.test</groupId><artifactId>x</artifactId>\
         <versioning><versions><version>1</version><version>2</version></versions>\
         </versioning></metadata>";
     let path = root.join("repository/org/test/x/maven-metadata.xml");
-    fs::write(&path, metadata).unwrap();
-    fs::write(
-        path.with_extension("xml.sha256"),
-        crate::common::sha256_hex(metadata.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&path, metadata.as_bytes());
     let write = |path: &str, text: String| fs::write(root.join(path), text).unwrap();
     write("b/pom.xml", module("b", &[dependency("x", "[1]", "")]));
     write("r/pom.xml", r);
@@ -787,12 +830,7 @@ fn publish(root: &Path, artifact: &str, files: &[(&str, &[u8])]) {
     let dir = root.join(format!("repository/org/test/{artifact}/1"));
     fs::create_dir_all(&dir).unwrap();
     for (name, bytes) in files {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
 }
 
@@ -1015,12 +1053,7 @@ fn assert_dependency_model_merge_requires_relock(ext: &str) {
         ("lib-2.0.pom", lib.as_bytes()),
         ("lib-2.0.jar", b"lib 2 jar".as_slice()),
     ] {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
     assert_success(&project.raeva(&["sync", "--offline"]), "resolve merged BOM");
     let lock = rv_lock::Lockfile::read(&lock_path).unwrap();
@@ -1070,12 +1103,7 @@ fn a_root_import_inheriting_a_reactor_pom_cannot_merge_into_a_stale_graph() {
         ("lib-2.0.pom", lib.as_bytes()),
         ("lib-2.0.jar", b"lib 2 jar".as_slice()),
     ] {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
     git(&root, &["init", "-b", "main"]);
     git(&root, &["add", "."]);
@@ -1196,12 +1224,7 @@ fn assert_range_merge_requires_relock(ext: &str, management: &str) {
     let metadata = "<metadata><groupId>org.test</groupId><artifactId>a</artifactId>\
         <versioning><versions><version>1</version></versions></versioning></metadata>";
     let path = root.join("repository/org/test/a/maven-metadata.xml");
-    fs::write(&path, metadata).unwrap();
-    fs::write(
-        path.with_extension("xml.sha256"),
-        crate::common::sha256_hex(metadata.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&path, metadata.as_bytes());
     publish(
         &root,
         "ext",
@@ -1353,8 +1376,18 @@ fn a_transitive_range_keeps_records_per_module() {
 /// changes `b`'s record too.
 #[test]
 fn a_managed_range_after_a_relocation_covers_the_reactor_module_it_reaches() {
+    for mode in ["3.9", "3.10"] {
+        covers_the_reactor_module_after_a_relocation(mode);
+    }
+}
+
+fn covers_the_reactor_module_after_a_relocation(mode: &str) {
+    // Maven 3.10 refuses the repository id `local`.
+    let module = |name: &str, body: &str| {
+        update_module(name, body).replace("<id>local</id>", "<id>here</id>")
+    };
     let a = |body: &str| {
-        update_module("a", body).replace(
+        module("a", body).replace(
             "<version>1</version><repositories>",
             "<version>2</version><repositories>",
         )
@@ -1368,8 +1401,9 @@ fn a_managed_range_after_a_relocation_covers_the_reactor_module_it_reaches() {
              </project>",
         ),
         ("a/pom.xml", &a("")),
-        ("b/pom.xml", &update_module("b", "")),
-        ("m/pom.xml", &update_module("m", "")),
+        ("b/pom.xml", &module("b", "")),
+        ("m/pom.xml", &module("m", "")),
+        ("raeva.toml", &format!("[lock]\nmaven = \"{mode}\"\n")),
     ]);
     let root = project.root();
     release(&root, "a", "1", "", &["1"]);
@@ -1382,16 +1416,19 @@ fn a_managed_range_after_a_relocation_covers_the_reactor_module_it_reaches() {
         "<dependencies>{}</dependencies>",
         update_dependency("old", "1")
     );
-    fs::write(root.join("m/pom.xml"), update_module("m", &m)).unwrap();
+    fs::write(root.join("m/pom.xml"), module("m", &m)).unwrap();
     let b = format!(
         "<dependencyManagement><dependencies>{}</dependencies></dependencyManagement>\
          <dependencies>{}</dependencies>",
         update_dependency("a", "[1,2]"),
         update_dependency("m", "1")
     );
-    fs::write(root.join("b/pom.xml"), update_module("b", &b)).unwrap();
+    fs::write(root.join("b/pom.xml"), module("b", &b)).unwrap();
     let record = |label| {
-        assert_success(&project.raeva(&["sync", "--offline"]), label);
+        assert_success(
+            &project.raeva(&["sync", "--offline"]),
+            &format!("{label} {mode}"),
+        );
         let lock = rv_lock::Lockfile::read(&root.join("raeva.lock")).unwrap();
         let b = (lock.platforms[0].modules.iter())
             .find(|module| module.path == "b/pom.xml")
@@ -1409,7 +1446,7 @@ fn a_managed_range_after_a_relocation_covers_the_reactor_module_it_reaches() {
         update_dependency("z", "1")
     );
     fs::write(root.join("a/pom.xml"), a(&z)).unwrap();
-    assert_ne!(record("sync edit"), before);
+    assert_ne!(record("sync edit"), before, "{mode}");
 }
 
 /// Writes `org.test:{artifact}:{version}` with `dependencies` and lists
@@ -1426,12 +1463,7 @@ fn release(root: &Path, artifact: &str, version: &str, dependencies: &str, versi
         (format!("{artifact}-{version}.pom"), pom.as_bytes()),
         (format!("{artifact}-{version}.jar"), artifact.as_bytes()),
     ] {
-        fs::write(dir.join(version).join(&name), bytes).unwrap();
-        fs::write(
-            dir.join(version).join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(version).join(name), bytes);
     }
     let listed: String = (versions.iter())
         .map(|version| format!("<version>{version}</version>"))
@@ -1473,12 +1505,7 @@ fn snapshot_bom(root: &Path, version: &str) {
     );
     let dir = root.join("repository/org/test/bom/1-SNAPSHOT");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("bom-1-SNAPSHOT.pom"), &pom).unwrap();
-    fs::write(
-        dir.join("bom-1-SNAPSHOT.pom.sha256"),
-        crate::common::sha256_hex(pom.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&dir.join("bom-1-SNAPSHOT.pom"), pom.as_bytes());
 }
 
 const BOM_IMPORT: &str = "<dependencyManagement><dependencies><dependency>\
@@ -1565,6 +1592,94 @@ fn has(module: &rv_lock::LockModule, coordinate: &str) -> bool {
     (module.packages.iter()).any(|package| package.coordinate.gav.to_string() == coordinate)
 }
 
+/// Branch `left` makes `b` depend on reactor module `c`, whose range on `t`
+/// picked 1.0; branch `right` takes a new `t` release with `--update`, which
+/// moves only `c`'s rows, as no POM changes. Module `d` keeps `t` 1.0 locked,
+/// so the merged rows still decode, and `b`'s graph must not be trusted.
+#[test]
+fn a_reactor_dependency_and_an_update_of_its_graph_cannot_merge_into_a_stale_graph() {
+    let dependencies = |artifact: &str, version: &str| {
+        format!(
+            "<dependencies>{}</dependencies>",
+            update_dependency(artifact, version)
+        )
+    };
+    let project = Project::synced_with(&[
+        (
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+             <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules><module>b</module><module>c</module><module>d</module></modules>\
+             </project>",
+        ),
+        ("b/pom.xml", &update_module("b", "")),
+        ("c/pom.xml", &update_module("c", "")),
+        ("d/pom.xml", &update_module("d", "")),
+    ]);
+    let root = project.root();
+    release(&root, "t", "1.0", "", &["1.0"]);
+    fs::write(
+        root.join("c/pom.xml"),
+        update_module("c", &dependencies("t", "[1,2)")),
+    )
+    .unwrap();
+    fs::write(
+        root.join("d/pom.xml"),
+        update_module("d", &dependencies("t", "1.0")),
+    )
+    .unwrap();
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync base");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "test: record base"]);
+    git(&root, &["switch", "-c", "left"]);
+    fs::write(
+        root.join("b/pom.xml"),
+        update_module("b", &dependencies("c", "1")),
+    )
+    .unwrap();
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync dependency");
+    git(&root, &["add", "b/pom.xml", "raeva.lock"]);
+    git(&root, &["commit", "-m", "test: depend on c"]);
+    git(&root, &["switch", "-c", "right", "main"]);
+    release(&root, "t", "1.1", "", &["1.0", "1.1"]);
+    assert_success(
+        &project.raeva(&["sync", "--offline", "--update"]),
+        "sync update",
+    );
+    git(&root, &["add", "raeva.lock"]);
+    git(&root, &["commit", "-m", "test: update"]);
+    if !git_output(&root, &["merge", "--no-edit", "left"])
+        .status
+        .success()
+    {
+        git(&root, &["checkout", "--theirs", "raeva.lock"]);
+    }
+    let lock = fs::read(root.join("raeva.lock")).unwrap();
+    let merged = rv_lock::Lockfile::read(&root.join("raeva.lock")).unwrap();
+    let module = |lock: &rv_lock::Lockfile, path: &str| {
+        (lock.platforms[0].modules.iter())
+            .find(|module| module.path == path)
+            .unwrap()
+            .clone()
+    };
+    assert!(has(&module(&merged, "b/pom.xml"), "org.test:t:1.0"));
+    assert!(has(&module(&merged, "c/pom.xml"), "org.test:t:1.1"));
+    assert_status(
+        &project.raeva(&["sync", "--frozen", "--offline"]),
+        7,
+        "merged stale reactor dependency",
+    );
+    assert_eq!(fs::read(root.join("raeva.lock")).unwrap(), lock);
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync merge");
+    let lock = rv_lock::Lockfile::read(&root.join("raeva.lock")).unwrap();
+    assert!(has(&module(&lock, "b/pom.xml"), "org.test:t:1.1"));
+    assert_success(
+        &project.raeva(&["sync", "--frozen", "--offline"]),
+        "frozen corrected graph",
+    );
+}
+
 /// One branch excludes `w` from `b`'s dependency on `t`, which brings in
 /// nothing yet; the other takes a new `t` release that depends on `w`.
 #[test]
@@ -1645,12 +1760,7 @@ fn a_module_edit_and_an_update_of_a_bom_it_starts_reading_cannot_merge_into_a_st
             let pom = fs::read_to_string(dir.join("w-1.pom"))
                 .unwrap()
                 .replace("<dependencies>", &format!("{BOM_IMPORT}<dependencies>"));
-            fs::write(dir.join("w-1.pom"), &pom).unwrap();
-            fs::write(
-                dir.join("w-1.pom.sha256"),
-                crate::common::sha256_hex(pom.as_bytes()),
-            )
-            .unwrap();
+            write_with_sha256(&dir.join("w-1.pom"), pom.as_bytes());
         },
         &update_module(
             "b",
@@ -1768,12 +1878,7 @@ fn a_support_pom_only_the_other_side_read_cannot_merge_into_the_lock() {
     let pom = fs::read_to_string(dir.join("w-1.pom"))
         .unwrap()
         .replace("<dependencies>", &format!("{import}<dependencies>"));
-    fs::write(dir.join("w-1.pom"), &pom).unwrap();
-    fs::write(
-        dir.join("w-1.pom.sha256"),
-        crate::common::sha256_hex(pom.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&dir.join("w-1.pom"), pom.as_bytes());
     let b = |dependencies: &str| {
         update_module(
             "b",
@@ -2172,6 +2277,10 @@ fn a_name_only_a_kept_platform_reads_decides_whether_it_is_kept() {
     let at = text.find(name).expect("v is listed");
     let rest = text[at + name.len()..].trim_start_matches(',').trim_start();
     fs::write(&lock_path, format!("{}{rest}", &text[..at])).unwrap();
+    // In the text raeva writes, which a sync that reuses the lock keeps.
+    (rv_lock::Lockfile::read(&lock_path).unwrap())
+        .write_atomic(&lock_path)
+        .unwrap();
     let lock = fs::read(&lock_path).unwrap();
     assert_success(
         &project.raeva(&["sync", "--offline", "--platforms", "linux-x86_64", "-Dv=2"]),
@@ -2703,7 +2812,7 @@ fn a_reactor_bom_profile_its_import_activates_too_keeps_records_per_module() {
     let import = "<dependencyManagement><dependencies><dependency><groupId>org.test</groupId>\
         <artifactId>a</artifactId><version>1</version><type>pom</type><scope>import</scope>\
         </dependency></dependencies></dependencyManagement>";
-    let project = Project::synced_with(&[
+    let project = Project::with(&[
         (
             "pom.xml",
             &module(
@@ -2904,6 +3013,160 @@ fn independent_adjacent_module_edits_merge_with_git_and_pass_frozen() {
     assert_eq!(fs::read(root.join("raeva.lock")).unwrap(), bytes);
 }
 
+/// Branch `left` adds module `d`, whose coordinates no other graph names;
+/// branch `right` changes what module `b` depends on. Schema 8 hashed every
+/// module's path and coordinates into each graph digest, so `left` rewrote
+/// the graph line of every module and the locks conflicted on `b`'s. Now
+/// `left` touches only the root's rows and `d`'s, and git merges the locks
+/// into one that `--frozen` trusts.
+#[test]
+fn a_new_module_and_an_edit_of_another_module_merge_with_git_and_pass_frozen() {
+    let project = reactor_dependency_project();
+    let root = project.root();
+    let lock_path = root.join("raeva.lock");
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "test: record base"]);
+    let graphs = |lock: &rv_lock::Lockfile| {
+        let inputs = lock.platforms[0].model_inputs.as_ref().unwrap();
+        inputs.graphs.clone()
+    };
+    let base = graphs(&rv_lock::Lockfile::read(&lock_path).unwrap());
+    git(&root, &["switch", "-c", "left"]);
+    let pom = root.join("pom.xml");
+    fs::write(
+        &pom,
+        fs::read_to_string(&pom)
+            .unwrap()
+            .replace("</modules>", "<module>d</module></modules>"),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("d")).unwrap();
+    fs::write(
+        root.join("d/pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>d</artifactId><version>1</version></project>",
+    )
+    .unwrap();
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync new module");
+    let left = graphs(&rv_lock::Lockfile::read(&lock_path).unwrap());
+    for module in ["a/pom.xml", "b/pom.xml", "c/pom.xml"] {
+        assert_eq!(left[module], base[module], "{module}");
+    }
+    assert_ne!(left["pom.xml"], base["pom.xml"]);
+    git(&root, &["add", "pom.xml", "d/pom.xml", "raeva.lock"]);
+    git(&root, &["commit", "-m", "test: add module d"]);
+    git(&root, &["switch", "-c", "right", "main"]);
+    let b = root.join("b/pom.xml");
+    fs::write(
+        &b,
+        fs::read_to_string(&b).unwrap().replace(
+            "</project>",
+            "<repositories><repository><id>local</id>\
+             <url>file://${project.basedir}/../repository/</url></repository></repositories>\
+             <dependencies><dependency><groupId>org.test</groupId><artifactId>lib</artifactId>\
+             <version>1.0</version></dependency></dependencies></project>",
+        ),
+    )
+    .unwrap();
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync module edit");
+    git(&root, &["add", "b/pom.xml", "raeva.lock"]);
+    git(&root, &["commit", "-m", "test: depend on lib"]);
+    git(&root, &["merge", "--no-edit", "left"]);
+    let bytes = fs::read(&lock_path).unwrap();
+    assert_success(
+        &project.raeva(&["sync", "--frozen", "--offline"]),
+        "frozen merged tree",
+    );
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync merged tree");
+    assert_eq!(fs::read(&lock_path).unwrap(), bytes);
+    let lock = rv_lock::Lockfile::read(&lock_path).unwrap();
+    let consumer = (lock.platforms[0].modules.iter())
+        .find(|module| module.path == "b/pom.xml")
+        .unwrap();
+    assert!(has(consumer, "org.test:lib:1.0"), "{consumer:?}");
+}
+
+/// Branch `left` adds module `org.test:lib:2.0`; branch `right` makes module
+/// `b` depend on `org.test:lib:[1.0,3.0)`, which only the external 1.0
+/// satisfied. Git merges the locks cleanly and the rows still decode, but
+/// the reactor now has a candidate for `b`'s range, so `--frozen` refuses
+/// the lock.
+#[test]
+fn a_new_module_another_branch_depends_on_cannot_merge_into_a_stale_graph() {
+    let project = reactor_dependency_project();
+    let root = project.root();
+    let lock_path = root.join("raeva.lock");
+    let metadata = "<metadata><groupId>org.test</groupId><artifactId>lib</artifactId>\
+        <versioning><versions><version>1.0</version></versions></versioning></metadata>";
+    let path = root.join("repository/org/test/lib/maven-metadata.xml");
+    write_with_sha256(&path, metadata.as_bytes());
+    git(&root, &["init", "-b", "main"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "test: record base"]);
+    git(&root, &["switch", "-c", "left"]);
+    let pom = root.join("pom.xml");
+    fs::write(
+        &pom,
+        fs::read_to_string(&pom)
+            .unwrap()
+            .replace("</modules>", "<module>lib</module></modules>"),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("lib")).unwrap();
+    fs::write(
+        root.join("lib/pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>lib</artifactId><version>2.0</version></project>",
+    )
+    .unwrap();
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync new module");
+    git(&root, &["add", "pom.xml", "lib/pom.xml", "raeva.lock"]);
+    git(&root, &["commit", "-m", "test: add module lib"]);
+    git(&root, &["switch", "-c", "right", "main"]);
+    let b = root.join("b/pom.xml");
+    fs::write(
+        &b,
+        fs::read_to_string(&b).unwrap().replace(
+            "</project>",
+            "<repositories><repository><id>local</id>\
+             <url>file://${project.basedir}/../repository/</url></repository></repositories>\
+             <dependencies><dependency><groupId>org.test</groupId><artifactId>lib</artifactId>\
+             <version>[1.0,3.0)</version></dependency></dependencies></project>",
+        ),
+    )
+    .unwrap();
+    assert_success(&project.raeva(&["sync", "--offline"]), "sync module edit");
+    git(&root, &["add", "b/pom.xml", "raeva.lock"]);
+    git(&root, &["commit", "-m", "test: depend on lib"]);
+    git(&root, &["merge", "--no-edit", "left"]);
+    let lock = fs::read(&lock_path).unwrap();
+    assert_status(
+        &project.raeva(&["sync", "--frozen", "--offline"]),
+        7,
+        "merged new module drift",
+    );
+    assert_eq!(fs::read(&lock_path).unwrap(), lock);
+    assert_success(
+        &project.raeva(&["sync", "--offline"]),
+        "resolve merged tree",
+    );
+    let lock = rv_lock::Lockfile::read(&lock_path).unwrap();
+    let consumer = (lock.platforms[0].modules.iter())
+        .find(|module| module.path == "b/pom.xml")
+        .unwrap();
+    assert!(
+        (consumer.packages.iter()).any(|package| package.coordinate.gav.to_string()
+            == "org.test:lib:2.0"
+            && package.workspace_module.is_some()),
+        "{consumer:?}"
+    );
+    assert_success(
+        &project.raeva(&["sync", "--frozen", "--offline"]),
+        "frozen corrected graph",
+    );
+}
+
 fn parent_child_project() -> Project {
     Project::synced_with(&[
         (
@@ -2990,12 +3253,7 @@ fn merged_parent_value_and_child_interpolation_refuse_stale_graph() {
         ("lib-2.0.pom", pom.as_bytes()),
         ("lib-2.0.jar", b"lib 2 jar".as_slice()),
     ] {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
     assert_status(
         &project.raeva(&["sync", "--frozen", "--offline"]),
@@ -3211,8 +3469,9 @@ fn a_condition_listed_as_its_variable_counts_for_the_graph_that_tested_it() {
 }
 
 /// A `-D` name no graph reads, on the command line or in
-/// `.mvn/maven.config`, leaves a sync and `--frozen` on the lock as written,
-/// without resolving, and a sync that resolves writes the same bytes.
+/// `.mvn/maven.config`, leaves a sync on the lock as written, without
+/// resolving, and `--frozen` passes; a sync that resolves writes the same
+/// bytes.
 #[test]
 fn an_unread_define_neither_resolves_nor_changes_the_lock() {
     let project = Project::synced();
@@ -3223,7 +3482,11 @@ fn an_unread_define_neither_resolves_nor_changes_the_lock() {
         let out = project.raeva(args);
         assert_success(&out, what);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.starts_with("Checked"), "{what}: {stderr}");
+        let reused = !args.contains(&"--frozen");
+        assert!(
+            stderr.starts_with("Checked") == reused && stderr.contains("Checked"),
+            "{what}: {stderr}"
+        );
         assert_eq!(fs::read(&lock_path).unwrap(), lock, "{what}");
     };
     checked(&["sync", "--offline", "-DskipTests"], "sync with -D");
@@ -3285,7 +3548,7 @@ fn user_property_values_only_matter_when_a_model_looks_up_the_name() {
         "record an absent override",
     );
     let text = fs::read_to_string(root.join("raeva.lock")).unwrap();
-    assert!(text.contains("user-property:lib.version"), "{text}");
+    assert!(text.contains("user-override:lib.version"), "{text}");
     assert!(!text.contains("ci.note"), "{text}");
     assert_status(
         &project.raeva(&["sync", "--frozen", "--offline", "-Dlib.version=2.0"]),
@@ -3346,13 +3609,16 @@ fn conflicted_shared_graphs_recover_every_platform_and_jdk() {
         ]
     );
     assert_success(
-        &project.raeva(&[
-            "sync",
-            "--frozen",
-            "--offline",
-            "--platforms",
-            "linux-x86_64,windows-x86_64",
-        ]),
+        &project.raeva_with(
+            &[("JAVA_VERSION", "17")],
+            &[
+                "sync",
+                "--frozen",
+                "--offline",
+                "--platforms",
+                "linux-x86_64,windows-x86_64",
+            ],
+        ),
         "frozen regenerated targets",
     );
 }
@@ -3364,7 +3630,7 @@ fn settings_activation_tracks_an_absent_user_property_lookup() {
         project.m2_settings(),
         "<settings><profiles><profile><id>extra</id>\
         <activation><property><name>settings.flag</name></property></activation>\
-        <repositories><repository><id>extra</id><url>file://${settings.repo}/</url>\
+        <repositories><repository><id>extra</id><url>file:///settings-repo/</url>\
         </repository></repositories></profile></profiles></settings>",
     )
     .unwrap();
@@ -3441,12 +3707,15 @@ fn user_values_interpolated_into_activation_text_stay_out_of_the_lock() {
         </profile></profiles></project>");
     fs::write(&path, pom).unwrap();
     assert_success(
-        &project.raeva(&[
-            "sync",
-            "--offline",
-            "-Dactivation.version=private-jdk-value",
-            "-Dactivation.name=private-property-value",
-        ]),
+        &project.raeva_with(
+            &[("JAVA_VERSION", "17")],
+            &[
+                "sync",
+                "--offline",
+                "-Dactivation.version=private-jdk-value",
+                "-Dactivation.name=private-property-value",
+            ],
+        ),
         "sync with interpolated activation text",
     );
     let text = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
@@ -3467,12 +3736,7 @@ fn dependency_pom_lookups_remain_inputs_during_a_frozen_check() {
         <activation><property><name>dep.flag</name><value>on</value></property></activation>\
         <dependencies><dependency><groupId>org.test</groupId><artifactId>leaf</artifactId>\
         <version>1.0</version></dependency></dependencies></profile></profiles></project>";
-    fs::write(&pom, text).unwrap();
-    fs::write(
-        pom.with_extension("pom.sha256"),
-        crate::common::sha256_hex(text.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&pom, text.as_bytes());
     fs::remove_file(root.join("raeva.lock")).unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let env = [("RAEVA_HOME", home.path().to_str().unwrap())];

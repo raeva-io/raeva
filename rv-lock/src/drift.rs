@@ -2,7 +2,7 @@
 //! produce: the comparison `--frozen` makes with a fresh resolution, and the
 //! checks that decide whether a lockfile may be reused without resolving.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -10,8 +10,8 @@ use rv_maven_types::{ArtifactCoord, Gav, is_snapshot_version, resolves_through_s
 
 use crate::ambient::AmbientInput;
 use crate::lock::{
-    LockArtifact, LockModule, LockPlatform, Lockfile, SupportPom, canonicalize_module,
-    split_support_pom_coord,
+    EvictedRange, LockArtifact, LockModule, LockPlatform, Lockfile, RangeVersion, SupportPom,
+    canonicalize_module, split_support_pom_coord,
 };
 use crate::lock_origin::{
     LockOrigins, OriginIdentity, is_project_relative_origin, origin_identity, recorded_key,
@@ -124,8 +124,8 @@ impl LockPlatform {
 impl Lockfile {
     /// The first system-scoped file whose bytes no longer match the digest
     /// this lockfile records, or that is gone or unreadable, with the
-    /// lockfile in `lock_root`. This needs no resolution, so `--frozen`
-    /// checks it even when it checks the local inputs only.
+    /// lockfile in `lock_root`. This needs no resolution, so a sync checks
+    /// it before it keeps a lock whose inputs are unchanged.
     pub fn system_file_drift(&self, lock_root: &Path) -> Option<ResolutionDrift> {
         let mut platforms = self.platforms.iter();
         platforms.find_map(|platform| platform.system_file_drift(lock_root))
@@ -157,11 +157,21 @@ impl Lockfile {
     /// file can be recorded under another repository with and without it.
     /// `declared` decides, for each platform, which recorded repositories the current
     /// configuration and resolution may use, so a recorded origin nothing
-    /// declares stays drift.
+    /// declares stays drift. `declared_for_support_poms` adds, for a support
+    /// POM's `g:a:v`, those that served only it, such as an imported BOM's
+    /// own repositories, which Maven searches for that BOM's parents and
+    /// imports alone.
+    ///
+    /// For the same reason a module's `range_versions` may name other
+    /// repositories when nothing else in the module differs, its ranges
+    /// took the same versions, and `declared` accepts each repository only
+    /// this lockfile names: an offline Maven then reads the recorded lists
+    /// from repositories it searches and takes those versions.
     pub fn resolution_drift(
         &self,
         fresh: &Lockfile,
         declared: impl Fn(&Platform, &str) -> bool,
+        declared_for_support_poms: impl Fn(&Platform, &str, &str) -> bool,
     ) -> Option<ResolutionDrift> {
         // The canonical form sorts platforms, modules and rows, so the two
         // sides zip in order.
@@ -171,12 +181,20 @@ impl Lockfile {
         if inputs_drifted(&a, &b) {
             return Some(ResolutionDrift::Inputs);
         }
-        if a.repo_ids != b.repo_ids {
+        if repo_ids_drifted(&a, &b) {
             return Some(ResolutionDrift::RepositoryIds);
         }
         if a.platforms.len() != b.platforms.len() {
             return Some(ResolutionDrift::Platforms);
         }
+        // The export labels a support POM with its repository for every
+        // platform, so a row of any platform that pins no POM for its file
+        // reads it there.
+        let pomless: HashSet<Gav> = (a.platforms.iter().chain(&b.platforms))
+            .flat_map(|platform| &platform.artifacts)
+            .filter(|row| row.pom_sha256.is_none())
+            .map(|row| row.pom_gav())
+            .collect();
         for (lhs, rhs) in a.platforms.iter().zip(&b.platforms) {
             if lhs.platform != rhs.platform {
                 return Some(ResolutionDrift::Platforms);
@@ -190,13 +208,17 @@ impl Lockfile {
                     platform: lhs.platform.clone(),
                 });
             }
-            if let Some(drift) = module_drift(lhs, rhs) {
+            let declared = |url: &str| declared(&lhs.platform, url);
+            if let Some(drift) = module_drift(lhs, rhs, &declared) {
                 return Some(drift);
             }
-            if let Some(drift) = artifact_drift(lhs, rhs, &|url| declared(&lhs.platform, url)) {
+            if let Some(drift) = artifact_drift(lhs, rhs, &declared) {
                 return Some(drift);
             }
-            if let Some(drift) = support_pom_drift(lhs, rhs, &|url| declared(&lhs.platform, url)) {
+            let declared = |coord: &str, url: &str| {
+                declared(url) || declared_for_support_poms(&lhs.platform, coord, url)
+            };
+            if let Some(drift) = support_pom_drift(lhs, rhs, &pomless, &declared) {
                 return Some(drift);
             }
         }
@@ -204,8 +226,8 @@ impl Lockfile {
     }
 
     /// Whether a locked SNAPSHOT, an artifact or a support POM, is due for a
-    /// refresh: the lockfile is at least as old as the shortest update
-    /// interval of the snapshot repositories, since Maven checks each by its
+    /// refresh: the last check, `lock_age_secs` ago, is at least as old as
+    /// the shortest update interval of the snapshot repositories, since Maven checks each by its
     /// own policy and a newer build in any of them replaces the locked one.
     ///
     /// `policies` pairs the URL of each snapshot-enabled repository with its
@@ -229,11 +251,10 @@ impl Lockfile {
 
     /// The first recorded origin no declaration names: neither one of
     /// `configured` nor one of the URLs `declared` lists for that platform.
-    /// Artifact rows and support POMs both count. An empty artifact origin is
-    /// skipped (system-scoped rows name no repository). An empty support POM
-    /// origin is undeclared: a support POM always comes from a repository. A
-    /// project-relative origin that two distinct URLs map to is ambiguous and
-    /// declares nothing.
+    /// Artifact rows, support POMs and evicted ranges count. The empty
+    /// origin is named by a declaration whose URL the lock cannot record
+    /// ([`LockOrigins::key`]). A project-relative origin that two distinct
+    /// URLs map to is ambiguous and declares nothing.
     pub fn undeclared_origin(
         &self,
         origins: &LockOrigins,
@@ -243,7 +264,7 @@ impl Lockfile {
         // Each declared origin key, with the distinct directories or URLs
         // that map to it.
         let declare = |keys: &mut HashMap<String, BTreeSet<OriginIdentity>>, url: &str| {
-            if let Some(key) = origins.declared(url) {
+            if let Some(key) = origins.key(url) {
                 keys.entry(key).or_default().insert(origin_identity(url));
             }
         };
@@ -271,14 +292,17 @@ impl Lockfile {
                 .artifacts
                 .iter()
                 .flat_map(LockArtifact::origins)
-                .filter(|origin| !origin.is_empty())
                 .find(|origin| undeclared(origin, &keys));
             let support = platform
                 .support_poms
                 .values()
                 .map(|pin| pin.repo_url.as_str())
-                .find(|url| url.is_empty() || undeclared(url, &keys));
-            if let Some(url) = artifact.or(support) {
+                .find(|url| undeclared(url, &keys));
+            let evicted = (platform.modules.iter())
+                .flat_map(|module| &module.evicted_ranges)
+                .map(|range| range.origin.as_str())
+                .find(|origin| undeclared(origin, &keys));
+            if let Some(url) = artifact.or(support).or(evicted) {
                 return Some(url.to_string());
             }
         }
@@ -343,7 +367,11 @@ pub fn snapshot_refresh_due<'a>(
     })
 }
 
-fn module_drift(lhs: &LockPlatform, rhs: &LockPlatform) -> Option<ResolutionDrift> {
+fn module_drift(
+    lhs: &LockPlatform,
+    rhs: &LockPlatform,
+    declared: &dyn Fn(&str) -> bool,
+) -> Option<ResolutionDrift> {
     let drift = |path: &str| {
         Some(ResolutionDrift::Module {
             platform: lhs.platform.clone(),
@@ -360,6 +388,7 @@ fn module_drift(lhs: &LockPlatform, rhs: &LockPlatform) -> Option<ResolutionDrif
     }
     let (lhs_versions, rhs_versions) =
         (module_versions(&lhs.modules), module_versions(&rhs.modules));
+    let listed = ListedVersions::of(&[lhs, rhs]);
     for (left, right) in lhs.modules.iter().zip(&rhs.modules) {
         if left.path != right.path {
             return drift(&left.path);
@@ -379,14 +408,211 @@ fn module_drift(lhs: &LockPlatform, rhs: &LockPlatform) -> Option<ResolutionDrif
         }
         // A bump of the reactor's own versions, as `versions:set` makes, is
         // not drift when everything else is equal.
-        if left != right
-            && with_module_versions(left, &lhs_versions, &HashMap::new())
-                != with_module_versions(right, &rhs_versions, &HashMap::new())
+        if left == right {
+            continue;
+        }
+        let mut left = with_module_versions(left, &lhs_versions, &HashMap::new());
+        let right = with_module_versions(right, &rhs_versions, &HashMap::new());
+        if left == right
+            || range_versions_drifted(
+                &left.range_versions,
+                &right.range_versions,
+                &listed,
+                declared,
+            )
+            || evicted_ranges_drifted(
+                &left.evicted_ranges,
+                &right.evicted_ranges,
+                &listed,
+                declared,
+            )
         {
+            if left != right {
+                return drift(&left.path);
+            }
+            continue;
+        }
+        // Only the repositories that listed the ranges may differ.
+        left.range_versions.clone_from(&right.range_versions);
+        left.evicted_ranges.clone_from(&right.evicted_ranges);
+        if left != right {
             return drift(&left.path);
         }
     }
     None
+}
+
+/// What both sides of a platform list of each `group:artifact` that
+/// ranges read. An export writes one list per repository from the lines of
+/// every module, so a line one module records can show its version to a
+/// range of another module that searches that repository.
+struct ListedVersions<'a> {
+    /// The versions ranges took, over the modules of both sides.
+    taken: BTreeMap<(&'a str, &'a str), BTreeSet<&'a str>>,
+}
+
+impl<'a> ListedVersions<'a> {
+    fn of(platforms: &[&'a LockPlatform]) -> Self {
+        let mut taken: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for module in platforms.iter().flat_map(|platform| &platform.modules) {
+            for read in &module.range_versions {
+                let key = (read.group.as_str(), read.artifact.as_str());
+                taken.entry(key).or_default().insert(read.version.as_str());
+            }
+        }
+        Self { taken }
+    }
+
+    /// Whether a list of `group:artifact` from another repository can show
+    /// no range another version than the one it took: every range of the
+    /// platform took the same one version on both sides.
+    fn one_version(&self, group: &str, artifact: &str) -> bool {
+        self.taken
+            .get(&(group, artifact))
+            .is_some_and(|versions| versions.len() == 1)
+    }
+
+    /// Whether no range of the platform took a version of
+    /// `group:artifact`, so only ranges that lost read its lists.
+    fn untaken(&self, group: &str, artifact: &str) -> bool {
+        !self.taken.contains_key(&(group, artifact))
+    }
+}
+
+/// Whether a module's recorded range versions differ from `fresh`'s in
+/// more than the repositories that listed them: the ranges took other
+/// versions, or a line only the lockfile has names a repository `declared`
+/// rejects or an artifact whose ranges took more than one version. The
+/// versions are what an export lists, so they must be the same even where
+/// the graph is.
+fn range_versions_drifted(
+    recorded: &[RangeVersion],
+    fresh: &[RangeVersion],
+    listed: &ListedVersions<'_>,
+    declared: &dyn Fn(&str) -> bool,
+) -> bool {
+    let taken = |reads: &[RangeVersion]| -> BTreeSet<(String, String, String)> {
+        (reads.iter())
+            .map(|read| {
+                (
+                    read.group.clone(),
+                    read.artifact.clone(),
+                    read.version.clone(),
+                )
+            })
+            .collect()
+    };
+    taken(recorded) != taken(fresh)
+        || (recorded.iter()).any(|read| {
+            !fresh.contains(read)
+                && (!declared(&read.origin) || !listed.one_version(&read.group, &read.artifact))
+        })
+}
+
+/// Whether a module's ranges that lost differ from `fresh`'s in more than
+/// the repositories that listed them, on the terms of
+/// [`range_versions_drifted`]: each range offers the same versions over
+/// all its lists, and a list only the lockfile has is from a repository
+/// `declared` accepts, of an artifact no range took a version of.
+fn evicted_ranges_drifted(
+    recorded: &[EvictedRange],
+    fresh: &[EvictedRange],
+    listed: &ListedVersions<'_>,
+    declared: &dyn Fn(&str) -> bool,
+) -> bool {
+    offered(recorded) != offered(fresh)
+        || (recorded.iter()).any(|range| {
+            !fresh.contains(range)
+                && (!declared(&range.origin) || !listed.untaken(&range.group, &range.artifact))
+        })
+}
+
+/// The versions each range that lost offers over all its lists.
+fn offered(ranges: &[EvictedRange]) -> BTreeMap<(&str, &str, &str), BTreeSet<&str>> {
+    let mut offered: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+    for range in ranges {
+        let key = (
+            range.group.as_str(),
+            range.artifact.as_str(),
+            range.range.as_str(),
+        );
+        (offered.entry(key).or_default()).extend(range.versions.iter().map(String::as_str));
+    }
+    offered
+}
+
+/// Whether the repository ids differ in more than the repositories only
+/// one side records a row from: the ids of a repository both record differ,
+/// or one records a repository no row moved to or from, or that the other
+/// side names somewhere and so needs the ids for. Whether a row may move is
+/// for the row comparison to decide.
+fn repo_ids_drifted(lhs: &Lockfile, rhs: &Lockfile) -> bool {
+    if lhs.repo_ids == rhs.repo_ids {
+        return false;
+    }
+    let mut moved = BTreeSet::new();
+    for (left, right) in lhs.platforms.iter().zip(&rhs.platforms) {
+        let artifacts = |platform: &LockPlatform| -> BTreeMap<String, String> {
+            (platform.artifacts.iter())
+                .map(|row| (row.coordinate.to_string(), row.repo_url.clone()))
+                .chain(
+                    (platform.support_poms.iter())
+                        .map(|(coord, pom)| (format!("pom {coord}"), pom.repo_url.clone())),
+                )
+                .collect()
+        };
+        let right = artifacts(right);
+        for (coord, url) in artifacts(left) {
+            if let Some(other) = right.get(&coord)
+                && *other != url
+            {
+                moved.insert(url);
+                moved.insert(other.clone());
+            }
+        }
+    }
+    let (left_named, right_named) = (named_origins(lhs), named_origins(rhs));
+    let origins = (lhs.repo_ids.keys()).chain(rhs.repo_ids.keys());
+    origins.into_iter().any(
+        |origin| match (lhs.repo_ids.get(origin), rhs.repo_ids.get(origin)) {
+            (Some(left), Some(right)) => left != right,
+            (Some(_), None) => !moved.contains(origin) || right_named.contains(origin.as_str()),
+            _ => !moved.contains(origin) || left_named.contains(origin.as_str()),
+        },
+    )
+}
+
+/// Every origin the rows and module records of `lock` name.
+fn named_origins(lock: &Lockfile) -> BTreeSet<&str> {
+    let mut named = BTreeSet::new();
+    for platform in &lock.platforms {
+        for row in &platform.artifacts {
+            named.insert(row.repo_url.as_str());
+            named.extend(row.other_repo_urls.iter().map(String::as_str));
+            named.extend(row.pom_repo_urls.iter().map(String::as_str));
+        }
+        named.extend(
+            platform
+                .support_poms
+                .values()
+                .map(|pom| pom.repo_url.as_str()),
+        );
+        for module in &platform.modules {
+            named.extend(
+                module
+                    .range_versions
+                    .iter()
+                    .map(|read| read.origin.as_str()),
+            );
+            named.extend(
+                module
+                    .evicted_ranges
+                    .iter()
+                    .map(|range| range.origin.as_str()),
+            );
+        }
+    }
+    named
 }
 
 /// Each module's version, by path.
@@ -518,8 +744,9 @@ fn artifact_drift<'a>(
 }
 
 /// Whether the configuration differs, or a condition both lockfiles record
-/// has another outcome. `config_hash` covers the host inputs too, so it is
-/// compared only when both record the same ones.
+/// has another outcome. `config_hash` covers the host inputs too, and they
+/// decide the `-D` names of the command line, so both are compared only
+/// when both record the same ones.
 fn inputs_drifted(on_disk: &Lockfile, fresh: &Lockfile) -> bool {
     let (lhs, rhs) = (&on_disk.resolution, &fresh.resolution);
     let outcome = |inputs: &'_ BTreeSet<AmbientInput>| -> HashMap<String, bool> {
@@ -534,7 +761,8 @@ fn inputs_drifted(on_disk: &Lockfile, fresh: &Lockfile) -> bool {
             .collect()
     };
     let fresh_outcomes = outcome(&rhs.ambient_inputs);
-    (lhs.ambient_inputs == rhs.ambient_inputs && on_disk.config_hash != fresh.config_hash)
+    (lhs.ambient_inputs == rhs.ambient_inputs
+        && (on_disk.config_hash != fresh.config_hash || lhs.command_line != rhs.command_line))
         || outcome(&lhs.ambient_inputs)
             .iter()
             .any(|(condition, holds)| {
@@ -546,18 +774,26 @@ fn inputs_drifted(on_disk: &Lockfile, fresh: &Lockfile) -> bool {
 
 /// Compare every support POM of one platform, including removed pins. A
 /// release POM recorded under another repository is drift on the terms of
-/// [`origin_drifted`].
+/// [`origin_drifted`], and always beside a row of any platform that pins no
+/// POM for its file (`pomless_files`): the export labels the POM with that
+/// repository, which decides whether the row's module reads it.
 fn support_pom_drift(
     lhs: &LockPlatform,
     rhs: &LockPlatform,
-    declared: &dyn Fn(&str) -> bool,
+    pomless_files: &HashSet<Gav>,
+    declared: &dyn Fn(&str, &str) -> bool,
 ) -> Option<ResolutionDrift> {
+    let pomless = |coord: &str, pin: &SupportPom| {
+        pin.file_gav(coord)
+            .is_some_and(|file| pomless_files.contains(&file))
+    };
     let differ = |coord: &str, l: Option<&SupportPom>, r: Option<&SupportPom>| match (l, r) {
         (Some(l), Some(r)) => {
             l.sha256 != r.sha256
                 || l.snapshot != r.snapshot
                 || (l.repo_url != r.repo_url
-                    && (!declared(&l.repo_url)
+                    && (!declared(coord, &l.repo_url)
+                        || pomless(coord, l)
                         || split_support_pom_coord(coord)
                             .is_none_or(|(_, _, version)| is_snapshot_version(version))))
         }
@@ -594,10 +830,10 @@ fn origin_drifted(l: &LockArtifact, r: &LockArtifact, declared: &dyn Fn(&str) ->
     if l.repo_url == r.repo_url {
         return false;
     }
-    if !declared(&l.repo_url)
-        || is_snapshot_version(&l.file_version())
-        || is_snapshot_version(&r.file_version())
-    {
+    // A timestamped SNAPSHOT build is pinned bytes, as a release is; a
+    // non-unique file can be redeployed under its name.
+    let mutable = |row: &LockArtifact| resolves_through_snapshot_metadata(&row.file_version());
+    if !declared(&l.repo_url) || mutable(l) || mutable(r) {
         return true;
     }
     !matches!((l.pin(), r.pin()), (Some(lhs), Some(rhs)) if lhs == rhs)

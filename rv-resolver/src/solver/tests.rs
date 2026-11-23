@@ -5,17 +5,24 @@ use super::{Backend, Management, ResolvedProject, ResolvedVersion, Solver, Solve
 use crate::context::RepoContext;
 use crate::error::ResolveError;
 use crate::graph::Graph;
-use rv_maven_model::{Dependency, Exclusion, Project, Relocation, Scope};
-use rv_maven_types::{Coord, Version, VersionReq};
+use rv_maven_model::{ArtifactTypes, Dependency, Exclusion, Project, Relocation, Scope};
+use rv_maven_types::{Coord, MavenMode, Version, VersionReq};
 
 #[derive(Default)]
 struct MockBackend {
     fetches: std::sync::Mutex<Vec<String>>,
     prefetches: std::sync::Mutex<Vec<String>>,
+    kept_artifacts: std::sync::Mutex<Vec<String>>,
     listings: std::sync::Mutex<Vec<String>>,
     projects: HashMap<String, Project>,
     versions: HashMap<String, Vec<Version>>,
     project_repos: HashMap<String, &'static str>,
+    mode: MavenMode,
+    /// Gives each fetched POM a digest, which an unfetched one lacks.
+    records_poms: bool,
+    /// Names a newer build than the fetched one in metadata asked again.
+    metadata_moves: bool,
+    metadata_reads: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 impl MockBackend {
@@ -58,8 +65,16 @@ impl MockBackend {
 const SNAPSHOT_BUILDS: [&str; 2] = ["20261011.010101-1", "20261012.010101-2"];
 
 impl Backend for MockBackend {
+    fn maven_mode(&self) -> MavenMode {
+        self.mode
+    }
+
     fn prefetch_project(&self, coord: &Coord, _repos: &RepoContext) {
         self.prefetches.lock().unwrap().push(coord.to_string());
+    }
+
+    fn prefetch_kept_artifact(&self, coord: &Coord, _repos: &RepoContext) {
+        self.kept_artifacts.lock().unwrap().push(coord.to_string());
     }
 
     fn prefetch_range(
@@ -79,6 +94,19 @@ impl Backend for MockBackend {
         _repos: &'a RepoContext,
     ) -> super::BoxFuture<'a, super::Result<ResolvedVersion>> {
         Box::pin(async move {
+            let reads = {
+                let mut reads = self.metadata_reads.lock().unwrap();
+                let count = reads.entry(coord.to_string()).or_default();
+                *count += 1;
+                *count
+            };
+            if self.metadata_moves && reads > 1 {
+                let base = coord.version.as_str().trim_end_matches("SNAPSHOT");
+                return Ok(ResolvedVersion {
+                    version: Version::parse(&format!("{base}20991231.235959-9")).unwrap(),
+                    repo: None,
+                });
+            }
             let build = coord
                 .version
                 .as_str()
@@ -100,6 +128,7 @@ impl Backend for MockBackend {
                 .map(|&repo| crate::graph::RepoRef {
                     id: None,
                     url: Arc::from(repo),
+                    pinned: false,
                 });
             Ok(ResolvedVersion {
                 version: build.map_or_else(|| coord.version.clone(), |build| build.version),
@@ -136,9 +165,9 @@ impl Backend for MockBackend {
                 .iter()
                 .filter(|version| match dynamic {
                     Some(token) => token.admits(version.as_str()),
-                    None => req.matches(version),
+                    None => req.matches_in(version, self.mode),
                 })
-                .max()
+                .max_by(|a, b| a.cmp_in(b, self.mode))
                 .cloned()
                 .ok_or_else(|| ResolveError::VersionNotFound {
                     coord: key,
@@ -163,15 +192,28 @@ impl Backend for MockBackend {
                 .await?;
             let mut versions: Vec<_> = self.versions[&format!("{group_id}:{artifact_id}")]
                 .iter()
-                .filter(|version| req.matches(version))
+                .filter(|version| req.matches_in(version, self.mode))
                 .map(|version| ResolvedVersion {
                     version: version.clone(),
                     repo: None,
                 })
                 .collect();
-            Version::sort_by_key(&mut versions, |resolved| &resolved.version);
+            Version::sort_by_key_in(&mut versions, self.mode, |resolved| &resolved.version);
             Ok(versions)
         })
+    }
+
+    fn pom_read(
+        &self,
+        coord: &Coord,
+        _repos: &RepoContext,
+    ) -> Option<Option<rv_maven_types::BlobId>> {
+        if !self.records_poms {
+            return Some(None);
+        }
+        let key = coord.to_string();
+        let fetched = self.fetches.lock().unwrap().contains(&key);
+        fetched.then(|| Some(rv_maven_types::BlobId::from_bytes(key.as_bytes())))
     }
 
     fn fetch_project<'a>(
@@ -218,6 +260,8 @@ fn dep(group_id: &str, artifact_id: &str, version: &str) -> Dependency {
         optional: None,
         exclusions: Vec::new(),
         system_path: None,
+        system_path_from_project: Default::default(),
+        origin: Default::default(),
     }
 }
 
@@ -244,7 +288,7 @@ fn managed(group: &str, artifact: &str, version: &str) -> Management {
         scope: None,
         ..dep(group, artifact, version)
     };
-    Management::new(vec![entry])
+    Management::new(vec![entry], ArtifactTypes::core(MavenMode::Maven39))
 }
 
 const G: &str = "g";
@@ -307,7 +351,7 @@ fn management(tokens: &str) -> Management {
             ..parse_dep(token)
         })
         .collect();
-    Management::new(entries)
+    Management::new(entries, ArtifactTypes::core(MavenMode::Maven39))
 }
 
 /// A backend from one line per project: `coordinate[~classifier]`, then
@@ -400,7 +444,7 @@ fn render(result: Result<Graph, ResolveError>) -> String {
                 }
             }
             if node.scope != Scope::Compile {
-                label.push_str(&format!("@{}", node.scope));
+                label.push_str(&format!("@{}", node.scope.as_str()));
             }
             if let Some(path) = &node.system_path {
                 label.push_str(&format!("={path}"));
@@ -421,7 +465,7 @@ fn root(text: &str) -> SolverRoot {
     let (scope, deps) = match text.strip_prefix('@') {
         Some(rest) => {
             let (scope, deps) = rest.split_once(' ').unwrap();
-            (Scope::parse(scope), deps)
+            (scope.parse().unwrap(), deps)
         }
         None => (Scope::Compile, text),
     };
@@ -443,10 +487,7 @@ async fn check(cases: &[Case<'_>]) {
             .solve(root(root_deps))
             .await;
         let actual = render(solved);
-        assert!(
-            actual.starts_with(expected) && (expected.starts_with("ERR") || actual == *expected),
-            "{name}: got {actual}, expected {expected}"
-        );
+        assert_eq!(actual, *expected, "{name}");
     }
 }
 
@@ -474,14 +515,14 @@ async fn nearest_wins_mediation() {
             "x:2.0 b:1", "", "b:1 c:1 x:2.0"),
         ("disjoint hard ranges conflict",
             &["b:1 > c:1", "c:1 > x:[2.0,3.0)", "d:1 > e:1", "e:1 > x:[1.0,1.8)", "x:1.5", "x:2.5"],
-            "b:1 d:1", "", "ERR VersionConflict"),
+            "b:1 d:1", "", "ERR VersionConflict: version conflict for g:x: requested [1.0,1.8), selected 2.5"),
         ("a nearer hard pin outside a deeper range conflicts",
             &["a:1.5", "a:2.5", "a:2.0", "b:1 > a:[2,3)"],
-            "a:[1.5] b:1", "", "ERR VersionConflict"),
+            "a:[1.5] b:1", "", "ERR VersionConflict: version conflict for g:a: requested [2,3), selected 1.5"),
         ("a nearer soft version inside a deeper range succeeds",
             &["a:2.5", "b:1 > a:[2,3)"], "a:2.5 b:1", "", "a:2.5 b:1"),
         ("a losing hard pin conflicts",
-            &["a:1.5", "a:2.5", "b:1 > a:[2.5]"], "a:[1.5] b:1", "", "ERR VersionConflict"),
+            &["a:1.5", "a:2.5", "b:1 > a:[2.5]"], "a:[1.5] b:1", "", "ERR VersionConflict: version conflict for g:a: requested [2.5], selected 1.5"),
         ("a losing soft pin does not", pins, "a:1.5 b:1", "", "a:1.5 b:1"),
         ("a two-bound pin is the version as written",
             &["x:1.0", "x:1.0.0", "versions x 1.0.0"], "x:[1.0,1.0]", "", "x:1.0"),
@@ -503,14 +544,14 @@ async fn nearest_wins_mediation() {
             &["dyn:1.0.5", "dyn:1.1.0-SNAPSHOT", "versions dyn 1.0.0 1.0.5 1.1.0-SNAPSHOT"],
             "dyn:RELEASE", "", "dyn:1.0.5"),
         ("Gradle's latest.release is refused", &["dyn:1.0.5", "versions dyn 1.0.5"],
-            "dyn:latest.release", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn"),
+            "dyn:latest.release", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn: latest.release"),
         ("LATEST takes snapshots",
             &["dyn:1.0.5", "dyn:1.1.0-SNAPSHOT", "versions dyn 1.0.0 1.0.5 1.1.0-SNAPSHOT"],
             "dyn:LATEST", "", "dyn:1.1.0-SNAPSHOT"),
         ("Gradle's dynamic syntax is refused", &["dyn:1.0.5", "versions dyn 1.0.5"],
-            "dyn:1.+", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn"),
+            "dyn:1.+", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn: 1.+"),
         ("a trailing plus is refused", &["dyn:1.0.5"],
-            "dyn:+", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn"),
+            "dyn:+", "", "ERR InvalidVersionRequirement: invalid version requirement for g:dyn: +"),
         ("an inner plus is part of the version", &["dyn:1.0+b1"], "dyn:1.0+b1", "", "dyn:1.0+b1"),
         ("a version with an undefined property names it and its POM", &["a:1 > x:${undefined}"],
             "a:1", "", "ERR UndefinedProperty: property undefined is not defined: g:a:1 declares g:x:${undefined}"),
@@ -536,12 +577,12 @@ async fn nearest_wins_mediation() {
             "ERR UndefinedProperty: property ours is not defined: g:root:1.0 declares g:x:${ours}"),
         ("a group with an undefined property names it", &["a:1 > ${undefined}:x:1"],
             "a:1", "", "ERR UndefinedProperty: property undefined is not defined: g:a:1 declares ${undefined}:x:1"),
-        ("a nested undefined property names the inner one", &["a:1 > x:${outer.${inner}}"],
-            "a:1", "", "ERR UndefinedProperty: property inner is not defined: g:a:1 declares g:x:${outer.${inner}}"),
+        ("a nested property is one name up to the first brace", &["a:1 > x:${outer.${inner}}"],
+            "a:1", "", "ERR UndefinedProperty: property outer.${inner is not defined: g:a:1 declares g:x:${outer.${inner}}"),
         ("a version-less dependency needs management", &[], "lib:_", "",
-            "ERR MissingVersion"),
+            "ERR MissingVersion: missing version for dependency g:lib"),
         ("a system dependency needs a version", &[], "native:_@system=/opt/n.jar", "",
-            "ERR MissingVersion"),
+            "ERR MissingVersion: missing version for dependency g:native"),
         ("a system dependency resolves locally", &[], "native:1.2.3@system=/opt/n.jar", "",
             "native:1.2.3@system=/opt/n.jar+local"),
         ("a direct system dependency beats a transitive one", &["lib:1 > tools:2", "tools:2"],
@@ -568,12 +609,17 @@ async fn an_endless_relocation_chain_fails() {
     cached.extend(["b:1 => g:c1:1", "a:1 => g:x:1", "x:1 => g:b:1"].map(String::from));
     for (name, projects, root, expected) in [
         ("32 relocations", &at_most, "c0:1", "c32:1"),
-        ("33 relocations", &too_long, "c0:1", "ERR RelocationCycle"),
+        (
+            "33 relocations",
+            &too_long,
+            "c0:1",
+            "ERR RelocationCycle: relocation cycle detected: g:c0:1 -> g:c33:1 (more than 32 relocations)",
+        ),
         (
             "33 relocations through a cached chain",
             &cached,
             "b:1 a:1",
-            "ERR RelocationCycle",
+            "ERR RelocationCycle: relocation cycle detected: g:a:1 -> g:c31:1 (more than 32 relocations)",
         ),
     ] {
         let projects: Vec<&str> = projects.iter().map(String::as_str).collect();
@@ -601,7 +647,24 @@ async fn many_winner_changes_still_converge() {
     .await;
 }
 
-/// The ledger's probe graphs, where a hard range evicts an expanded node, a
+/// Each version of a range carries the range, which is one constraint
+/// however many versions it lists.
+#[tokio::test]
+async fn a_range_over_many_versions_selects_in_linear_time() {
+    let projects: Vec<String> = (1..=20_000).map(|i| format!("x:{i}")).collect();
+    let projects: Vec<&str> = projects.iter().map(String::as_str).collect();
+    let backend = MockBackend {
+        mode: MavenMode::Maven310,
+        ..backend(&projects)
+    };
+    let started = std::time::Instant::now();
+    let solved = Solver::new(&backend).solve(root("x:[1,20000]")).await;
+    assert_eq!(render(solved), "x:20000");
+    // Quadratic, this took 26s; linear, 0.3s.
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// Probe graphs where a hard range evicts an expanded node, a
 /// relocation joins two conflict groups, or tree order decides a tie, with
 /// Maven 3.9.12's answers.
 #[tokio::test]
@@ -731,10 +794,10 @@ async fn mediation_after_evictions_and_relocations() {
             "r:1", "", "a:2 b:2 r:1"),
         ("managed relocation ranges that cycle fail",
             &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 => g:c:1", "c:1", "c:2 => g:a:1"],
-            "p:1", "b:[2,3) c:[2,3)", "ERR RelocationCycle"),
+            "p:1", "b:[2,3) c:[2,3)", "ERR RelocationCycle: relocation cycle detected: g:c -> g:b:1 (more than 8 managed relocations)"),
         ("managed relocations that cycle fail",
             &["p:1 > a:1", "a:1 => g:b:1", "b:1", "b:2 => g:c:1", "c:1", "c:2 => g:a:1"],
-            "p:1", "b:2 c:2", "ERR RelocationCycle"),
+            "p:1", "b:2 c:2", "ERR RelocationCycle: relocation cycle detected: g:c -> g:b:1 (more than 8 managed relocations)"),
         ("a hard range overrides a nearer system declaration",
             &["p:1 > s:[2]", "s:2"],
             "s:1@system=/opt/s.jar p:1", "", "p:1 s:2@system"),
@@ -785,7 +848,7 @@ async fn mediation_after_evictions_and_relocations() {
             "s:[2]@system=/opt/s.jar p:1", "", "p:1 s:2@system=/opt/s.jar+local"),
         ("a pinned system dependency conflicts with another pin",
             &["p:1 > s:[1]", "s:1"],
-            "s:[2]@system=/opt/s.jar p:1", "", "ERR VersionConflict"),
+            "s:[2]@system=/opt/s.jar p:1", "", "ERR VersionConflict: version conflict for g:s: requested [1], selected 2"),
         ("a system range backtracks over its local versions",
             &["p:1 > s:[1,2]", "s:1", "s:2 > leaf:1", "s:3", "leaf:1"],
             "s:[1,3]@system=/opt/s.jar p:1", "", "p:1 s:2@system=/opt/s.jar+local"),
@@ -841,8 +904,9 @@ async fn scopes_and_optional_dependencies() {
             "a:1@test", "", "a:1@test s:1@system=/opt/s.jar+local"),
         ("an optional system one is not", &["a:1 > s:1@system=/opt/s.jar?"], "a:1", "",
             "a:1"),
-        ("a scope in other case is unknown and followed",
-            &["a:1 > p:1@Provided s:1@SYSTEM", "p:1", "s:1"], "a:1", "", "a:1 p:1 s:1"),
+        ("a scope in other case is unknown, kept and followed",
+            &["a:1 > p:1@Provided s:1@SYSTEM", "p:1", "s:1"], "a:1", "",
+            "a:1 p:1@Provided s:1@SYSTEM"),
     ];
     check(cases).await;
 }
@@ -924,10 +988,11 @@ async fn the_widest_path_scope_wins() {
 }
 
 /// Each left branch of a chain of diamonds below a cycle adds its own
-/// exclusion, so the paths carry 2^levels exclusion sets. The gathering for
-/// the broken node stops at a budget instead of running for hours.
+/// exclusion, so the paths carry 2^levels exclusion sets, none of which
+/// shares the children of another. Collection stops at its bound instead of
+/// running for hours.
 #[tokio::test]
-async fn a_cycle_gathering_through_too_many_exclusion_sets_stops() {
+async fn a_graph_through_too_many_exclusion_sets_stops() {
     const LEVELS: usize = 24;
     let mut lines = vec!["d:1 > t:1 x:1".to_string(), "t:1 > a0:1".to_string()];
     lines.push("x:1 > a0:1".to_string());
@@ -942,9 +1007,49 @@ async fn a_cycle_gathering_through_too_many_exclusion_sets_stops() {
     let solved = Solver::new(&backend(&lines)).solve(root("d:1")).await;
     let actual = render(solved);
     assert!(
-        actual.starts_with("ERR GraphLimitExceeded: dependency graph exceeds 100000 states"),
+        actual.starts_with("ERR GraphLimitExceeded: dependency graph exceeds 1000000 declarations"),
         "got {actual}"
     );
+}
+
+/// A POM may declare a dependency both without a classifier and with an
+/// empty one, which Maven keeps as two declarations of one artifact and
+/// mediates as siblings: Maven 3.9.12 and 3.10.0, either collector, take
+/// the higher version, and of one version the scope declared first. The
+/// breadth-first collector skips the children of the later winner.
+#[tokio::test]
+async fn empty_classifier_twins_are_two_declarations() {
+    let versions: &[&str] = &["lib:1 > x:1 x:2~", "x:1 > y:1", "x:2 > y:1", "y:1"];
+    let scopes: &[&str] = &["lib:1 > x:2 x:1~@runtime", "x:1 > y:1", "x:2 > y:1", "y:1"];
+    let cases: &[(&[&str], &str, &str, &str)] = &[
+        (versions, "lib:1", "lib:1 x:2 y:1", "lib:1 x:2"),
+        (scopes, "lib:1", "lib:1 x:2 y:1", "lib:1 x:2 y:1"),
+        (
+            &["x:1 > y:1", "y:1"],
+            "x:1~@runtime x:1",
+            "x:1@runtime y:1@runtime",
+            "x:1@runtime y:1@runtime",
+        ),
+        (
+            &["x:1 > y:1", "y:1"],
+            "x:1 x:1~@runtime",
+            "x:1 y:1",
+            "x:1 y:1",
+        ),
+    ];
+    for &(lines, roots, depth_first, breadth_first) in cases {
+        for (breadth, expected) in [(false, depth_first), (true, breadth_first)] {
+            let solved = Solver::new(&backend(lines))
+                .breadth_first(breadth)
+                .solve(root(roots))
+                .await;
+            assert_eq!(
+                render(solved),
+                expected,
+                "{roots}, breadth first: {breadth}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -959,17 +1064,20 @@ async fn dependency_management() {
     let managed_child: &[&str] = &["lib:1 > child:1", "child:1"];
     #[rustfmt::skip]
     let cases: &[Case<'_>] = &[
-        ("management fills a missing version", &["o:bar:3.0"], "o:bar:_", "o:bar:3.0",
-            "o:bar:3.0"),
+        ("management overrides a transitive version", &["q:1 > o:bar:1.0", "o:bar:3.0"], "q:1",
+            "o:bar:3.0", "o:bar:3.0 q:1"),
+        ("a root's own dependency takes no version from management", &["o:bar:3.0"], "o:bar:_",
+            "o:bar:3.0", "ERR MissingVersion: missing version for dependency o:bar"),
         ("a hard pin beats management", pinned, "lib:[1.0]", "lib:2.0", "lib:1.0"),
         ("a soft direct version beats management", pinned, "lib:1.0", "lib:2.0", "lib:1.0"),
         ("a managed two-bound pin conflicts as the short form does",
             &["e:1 => g:f:1", "e:3 => g:x:3", "f:1", "x:3 > e:3", "d:3 > f:[1] x:[3]"],
-            "e:[3] d:3", "e:[1,1]", "ERR VersionConflict"),
+            "e:[3] d:3", "e:[1,1]", "ERR VersionConflict: version conflict for g:x: requested [3], selected 1"),
         ("a test-jar entry does not manage the jar", &["lib:1.0"], "lib:1.0", "lib:2.0~tests",
             "lib:1.0"),
-        ("jar and test-jar entries manage independently", &["lib:1.0", "lib:2.0~tests"],
-            "lib:_ lib:_#test-jar", "lib:1.0 lib:2.0~tests", "lib:1.0 lib:2.0~tests"),
+        ("jar and test-jar entries manage independently",
+            &["q:1 > lib:1 lib:1#test-jar", "lib:1.0", "lib:2.0~tests"], "q:1",
+            "lib:1.0 lib:2.0~tests", "lib:1.0 lib:2.0~tests q:1"),
         ("managed exclusions prune transitive nodes",
             &["lib:1 > mid:1", "mid:1 > cl:cl:1.2", "cl:cl:1.2"], "lib:1", "mid:_!cl:cl",
             "lib:1 mid:1"),
@@ -987,6 +1095,8 @@ async fn dependency_management() {
             "ERR Pom: pom error: invalid model: system-scoped dependency g:tools requires a non-empty <systemPath>"),
         ("management sets a transitive scope", managed_child, "lib:1", "child:_@test",
             "child:1@test lib:1"),
+        ("an empty managed scope or version leaves the field to a later entry", managed_child,
+            "lib:1", "child:@ child:1~@test", "child:1@test lib:1"),
         ("a dependency managed to test keeps its subtree",
             &["lib:1 > extra:1@-", "extra:1 > leaf:1", "leaf:1"], "lib:1", "extra:_@test",
             "extra:1@test leaf:1@test lib:1"),
@@ -1001,10 +1111,9 @@ async fn dependency_management() {
             "core:1@provided guava:1@test"),
         ("a declared test transitive stays dropped", &["lib:1 > extra:1@test", "extra:1"],
             "lib:1", "extra:_@compile", "lib:1"),
-        ("a dependency's own management fills a version, not the scope",
-            &["testlib:1 > junit:_ | junit:4.13.2@test", "junit:4.13.2 > hamcrest:1.3",
-                "hamcrest:1.3"], "testlib:1@test", "",
-            "hamcrest:1.3@test junit:4.13.2@test testlib:1@test"),
+        ("a dependency's own management fills a version and the scope",
+            &["testlib:1 > junit:_@- | junit:4.13.2@test", "junit:4.13.2 > hamcrest:1.3",
+                "hamcrest:1.3"], "testlib:1", "", "testlib:1"),
         ("an explicit child version beats its management",
             &["lib:1 > child:2 | child:1", "child:2"], "lib:1", "", "child:2 lib:1"),
         ("management applies to a relocated transitive", relocated, "mid:1", "n:lib:7.0",
@@ -1025,7 +1134,7 @@ async fn relocations() {
         ("a partial relocation keeps the rest", &["old:lib:1.0 => new:_:_", "new:lib:1.0"],
             "old:lib:1.0", "", "new:lib:1.0"),
         ("relocation cycles fail", &["a:1 => _:b:1", "b:1 => _:a:1"], "a:1", "",
-            "ERR RelocationCycle"),
+            "ERR RelocationCycle: relocation cycle detected: g:a:1 -> g:b:1 -> g:a:1"),
         ("a relocation onto a resolved node is no cycle",
             &["mid:1 > bc:ext:1.0", "bc:ext:1.0 => _:base:_", "bc:base:1.0"],
             "bc:base:1.0 mid:1", "", "bc:base:1.0 mid:1"),
@@ -1049,11 +1158,11 @@ async fn relocations() {
         ("old:lib:1.0.0", "old:lib:1.0.0"),
         ("old:lib:1.1", "old:lib:1.1.0"),
     ] {
-        let (resolved, _, _, _, _) = solver
+        let fetched = solver
             .fetch_project_with_relocation_cached(&coord(from), &RepoContext::default(), &cache)
             .await
             .unwrap();
-        assert_eq!(resolved.to_string(), to);
+        assert_eq!(fetched.target.to_string(), to);
     }
 
     // The node records the target's repository, not the one that listed
@@ -1099,6 +1208,67 @@ async fn a_kept_snapshot_build_takes_the_targets_repository() {
         .find(|node| node.coord.artifact_id.as_str() == "lib")
         .unwrap();
     assert_eq!(target.repo_url.as_deref(), Some("mock://lib"));
+}
+
+/// The Maven 3.9 reading of a relocating SNAPSHOT is the POMs its fetch
+/// read, however the metadata reads once the fetch is done.
+#[tokio::test]
+async fn a_reading_keeps_the_builds_its_fetch_read() {
+    let mut backend = backend(&["old:1-20261011.010101-1 => g:end:1", "end:1"]);
+    backend.records_poms = true;
+    backend.metadata_moves = true;
+    let graph = Solver::new(&backend)
+        .solve(root("old:1-SNAPSHOT"))
+        .await
+        .unwrap();
+    let digest = |key: &str| Some(rv_maven_types::BlobId::from_bytes(key.as_bytes()));
+    let relocated = crate::graph::PomReading::Bytes(vec![
+        digest("g:old:1-20261011.010101-1"),
+        digest("g:end:1"),
+    ]);
+    let old = (graph.descriptors.iter()).find(|(key, _)| key.to_string() == "g:old:1-SNAPSHOT");
+    assert_eq!(old.map(|(_, reading)| reading), Some(&relocated));
+    assert_eq!(
+        backend
+            .metadata_reads
+            .lock()
+            .unwrap()
+            .get("g:old:1-SNAPSHOT"),
+        Some(&1)
+    );
+}
+
+/// A chain that runs into one the walk already followed takes the POMs
+/// that walk read along it from the relocation cache.
+#[tokio::test]
+async fn a_cached_relocation_keeps_the_poms_read_along_it() {
+    let mut backend = backend(&[
+        "a:1 => g:mid:1",
+        "b:1 => g:mid:1",
+        "mid:1 => g:end:1",
+        "end:1",
+    ]);
+    backend.records_poms = true;
+    let graph = Solver::new(&backend).solve(root("a:1 b:1")).await.unwrap();
+    let digest = |key: &str| Some(rv_maven_types::BlobId::from_bytes(key.as_bytes()));
+    let reading = |artifact: &str| {
+        let key = format!("g:{artifact}:1");
+        (graph.descriptors.iter())
+            .find(|(read, _)| read.to_string() == key)
+            .map(|(_, reading)| reading.clone())
+    };
+    for from in ["a", "b"] {
+        let chain = [
+            format!("g:{from}:1"),
+            "g:mid:1".to_string(),
+            "g:end:1".to_string(),
+        ];
+        let expected =
+            crate::graph::PomReading::Bytes(chain.iter().map(|key| digest(key)).collect());
+        assert_eq!(reading(from), Some(expected), "{from}");
+    }
+    let fetched = backend.fetches.lock().unwrap();
+    assert_eq!(fetched.iter().filter(|key| *key == "g:mid:1").count(), 1);
 }
 
 /// maven-resolver's root node has no dependency, so a transitive dependency
@@ -1247,6 +1417,46 @@ async fn queued_projects_are_hinted_before_they_are_fetched() {
     }
 }
 
+/// A dependency below the root's own, queued at the version the root's
+/// management fixes, has its artifact hinted as declared, type and
+/// classifier included. One that management leaves alone or fixes
+/// elsewhere is not, nor one the root declares below its own, whose
+/// declaration wins, or excludes below one of its own, where a declaration
+/// it may lose to does not reach it. The root's own are hinted as well in a
+/// depth-first walk, which places nothing until the whole graph is in.
+#[tokio::test]
+async fn kept_artifacts_are_hinted_as_queued() {
+    let backend = backend(&[
+        "a:1.0 > b:1.0 c:2.0 d:1.0 e:1.0 t:1.0#test-jar n:1.0~natives q:1.0 r:1.0",
+        "b:1.0",
+        "c:1.5",
+        "d:1.0",
+        "e:1.0",
+        "t:1.0~tests",
+        "n:1.0~natives",
+        "q:1.0",
+        "r:1.0",
+        "r:2.0",
+        "s:1.0 > q:1.0",
+    ]);
+    for (breadth_first, own) in [(false, &["g:a:1.0", "g:r:2.0", "g:s:1.0"][..]), (true, &[])] {
+        Solver::new(&backend)
+            .with_management(management(
+                "a:1.0 b:1.0 c:1.5 e:[1.0,2.0) t:1.0#test-jar n:1.0~natives q:1.0 r:1.0",
+            ))
+            .breadth_first(breadth_first)
+            .solve(root("a:1.0 r:2.0 s:1.0!q"))
+            .await
+            .unwrap();
+        let mut hinted = std::mem::take(&mut *backend.kept_artifacts.lock().unwrap());
+        hinted.sort();
+        let mut expected = ["g:b:1.0", "g:c:1.5", "g:n:1.0::natives", "g:t:1.0::tests"].to_vec();
+        expected.extend(own);
+        expected.sort();
+        assert_eq!(hinted, expected, "breadth first: {breadth_first}");
+    }
+}
+
 /// A range is hinted for listing as its declaration is queued, unless the
 /// solver skips that declaration.
 #[tokio::test]
@@ -1261,6 +1471,208 @@ async fn queued_ranges_are_hinted_for_listing() {
     assert_eq!(*backend.listings.lock().unwrap(), ["g:ranged:[1.0,2.0)"]);
 }
 
+/// A relocated loser is read as Maven 3.9's descriptor reader reads it:
+/// the target's POM and what is below it.
+#[tokio::test]
+async fn maven_39_reads_below_a_relocated_loser() {
+    let backend = backend(&[
+        "a:1.0 > c:2.0",
+        "b:1.0 > c:1.0",
+        "c:1.0 => g:moved:1.0",
+        "c:2.0",
+        "moved:1.0 > below-moved:1.0",
+        "below-moved:1.0",
+    ]);
+    let solved = Solver::new(&backend).solve(root("a:1.0 b:1.0")).await;
+    assert_eq!(render(solved), "a:1.0 b:1.0 c:2.0");
+    let read: std::collections::BTreeSet<String> =
+        backend.fetches.lock().unwrap().iter().cloned().collect();
+    assert!(read.contains("g:below-moved:1.0"), "{read:?}");
+}
+
 mod known_gaps;
+mod modes;
 mod nearest;
 mod ranges;
+
+/// Maven 3.9's depth-first collector reads the whole dirty tree: below a
+/// version that loses mediation, and each version a range accepts, but
+/// nothing a selector drops. Maven 3.10's skips below the loser.
+#[tokio::test]
+async fn maven_39_reads_below_losers() {
+    let lines = [
+        "a:1.0 > c:2.0",
+        "b:1.0 > c:1.0 tested:1.0@test r:[1.0,2.0)",
+        "c:1.0 > d:1.0 hidden:1.0?",
+        "c:2.0",
+        "d:1.0",
+        "r:1.0 > below-range:1.0",
+        "r:1.5",
+        "below-range:1.0",
+    ];
+    let root = root("a:1.0 b:1.0");
+    let maven_310 = MockBackend {
+        mode: MavenMode::Maven310,
+        ..backend(&lines)
+    };
+    let solved = Solver::new(&maven_310).solve(root.clone()).await;
+    assert_eq!(render(solved), "a:1.0 b:1.0 c:2.0 r:1.5");
+    let solved: std::collections::BTreeSet<String> =
+        maven_310.fetches.lock().unwrap().iter().cloned().collect();
+    assert!(!solved.contains("g:d:1.0"), "{solved:?}");
+    let backend = backend(&lines);
+    let solved = Solver::new(&backend).solve(root).await;
+    assert_eq!(render(solved), "a:1.0 b:1.0 c:2.0 r:1.5");
+    let read: std::collections::BTreeSet<String> =
+        backend.fetches.lock().unwrap().iter().cloned().collect();
+    assert_eq!(
+        read.iter().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "g:a:1.0",
+            "g:b:1.0",
+            "g:below-range:1.0",
+            "g:c:1.0",
+            "g:c:2.0",
+            "g:d:1.0",
+            "g:r:1.0",
+            "g:r:1.5"
+        ]
+    );
+}
+
+/// Below a loser, a dependency without a version takes it from the
+/// management of the POM that declares it, and a range no list names a
+/// version of fails, through the POMs that declare it.
+#[tokio::test]
+async fn maven_39_manages_and_lists_below_losers() {
+    let managed = backend(&[
+        "a:1.0 > c:2.0",
+        "b:1.0 > c:1.0",
+        "c:1.0 > d:_ | d:1.0",
+        "c:2.0",
+        "d:1.0 > below-managed:1.0",
+        "below-managed:1.0",
+    ]);
+    let solved = Solver::new(&managed).solve(root("a:1.0 b:1.0")).await;
+    assert_eq!(render(solved), "a:1.0 b:1.0 c:2.0");
+    let read: std::collections::BTreeSet<String> =
+        managed.fetches.lock().unwrap().iter().cloned().collect();
+    assert!(read.contains("g:below-managed:1.0"), "{read:?}");
+
+    let ranged = backend(&[
+        "a:1.0 > c:2.0",
+        "b:1.0 > c:1.0",
+        "c:1.0 > r:[5.0,6.0)",
+        "c:2.0",
+        "r:1.0",
+    ]);
+    let error = Solver::new(&ranged)
+        .solve(root("a:1.0 b:1.0"))
+        .await
+        .unwrap_err();
+    let crate::error::ResolveError::Declared { via, error, .. } = error else {
+        panic!("{error}");
+    };
+    assert_eq!(via, ["g:b:1.0", "g:c:1.0"]);
+    assert!(
+        matches!(*error, crate::error::ResolveError::VersionNotFound { .. }),
+        "{error}"
+    );
+}
+
+/// Below a loser, Maven 3.9's collector selects as everywhere: a
+/// declaration's own exclusions apply below it alone, a node already on
+/// the path is a cycle Maven does not expand, and a relocation target is
+/// declared again, so the exclusions above it and the root's management
+/// select it.
+#[tokio::test]
+async fn maven_39_selects_below_losers() {
+    let no_version = "r:[5.0,6.0)";
+    let cases: [(&str, &[&str], &str, &str); 4] = [
+        (
+            "sibling",
+            &["p1:1 > c:2!r", "p2:1 > c:2"],
+            "c:1 p1:1 p2:1",
+            "",
+        ),
+        ("cycle", &["a:1 > b:1", "b:1 > a:2", "a:2 > R"], "a:1", ""),
+        (
+            "excluded",
+            &["p:1 > old:1", "old:1 => g:new:1", "new:1 > R"],
+            "p:1!new",
+            "",
+        ),
+        (
+            "managed",
+            &["p:1 > old:1", "old:1 => g:new:1", "new:1 > R", "new:2"],
+            "p:1",
+            "new:2",
+        ),
+    ];
+    for (name, lines, roots, managed) in cases {
+        let mut lines: Vec<String> = (lines.iter())
+            .map(|line| line.replace('R', no_version))
+            .collect();
+        lines.extend([
+            "c:1".to_string(),
+            "c:2 > r:[5.0,6.0)".to_string(),
+            "r:1.0".to_string(),
+        ]);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let backend = backend(&lines);
+        let read = Solver::new(&backend)
+            .with_management(management(managed))
+            .solve(root(roots))
+            .await;
+        match name {
+            "sibling" => {
+                let Err(crate::error::ResolveError::Declared { via, .. }) = read else {
+                    panic!("{name}: the declaration without the exclusion lists the range");
+                };
+                assert_eq!(via, ["g:p2:1", "g:c:2"], "{name}");
+            }
+            _ => assert!(read.is_ok(), "{name}: {:?}", read.err()),
+        }
+    }
+}
+
+/// Maven's ClassicDependencyManager manages `<optional>` from depth 2, after
+/// the selectors kept or dropped the dependency on its declared value: a
+/// managed `true` marks the edge, and a managed `false` does not bring
+/// back one declared optional. `mvn dependency:list` of Maven 3.9.12 and
+/// 3.10.0 lists the first child (optional) and leaves the second out.
+#[tokio::test]
+async fn managed_optional_marks_a_transitive_edge() {
+    let managed = |optional: &str| {
+        let entry = Dependency {
+            optional: Some(optional.to_string()),
+            ..parse_dep("child:_")
+        };
+        Management::new(vec![entry], ArtifactTypes::core(MavenMode::Maven39))
+    };
+    let edges = |graph: &Graph| {
+        let mut edges: Vec<(String, bool)> = Vec::new();
+        for node in graph.node_indices() {
+            for (_, target, edge) in graph.edges(node) {
+                let coord = &graph.node(target).unwrap().coord;
+                edges.push((coord.artifact_id.to_string(), edge.optional));
+            }
+        }
+        edges.sort();
+        edges
+    };
+    let solve = |lines: &'static [&'static str], optional: &'static str| async move {
+        Solver::new(&backend(lines))
+            .with_management(managed(optional))
+            .solve(root("lib:1"))
+            .await
+            .unwrap()
+    };
+    let graph = solve(&["lib:1 > child:1", "child:1"], "true").await;
+    assert_eq!(
+        edges(&graph),
+        [("child".into(), true), ("lib".into(), false)]
+    );
+    let graph = solve(&["lib:1 > child:1?", "child:1"], "false").await;
+    assert_eq!(edges(&graph), [("lib".into(), false)]);
+}

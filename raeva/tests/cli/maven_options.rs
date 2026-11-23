@@ -6,7 +6,9 @@ use std::fs;
 use std::path::Path;
 use std::process::Output;
 
-use crate::common::{assert_status, assert_success, raeva_command, sha256_hex};
+use crate::common::{
+    assert_status, assert_success, raeva_command, sha256_hex, stderr, write_with_sha256,
+};
 
 /// A project whose dependency version is `${lib.version}`, 1.0 in the POM,
 /// with a profile `extra` that adds `org.test:extra:1.0`, all served from
@@ -18,20 +20,7 @@ struct Project {
 }
 
 fn publish(repository: &Path, artifact: &str, version: &str) {
-    let dir = repository.join(format!("org/test/{artifact}/{version}"));
-    fs::create_dir_all(&dir).expect("create repository");
-    let pom = format!(
-        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
-         <artifactId>{artifact}</artifactId><version>{version}</version></project>"
-    );
-    let files = [
-        (format!("{artifact}-{version}.pom"), pom.into_bytes()),
-        (format!("{artifact}-{version}.jar"), b"jar".to_vec()),
-    ];
-    for (name, bytes) in files {
-        fs::write(dir.join(&name), &bytes).expect("write file");
-        fs::write(dir.join(format!("{name}.sha256")), sha256_hex(&bytes)).expect("sidecar");
-    }
+    crate::common::publish(repository, &format!("org.test:{artifact}:{version}"), "");
 }
 
 impl Project {
@@ -109,10 +98,6 @@ impl Project {
     }
 }
 
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 /// A settings file whose active profile sets `lib.version`.
 fn settings(version: &str) -> String {
     format!(
@@ -174,6 +159,335 @@ fn frozen_follows_the_profile_option() {
     assert_status(&project.frozen(&[]), 7, "-P! dropped");
 }
 
+/// raeva.lock names each `-P` id as Maven reads it, so two spellings of
+/// one selection write the same raeva.lock.
+#[test]
+fn equivalent_profile_options_write_the_same_lock() {
+    let project = Project::new();
+    let lock = project.path().join("raeva.lock");
+    project.sync(&["-Pextra", "-P!other"]);
+    let written = fs::read_to_string(&lock).expect("raeva.lock");
+    fs::remove_file(&lock).expect("remove raeva.lock");
+    project.sync(&["-P +extra,,-other"]);
+    assert_eq!(fs::read_to_string(&lock).expect("raeva.lock"), written);
+}
+
+/// `active_profiles` in raeva.toml adds to `<activeProfiles>`, as `-P`
+/// does: the profile settings.xml names still sets `lib.version`.
+#[test]
+fn active_profiles_add_to_the_settings_active_profiles() {
+    let project = Project::new();
+    fs::create_dir_all(project.home.path().join(".m2")).expect("mkdir");
+    fs::write(
+        project.home.path().join(".m2/settings.xml"),
+        settings("2.0"),
+    )
+    .expect("settings");
+    project.write("raeva.toml", "active_profiles = [\"extra\"]\n");
+    project.sync(&[]);
+    assert_eq!(project.locked(), ["extra:1.0", "lib:2.0"]);
+}
+
+/// A profile `<activeProfiles>` names keeps its repositories in Maven's
+/// request when `-P !id` turns it off, so they serve after Central what
+/// nothing earlier has: the project's repository and Central's mirror keep
+/// what they have.
+#[test]
+fn a_named_settings_profile_turned_off_keeps_its_repositories_after_central() {
+    let project = Project::new();
+    let corp = project.path().join("corp-repository");
+    let central = project.path().join("central-mirror");
+    for (artifact, version) in [("corp", "1.0"), ("lib", "1.0"), ("dual", "1.0")] {
+        publish(&corp, artifact, version);
+    }
+    publish(&central, "dual", "1.0");
+    let url = |dir: &Path| url::Url::from_directory_path(dir).expect("URL").to_string();
+    fs::create_dir_all(project.home.path().join(".m2")).expect("mkdir");
+    fs::write(
+        project.home.path().join(".m2/settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>c</id><url>{}</url><mirrorOf>central</mirrorOf>\
+             </mirror></mirrors><profiles><profile><id>corp</id><repositories><repository>\
+             <id>corp-dep</id><url>{}</url></repository></repositories></profile>\
+             </profiles><activeProfiles><activeProfile>corp</activeProfile>\
+             </activeProfiles></settings>",
+            url(&central),
+            url(&corp)
+        ),
+    )
+    .expect("settings");
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "</dependencies><profiles>",
+            "<dependency><groupId>org.test</groupId><artifactId>corp</artifactId>\
+             <version>1.0</version></dependency><dependency><groupId>org.test</groupId>\
+             <artifactId>dual</artifactId><version>1.0</version></dependency>\
+             </dependencies><profiles>",
+        ),
+    );
+    project.sync(&["-P!corp"]);
+    assert_eq!(project.locked(), ["corp:1.0", "dual:1.0", "lib:1.0"]);
+    let text = fs::read_to_string(project.path().join("raeva.lock")).expect("raeva.lock");
+    let lock: toml::Value = toml::from_str(&text).expect("parse raeva.lock");
+    let origins: Vec<_> = (lock["platforms"][0]["artifacts"]
+        .as_array()
+        .expect("rows")
+        .iter())
+    .map(|row| {
+        let artifact = row["coordinate"]["artifact"].as_str().expect("artifact");
+        (artifact, row["repo_url"].as_str().expect("repo_url"))
+    })
+    .collect();
+    assert_eq!(
+        origins,
+        [
+            ("corp", "./corp-repository/"),
+            ("dual", "https://repo1.maven.org/maven2/"),
+            ("lib", "./repository/")
+        ],
+        "{text}"
+    );
+}
+
+/// The project's own declaration of a repository that a profile turned off
+/// by `-P !id` also names is searched before Central, as in Maven's model,
+/// whose request copy under the same id is dropped.
+#[test]
+fn a_project_repository_a_turned_off_profile_also_names_precedes_central() {
+    let project = Project::new();
+    let corp = project.path().join("corp-repository");
+    let central = project.path().join("central-mirror");
+    for repository in [&corp, &central] {
+        publish(repository, "corp", "1.0");
+    }
+    let url = |dir: &Path| url::Url::from_directory_path(dir).expect("URL").to_string();
+    fs::create_dir_all(project.home.path().join(".m2")).expect("mkdir");
+    fs::write(
+        project.home.path().join(".m2/settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>c</id><url>{}</url><mirrorOf>central</mirrorOf>\
+             </mirror></mirrors><profiles><profile><id>corp</id><repositories><repository>\
+             <id>corp-dep</id><url>{}</url></repository></repositories></profile>\
+             </profiles><activeProfiles><activeProfile>corp</activeProfile>\
+             </activeProfiles></settings>",
+            url(&central),
+            url(&corp)
+        ),
+    )
+    .expect("settings");
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "</repository></repositories>",
+            "</repository><repository><id>corp-dep</id>\
+             <url>file://${project.basedir}/corp-repository/</url></repository></repositories>",
+        )
+        .replace(
+            "</dependencies><profiles>",
+            "<dependency><groupId>org.test</groupId><artifactId>corp</artifactId>\
+             <version>1.0</version></dependency></dependencies><profiles>",
+        ),
+    );
+    project.sync(&["-P!corp"]);
+    let text = fs::read_to_string(project.path().join("raeva.lock")).expect("raeva.lock");
+    let lock: toml::Value = toml::from_str(&text).expect("parse raeva.lock");
+    let rows = lock["platforms"][0]["artifacts"].as_array().expect("rows");
+    let origin = (rows.iter())
+        .find(|row| row["coordinate"]["artifact"].as_str() == Some("corp"))
+        .map(|row| row["repo_url"].as_str().expect("repo_url").to_string());
+    assert_eq!(origin.as_deref(), Some("./corp-repository/"), "{text}");
+}
+
+/// A `-P` value of `.mvn/maven.config` or `MAVEN_ARGS` that takes a
+/// variable set here but outside `allow_env_substitution` names a profile
+/// Maven reads and raeva cannot, so the sync refuses (exit 3), as a POM
+/// activation on it does; 0.6.0 warned and locked without the profile.
+/// Allowed, the variable is read, and `--frozen` fails once it changes.
+#[test]
+fn a_hidden_variable_in_a_profile_option_refuses() {
+    let project = Project::new();
+    let run = |args: &[&str], value: &str, maven_args: Option<&str>| {
+        let mut command = raeva_command(project.path(), project.home.path());
+        command.env("RAEVA_TEST_PROFILE", value).args(args);
+        if let Some(maven_args) = maven_args {
+            command.env("MAVEN_ARGS", maven_args);
+        }
+        command.output().expect("run raeva")
+    };
+    project.write(".mvn/maven.config", "-P${env.RAEVA_TEST_PROFILE}\n");
+    let refused = run(&["sync", "--offline"], "extra", None);
+    assert_status(&refused, 3, "maven.config");
+    assert!(
+        stderr(&refused).contains("${env.RAEVA_TEST_PROFILE}"),
+        "{}",
+        stderr(&refused)
+    );
+    fs::remove_file(project.path().join(".mvn/maven.config")).unwrap();
+    let refused = run(
+        &["sync", "--offline"],
+        "extra",
+        Some("-P${env.RAEVA_TEST_PROFILE}"),
+    );
+    assert_status(&refused, 3, "MAVEN_ARGS");
+    assert!(!project.path().join("raeva.lock").exists());
+    project.write(".mvn/maven.config", "-P${env.RAEVA_TEST_PROFILE}\n");
+    fs::write(
+        project.home.path().join("config.toml"),
+        "[security]\nallow_env_substitution = [\"RAEVA_TEST_PROFILE\"]\n",
+    )
+    .unwrap();
+    assert_success(&run(&["sync", "--offline"], "extra", None), "allowed");
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    assert_success(
+        &run(&["sync", "--frozen", "--offline"], "extra", None),
+        "frozen",
+    );
+    assert_status(
+        &run(&["sync", "--frozen", "--offline"], "none", None),
+        7,
+        "changed",
+    );
+}
+
+/// `-itr` makes Maven also leave out the repositories a dependency's POM
+/// declares for its parent, which raeva follows, so it refuses in
+/// `.mvn/maven.config` as in `MAVEN_ARGS`; 0.6.0 ignored it in the file.
+#[test]
+fn ignoring_transitive_repositories_refuses() {
+    let project = Project::new();
+    for option in ["-itr", "--ignore-transitive-repositories"] {
+        project.write(".mvn/maven.config", &format!("{option}\n"));
+        let refused = project.raeva(&["sync", "--offline"]);
+        assert_status(&refused, 3, option);
+        assert!(stderr(&refused).contains("-itr"), "{}", stderr(&refused));
+    }
+}
+
+/// A Maven Wrapper script of the `script` type, as Maven Wrapper 3.1.1 to
+/// 3.3.x write it, passes `MAVEN_CONFIG` to Maven before its own
+/// arguments, where `mvn` and the `only-script` type pass none of it, so
+/// with such a script in the project, or as the traced build's launcher,
+/// raeva refuses a `MAVEN_CONFIG` that holds options Maven reads (exit 3),
+/// but for a reactor selection, which it ignores as in `MAVEN_ARGS`, and
+/// without one it is left out, as is a value such as the `maven` image's
+/// `/root/.m2`.
+#[test]
+fn a_maven_config_a_wrapper_script_passes_refuses() {
+    let project = Project::new();
+    let run = |value: &str| {
+        let mut command = raeva_command(project.path(), project.home.path());
+        command
+            .env("MAVEN_CONFIG", value)
+            .args(["sync", "--offline"]);
+        command.output().expect("run raeva")
+    };
+    assert_success(&run("-Pextra"), "no wrapper");
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    let quiet = run("-pl app");
+    assert_success(&quiet, "no wrapper, -pl");
+    assert!(
+        !stderr(&quiet).contains("SETTING_IGNORED"),
+        "{}",
+        stderr(&quiet)
+    );
+    project.write(
+        "mvnw",
+        "#!/bin/sh\nexec \"$JAVACMD\" $MAVEN_OPTS ${WRAPPER_LAUNCHER} $MAVEN_CONFIG \"$@\"\n",
+    );
+    for value in ["-Pextra", "-Dlib.version=2.0", "-B -s settings.xml"] {
+        let refused = run(value);
+        assert_status(&refused, 3, value);
+        assert!(
+            stderr(&refused).contains("MAVEN_CONFIG"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+    for value in ["/root/.m2", "-B -ntp", ""] {
+        assert_success(&run(value), value);
+    }
+    // A reactor selection picks only the modules the build runs, and raeva
+    // locks the whole reactor, so it is ignored, as in `MAVEN_ARGS`.
+    let mut command = raeva_command(project.path(), project.home.path());
+    command
+        .env("MAVEN_CONFIG", "-B -pl app --also-make")
+        .args(["--json", "sync", "--offline"]);
+    let output = command.output().expect("run raeva");
+    assert_success(&output, "MAVEN_CONFIG -pl -am");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let warnings = envelope["data"]["warnings"].as_array().expect("warnings");
+    for option in ["-pl", "-am"] {
+        let ignoring = format!("ignoring {option} in MAVEN_CONFIG; raeva locks the whole reactor");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning["code"] == "SETTING_IGNORED"
+                    && (warning["message"].as_str())
+                        .is_some_and(|message| message.contains(&ignoring))
+            }),
+            "{option}: {envelope}"
+        );
+    }
+    assert_status(&run("-pl app -Dlib.version=2.0"), 3, "-pl with -D");
+    // The same script as the traced build's launcher.
+    let script = fs::read_to_string(project.path().join("mvnw")).unwrap();
+    fs::remove_file(project.path().join("mvnw")).unwrap();
+    project.write("tools/mvnw", &script);
+    project.write(
+        "raeva.toml",
+        "[plugins]\nlock = true\ntrace = [\"validate\"]\nmvn = \"tools/mvnw\"\n",
+    );
+    assert_status(&run("-Pextra"), 3, "traced launcher");
+}
+
+/// A FIFO where a configuration file goes blocks the open that reads it.
+/// `mvn` and `MavenCli` read `.mvn/jvm.config` and `.mvn/maven.config`
+/// only when each is a regular file, so raeva skips such a one, and
+/// refuses a settings.xml that is none (exit 3), without opening either.
+#[cfg(unix)]
+#[test]
+fn a_configuration_fifo_is_not_opened() {
+    let mkfifo = |path: &Path| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(path).status();
+        assert!(made.is_ok_and(|status| status.success()), "{path:?}");
+    };
+    let run = |project: &Project| {
+        let mut child = raeva_command(project.path(), project.home.path())
+            .args(["sync", "--offline"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run raeva");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("raeva sync still runs after 120 seconds");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        child.wait_with_output().unwrap()
+    };
+    for file in [".mvn/jvm.config", ".mvn/maven.config"] {
+        let project = Project::new();
+        mkfifo(&project.path().join(file));
+        assert_success(&run(&project), file);
+        assert_eq!(project.locked(), ["lib:1.0"], "{file}");
+    }
+    let project = Project::new();
+    mkfifo(&project.home.path().join(".m2/settings.xml"));
+    let output = run(&project);
+    assert_status(&output, 3, "settings.xml");
+    assert!(
+        stderr(&output).contains("not a regular file"),
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// A profile `.mvn/maven.config` turns on is named in the `--frozen` error,
 /// which the lock's recorded command line cannot do.
 #[test]
@@ -184,9 +498,7 @@ fn frozen_names_a_profile_maven_config_activates() {
     let output = project.frozen(&[]);
     assert_status(&output, 7, "maven.config -P");
     assert!(
-        stderr(&output)
-            .contains("the configuration changed: active Maven profiles changed for platform")
-            && stderr(&output).contains("(locked: [], current: [extra])"),
+        stderr(&output).contains("-Pextra is set here and was not when raeva.lock was written"),
         "{}",
         stderr(&output)
     );
@@ -277,7 +589,12 @@ fn jvm_config_cannot_set_the_java_version() {
         ".mvn/jvm.config",
         "-Djava.version=1.4.2 -Djava.vm.version=1.4.2\n",
     );
-    project.sync(&[]);
+    let output = raeva_command(project.path(), project.home.path())
+        .env("JAVA_VERSION", "17")
+        .args(["sync", "--offline"])
+        .output()
+        .expect("run raeva");
+    assert_success(&output, "sync");
     assert_eq!(project.locked(), ["lib:1.0"]);
 }
 
@@ -314,19 +631,112 @@ fn frozen_checks_a_settings_property_that_shadows_jvm_config() {
     assert_eq!(project.locked(), ["lib:2.0"]);
 }
 
-/// `config_hash` covers a jvm.config value of a name the build reads even
-/// when a POM property hides it: adding one needs a sync, which locks the
-/// same dependencies.
+/// B1: a JVM option's `-D` of a name the POM, an active settings profile
+/// or an `activeByDefault` profile defines decides nothing, as the model's
+/// own value ranks above a system property, so `--frozen` holds when it is
+/// added or changes. A `-D` still overrides the model's value, and a
+/// transitive POM that reads the name without defining it still takes it.
 #[test]
-fn a_jvm_config_value_a_pom_property_hides_relocks_to_the_same_dependencies() {
+fn a_jvm_option_a_model_property_hides_keeps_the_lock() {
     let project = Project::new();
+    let opts = |value: &str| format!("-Dlib.version={value}");
+    let frozen = |opts: &str, args: &[&str]| {
+        project.raeva_opts(
+            opts,
+            &[],
+            &[args, &["sync", "--frozen", "--offline"]].concat(),
+        )
+    };
     project.sync(&[]);
     assert_eq!(project.locked(), ["lib:1.0"]);
     project.write(".mvn/jvm.config", "-Dlib.version=2.0\n");
-    assert_status(&project.frozen(&[]), 7, "new jvm.config value");
+    assert_success(&frozen("", &[]), "a jvm.config value the POM hides");
+    assert_success(
+        &frozen(&opts("3.0"), &[]),
+        "a MAVEN_OPTS value the POM hides",
+    );
+    let output = project.raeva_opts(
+        "",
+        &[("JAVA_TOOL_OPTIONS", "-Dlib.version=3.0")],
+        &["sync", "--frozen", "--offline"],
+    );
+    assert_success(&output, "a JAVA_TOOL_OPTIONS value the POM hides");
+    fs::remove_file(project.path().join(".mvn/jvm.config")).expect("rm jvm.config");
+
+    project.sync(&["-Dlib.version=2.0"]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+    assert_status(
+        &project.frozen(&["-Dlib.version=1.0"]),
+        7,
+        "a -D over the POM changed",
+    );
+    assert_status(&project.frozen(&[]), 7, "a -D over the POM removed");
+    assert_success(
+        &frozen(&opts("3.0"), &["-Dlib.version=2.0"]),
+        "a JVM -D below the -D",
+    );
+
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    let unset = pom.replace(
+        "<properties><lib.version>1.0</lib.version></properties>",
+        "",
+    );
+    let by_default = unset.replace(
+        "<profile><id>extra</id>",
+        "<profile><id>pin</id><activation><activeByDefault>true</activeByDefault>\
+         </activation><properties><lib.version>1.0</lib.version></properties></profile>\
+         <profile><id>extra</id>",
+    );
+    project.write("pom.xml", &by_default);
     project.sync(&[]);
     assert_eq!(project.locked(), ["lib:1.0"]);
-    assert_success(&project.frozen(&[]), "relocked");
+    assert_success(
+        &frozen(&opts("2.0"), &[]),
+        "an activeByDefault value hides it",
+    );
+
+    project.write("pom.xml", &unset);
+    let pinned = project.write("pinned.xml", &settings("1.0"));
+    let pinned = pinned.to_str().expect("path").to_string();
+    project.sync(&["-s", &pinned]);
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    assert_success(
+        &frozen(&opts("2.0"), &["-s", &pinned]),
+        "a settings profile value hides it",
+    );
+
+    // The root reads its own value and a dependency reads the JVM's, so
+    // the JVM's value decides the dependency's read.
+    let lib = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+               <artifactId>lib</artifactId><version>1.0</version><dependencies><dependency>\
+               <groupId>org.test</groupId><artifactId>extra</artifactId>\
+               <version>${extra.version}</version></dependency></dependencies></project>";
+    let path = "repository/org/test/lib/1.0/lib-1.0.pom";
+    fs::remove_file(project.path().join("raeva.lock")).expect("rm raeva.lock");
+    project.write(path, lib);
+    project.write(&format!("{path}.sha256"), &sha256_hex(lib.as_bytes()));
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<lib.version>1.0</lib.version>",
+            "<lib.version>1.0</lib.version><extra.version>1.0</extra.version>",
+        )
+        .replace(
+            "<version>${lib.version}</version></dependency></dependencies>",
+            "<version>${lib.version}</version></dependency><dependency>\
+             <groupId>org.test</groupId><artifactId>extra</artifactId>\
+             <version>${extra.version}</version></dependency></dependencies>",
+        ),
+    );
+    let output = project.raeva_opts("-Dextra.version=1.0", &[], &["sync", "--offline"]);
+    assert_success(&output, "a dependency reads the JVM value");
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    assert_success(&frozen("-Dextra.version=1.0", &[]), "unchanged");
+    assert_status(
+        &frozen("-Dextra.version=2.0", &[]),
+        7,
+        "the dependency's read changed",
+    );
 }
 
 /// A project `app` whose `lib` version is `version`, with `lib.version` and
@@ -370,20 +780,6 @@ fn frozen_checks_a_jvm_config_value_moved_to_the_command_line() {
     project.sync(&["-Dlib.version=2.0"]);
     assert_eq!(project.locked(), ["lib:2.0"]);
     assert_status(&project.frozen(&[]), 7, "moved back to jvm.config");
-}
-
-/// As [`frozen_checks_a_jvm_config_value_moved_to_the_command_line`], for a
-/// property whose name an expression computes.
-#[test]
-fn frozen_checks_a_computed_name_moved_to_jvm_config() {
-    let project = Project::new();
-    with_fetched_parent(&project, "${${project.artifactId}.version}");
-    project.sync(&["-Dapp.version=2.0"]);
-    assert_eq!(project.locked(), ["lib:2.0"]);
-    project.write(".mvn/jvm.config", "-Dapp.version=2.0\n");
-    assert_status(&project.frozen(&[]), 7, "moved to jvm.config");
-    project.sync(&[]);
-    assert_eq!(project.locked(), ["lib:1.0"]);
 }
 
 #[test]
@@ -449,7 +845,7 @@ fn a_jvm_config_value_a_define_overrides_keeps_a_dependency_lookup() {
     let pom = "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
                <artifactId>lib</artifactId><version>1.0</version><dependencies><dependency>\
                <groupId>org.test</groupId><artifactId>extra</artifactId>\
-               <version>${${project.artifactId}.version}</version></dependency>\
+               <version>${lib.version}</version></dependency>\
                </dependencies></project>";
     let path = "repository/org/test/lib/1.0/lib-1.0.pom";
     project.write(path, pom);
@@ -495,10 +891,11 @@ fn an_unknown_profile_warns() {
     let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
     project.write(
         "pom.xml",
-        &pom.replace(
+        &pom.replacen(
             "<groupId>org.test</groupId>",
             "<parent><groupId>org.test</groupId><artifactId>parent</artifactId>\
              <version>1</version></parent><groupId>org.test</groupId>",
+            1,
         ),
     );
     let url = url::Url::from_directory_path(project.path().join("repository")).expect("url");
@@ -660,52 +1057,107 @@ fn a_reactor_selection_on_the_command_line_gets_a_tip() {
     assert!(!stderr.contains("whole reactor"), "{stderr}");
 }
 
-/// A project cannot pick the settings file: a `-s` in `.mvn/maven.config`
-/// would bring mirrors, proxies, every environment variable and the local
-/// repository that the project's own files may not set, so it is ignored
-/// with `SETTING_IGNORED`. A command-line `-s` expands with the command
-/// line's `-D` values and the project directory.
+/// `-s` in `.mvn/maven.config` picks the settings file, as Maven 3.9.12
+/// and 3.10.0 read it: a `-s` of `MAVEN_ARGS` or of the command line wins
+/// over it, either expands with the `-D` values of the file and of the
+/// command line, and a relative one is taken from the working directory.
+/// `-gs` there fails the load (exit 3), since raeva reads no global
+/// settings file.
 #[test]
-fn a_settings_option_in_maven_config_is_ignored() {
+fn a_settings_option_in_maven_config_is_read() {
     let project = Project::new();
+    // As `mvn` runs in the project directory.
+    let raeva = |args: &[&str], maven_args: &str| {
+        raeva_command(project.path(), project.home.path())
+            .current_dir(project.path())
+            .env("MAVEN_ARGS", maven_args)
+            .args(args)
+            .args(["sync", "--offline"])
+            .output()
+            .expect("run raeva")
+    };
     project.write(".mvn/ci.xml", &settings("2.0"));
     project.write(".mvn/other.xml", &settings("1.0"));
-    project.write(".mvn/maven.config", "-s\n.mvn/ci.xml\n-Dchoice=ci\n");
-    let output = project.raeva(&["--json", "sync", "--offline"]);
+    project.write(".mvn/maven.config", "-s\n.mvn/ci.xml\n-Dchoice=other\n");
+    let output = raeva(&["--json"], "");
     assert_success(&output, "maven.config -s");
-    assert_eq!(project.locked(), ["lib:1.0"]);
-    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
-    let warnings = envelope["data"]["warnings"].as_array().expect("warnings");
+    assert_eq!(project.locked(), ["lib:2.0"]);
     assert!(
-        warnings
-            .iter()
-            .any(|warning| warning["code"] == "SETTING_IGNORED"
-                && warning["message"].as_str().is_some_and(|m| m.contains("-s")
-                    && m.ends_with("review the file and pass it as raeva -s <file> sync"))),
-        "{envelope}"
+        !String::from_utf8_lossy(&output.stdout).contains("SETTING_IGNORED"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
+    let frozen = raeva_command(project.path(), project.home.path())
+        .current_dir(project.path())
+        .args(["sync", "--frozen", "--offline"])
+        .output()
+        .expect("run raeva");
+    assert_success(&frozen, "frozen with the maven.config -s");
 
     let other = project.path().join(".mvn/other.xml");
     let other = other.to_str().expect("UTF-8 path");
-    let ci = project.path().join(".mvn/ci.xml");
-    project.sync(&["-s", ci.to_str().expect("UTF-8 path"), "-s", other]);
-    assert_eq!(project.locked(), ["lib:2.0"]);
-    project.sync(&["-s", "${session.rootDirectory}/.mvn/other.xml"]);
+    assert_success(&raeva(&["-s", other], ""), "-s");
     assert_eq!(project.locked(), ["lib:1.0"]);
-    project.sync(&[
-        "-Dchoice=other",
-        "-s",
-        "${maven.multiModuleProjectDirectory}/.mvn/${choice}.xml",
-    ]);
+    assert_success(&raeva(&[], &format!("-s {other}")), "MAVEN_ARGS -s");
     assert_eq!(project.locked(), ["lib:1.0"]);
-    // A -D value of the file does not pick the command line's -s either.
-    let output = project.raeva(&[
-        "-s",
-        "${maven.multiModuleProjectDirectory}/.mvn/${choice}.xml",
-        "sync",
-        "--offline",
-    ]);
-    assert_status(&output, 3, "-s expanded with a maven.config -D");
+    // A -D value of the file expands the command line's -s.
+    let chosen = "${maven.multiModuleProjectDirectory}/.mvn/${choice}.xml";
+    assert_success(&raeva(&["-s", chosen], ""), "-s with a maven.config -D");
+    assert_eq!(project.locked(), ["lib:1.0"]);
+
+    project.write(".mvn/maven.config", "-gs\n.mvn/ci.xml\n");
+    let output = raeva(&[], "");
+    assert_status(&output, 3, "maven.config -gs");
+    assert!(
+        stderr(&output).contains("-gs (--global-settings)"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A secret the launcher's `.mvn/maven.config` defines stays out of the
+/// message for the missing `-s` file it names, wherever `mvn` finds that
+/// `.mvn`: in `MAVEN_BASEDIR`, or up from the directory `PWD` names.
+#[test]
+fn a_secret_in_the_launcher_maven_config_is_hidden() {
+    let project = Project::new();
+    let base = tempfile::TempDir::new().expect("base");
+    fs::create_dir(base.path().join(".mvn")).expect(".mvn");
+    let config = "-Dapi.token=zqQ12zq\n-s\n/nonexistent/${api.token}\n";
+    fs::write(base.path().join(".mvn/maven.config"), config).expect("maven.config");
+    let check = |output: &Output, how: &str| {
+        assert_status(output, 3, how);
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr(output)
+        );
+        assert!(
+            shown.contains("does not exist") && shown.contains("***") && !shown.contains("zqQ12zq"),
+            "{how}: {shown}"
+        );
+    };
+    let mut raeva = raeva_command(project.path(), project.home.path());
+    raeva
+        .current_dir(project.path())
+        .args(["sync", "--offline"]);
+    let output = (raeva.env("MAVEN_BASEDIR", base.path()).output()).expect("run raeva");
+    check(&output, "MAVEN_BASEDIR");
+    #[cfg(unix)]
+    {
+        // `-C` names the working directory itself, as the kernel spells it
+        // (macOS keeps temporary directories under the /var link), so raeva
+        // takes `PWD` as the shell's name for it.
+        let root = project.path().canonicalize().expect("canonical root");
+        let link = base.path().join("app");
+        std::os::unix::fs::symlink(&root, &link).expect("link");
+        let mut raeva = raeva_command(&root, project.home.path());
+        raeva.current_dir(&root).env("PWD", &link);
+        check(
+            &(raeva.args(["sync", "--offline"]).output()).expect("run raeva"),
+            "PWD",
+        );
+    }
 }
 
 /// A `-s` file that is not a settings document, such as the project's
@@ -805,12 +1257,7 @@ fn an_undefined_property_in_a_coordinate_names_it() {
                 <groupId>org.test</groupId><artifactId>extra</artifactId><version>1.0</version>\
                 <classifier>${nisse.os.classifier}</classifier></dependency></dependencies>\
                 </project>";
-    fs::write(&lib, text).expect("write lib POM");
-    fs::write(
-        lib.with_extension("pom.sha256"),
-        sha256_hex(text.as_bytes()),
-    )
-    .expect("sidecar");
+    write_with_sha256(&lib, text.as_bytes());
     let output = project.raeva(&["--json", "-Dlib.version=2.0", "sync", "--offline"]);
     assert_status(
         &output,
@@ -896,12 +1343,7 @@ fn only_a_selected_invalid_pom_is_reported() {
         ("1.0/lib-1.0.pom", invalid),
         ("maven-metadata.xml", metadata),
     ] {
-        fs::write(dir.join(path), text).expect("write");
-        fs::write(
-            dir.join(format!("{path}.sha256")),
-            sha256_hex(text.as_bytes()),
-        )
-        .expect("write");
+        write_with_sha256(&dir.join(path), text.as_bytes());
     }
     let problems = |version: &str| {
         let define = format!("-Dlib.version={version}");
@@ -937,4 +1379,787 @@ fn a_range_skips_an_overlong_listed_version() {
 
     project.sync(&["-Dlib.version=[1.0,3.0)"]);
     assert_eq!(project.locked(), ["lib:2.0"]);
+}
+
+/// `<offline>true</offline>` in settings.xml makes the run offline, as
+/// `--offline` does, so nothing is requested from Central and `vuln` is
+/// refused.
+#[test]
+fn settings_offline_keeps_a_run_offline() {
+    let project = Project::new();
+    project.write(
+        "pom.xml",
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>app</artifactId><version>1</version><dependencies><dependency>\
+         <groupId>org.test</groupId><artifactId>absent</artifactId><version>1.0</version>\
+         </dependency></dependencies></project>",
+    );
+    let online = project.raeva(&["sync"]);
+    assert!(
+        !stderr(&online).contains("offline mode"),
+        "{}",
+        stderr(&online)
+    );
+    fs::create_dir_all(project.home.path().join(".m2")).expect("mkdir");
+    fs::write(
+        project.home.path().join(".m2/settings.xml"),
+        "<settings><offline> TRUE </offline></settings>",
+    )
+    .expect("settings");
+    let offline = project.raeva(&["sync"]);
+    assert!(
+        stderr(&offline).contains("offline mode"),
+        "{}",
+        stderr(&offline)
+    );
+    let vuln = project.raeva(&["vuln"]);
+    assert_eq!(vuln.status.code(), Some(2), "{}", stderr(&vuln));
+    assert!(
+        stderr(&vuln).contains("cannot run with offline mode set in settings.xml"),
+        "{}",
+        stderr(&vuln)
+    );
+}
+
+/// Maven honours `-o` in `.mvn/maven.config`, so raeva's run is offline:
+/// doctor probes no repository and vuln is refused.
+#[test]
+fn maven_config_offline_keeps_a_run_offline() {
+    let project = Project::new();
+    project.write(
+        "pom.xml",
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>app</artifactId><version>1</version></project>",
+    );
+    project.write(".mvn/maven.config", "--offline\n");
+    let doctor = project.raeva(&["doctor"]);
+    let out = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        out.contains("not probed offline"),
+        "{out}{}",
+        stderr(&doctor)
+    );
+    let vuln = project.raeva(&["vuln"]);
+    assert_eq!(vuln.status.code(), Some(2), "{}", stderr(&vuln));
+    assert!(
+        stderr(&vuln).contains("cannot run with offline mode"),
+        "{}",
+        stderr(&vuln)
+    );
+}
+
+/// Maven keeps the whitespace a `-D` value brings into a dependency's
+/// version and requests `1.0 `, which no repository holds, by Maven 3.9.12
+/// and 3.10.0 runs; after a range's closing bracket it is ignored. raeva
+/// refuses such a version instead of locking `1.0`.
+#[test]
+fn whitespace_a_define_brings_into_a_version_is_refused() {
+    let project = Project::new();
+    for value in ["1.0 ", " 1.0", "\t1.0", " [1.0,2.0)"] {
+        let output = project.raeva(&[&format!("-Dlib.version={value}"), "sync", "--offline"]);
+        assert_status(&output, 3, &format!("{value:?}"));
+        assert!(
+            stderr(&output).contains("'dependencies.dependency.version' for org.test:lib:jar"),
+            "{value:?}: {}",
+            stderr(&output)
+        );
+        assert!(!project.path().join("raeva.lock").exists(), "{value:?}");
+    }
+    project.sync(&["-Dlib.version=[2.0] "]);
+    assert_eq!(project.locked(), ["lib:2.0"]);
+}
+
+/// A dependency's POM keeps its other dependencies when one it leaves out
+/// of the graph takes a version with such whitespace, as Maven does.
+#[test]
+fn whitespace_in_a_dependency_pom_version_drops_nothing() {
+    let project = Project::new();
+    let repository = project.path().join("repository");
+    publish(&repository, "good", "1.0");
+    crate::common::publish(
+        &repository,
+        "org.test:mid:1.0",
+        "<dependencies><dependency><groupId>org.test</groupId><artifactId>good</artifactId>\
+         <version>1.0</version></dependency><dependency><groupId>org.test</groupId>\
+         <artifactId>ignored</artifactId><version>${revision}</version><scope>test</scope>\
+         </dependency></dependencies>",
+    );
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    let pom = pom.replace(
+        "<version>${lib.version}</version>",
+        "<version>${lib.version}</version></dependency><dependency><groupId>org.test</groupId>\
+         <artifactId>mid</artifactId><version>1.0</version>",
+    );
+    project.write("pom.xml", &pom);
+    project.sync(&["-Drevision=1.0 "]);
+    assert_eq!(project.locked(), ["good:1.0", "lib:1.0", "mid:1.0"]);
+}
+
+/// An active settings.xml profile repository whose URL does not parse, or
+/// a mirror of nothing used whose URL does not parse, is skipped with a
+/// warning, and the search goes on to the next repository, as Maven
+/// 3.9.12 and 3.10.0 do. Neither the URL nor what it was expanded from is
+/// shown, and `--frozen` reads the lock back.
+#[test]
+fn a_settings_url_that_does_not_parse_is_skipped_as_in_maven() {
+    const SENTINEL: &str = "hostsentinel";
+    let root = tempfile::TempDir::new().expect("project");
+    let home = tempfile::TempDir::new().expect("home");
+    let repository = root.path().join("repository");
+    crate::common::publish(&repository, "org.test:lib:1.0", "");
+    let url = url::Url::from_directory_path(&repository).expect("file URL");
+    fs::write(
+        root.path().join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+         <artifactId>app</artifactId><version>1</version><dependencies><dependency>\
+         <groupId>org.test</groupId><artifactId>lib</artifactId><version>1.0</version>\
+         </dependency></dependencies></project>",
+    )
+    .expect("pom.xml");
+    fs::create_dir_all(home.path().join(".m2")).expect(".m2");
+    fs::write(
+        home.path().join(".m2/settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>unused</id><mirrorOf>nothing</mirrorOf>\
+             <url>https://[${{env.RV_BAD_HOST}}</url></mirror></mirrors><profiles><profile>\
+             <id>p</id><repositories><repository><id>bad</id>\
+             <url>https://[${{env.RV_BAD_HOST}}</url></repository><repository><id>good</id>\
+             <url>{url}</url></repository></repositories></profile></profiles>\
+             <activeProfiles><activeProfile>p</activeProfile></activeProfiles></settings>"
+        ),
+    )
+    .expect("settings.xml");
+    let run = |args: &[&str]| {
+        raeva_command(root.path(), home.path())
+            .env("RV_BAD_HOST", SENTINEL)
+            .args(args)
+            .output()
+            .expect("run raeva")
+    };
+    let sync = run(&["--json", "sync"]);
+    assert_success(&sync, "sync");
+    let warnings = crate::common::envelope(&sync)["data"]["warnings"].to_string();
+    for entry in ["repository 'bad'", "mirror 'unused'"] {
+        assert!(warnings.contains(entry), "{warnings}");
+    }
+    let lock = fs::read_to_string(root.path().join("raeva.lock")).expect("raeva.lock");
+    assert!(lock.contains("org.test:lib:1.0"), "{lock}");
+    let frozen = run(&["-v", "sync", "--frozen"]);
+    assert_success(&frozen, "sync --frozen");
+    assert_eq!(
+        fs::read_to_string(root.path().join("raeva.lock")).expect("raeva.lock"),
+        lock
+    );
+    for output in [&sync, &frozen] {
+        let shown = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!shown.contains(SENTINEL), "{shown}");
+    }
+}
+
+/// The reactor selection of `MAVEN_ARGS` picks the modules a build runs,
+/// not what they resolve, and raeva locks the whole reactor: it is read,
+/// with its values, and ignored with `SETTING_IGNORED`, so the lock is the
+/// one written without it, and `--frozen` takes it.
+#[test]
+fn a_reactor_selection_in_maven_args_is_ignored() {
+    let project = Project::new();
+    let run = |args: &str, sync: &[&str]| {
+        raeva_command(project.path(), project.home.path())
+            .env("MAVEN_ARGS", args)
+            .args(sync)
+            .output()
+            .expect("run raeva")
+    };
+    project.sync(&[]);
+    let lock = fs::read(project.path().join("raeva.lock")).expect("raeva.lock");
+    fs::remove_file(project.path().join("raeva.lock")).expect("remove raeva.lock");
+    let output = run("-pl app -am", &["--json", "sync", "--offline"]);
+    assert_success(&output, "MAVEN_ARGS -pl -am");
+    assert_eq!(
+        fs::read(project.path().join("raeva.lock")).expect("raeva.lock"),
+        lock
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let warnings = envelope["data"]["warnings"].as_array().expect("warnings");
+    for option in ["-pl", "-am"] {
+        let ignoring = format!("ignoring {option} in MAVEN_ARGS; raeva locks the whole reactor");
+        assert!(
+            warnings.iter().any(|warning| {
+                warning["code"] == "SETTING_IGNORED"
+                    && warning["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(&ignoring))
+            }),
+            "{option}: {envelope}"
+        );
+    }
+    for args in [
+        "--projects=app --also-make-dependents",
+        "-pl=app -rf app",
+        "-N -B --resume-from app",
+    ] {
+        assert_success(&run(args, &["sync", "--frozen", "--offline"]), args);
+    }
+    let refused = run("-pl app -f other.xml", &["sync", "--offline"]);
+    assert_status(&refused, 3, "MAVEN_ARGS -f");
+    assert!(stderr(&refused).contains("-f"), "{}", stderr(&refused));
+    let refused = run("-pl", &["sync", "--offline"]);
+    assert_status(&refused, 3, "MAVEN_ARGS -pl without its value");
+}
+
+/// `mvn` puts the words of `MAVEN_ARGS` before its own arguments, so Maven
+/// 3.9.12 and 3.10.0 take its `-D` and `-P` as ones on the command line
+/// before the others, where raeva, which read none of it, locked lib 1.0
+/// and left `extra` off. A later `-D` of raeva's command line wins, a
+/// changed one makes `--frozen` fail as a changed `-D` there does, options
+/// that change nothing resolved pass, and one raeva cannot read as `mvn`
+/// does fails the load (exit 3), naming the option, never a value.
+#[test]
+fn maven_args_read_as_the_start_of_the_command_line() {
+    let project = Project::new();
+    let run = |args: &str, options: &[&str]| {
+        raeva_command(project.path(), project.home.path())
+            .env("MAVEN_ARGS", args)
+            .args(options)
+            .args(["sync", "--offline"])
+            .output()
+            .expect("run raeva")
+    };
+    let frozen = |args: &str| {
+        raeva_command(project.path(), project.home.path())
+            .env("MAVEN_ARGS", args)
+            .args(["sync", "--frozen", "--offline"])
+            .output()
+            .expect("run raeva")
+    };
+    for mode in ["3.9", "3.10"] {
+        project.write("raeva.toml", &format!("[lock]\nmaven = \"{mode}\"\n"));
+        for (args, options, locked) in [
+            ("-Dlib.version=2.0", &[][..], &["lib:2.0"][..]),
+            ("--define lib.version=2.0", &[], &["lib:2.0"]),
+            ("-Pextra", &[], &["extra:1.0", "lib:1.0"]),
+            ("-Dlib.version=2.0", &["-Dlib.version=1.0"], &["lib:1.0"]),
+            ("-DskipTests -B -T 4 -ntp -o -U", &[], &["lib:1.0"]),
+        ] {
+            let case = format!("{mode}: {args} {options:?}");
+            assert_success(&run(args, options), &case);
+            assert_eq!(project.locked(), locked, "{case}");
+        }
+        assert_success(&run("-Dlib.version=2.0", &[]), mode);
+        assert_success(&frozen("-B -Dlib.version=2.0"), mode);
+        assert_status(&frozen(""), 7, mode);
+        assert_status(&frozen("-Dlib.version=1.0"), 7, mode);
+        // `sh` reads `!` as written, and Maven 3.9.12 and 3.10.0 deactivate
+        // the profile `.mvn/maven.config` activates; `mvn.cmd` drops it.
+        if cfg!(unix) {
+            project.write(".mvn/maven.config", "-Pextra\n");
+            assert_success(&run("-P!extra", &[]), mode);
+            assert_eq!(project.locked(), ["lib:1.0"], "{mode} -P!extra");
+            fs::remove_file(project.path().join(".mvn/maven.config")).unwrap();
+        }
+    }
+    let mut refused = vec![
+        ("-gs other.xml", "-gs"),
+        ("-f other.xml", "-f"),
+        ("-t toolchains.xml", "-t"),
+        (
+            "--ignore-transitive-repositories",
+            "--ignore-transitive-repositories",
+        ),
+        ("-Zsecret=zqSECRETzq", "-Z"),
+        ("-Dlib.version=*", "'*'"),
+    ];
+    if cfg!(windows) {
+        refused.extend([("\"-Dlib.version=2.0\"", "'\"'"), ("-P!extra", "'!'")]);
+    }
+    for (args, named) in refused {
+        let output = run(args, &[]);
+        assert_status(&output, 3, args);
+        let said = stderr(&output);
+        assert!(
+            said.contains("MAVEN_ARGS") && said.contains(named),
+            "{args}: {said}"
+        );
+        assert!(
+            crate::common::markers_in(&said).next().is_none() && !said.contains("2.0"),
+            "{args}: {said}"
+        );
+    }
+}
+
+impl Project {
+    /// raeva with `MAVEN_OPTS` `opts` before the harness's `-Duser.home`,
+    /// and the variables `env`.
+    fn raeva_opts(&self, opts: &str, env: &[(&str, &str)], args: &[&str]) -> Output {
+        let mut command = raeva_command(self.path(), self.home.path());
+        crate::common::isolate_maven_user_home(&mut command, self.home.path(), opts);
+        command.envs(env.iter().copied());
+        command.args(args).output().expect("run raeva")
+    }
+
+    /// The settings.xml whose active profile sets `lib.version` to
+    /// `${lv}`, which settings.xml takes from the system properties.
+    fn settings_from_lv(&self) -> String {
+        let file = self.write("settings.xml", &settings("${lv}"));
+        file.to_str().expect("path").to_string()
+    }
+}
+
+/// F1: a `-D` of `MAVEN_OPTS` or a JVM variable is a system property, as
+/// `.mvn/jvm.config`'s is, which settings.xml takes; `--frozen` goes stale
+/// when it changes, and the JVM's order decides between channels.
+#[test]
+fn a_jvm_option_variable_define_is_a_system_property() {
+    let project = Project::new();
+    let settings = project.settings_from_lv();
+    let sync = |opts: &str, env: &[(&str, &str)]| {
+        let output = project.raeva_opts(opts, env, &["-s", &settings, "sync", "--offline"]);
+        assert_success(&output, &format!("{opts} {env:?}"));
+        project.locked()
+    };
+    let frozen = |opts: &str, env: &[(&str, &str)]| {
+        project.raeva_opts(
+            opts,
+            env,
+            &["-s", &settings, "sync", "--frozen", "--offline"],
+        )
+    };
+    assert_eq!(sync("-Dlv=2.0", &[]), ["lib:2.0"]);
+    assert_success(&frozen("-Dlv=2.0", &[]), "the same MAVEN_OPTS");
+    assert_success(&frozen("-Dlv=2.0 -Dunread=1", &[]), "a -D nothing reads");
+    assert_status(&frozen("-Dlv=1.0", &[]), 7, "another MAVEN_OPTS value");
+    assert_status(
+        &frozen("", &[("JAVA_TOOL_OPTIONS", "-Dlv=1.0")]),
+        7,
+        "moved",
+    );
+    let text = fs::read_to_string(project.path().join("raeva.lock")).expect("raeva.lock");
+    assert!(
+        !text.contains("-Dlv") && !text.contains("MAVEN_OPTS"),
+        "{text}"
+    );
+    assert_eq!(sync("", &[("JAVA_TOOL_OPTIONS", "-Dlv=2.0")]), ["lib:2.0"]);
+    // `.mvn/jvm.config` comes after JAVA_TOOL_OPTIONS and before MAVEN_OPTS.
+    project.write(".mvn/jvm.config", "-Dlv=1.0\n");
+    assert_eq!(sync("-Dlv=2.0", &[]), ["lib:2.0"]);
+    assert_eq!(sync("", &[("JAVA_TOOL_OPTIONS", "-Dlv=2.0")]), ["lib:1.0"]);
+    assert_eq!(sync("", &[("_JAVA_OPTIONS", "-Dlv=2.0")]), ["lib:2.0"]);
+}
+
+/// A JVM option raeva cannot read exactly refuses where a read takes the
+/// name it may set, and only there.
+#[test]
+fn an_unread_jvm_option_refuses_where_its_name_is_read() {
+    let project = Project::new();
+    let settings = project.settings_from_lv();
+    // `mvn`'s shell may expand the pattern to the names of files.
+    let glob = "-Dlv=2*";
+    let output = project.raeva_opts(glob, &[], &["-s", &settings, "sync", "--offline"]);
+    assert_status(&output, 3, "a pattern in MAVEN_OPTS");
+    let output = project.raeva_opts(
+        "-Dother=2* -Dlv=2.0",
+        &[],
+        &["-s", &settings, "sync", "--offline"],
+    );
+    assert_success(&output, "a pattern of a name nothing reads");
+    assert_eq!(project.locked(), ["lib:2.0"]);
+    // A later channel sets it exactly.
+    let later = [("_JAVA_OPTIONS", "-Dlv=1.0")];
+    let output = project.raeva_opts(glob, &later, &["-s", &settings, "sync", "--offline"]);
+    assert_success(&output, "_JAVA_OPTIONS after the pattern");
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    // Maven expands settings.xml before the POM's properties, so one of
+    // them is no fallback there; a POM takes its own over the JVM's.
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    let with_lv = pom.replace("<properties>", "<properties><lv>1.0</lv>");
+    project.write("pom.xml", &with_lv);
+    let output = project.raeva_opts(glob, &[], &["-s", &settings, "sync", "--offline"]);
+    assert_status(&output, 3, "a settings value a POM property would fill");
+    project.write("pom.xml", &with_lv.replace("${lib.version}", "${lv}"));
+    let output = project.raeva_opts(glob, &[], &["sync", "--offline"]);
+    assert_success(&output, "a POM's own property");
+    assert_eq!(project.locked(), ["lib:1.0"]);
+    project.write("pom.xml", &pom);
+    project.write(".mvn/maven.config", "-Dlib.version=${lv}\n");
+    let output = project.raeva_opts(glob, &[], &["sync", "--offline"]);
+    assert_status(&output, 3, "a maven.config value");
+    project.write("pom.xml", &with_lv);
+    let output = project.raeva_opts(glob, &[], &["sync", "--offline"]);
+    assert_status(&output, 3, "a maven.config value a POM property would fill");
+}
+
+/// `mvn` passes `.mvn/jvm.config` on in its unquoted `$MAVEN_OPTS`, so a
+/// pattern there that names a file in the directory `mvn` runs in may set
+/// another value: a profile its name activates is not locked. A pattern
+/// of a name nothing reads, such as `http.nonProxyHosts`, still syncs.
+#[cfg(unix)]
+#[test]
+fn a_jvm_config_pattern_the_shell_may_expand_refuses_where_its_name_is_read() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>choice</name><value>*</value>\
+             </property></activation>",
+        ),
+    );
+    project.write("-Dchoice=2", "");
+    let sync = || {
+        let mut command = raeva_command(project.path(), project.home.path());
+        (command
+            .current_dir(project.path())
+            .args(["sync", "--offline"]))
+        .output()
+        .expect("run raeva")
+    };
+    project.write(".mvn/jvm.config", "-Dchoice=*\n");
+    let output = sync();
+    assert_status(&output, 3, "a pattern in .mvn/jvm.config");
+    assert!(
+        stderr(&output).contains("depends on choice"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!project.path().join("raeva.lock").exists());
+    project.write(".mvn/jvm.config", "-Dhttp.nonProxyHosts=*.corp|localhost\n");
+    assert_success(&sync(), "a pattern of a name nothing reads");
+    assert_eq!(project.locked(), ["lib:1.0"]);
+}
+
+/// A5: a `-D` of `MAVEN_OPTS` activates a POM profile, over the same name
+/// in `.mvn/jvm.config`, which the JVM reads before it; the profile follows
+/// it in `--frozen`.
+#[test]
+fn a_maven_opts_define_activates_a_profile() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>x</name><value>true</value>\
+             </property></activation>",
+        ),
+    );
+    let sync = |opts: &str| {
+        let output = project.raeva_opts(opts, &[], &["sync", "--offline"]);
+        assert_success(&output, opts);
+        project.locked()
+    };
+    let frozen = |opts: &str| project.raeva_opts(opts, &[], &["sync", "--frozen", "--offline"]);
+    assert_eq!(sync("-Dx=true"), ["extra:1.0", "lib:1.0"]);
+    assert_success(&frozen("-Dx=true"), "the same MAVEN_OPTS");
+    assert_status(&frozen(""), 7, "without the -D");
+    project.write(".mvn/jvm.config", "-Dx=true\n");
+    assert_eq!(sync("-Dx=1"), ["lib:1.0"]);
+    assert_eq!(sync(""), ["extra:1.0", "lib:1.0"]);
+}
+
+/// A5 through a mavenrc file, which sets `MAVEN_OPTS` for `mvn`.
+#[cfg(unix)]
+#[test]
+fn a_mavenrc_maven_opts_define_activates_a_profile() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>x</name><value>true</value>\
+             </property></activation>",
+        ),
+    );
+    let mavenrc = project.home.path().join(".mavenrc");
+    fs::write(&mavenrc, "MAVEN_OPTS=\"$MAVEN_OPTS -Dx=true\"\n").expect("mavenrc");
+    let output = project.raeva_opts("", &[], &["sync", "--offline"]);
+    assert_success(&output, "a mavenrc -D");
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    fs::write(&mavenrc, "MAVEN_OPTS=\"$MAVEN_OPTS -Dx=false\"\n").expect("mavenrc");
+    let output = project.raeva_opts("", &[], &["sync", "--frozen", "--offline"]);
+    assert_status(&output, 7, "a mavenrc that changes the -D");
+}
+
+/// `mvn` runs in the project directory, so the mavenrc files are sourced
+/// there, also for `raeva -C` from another: a file that reads one there
+/// gives the lock what it gives `mvn`.
+#[cfg(unix)]
+#[test]
+fn a_mavenrc_is_sourced_in_the_project_directory() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>x</name><value>true</value>\
+             </property></activation>",
+        ),
+    );
+    project.write("local.rc", "MAVEN_OPTS=\"$MAVEN_OPTS -Dx=true\"\n");
+    let mavenrc = project.home.path().join(".mavenrc");
+    fs::write(&mavenrc, "if [ -f ./local.rc ]; then . ./local.rc; fi\n").expect("mavenrc");
+    let sync = |args: &[&str]| {
+        let mut command = raeva_command(project.path(), project.home.path());
+        crate::common::isolate_maven_user_home(&mut command, project.home.path(), "");
+        (command.current_dir(project.home.path()).args(args))
+            .output()
+            .expect("run raeva")
+    };
+    assert_success(&sync(&["sync", "--offline"]), "sync from elsewhere");
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    fs::remove_file(project.path().join("local.rc")).expect("local.rc");
+    let frozen = sync(&["sync", "--frozen", "--offline"]);
+    assert_status(&frozen, 7, "a project without the file");
+}
+
+/// A mavenrc file that leaves the shell in another directory, from which
+/// `mvn` then finds the project and the JVM reads a relative option file,
+/// refuses the sync; one that goes back does not.
+#[cfg(unix)]
+#[test]
+fn a_mavenrc_that_stays_in_another_directory_is_refused() {
+    let project = Project::new();
+    fs::create_dir_all(project.path().join("sub")).expect("sub");
+    let mavenrc = project.home.path().join(".mavenrc");
+    let sync = || {
+        let mut command = raeva_command(project.path(), project.home.path());
+        crate::common::isolate_maven_user_home(&mut command, project.home.path(), "");
+        (command.args(["sync", "--offline"]))
+            .output()
+            .expect("run raeva")
+    };
+    fs::write(&mavenrc, "cd sub\n").expect("mavenrc");
+    let moved = sync();
+    assert_status(&moved, 3, "a mavenrc that stays in sub");
+    let said = stderr(&moved);
+    assert!(
+        said.contains(".mavenrc") && said.contains("changes the directory"),
+        "{said}"
+    );
+    fs::write(&mavenrc, "cd sub\ncd - >/dev/null\n").expect("mavenrc");
+    assert_success(&sync(), "a mavenrc that goes back");
+}
+
+/// The directory a mavenrc file moves to may hold a secret, which the
+/// refusal does not show.
+#[cfg(unix)]
+#[test]
+fn the_directory_a_mavenrc_moves_to_is_not_shown() {
+    let project = Project::new();
+    fs::create_dir_all(project.path().join("zqMOVEDzq")).expect("secret directory");
+    fs::write(
+        project.home.path().join(".mavenrc"),
+        "export REPO_TOKEN=zqMOVEDzq\ncd \"$REPO_TOKEN\"\n",
+    )
+    .expect("mavenrc");
+    let mut command = raeva_command(project.path(), project.home.path());
+    crate::common::isolate_maven_user_home(&mut command, project.home.path(), "");
+    let moved = (command.args(["sync", "--offline"]))
+        .output()
+        .expect("run raeva");
+    assert_status(&moved, 3, "a mavenrc that moves to a secret");
+    assert!(!stderr(&moved).contains("zqMOVEDzq"), "{}", stderr(&moved));
+}
+
+/// `cmd` expands a `%` in the path of the script raeva sources the
+/// mavenrc files with, so a temporary directory whose path has one leaves
+/// it in raeva's own cache, and the sync refuses where that has one too.
+#[cfg(windows)]
+#[test]
+fn a_temporary_directory_with_a_percent_sign_still_sources_mavenrc_pre() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>x</name><value>true</value>\
+             </property></activation>",
+        ),
+    );
+    let home = project.home.path();
+    fs::write(
+        home.join("mavenrc_pre.bat"),
+        "@echo off\r\nset \"MAVEN_OPTS=%MAVEN_OPTS% -Dx=true\"\r\n",
+    )
+    .expect("mavenrc_pre.bat");
+    let temp = home.join("t%USERNAME%p");
+    fs::create_dir_all(&temp).expect("temp");
+    let sync = |raeva_home: &Path| {
+        let mut command = raeva_command(project.path(), home);
+        crate::common::isolate_maven_user_home(&mut command, home, "");
+        (command.env("TEMP", &temp).env("TMP", &temp))
+            .env("USERNAME", "zqother")
+            .env("RAEVA_HOME", raeva_home)
+            .args(["sync", "--offline"])
+            .output()
+            .expect("run raeva")
+    };
+    assert_success(&sync(home), "sync with % in the temporary directory");
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    let refused = sync(&home.join("r%USERNAME%h"));
+    assert_status(&refused, 3, "% in both directories");
+    assert!(stderr(&refused).contains("% or !"), "{}", stderr(&refused));
+}
+
+/// A secret-named `-D` of `MAVEN_OPTS` that a profile reads decides it,
+/// and its value reaches neither raeva.lock nor any message.
+#[test]
+fn a_secret_named_maven_opts_define_stays_hidden() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>deploy.token</name>\
+             <value>!zqOTHERzq</value></property></activation>",
+        ),
+    );
+    let hidden = |output: &Output| {
+        let text = fs::read_to_string(project.path().join("raeva.lock")).expect("raeva.lock");
+        let said = format!(
+            "{}{}",
+            stderr(output),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            !said.contains("zqMARKzq") && !said.contains("zqTHIRDzq"),
+            "{said}"
+        );
+        assert!(!text.contains("zqMARKzq"), "{text}");
+    };
+    let output = project.raeva_opts("-Ddeploy.token=zqMARKzq", &[], &["-v", "sync", "--offline"]);
+    assert_success(&output, "a secret-named define");
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+    hidden(&output);
+    let frozen = |value: &str| {
+        let opts = format!("-Ddeploy.token={value}");
+        project.raeva_opts(&opts, &[], &["-v", "sync", "--frozen", "--offline"])
+    };
+    assert_success(&frozen("zqMARKzq"), "the same value");
+    for value in ["zqTHIRDzq", "zqOTHERzq"] {
+        let output = frozen(value);
+        assert_status(&output, 7, value);
+        hidden(&output);
+    }
+}
+
+/// A2 and B2: an option file reads as the JVM reads it beside a quoted
+/// value, and an argument file with its `#` comments.
+#[test]
+fn option_files_read_beside_quotes_and_comments() {
+    let project = Project::new();
+    let settings = project.settings_from_lv();
+    let vm = project.write("vm.options", "-Dlv=2.0\n");
+    let args = project.write("jvm.args", "# CI settings\n-Xmx256m\n-Dlv=2.0 # read\n");
+    let sync = |opts: &str, env: &[(&str, &str)]| {
+        let output = project.raeva_opts(opts, env, &["-s", &settings, "sync", "--offline"]);
+        assert_success(&output, &format!("{opts} {env:?}"));
+        project.locked()
+    };
+    let quoted = format!("-XX:VMOptionsFile={} \"-Dq=a b\"", vm.display());
+    assert_eq!(sync("-Dlv=3.0", &[("_JAVA_OPTIONS", &quoted)]), ["lib:2.0"]);
+    // The harness's `mvn` runs no JDK raeva can tell, which may not read
+    // JDK_JAVA_OPTIONS and its file.
+    let launcher = format!("\"-Dq=a b\" @{}", args.display());
+    let env = [
+        ("JAVA_TOOL_OPTIONS", "-Dlv=3.0"),
+        ("JDK_JAVA_OPTIONS", launcher.as_str()),
+    ];
+    let output = project.raeva_opts("", &env, &["-s", &settings, "sync", "--offline"]);
+    assert_status(&output, 3, "JDK_JAVA_OPTIONS of an unknown JDK");
+    assert_eq!(
+        sync(&format!("-Dlv=3.0 @{}", args.display()), &[]),
+        ["lib:2.0"]
+    );
+}
+
+/// A1: a POM reads `.mvn/jvm.config`'s `user.home` only where the JVM
+/// takes it last; one a later channel sets is the host's, which a lock
+/// cannot follow.
+#[test]
+fn a_later_user_home_hides_the_jvm_config_one_from_a_pom() {
+    let project = Project::new();
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><file><exists>${user.home}/marker</exists></file>\
+             </activation>",
+        ),
+    );
+    let config_home = project.path().join("j");
+    project.write("j/marker", "");
+    project.write(
+        ".mvn/jvm.config",
+        &format!("-Duser.home={}\n", config_home.display()),
+    );
+    // The harness's MAVEN_OPTS sets another user.home after jvm.config.
+    let output = project.raeva(&["sync", "--offline"]);
+    assert_status(&output, 3, "a POM reading a host user.home");
+    let home = format!("-Duser.home={}", project.home.path().display());
+    let output = raeva_command(project.path(), project.home.path())
+        .env("MAVEN_OPTS", "")
+        .env("JAVA_TOOL_OPTIONS", &home)
+        .args(["sync", "--offline"])
+        .output()
+        .expect("run raeva");
+    assert_success(&output, "jvm.config's user.home, read last");
+    assert_eq!(project.locked(), ["extra:1.0", "lib:1.0"]);
+}
+
+/// B3: a `-Djava.specification.version` of the environment, which JDK 8
+/// and 11 take and later JDKs ignore, fails only what reads it, naming its
+/// channel; `.mvn/jvm.config`'s fails the load, as the project's.
+#[test]
+fn a_jdk_dependent_environment_define_fails_only_its_reads() {
+    let project = Project::new();
+    let spec = "-Djava.specification.version=17";
+    let sync =
+        |opts: &str, env: &[(&str, &str)]| project.raeva_opts(opts, env, &["sync", "--offline"]);
+    assert_success(&sync(spec, &[]), "nothing reads it");
+    assert_success(
+        &sync("", &[("JAVA_TOOL_OPTIONS", spec)]),
+        "nothing reads it",
+    );
+    let pom = fs::read_to_string(project.path().join("pom.xml")).expect("pom.xml");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<id>extra</id>",
+            "<id>extra</id><activation><property><name>java.specification.version</name>\
+             <value>17</value></property></activation>",
+        ),
+    );
+    assert_status(&sync(spec, &[]), 3, "an activation reads it");
+    project.write(
+        "pom.xml",
+        &pom.replace(
+            "<lib.version>1.0</lib.version>",
+            "<lib.version>${java.specification.version}</lib.version>",
+        ),
+    );
+    let output = sync("", &[("JAVA_TOOL_OPTIONS", spec)]);
+    assert_status(&output, 3, "a version reads it");
+    assert!(
+        stderr(&output).contains("JAVA_TOOL_OPTIONS"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("jvm.config"),
+        "{}",
+        stderr(&output)
+    );
+    project.write("pom.xml", &pom);
+    project.write(".mvn/jvm.config", &format!("{spec}\n"));
+    assert_status(&sync("", &[]), 3, "jvm.config's");
 }

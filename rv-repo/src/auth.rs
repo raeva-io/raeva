@@ -1,5 +1,5 @@
 use reqwest::RequestBuilder;
-use rv_config::{AuthConfig, AuthConfigLayers};
+use rv_config::{AuthConfig, AuthConfigLayers, CredentialScope};
 use rv_store::metadata_cache::KeyedDigest;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashSet;
@@ -181,9 +181,20 @@ pub(crate) struct AuthStore {
     /// only to these: nothing else ties it to an origin, and the project's
     /// POMs and `raeva.toml` must not choose where it goes.
     user_origins: Option<Arc<HashSet<String>>>,
+    /// Where Maven 3.10 sends a settings.xml server's username and
+    /// password, in that mode.
+    credential_scope: Option<Arc<CredentialScope>>,
     /// Credential lookups made through this store and its clones.
     #[cfg(test)]
     lookups: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl AuthStore {
+    /// This store with the Maven 3.10 credential scope of `config`.
+    pub(crate) fn with_credential_scope_of(mut self, config: &rv_config::Config) -> Self {
+        self.credential_scope = config.credential_scope().cloned().map(Arc::new);
+        self
+    }
 }
 
 impl fmt::Debug for AuthStore {
@@ -202,7 +213,7 @@ impl Default for AuthStore {
 
 impl AuthStore {
     pub(crate) fn from_config(config: &rv_config::Config) -> Result<Self> {
-        let configured = (config.repositories().iter().map(|repo| repo.url.as_str()))
+        let configured = (config.all_repositories().map(|repo| repo.url.as_str()))
             .chain(config.mirrors().iter().map(|mirror| mirror.url.as_str()))
             .chain(config.user_endpoint_urls().iter().map(String::as_str));
         let named = NamedOrigins::default();
@@ -222,6 +233,7 @@ impl AuthStore {
         Ok(Self {
             named_origins: Some(named),
             user_origins: Some(Arc::new(user_origins)),
+            credential_scope: config.credential_scope().cloned().map(Arc::new),
             ..Self::new(ConfigAuthLayers::from(config.auth_layers()))
         })
     }
@@ -269,6 +281,7 @@ impl AuthStore {
             cleartext_warned: Arc::new(Mutex::new(HashSet::new())),
             named_origins: None,
             user_origins: None,
+            credential_scope: None,
             #[cfg(test)]
             lookups: Arc::default(),
         }
@@ -323,11 +336,31 @@ impl AuthStore {
         Ok(Some(resolved))
     }
 
+    /// Whether an entry could give `repo` a credential: its id's, or the
+    /// default unless `host_changed`. Wider than the lookup and silent.
+    pub(crate) fn has_credential(&self, repo: &Repository, host_changed: bool) -> bool {
+        (!host_changed && self.layers.has_default())
+            || repo.id.as_deref().is_some_and(|id| {
+                (self.layers.by_file().iter()).any(|(_, configs)| {
+                    (configs.iter().find(|entry| entry.id.as_deref() == Some(id)))
+                        .is_some_and(|entry| !entry.password_dropped)
+                })
+            })
+    }
+
     fn lookup_auth(&self, repo: &Repository, host_changed: bool) -> Result<Option<Auth>> {
         if let Some(id) = repo.id.as_deref() {
             for (file, configs) in self.layers.by_file() {
                 let source = file.label();
                 if let Some(config) = configs.iter().find(|entry| entry.id.as_deref() == Some(id)) {
+                    if config.password_dropped {
+                        tracing::debug!(
+                            repo_id = id,
+                            auth_source = source,
+                            "sending no credential: the entry's password was dropped"
+                        );
+                        return Ok(None);
+                    }
                     // An entry carrying none of the fields raeva models says
                     // nothing about HTTP credentials for this id: a
                     // settings.xml `<server>` may exist purely for
@@ -345,7 +378,11 @@ impl AuthStore {
                         );
                         continue;
                     }
-                    if self.withholds_id_credential(id, repo, source) {
+                    if self.withholds_id_credential(id, repo, source)
+                        || (file == CredentialFile::Settings
+                            && config.token.is_none()
+                            && self.withholds_out_of_scope(id, repo)?)
+                    {
                         return Ok(None);
                     }
                     let auth = build_complete_auth(config, file, source)?;
@@ -366,9 +403,9 @@ impl AuthStore {
             if self.layers.has_default() {
                 tracing::warn!(
                     sec_code = "CROSS_HOST_MIRROR",
-                    repo_url = %rv_config::redact_url(&repo.url),
+                    repo_url = %rv_config::redact_repository_url(&repo.url),
                     "not sending the default credential to the mirror {}, which is on another host than the repository it mirrors",
-                    rv_config::redact_url(&repo.url)
+                    rv_config::redact_repository_url(&repo.url)
                 );
             }
             return Ok(None);
@@ -406,7 +443,7 @@ impl AuthStore {
         {
             return false;
         }
-        let origin = origin.unwrap_or_else(|| rv_config::redact_url(&repo.url));
+        let origin = shown_origin(&repo.url);
         let key = format!("id-withheld:{id}\u{1f}{origin}");
         let (id, source) = (id.to_string(), source.to_string());
         self.warn_unusable_once(key, move || {
@@ -422,6 +459,57 @@ impl AuthStore {
             )
         });
         true
+    }
+
+    /// Whether the username and password of the settings.xml server `id`
+    /// are kept from `repo` in the Maven 3.10 mode, as Maven keeps them
+    /// from an origin its [`CredentialScope`] does not bind to the id.
+    /// Reported once per id and origin. Nor does Maven send them to a
+    /// repository a dependency's POM declares while it collects
+    /// dependencies; only that POM's own model, for its parent or imported
+    /// BOMs, gets them there.
+    fn withholds_out_of_scope(&self, id: &str, repo: &Repository) -> Result<bool> {
+        let Some(scope) = self.credential_scope.as_deref() else {
+            return Ok(false);
+        };
+        let origin = || shown_origin(&repo.url);
+        if !scope.sends(id, &repo.url) {
+            let origin = origin();
+            let id = id.to_string();
+            self.warn_unusable_once(format!("id-withheld:{id}\u{1f}{origin}"), move || {
+                tracing::warn!(
+                    sec_code = "ID_CREDENTIAL_WITHHELD",
+                    repo_id = id,
+                    origin = %origin,
+                    auth_source = "settings.xml",
+                    "not sending the username and password of the settings.xml server '{id}' \
+                     to {origin}: Maven 3.10 binds them to the origins of the mirrors and \
+                     repositories settings.xml gives that id and of the server's \
+                     <repositoryOrigins>; add {origin} there if they belong to it, or set \
+                     maven.repository.credentialScope=id"
+                )
+            });
+            return Ok(true);
+        }
+        if repo.descriptor() && !scope.to_descriptors() {
+            let origin = origin();
+            let id = id.to_string();
+            self.warn_unusable_once(format!("descriptor:{id}\u{1f}{origin}"), move || {
+                tracing::warn!(
+                    sec_code = "ID_CREDENTIAL_WITHHELD",
+                    repo_id = id,
+                    origin = %origin,
+                    auth_source = "settings.xml",
+                    "not sending the username and password of the settings.xml server '{id}' \
+                     to {origin}: a dependency's POM declares that repository, and Maven 3.10 \
+                     sends them there only for that POM's parent or imported BOMs; mirror the \
+                     repository, or set \
+                     aether.remoteRepositoryManager.authToDescriptorRepositories=true"
+                )
+            });
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Whether an entry without an id is kept from `repo`, whose origin no
@@ -440,7 +528,7 @@ impl AuthStore {
             return false;
         }
         if self.layers.has_default() {
-            let origin = origin.unwrap_or_else(|| rv_config::redact_url(&repo.url));
+            let origin = shown_origin(&repo.url);
             self.warn_unusable_once(format!("default-withheld\u{1f}{origin}"), move || {
                 tracing::warn!(
                     sec_code = "DEFAULT_CREDENTIAL_WITHHELD",
@@ -523,6 +611,13 @@ fn http_origin(url: &str) -> Option<String> {
     matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
 }
 
+/// The origin of `url` as messages show it: that of `url` after
+/// [`rv_config::redact_url`], without its userinfo.
+fn shown_origin(url: &str) -> String {
+    let shown = rv_config::redact_url(url);
+    http_origin(&shown).unwrap_or(shown)
+}
+
 impl Auth {
     fn method(&self) -> &'static str {
         match self.scheme {
@@ -601,10 +696,19 @@ mod tests {
     use std::sync::Mutex;
 
     use super::{Auth, AuthStore, Scheme, is_loopback_host};
+    use crate::error::RepoError;
     use crate::repository::Repository;
     use rv_config::AuthConfig;
     use rv_test_support::capture_warnings;
     use secrecy::{ExposeSecret, SecretString};
+
+    #[test]
+    fn a_shown_origin_has_no_userinfo() {
+        assert_eq!(
+            super::shown_origin("https://u:pw@repo.example:8443/m2/"),
+            "https://repo.example:8443"
+        );
+    }
 
     #[test]
     fn loopback_is_decided_on_the_parsed_host() {
@@ -669,6 +773,7 @@ mod tests {
     /// highest-precedence source that carries a credential, then the id-less
     /// default, which is withheld from a cross-host mirror. A `<server>` with
     /// only fields raeva does not model, such as an scp private key, is skipped.
+    /// [`AuthStore::has_credential`] says yes wherever one answers.
     #[test]
     fn credentials_follow_id_precedence_and_host_change() {
         let (corp, cdn) = ("https://repo.example/", "https://cdn.example/");
@@ -693,7 +798,44 @@ mod tests {
                 .for_repository_with_policy(&repo(id, url), host_changed)
                 .unwrap();
             assert_eq!(shown(auth.as_ref()).as_deref(), expected, "case {index}");
+            let some = store.has_credential(&repo(id, url), host_changed);
+            assert!(some || expected.is_none(), "case {index}");
         }
+        let (corp, other) = (repo(Some("corp"), corp), repo(Some("other"), cdn));
+        let default = sources(vec![bearer(None, "default")], Vec::new(), Vec::new());
+        assert!(!default.has_credential(&corp, true));
+        let named = sources(vec![bearer(Some("corp"), "token")], Vec::new(), Vec::new());
+        assert!(!named.has_credential(&other, false));
+    }
+
+    /// A settings.xml `<server>` whose password was dropped sends nothing
+    /// for its id: the default does not answer in its place, and a higher
+    /// source with the id still does.
+    #[test]
+    fn a_server_whose_password_was_dropped_sends_nothing() {
+        let mut dropped = AuthConfig::new(Some("corp"));
+        dropped.password_dropped = true;
+        let corp = repo(Some("corp"), "https://repo.example/");
+        let store = sources(
+            vec![bearer(None, "default")],
+            Vec::new(),
+            vec![dropped.clone()],
+        );
+        assert!(
+            store
+                .for_repository_with_policy(&corp, false)
+                .unwrap()
+                .is_none()
+        );
+        let store = sources(Vec::new(), Vec::new(), vec![dropped.clone()]);
+        assert!(!store.has_credential(&corp, false));
+        let store = sources(
+            Vec::new(),
+            vec![basic(Some("corp"), "u", "p")],
+            vec![dropped],
+        );
+        let auth = store.for_repository_with_policy(&corp, false).unwrap();
+        assert_eq!(shown(auth.as_ref()).as_deref(), Some("basic u p"));
     }
 
     #[test]
@@ -948,11 +1090,12 @@ mod tests {
                 ],
                 || {
                     let config = rv_config::Config::load(&project).unwrap();
+                    // The later profile's entry wins the shared id, as in Maven.
                     assert!(
                         !config
                             .repositories()
                             .iter()
-                            .any(|repo| repo.url.contains("b.example"))
+                            .any(|repo| repo.url.contains("a.example"))
                     );
                     let store = AuthStore::from_config(&config).unwrap();
                     for (host, allowed) in [
@@ -1062,11 +1205,114 @@ mod tests {
     /// settings.xml `${env.X}` reaches the credential, a project `[[auth]]`
     /// entry replaces a lower-precedence settings bearer, and no rendering
     /// shows the secret.
+    /// In the Maven 3.10 mode a settings.xml server's username and password
+    /// go only where Maven 3.10 sends them: to an origin bound to the id,
+    /// and to a repository a dependency's POM declares only when
+    /// `aether.remoteRepositoryManager.authToDescriptorRepositories` lets
+    /// them, raeva refusing the request it cannot tell from one Maven
+    /// makes. A bearer header and a config.toml entry are not bound, and
+    /// the 3.9 mode sends by id.
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "settings.xml is read from the profile directory, which HOME does not redirect on Windows"
-    )]
+    fn maven_310_sends_a_settings_password_only_within_its_credential_scope() {
+        let _env_guard = ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("home");
+        let project = home.path().join("project");
+        let m2 = home.path().join(".m2");
+        let raeva_home = home.path().join("raeva");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::create_dir_all(&m2).expect("m2");
+        std::fs::create_dir_all(&raeva_home).expect("raeva home");
+        std::fs::write(
+            m2.join("settings.xml"),
+            "<settings><servers><server><id>corp</id><username>ci</username>\
+             <password>fake-password</password><repositoryOrigins><repositoryOrigin>\
+             https://nexus.corp</repositoryOrigin></repositoryOrigins></server><server>\
+             <id>tok</id><configuration><httpHeaders><property><name>Authorization</name>\
+             <value>Bearer fake-token</value></property></httpHeaders></configuration>\
+             <repositoryOrigins><repositoryOrigin>https://nexus.corp</repositoryOrigin>\
+             </repositoryOrigins></server></servers></settings>",
+        )
+        .expect("settings.xml");
+        std::fs::write(
+            raeva_home.join("config.toml"),
+            "[[auth]]\nid = 'mine'\nusername = 'me'\npassword = 'fake-mine'\n\
+             [security]\ntransitive_repository_allowlist = ['https://nexus.corp/', \
+             'https://other.corp/', 'https://elsewhere.example/']\n",
+        )
+        .expect("config.toml");
+        let at = |id: &str, url: &str, provenance, descriptor| {
+            let mut repo = repo(Some(id), url);
+            repo.set_provenance(provenance);
+            repo.set_descriptor(descriptor);
+            repo
+        };
+        use crate::Provenance::{Configured, FetchedPom};
+        let basic = Some("basic ci fake-password");
+        #[rustfmt::skip]
+        let cases = [
+            (at("corp", "https://nexus.corp/m2/", Configured, false), basic, basic, basic),
+            (at("corp", "https://NEXUS.corp:443/x/", FetchedPom, false), basic, basic, basic),
+            (at("corp", "https://other.corp/m2/", Configured, false), None, basic, None),
+            (at("corp", "https://nexus.corp/m2/", FetchedPom, true), None, basic, basic),
+            (at("corp", "https://other.corp/m2/", FetchedPom, true), None, basic, None),
+            (at("tok", "https://other.corp/m2/", FetchedPom, true), Some("bearer fake-token"),
+                Some("bearer fake-token"), Some("bearer fake-token")),
+            (at("mine", "https://elsewhere.example/", FetchedPom, true), Some("basic me fake-mine"),
+                Some("basic me fake-mine"), Some("basic me fake-mine")),
+        ];
+        let home_string = home.path().to_string_lossy().into_owned();
+        let raeva_home = raeva_home.to_string_lossy().into_owned();
+        temp_env::with_vars(
+            [
+                ("HOME", Some(home_string.as_str())),
+                ("USERPROFILE", Some(home_string.as_str())),
+                (
+                    rv_config::MAVEN_USER_HOME_TEST_ENV,
+                    Some(home_string.as_str()),
+                ),
+                ("RAEVA_HOME", Some(raeva_home.as_str())),
+            ],
+            || {
+                let mvn = project.join(".mvn");
+                std::fs::create_dir_all(&mvn).expect(".mvn");
+                for (mode, options) in [
+                    ("3.10", ""),
+                    ("3.9", ""),
+                    (
+                        "3.10",
+                        "-Daether.remoteRepositoryManager.authToDescriptorRepositories=true",
+                    ),
+                ] {
+                    std::fs::write(
+                        project.join("raeva.toml"),
+                        format!("[lock]\nmaven = '{mode}'\n"),
+                    )
+                    .expect("raeva.toml");
+                    std::fs::write(mvn.join("maven.config"), options).expect("maven.config");
+                    let config = rv_config::Config::load(&project).expect("config");
+                    let store = AuthStore::from_config(&config).expect("store");
+                    for (repo, in_310, in_39, to_descriptors) in &cases {
+                        let want = match (mode, options.is_empty()) {
+                            ("3.9", _) => in_39,
+                            (_, true) => in_310,
+                            _ => to_descriptors,
+                        };
+                        let got = match store.for_repository_with_policy(repo, false) {
+                            Ok(auth) => shown(auth.as_ref()),
+                            Err(RepoError::Config(message)) => {
+                                assert!(!message.contains("fake-"), "{message}");
+                                Some("refused".to_string())
+                            }
+                            Err(err) => panic!("{err}"),
+                        };
+                        assert_eq!(got.as_deref(), *want, "{mode} {options} {repo:?}");
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
     fn loaded_credentials_interpolate_layer_and_redact() {
         let _env_guard = ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("home");
@@ -1111,6 +1357,10 @@ mod tests {
             [
                 ("HOME", Some(home_string.as_str())),
                 ("USERPROFILE", Some(home_string.as_str())),
+                (
+                    rv_config::MAVEN_USER_HOME_TEST_ENV,
+                    Some(home_string.as_str()),
+                ),
                 ("RAEVA_HOME", Some(raeva_home.as_str())),
                 ("RAEVA_USER", Some(ci_user)),
                 ("RAEVA_TOKEN", Some(ci_secret)),

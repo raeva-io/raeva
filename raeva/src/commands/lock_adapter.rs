@@ -1,8 +1,9 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
-use rv_lock::{LockArtifact, LockModule, LockModulePackage, LockPlatform, Scope};
+use rv_lock::{LockArtifact, LockModule, LockModulePackage, LockPlatform, PackageSource, Scope};
 use rv_maven_types::ArtifactCoord;
-use rv_sbom::{Component, Hash, HashAlgorithm};
+use rv_sbom::{Component, ComponentScope, Hash, HashAlgorithm, Property};
 use rv_vuln::Dependency;
 
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +18,22 @@ pub(crate) enum LockAdapterError {
         to: usize,
         packages: usize,
     },
+    #[error(
+        "{0} has different hashes in two selected modules; pass --module to write one \
+         module's SBOM"
+    )]
+    DifferentHashes(String),
+}
+
+impl From<LockAdapterError> for crate::error::CliError {
+    fn from(err: LockAdapterError) -> Self {
+        match err {
+            LockAdapterError::DifferentHashes(_) => Self::Usage(err.to_string()),
+            err => Self::LockfileDefect {
+                details: err.to_string(),
+            },
+        }
+    }
 }
 
 pub(crate) struct VulnerabilityDependencies {
@@ -32,21 +49,80 @@ pub(crate) struct VulnerabilityDependencies {
 
 pub(crate) struct SbomDependencies {
     pub root: Component,
+    /// Sorted by [`Component::reference`].
     pub components: Vec<Component>,
-    /// Each selected module's path, purl, and the purls of its packages.
-    pub modules: Vec<(String, String, BTreeSet<String>)>,
+    /// Each selected module's path, purl, and the components of its
+    /// packages: each one's reference, with its purl.
+    pub modules: Vec<(String, String, BTreeMap<String, String>)>,
+    /// The model of each component, the root's included, by reference: a
+    /// module and a repository file of its coordinates have their own.
+    pub models: BTreeMap<String, ComponentModel>,
 }
 
+/// Where a component's model comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ComponentModel {
+    /// The reactor module's POM at this path.
+    Module(String),
+    /// The POM raeva.lock pins for a repository file.
+    Pinned,
+    /// The POM raeva.lock pins for the repository file of the coordinates
+    /// of the module that reads it. Maven builds that file with the
+    /// module's model, so the lock holds neither the POM's parents nor
+    /// their range selections.
+    OwnPinned,
+    /// None: a system-scoped file has no POM.
+    System,
+}
+
+#[cfg(test)]
 pub(crate) fn adapt_sbom_modules(
     platform: &LockPlatform,
     modules: &[&LockModule],
+) -> Result<SbomDependencies, LockAdapterError> {
+    let listed = listed_module_purls(platform, modules)?;
+    adapt_sbom_modules_listing(platform, modules, &listed)
+}
+
+/// The purl of each module an SBOM of `modules` lists: the modules and the
+/// reactor modules their packages name. A file of a listed module's
+/// coordinates is a component of its own.
+pub(crate) fn listed_module_purls(
+    platform: &LockPlatform,
+    modules: &[&LockModule],
+) -> Result<BTreeSet<String>, LockAdapterError> {
+    let module_by_path = (platform.modules.iter())
+        .map(|module| (module.path.as_str(), module))
+        .collect::<BTreeMap<_, _>>();
+    let mut listed = BTreeSet::new();
+    for module in modules {
+        listed.insert(module_component(module)?.purl);
+        for package in (module.packages.iter()).filter(|package| package.workspace_module.is_some())
+        {
+            listed.insert(package_purl(package, &module_by_path)?);
+        }
+    }
+    Ok(listed)
+}
+
+/// `adapt_sbom_modules`, with `module_purls` the modules the whole
+/// document lists, which the selection on other targets adds to.
+pub(crate) fn adapt_sbom_modules_listing(
+    platform: &LockPlatform,
+    modules: &[&LockModule],
+    module_purls: &BTreeSet<String>,
 ) -> Result<SbomDependencies, LockAdapterError> {
     let root_module = modules
         .iter()
         .copied()
         .find(|module| module.path == "pom.xml")
         .or_else(|| modules.first().copied());
-    let mut root = module_component(root_module.ok_or(LockAdapterError::NoModule)?)?;
+    let root_module = root_module.ok_or(LockAdapterError::NoModule)?;
+    let mut root = module_component(root_module)?;
+    let mut models = BTreeMap::from([(
+        root.reference().to_string(),
+        ComponentModel::Module(root_module.path.clone()),
+    )]);
 
     let artifact_by_coordinate = platform
         .artifacts
@@ -58,33 +134,58 @@ pub(crate) fn adapt_sbom_modules(
         .iter()
         .map(|module| (module.path.as_str(), module))
         .collect::<BTreeMap<_, _>>();
+    // Keyed by reference.
     let mut components = BTreeMap::<String, Component>::new();
+    // Each component's resolved scope in each selected module that reaches it.
+    let mut scopes = BTreeMap::<String, BTreeSet<(&str, Scope)>>::new();
     let mut module_packages = Vec::with_capacity(modules.len());
 
     for module in modules {
         let graph_module = module_component(module)?;
         let module_purl = graph_module.purl.clone();
-        insert_component(&mut components, graph_module);
+        (models.entry(graph_module.reference().to_string()))
+            .or_insert_with(|| ComponentModel::Module(module.path.clone()));
+        insert_component(&mut components, graph_module)?;
         let package_purls = module
             .packages
             .iter()
             .map(|package| package_purl(package, &module_by_path))
             .collect::<Result<Vec<_>, _>>()?;
-        module_packages.push((
-            module.path.clone(),
-            module_purl.clone(),
-            package_purls.iter().cloned().collect(),
-        ));
-
+        let mut package_components = BTreeMap::new();
+        let mut package_refs = Vec::with_capacity(module.packages.len());
         for (index, package) in module.packages.iter().enumerate() {
-            let component = package_component(
+            let mut component = package_component(
                 package,
                 &artifact_by_coordinate,
                 &module_by_path,
                 package_purls[index].clone(),
             )?;
-            insert_component(&mut components, component);
+            let model = match package.source() {
+                PackageSource::Module(path) => ComponentModel::Module(path.to_string()),
+                PackageSource::Repository if module.owns(&package.coordinate.gav) => {
+                    ComponentModel::OwnPinned
+                }
+                PackageSource::Repository => ComponentModel::Pinned,
+                PackageSource::System(_) => ComponentModel::System,
+            };
+            // A file of a module's coordinates, such as the repository's
+            // jar a module takes of itself, is a component of its own with
+            // its own hash.
+            if !matches!(model, ComponentModel::Module(_)) && module_purls.contains(&component.purl)
+            {
+                component.bom_ref = Some(format!("{}#file", component.purl));
+            }
+            let reference = component.reference().to_string();
+            models.entry(reference.clone()).or_insert(model);
+            package_components.insert(reference.clone(), component.purl.clone());
+            insert_component(&mut components, component)?;
+            scopes
+                .entry(reference.clone())
+                .or_default()
+                .insert((module.path.as_str(), package.scope));
+            package_refs.push(reference);
         }
+        module_packages.push((module.path.clone(), module_purl.clone(), package_components));
 
         let mut incoming = vec![0; module.packages.len()];
         for edge in &module.edges {
@@ -97,29 +198,14 @@ pub(crate) fn adapt_sbom_modules(
             }
             add_dependency(
                 &mut components,
-                &package_purls[edge.from],
-                package_purls[edge.to].clone(),
+                &package_refs[edge.from],
+                package_refs[edge.to].clone(),
             )?;
             incoming[edge.to] += 1;
         }
 
         for index in crate::commands::util::module_roots(module, &incoming) {
-            add_dependency(&mut components, &module_purl, package_purls[index].clone())?;
-        }
-    }
-
-    let selected_paths = modules
-        .iter()
-        .map(|module| module.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let reachable_workspace_paths = modules
-        .iter()
-        .flat_map(|module| &module.packages)
-        .filter_map(|package| package.workspace_module.as_deref())
-        .collect::<BTreeSet<_>>();
-    for path in reachable_workspace_paths.difference(&selected_paths) {
-        if let Some(module) = module_by_path.get(path) {
-            insert_component(&mut components, module_component(module)?);
+            add_dependency(&mut components, &module_purl, package_refs[index].clone())?;
         }
     }
 
@@ -130,12 +216,60 @@ pub(crate) fn adapt_sbom_modules(
         component.dependencies.sort();
         component.dependencies.dedup();
     }
+    for (reference, component) in &mut components {
+        match scopes.get(reference) {
+            Some(scopes) => set_scope(component, scopes),
+            // A reactor module no selected module resolves, which CycloneDX
+            // would read as `required` too.
+            None => component.scope = Some(ComponentScope::Required),
+        }
+    }
 
     Ok(SbomDependencies {
         root,
         components: components.into_values().collect(),
         modules: module_packages,
+        models,
     })
+}
+
+/// Write the scope the modules resolve the component to: one property when
+/// they agree, else one per module, so a large reactor does not repeat a
+/// module list on every component. Test scope is `excluded`, every other
+/// scope is on the runtime call graph and `required`, and `scope` is
+/// `required` when any module needs it at runtime. A module that resolves
+/// it to the empty scope adds no property.
+fn set_scope(component: &mut Component, scopes: &BTreeSet<(&str, Scope)>) {
+    let test_only = scopes.iter().all(|(_, scope)| *scope == Scope::Test);
+    component.scope = Some(if test_only {
+        ComponentScope::Excluded
+    } else {
+        ComponentScope::Required
+    });
+    if test_only {
+        // Registered in the CycloneDX property taxonomy.
+        component.properties.push(Property {
+            name: "cdx:maven:package:test".to_string(),
+            value: "true".to_string(),
+        });
+    }
+    let property = |value: String| Property {
+        name: "raeva:maven:scope".to_string(),
+        value,
+    };
+    let mut distinct = scopes.iter().map(|(_, scope)| scope);
+    match distinct.next() {
+        Some(first) if distinct.all(|scope| scope == first) => {
+            if *first != Scope::Empty {
+                component.properties.push(property(first.to_string()));
+            }
+        }
+        _ => component.properties.extend(
+            (scopes.iter())
+                .filter(|(_, scope)| *scope != Scope::Empty)
+                .map(|(path, scope)| property(format!("{scope} {path}"))),
+        ),
+    }
 }
 
 fn package_component(
@@ -176,9 +310,12 @@ fn package_component(
         version: gav.version().to_string(),
         group: Some(gav.group.to_string()),
         purl,
+        bom_ref: None,
         hashes,
         licenses: Vec::new(),
         dependencies: Vec::new(),
+        scope: None,
+        properties: Vec::new(),
     })
 }
 
@@ -193,9 +330,12 @@ fn module_component(module: &LockModule) -> Result<Component, LockAdapterError> 
             module.gav.version(),
             &module.packaging,
         )?,
+        bom_ref: None,
         hashes: Vec::new(),
         licenses: Vec::new(),
         dependencies: Vec::new(),
+        scope: None,
+        properties: Vec::new(),
     })
 }
 
@@ -225,16 +365,20 @@ fn package_purl(
     Ok(dependency_from_coordinate(&package.coordinate).purl()?)
 }
 
-fn insert_component(components: &mut BTreeMap<String, Component>, component: Component) {
-    components
-        .entry(component.purl.clone())
-        .and_modify(|existing| {
-            existing.dependencies.extend(component.dependencies.clone());
-            if existing.hashes.is_empty() {
-                existing.hashes.clone_from(&component.hashes);
-            }
-        })
-        .or_insert(component);
+fn insert_component(
+    components: &mut BTreeMap<String, Component>,
+    component: Component,
+) -> Result<(), LockAdapterError> {
+    match components.entry(component.reference().to_string()) {
+        Entry::Occupied(mut entry) if entry.get().hashes == component.hashes => {
+            entry.get_mut().dependencies.extend(component.dependencies);
+        }
+        Entry::Occupied(_) => return Err(LockAdapterError::DifferentHashes(component.purl)),
+        Entry::Vacant(entry) => {
+            entry.insert(component);
+        }
+    }
+    Ok(())
 }
 
 fn add_dependency(
@@ -343,7 +487,7 @@ mod tests {
     use rv_lock::{LockArtifact, LockEdge, LockModule, LockModulePackage, LockPlatform, Platform};
     use rv_maven_types::{ArtifactCoord, Gav};
 
-    use super::{adapt_sbom_modules, adapt_vulnerability_modules};
+    use super::{ComponentScope, adapt_sbom_modules, adapt_vulnerability_modules};
 
     fn package(
         group: &str,
@@ -369,7 +513,7 @@ mod tests {
             "jar".to_string(),
         );
         app.packages = vec![workspace, external.clone()];
-        app.edges = vec![LockEdge::new(0, 1, Some(rv_lock::Scope::Compile), false)];
+        app.edges = vec![LockEdge::new(0, 1, rv_lock::Scope::Compile, false)];
         let mut lib = LockModule::new(
             "lib/pom.xml".to_string(),
             Gav::new("com.example", "lib", "1"),
@@ -413,6 +557,34 @@ mod tests {
         );
     }
 
+    /// Two modules that lock other system files for one coordinate give
+    /// its component two hashes, which one SBOM cannot hold.
+    #[test]
+    fn one_component_with_two_hashes_is_refused() {
+        let mut platform = LockPlatform::new(
+            Platform::new("linux", "x86_64").expect("platform"),
+            "a".repeat(64),
+        );
+        for (name, digest) in [("app", 'a'), ("lib", 'b')] {
+            let mut tools = package("com.acme", "tools", None, true);
+            tools.system_path = Some("lib/tools.jar".to_string());
+            tools.system_sha256 = Some(digest.to_string().repeat(64).parse().unwrap());
+            let mut module = LockModule::new(
+                format!("{name}/pom.xml"),
+                Gav::new("com.example", name, "1"),
+                "jar".to_string(),
+            );
+            module.packages = vec![tools];
+            platform.modules.push(module);
+        }
+        let selected: Vec<_> = platform.modules.iter().collect();
+        let err = adapt_sbom_modules(&platform, &selected)
+            .err()
+            .expect("two hashes");
+        assert!(err.to_string().contains("different hashes"), "{err}");
+        adapt_sbom_modules(&platform, &selected[..1]).expect("one module");
+    }
+
     /// A module's test-jar is its own component, and no component depends
     /// on itself, even through a self edge.
     #[test]
@@ -432,8 +604,8 @@ mod tests {
             tests,
         ];
         app.edges = vec![
-            LockEdge::new(1, 0, Some(rv_lock::Scope::Test), false),
-            LockEdge::new(0, 0, Some(rv_lock::Scope::Compile), false),
+            LockEdge::new(1, 0, rv_lock::Scope::Test, false),
+            LockEdge::new(0, 0, rv_lock::Scope::Compile, false),
         ];
         let lib = LockModule::new(
             "lib/pom.xml".to_string(),
@@ -507,9 +679,78 @@ mod tests {
         );
         module.packages = packages;
         module.edges = (edges.iter())
-            .map(|&(from, to, scope)| LockEdge::new(from, to, Some(scope), false))
+            .map(|&(from, to, scope)| LockEdge::new(from, to, scope, false))
             .collect();
         module
+    }
+
+    /// A reactor module no selected module depends on is a library component
+    /// with the scope CycloneDX assumes when none is given, `required`, and
+    /// no `raeva:maven:scope`, since no module resolves it.
+    #[test]
+    fn a_module_nothing_depends_on_is_required() {
+        let app = scoped_module("app/pom.xml", Vec::new(), &[]);
+        let gwt = scoped_module("gwt/pom.xml", Vec::new(), &[]);
+        let mut platform = LockPlatform::new(
+            Platform::new("linux", "x86_64").expect("platform"),
+            "a".repeat(64),
+        );
+        platform.modules = vec![app, gwt];
+        let selected = platform.modules.iter().collect::<Vec<_>>();
+        let adapted = adapt_sbom_modules(&platform, &selected).expect("adapt");
+        let [gwt] = adapted.components.as_slice() else {
+            panic!("{:?}", adapted.components);
+        };
+        assert_eq!(gwt.purl, "pkg:maven/com.example/gwt@1");
+        assert_eq!(gwt.scope, Some(ComponentScope::Required));
+        assert!(gwt.properties.is_empty(), "{:?}", gwt.properties);
+    }
+
+    /// The empty scope has no `raeva:maven:scope` value: Maven gives such a
+    /// package none, so the property is left out, alone or per module.
+    #[test]
+    fn the_empty_scope_has_no_scope_property() {
+        use rv_lock::Scope::{Compile, Empty};
+        let app = scoped_module(
+            "app/pom.xml",
+            vec![scoped("none", None, Empty), scoped("mixed", None, Empty)],
+            &[],
+        );
+        let lib = scoped_module("lib/pom.xml", vec![scoped("mixed", None, Compile)], &[]);
+        let mut platform = LockPlatform::new(
+            Platform::new("linux", "x86_64").expect("platform"),
+            "a".repeat(64),
+        );
+        platform.artifacts = ["none", "mixed"]
+            .map(|artifact| {
+                LockArtifact::new(
+                    ArtifactCoord::new("org.example", artifact, "1", "jar", None),
+                    "https://repo.example/".to_string(),
+                )
+            })
+            .into();
+        platform.modules = vec![app, lib];
+        let selected = platform.modules.iter().collect::<Vec<_>>();
+        let adapted = adapt_sbom_modules(&platform, &selected).expect("adapt");
+        let properties = |artifact: &str| {
+            let purl = format!("pkg:maven/org.example/{artifact}@1");
+            let component = (adapted.components.iter())
+                .find(|component| component.purl == purl)
+                .expect("component");
+            assert_eq!(
+                component.scope,
+                Some(ComponentScope::Required),
+                "{artifact}"
+            );
+            (component.properties.iter())
+                .map(|property| format!("{}={}", property.name, property.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(properties("none"), Vec::<String>::new());
+        assert_eq!(
+            properties("mixed"),
+            ["raeva:maven:scope=compile lib/pom.xml"]
+        );
     }
 
     /// Test-only packages are dropped per module before the union, and the

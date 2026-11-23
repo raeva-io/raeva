@@ -73,6 +73,8 @@ const PROJECT_CASES: &[Case] = &[
 /// what the plugin reads hold on every host.
 fn run_golden(project: &Path, home: &Path, args: &[&str]) -> Output {
     raeva_command(project, home)
+        // The host-conditions case tests the JDK, which `JAVA_VERSION` names.
+        .env("JAVA_VERSION", "17")
         .env(
             rv_maven_model::OS_RELEASE_TEST_ENV,
             "ID=ubuntu\nID_LIKE=debian\n",
@@ -126,6 +128,19 @@ fn check(name: &str) {
         fs::read_to_string(project.join("raeva.lock")).expect("re-read raeva.lock"),
         lock,
         "a frozen sync rewrote the lock"
+    );
+    // A plain sync of the same options reuses it without resolving, but
+    // where a SNAPSHOT check is due.
+    let again = run_golden(&project, home.path(), &args);
+    assert_success(
+        &again,
+        &format!("{} plain sync of the golden lock", case.name),
+    );
+    let said = String::from_utf8_lossy(&again.stderr);
+    assert!(
+        !said.contains("Resolving dependencies") || case.name == "snapshot",
+        "{}: {said}",
+        case.name
     );
 }
 
@@ -182,12 +197,12 @@ fn every_lock_diff_lock_is_in_the_frozen_golden() {
     });
     let mut mentioned: Vec<String> = frozen
         .lines()
-        .filter_map(|line| {
-            let rest = line.strip_prefix("lock-golden/")?;
-            let (_, right) = rest.split_once(" -> ")?;
-            let name = right.strip_prefix("lock-diff/")?;
-            name.ends_with(".lock").then(|| name.to_string())
-        })
+        .filter(|line| line.starts_with("lock-"))
+        .filter_map(|line| line.split_once(" -> "))
+        .flat_map(|(left, right)| [left, right])
+        .filter_map(|side| side.strip_prefix("lock-diff/"))
+        .filter(|name| name.ends_with(".lock"))
+        .map(str::to_string)
         .collect();
     mentioned.sort();
     assert_eq!(
@@ -399,8 +414,9 @@ fn a_lock_written_behind_a_mirror_of_everything_restores_cold_without_it() {
         "sync through the mirror",
     );
     let lock = fs::read_to_string(project.join("raeva.lock")).expect("raeva.lock");
+    let origin = crate::common::recorded_origin(&project, corp.as_str());
     assert!(
-        lock.contains(corp.as_str()),
+        lock.contains(&format!("\"{origin}\"")),
         "the mirror no longer answers for corp first:\n{lock}"
     );
 

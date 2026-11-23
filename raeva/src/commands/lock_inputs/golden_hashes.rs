@@ -57,6 +57,7 @@ fn hashes(case: &str) -> Hashes {
     let (home, project) = (dir.path().join("home"), dir.path().join("project"));
     let raeva_home = home.join("raeva-home");
     let maven_home = home.join("maven-home");
+    let no_jdk = home.join("no-jdk");
     temp_env::with_vars(
         [
             ("RAEVA_HOME", Some(raeva_home.as_os_str())),
@@ -71,6 +72,7 @@ fn hashes(case: &str) -> Hashes {
             ("RAEVA_LOW_SPEED_TIME", None),
             ("JAVA_HOME", None),
             ("JAVA_VERSION", None),
+            (rv_maven_model::JAVA_PATH_TEST_ENV, Some(no_jdk.as_os_str())),
         ],
         || {
             let config = Config::load(&project).expect("load config");
@@ -178,7 +180,7 @@ fn single_module_hashes_are_stable() {
     assert_eq!(actual.timeout_and_retries, (30, 3));
     assert_hashes(
         &actual,
-        "c0ec4de46cce1cc336386a86ba9b89d893e4aab61fd7cf166d3875ccd0ea97e1",
+        "508b249fde70ef8169dc1b80da0d5cdf1242a7318652de52c7f94e38680ce1ef",
         "f7045bbaf768ff3464df654909507163702a6672ee234dd42d60084e76c4fa8f",
     );
 }
@@ -213,7 +215,7 @@ fn reactor_with_local_parent_and_bom_import_hashes_are_stable() {
     );
     assert_hashes(
         &actual,
-        "016d908c638b40d43e47e0eeca11d1b8eedaf90e2a4f3520ad26bd9ea068c902",
+        "a2c3fd1f9f793f21d751b696db4b779bb1529435cd3964f8e8d0205c660287d9",
         "763a2e3ecde9d8bf585f7537cb0b97347f1e83daa5c48d0bb0cad77aadc521b3",
     );
 }
@@ -237,7 +239,7 @@ fn settings_with_mirror_and_local_repository_hashes_are_stable() {
     assert_eq!(actual.models[0].active_profiles, ["corp"]);
     assert_hashes(
         &actual,
-        "d06ee1d20a1acaf36c98986e069cf75f6af9ef6de59ac4ab441fe994210c8c7a",
+        "d1e66075d751fdcfa4f750c638778d73acce4077a125258c40803c9329599ff5",
         "6c88b4aa5a827c7142045984348187f212562a29ff04a78c3c8186ac1b453faf",
     );
 }

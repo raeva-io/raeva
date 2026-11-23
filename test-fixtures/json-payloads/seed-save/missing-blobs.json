@@ -1,0 +1,15 @@
+{
+  "exit_code": 7,
+  "stdout": {
+    "code": "LOCKFILE_MISMATCH",
+    "data": {
+      "warnings": []
+    },
+    "error": "the store does not hold every file raeva.lock pins: org.golden:api-spec:1.0:jar, org.golden:api-spec:1.0:pom, org.golden:core:1.1:jar and 11 more",
+    "exit_code": 7,
+    "hints": [
+      "Run 'raeva sync --frozen' first, then 'raeva seed save' again"
+    ],
+    "success": false
+  }
+}

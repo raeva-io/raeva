@@ -1,0 +1,867 @@
+# Dependency graphs where Maven 3.10 (maven-resolver 2, breadth-first
+# collection) and Maven 3.9 (maven-resolver 1.9, depth-first) may differ.
+# Maven 3.9 with its breadth-first collector gives the 3.10 result unless an
+# `expect 3.9-bf` line says otherwise.
+# differential.py checks the expect lines against real Maven; the Rust tests
+# in rv-resolver/src/solver/tests/modes.rs check raeva in each mode.
+
+## range-winner-skipped
+# A hard range beats the nearer soft version, but breadth-first collection
+# read the soft version first and skipped the range's subtree.
+root: a:1 b:1
+a:1 > x:1
+b:1 > x:[2,3)
+x:1 > old:1
+x:2 > new:1
+old:1
+new:1
+expect 3.9: a:1 b:1 new:1 x:2
+expect 3.10: a:1 b:1 x:2
+
+## range-first-keeps-children
+root: b:1 a:1
+a:1 > x:1
+b:1 > x:[2,3)
+x:1 > old:1
+x:2 > new:1
+old:1
+new:1
+expect 3.9: a:1 b:1 new:1 x:2
+expect 3.10: a:1 b:1 new:1 x:2
+
+## evicted-parent-hides-child
+# q:1 loses to the direct q:2, so x:1 below it never counts; x:2 below r
+# wins either way, with its child.
+root: p:1 q:2 r:1
+p:1 > q:1
+q:1 > x:1
+q:2
+r:1 > s:1
+s:1 > x:2
+x:1
+x:2 > y:1
+y:1
+expect 3.9: p:1 q:2 r:1 s:1 x:2 y:1
+expect 3.10: p:1 q:2 r:1 s:1 x:2 y:1
+
+## nearest-loser-subtree
+# The deeper x:2 loses to x:1; its child z is only below the loser.
+root: a:1 b:1
+a:1 > x:1
+b:1 > c:1
+c:1 > x:2
+x:1
+x:2 > z:1
+z:1
+expect 3.9: a:1 b:1 c:1 x:1
+expect 3.10: a:1 b:1 c:1 x:1
+
+## duplicate-scope-widening
+# The same x:1 is test-scoped first and compile below b; the leftmost
+# duplicate is resolved again for the scope.
+root: a:1@test b:1
+a:1 > x:1
+b:1 > x:1
+x:1 > y:1
+y:1
+expect 3.9: a:1@test b:1 x:1 y:1
+expect 3.10: a:1@test b:1 x:1 y:1
+
+## duplicate-deeper-left
+root: a:1 b:1
+a:1 > c:1
+c:1 > x:1
+b:1 > x:1@runtime
+x:1 > y:1
+y:1
+expect 3.9: a:1 b:1 c:1 x:1 y:1
+expect 3.10: a:1 b:1 c:1 x:1 y:1
+
+## relocation-evicts
+# old:1 relocates to new:1, which joins new's group and loses to new:2.
+root: a:1 new:2
+a:1 > old:1
+old:1 => new:1
+new:1 > n1:1
+new:2 > n2:1
+n1:1
+n2:1
+expect 3.9: a:1 n2:1 new:2
+expect 3.10: a:1 n2:1 new:2
+
+## relocation-wins-over-deeper
+root: old:1 a:1
+old:1 => new:1
+a:1 > new:2
+new:1 > n1:1
+new:2 > n2:1
+n1:1
+n2:1
+expect 3.9: a:1 n1:1 new:1
+expect 3.10: a:1 n1:1 new:1
+
+## range-relocates-midway
+# Breadth-first reads every version of the range and goes on past one that
+# relocates; depth-first stops at the first.
+root: a:[1,4)
+a:1
+a:2 => b:2
+a:3
+b:2 > c:1
+c:1
+expect 3.9: b:2 c:1
+expect 3.10: a:3
+expect 3.10-df: a:3
+
+## range-highest-relocates
+root: a:[1,3)
+a:1 > c:1
+a:2 => b:1
+b:1 > d:1
+c:1
+d:1
+expect 3.9: a:1 c:1
+expect 3.10: b:1 d:1
+
+## text-version-range
+# A version that starts with text equals 0 in 3.9 and sorts below 0 in 3.10.
+root: a:[0,1)
+versions a alpha 0.5
+a:alpha
+a:0.5
+expect 3.9: a:0.5
+expect 3.10: a:0.5
+
+## text-version-mediation
+root: a:alpha b:1
+b:1 > a:[0,1)
+versions a alpha 0.5
+a:alpha
+a:0.5
+expect 3.9: a:alpha b:1
+expect 3.10: a:0.5 b:1
+expect 3.10-df: a:0.5 b:1
+expect 3.9-bf: a:alpha b:1
+
+## cycle-through-loser
+root: a:1 b:1
+a:1 > b:2
+b:1 > a:2
+a:2 > c:1
+b:2 > d:1
+c:1
+d:1
+expect 3.9: a:1 b:1
+expect 3.10: a:1 b:1
+
+## optional-and-exclusion
+root: a:1 b:1!x
+a:1 > c:1
+c:1 > x:1
+b:1 > x:2
+x:1 > y:1
+x:2 > z:1
+y:1
+z:1
+expect 3.9: a:1 b:1 c:1 x:1 y:1
+expect 3.10: a:1 b:1 c:1 x:1 y:1
+
+## managed-transitive
+root: a:1 b:1
+manage: x:2@runtime
+a:1 > x:1
+b:1 > c:1
+c:1 > x:3
+x:1
+x:2 > w:1
+x:3
+w:1
+expect 3.9: a:1 b:1 c:1 w:1@runtime x:2@runtime
+expect 3.10: a:1 b:1 c:1 w:1@runtime x:2@runtime
+
+## winner-evicted-later
+# c:1 and c:2 are equally near, so the first wins, and x:1 below it is
+# nearer than x:2.
+root: a:1 b:1 d:1
+a:1 > c:1
+b:1 > c:2
+c:1 > x:1
+c:2
+d:1 > e:1
+e:1 > x:2
+x:1 > u:1
+x:2 > v:1
+u:1
+v:1
+expect 3.9: a:1 b:1 c:1 d:1 e:1 u:1 x:1
+expect 3.10: a:1 b:1 c:1 d:1 e:1 u:1 x:1
+
+## skipped-winner-deeper-range
+# The range below e beats the soft x:1, whose node breadth-first reads first.
+root: a:1 d:1
+a:1 > c:1
+c:1 > x:1
+d:1 > e:1
+e:1 > x:[2,3)
+x:1 > u:1
+x:2 > v:1
+u:1
+v:1
+expect 3.9: a:1 c:1 d:1 e:1 v:1 x:2
+expect 3.10: a:1 c:1 d:1 e:1 x:2
+
+## relocated-sibling-first
+# The relocated a:1 is read as b:1 before b:2, which wins as the higher
+# sibling with no children in breadth-first collection.
+root: a:1 b:2
+a:1 => b:1
+b:1
+b:2 > z:1
+z:1
+expect 3.9: b:2 z:1
+expect 3.10: b:2
+
+## version-relocation-unmanaged
+# A relocation within the same group and artifact turns off the root's
+# version management for the relocated node's children in 3.10.
+root: x:1.0
+manage: y:2
+x:1.0 => _:_:1.1
+x:1.1 > y:1
+y:1
+y:2
+expect 3.9: x:1.1 y:2
+expect 3.10: x:1.1 y:1
+
+## relocation-chain-defaults
+# A relocation that leaves fields out takes them from the requested
+# artifact in 3.10 and from the previous link in 3.9.
+root: g1:a:1
+g1:a:1 => g2:_:_
+g2:a:1 => _:b:_
+g1:b:1
+g2:b:1
+expect 3.9: g2:b:1
+expect 3.10: g1:b:1
+expect 3.10-df: g1:b:1
+expect 3.9-bf: g2:b:1
+
+## text-version-only-in-range
+root: x:[0,)
+versions x beta-1
+x:beta-1
+expect 3.9: x:beta-1
+expect 3.10: ERR No versions available for g:x:jar:[0,) within specified range
+expect 3.10-df: ERR No versions available for g:x:jar:[0,) within specified range
+expect 3.9-bf: x:beta-1
+
+## duplicate-forced-scope
+# The same y:1 is reached as test below a and as compile deeper below b;
+# the scope must widen to compile.
+root: a:1@test b:1
+a:1 > y:1
+b:1 > c:1
+c:1 > y:1
+y:1 > z:1
+z:1
+expect 3.9: a:1@test b:1 c:1 y:1 z:1
+expect 3.10: a:1@test b:1 c:1 y:1 z:1
+
+## relocation-target-excluded
+root: a:1!new
+a:1 > old:1
+old:1 => new:1
+new:1
+expect 3.9: a:1
+expect 3.10: a:1
+
+## same-gav-relocation
+# A relocation to the artifact itself (a message only) keeps the node and
+# its dependencies in 3.10.
+root: a:1
+a:1 > b:1 => a:1
+b:1
+expect 3.9: ERR java.lang.StackOverflowError
+expect 3.10: a:1 b:1
+expect 3.10-df: a:1 b:1
+expect 3.9-bf: ERR java.lang.StackOverflowError
+raeva 3.9: a:1 b:1
+
+## two-spellings-in-range
+# Maven 3.10 reads equal versions of a range once, as the spelling it meets
+# first going down from the highest.
+root: a:[1,2)
+a:1 > c:1
+c:1
+a:1.0 => g:b:2
+b:2 > d:1
+d:1
+expect 3.9: a:1 c:1
+expect 3.10: b:2 d:1
+
+## two-bound-pin
+root: a:1 c:1
+a:1 > x:[1,2]
+c:1 > x:[1,1]
+x:2 > d:1
+d:1
+x:1 => g:y:1
+y:1
+expect 3.9: a:1 c:1 y:1
+expect 3.10: a:1 c:1 d:1 x:2
+expect 3.10-df: a:1 c:1 d:1 x:2
+
+## managed-range-relocation-target
+root: p:1
+manage: b:[1,3]
+p:1 > a:1
+a:1 => g:b:1
+b:1
+b:2 => g:c:2
+b:3 => g:c:3
+c:2
+c:3
+expect 3.9: c:2 p:1
+expect 3.10: c:3 p:1
+expect 3.10-df: c:3 p:1
+
+## deeper-range-wins-skipped
+root: p:1 b:1
+p:1 > m:1
+b:1 > c:1
+m:1 > x:1
+x:1
+p:2 > x:2
+x:2 > z:1
+z:1
+c:1 > d:1
+d:1 > p:[2,2]
+expect 3.9: b:1 c:1 d:1 p:2 x:2 z:1
+expect 3.10: b:1 c:1 d:1 p:2
+
+## range-cycle-through-winner
+root: a:1 d:1 b:1
+a:1
+d:1 > a:2
+a:2 > c:[2,2]
+b:1 > c:1
+c:1 > a:[2,2]
+c:2 > q:1
+q:1
+expect 3.9: a:2 b:1 c:2 d:1 q:1
+expect 3.10: a:2 b:1 c:1 d:1
+
+## excluded-path-range
+root: a:1 b:1
+a:1 > m:1!x
+b:1 > m:1
+m:1 > x:1
+x:1 > a:[2,2]
+a:2 > q:1
+q:1
+expect 3.9: a:2 b:1 m:1 q:1 x:1
+expect 3.10: a:1 b:1 m:1
+
+## pin-detaches-relocation
+root: a:1 b:1 c:1
+a:1 > x:[1,2]
+b:1 > x:3
+c:1 > x:[1,1]
+x:3 > e:1
+x:2 > d:1
+d:1
+e:1
+x:1 => g:y:1
+dummy:1
+y:1 > yy:1
+yy:1
+expect 3.9: a:1 b:1 c:1 y:1 yy:1
+expect 3.10: a:1 b:1 c:1 d:1 x:2
+expect 3.10-df: a:1 b:1 c:1 d:1 x:2
+
+## relocated-range-nearer
+root: a:1 b:1 c:1
+a:1 > old:ox:[1,2]
+b:1 > y:2
+c:1 > old:ox:[1,1]
+old:ox:1 => g:y:1
+old:ox:2 > z:1
+y:1 > y1c:1
+y:2 > y2c:1
+z:1
+y1c:1
+y2c:1
+expect 3.9: a:1 b:1 c:1 y1c:1 y:1
+expect 3.10: a:1 b:1 c:1 old:ox:2 z:1
+expect 3.10-df: a:1 b:1 c:1 old:ox:2 z:1
+
+## deep-range-winner-childless
+root: a:1 p1:1
+a:1 > b:1
+p1:1 > p2:1
+b:1 > c:1
+c:1
+a:2 > c:2
+c:2 > leaf:1
+leaf:1
+p2:1 > p3:1
+p3:1 > a:[2]
+expect 3.9: a:2 c:2 leaf:1 p1:1 p2:1 p3:1
+expect 3.10: a:2 p1:1 p2:1 p3:1
+
+## range-winner-child-loses
+root: a:1 d:1
+a:1 > b:1
+d:1 > a:[2]
+b:1 > x:2
+x:2
+a:2 > x:1
+x:1
+expect 3.9: a:2 d:1 x:1
+expect 3.10: a:2 d:1
+
+## skipped-winner-child-nearer
+root: a:1 b:1 c:1 e:1
+a:1
+b:1 > a:2
+c:1 > d:1
+e:1 > a:[2]
+a:2 > x:1
+x:1
+d:1 > x:2
+x:2
+expect 3.9: a:2 b:1 c:1 d:1 e:1 x:1
+expect 3.10: a:2 b:1 c:1 d:1 e:1 x:2
+
+## relocation-range-direct-first
+root: new:1 old:[1,2]@test
+new:1 > leaf:1
+new:2 > leaf:1
+old:1
+old:2 => g:new:_
+leaf:1
+versions old 1 2
+expect 3.9: leaf:1 new:2
+expect 3.10: new:2
+
+## hard-pins-conflict-breadth-first
+root: p:[1,2] x:[1,1] a:1
+a:1 > c:1 d:1
+p:2 > z:1
+z:1
+p:1 > d:[2,2]
+c:1 > p:[1,1]
+d:1 > x:[2,2]
+d:2 > z2:1
+z2:1
+x:1 > z3:1
+z3:1
+x:2 > z4:1
+z4:1
+expect 3.9: a:1 c:1 d:2 p:1 x:1 z2:1 z3:1
+expect 3.10: ERR Unsolvable hard constraint combination; Could not resolve version conflict among [g:x:jar:[1,1], g:a:jar:1 -> g:d:jar:1 -> g:x:jar:[2,2]]
+
+## hard-pins-equal-only-in-3.9
+# [alpha] and [0] name one version in Maven 3.9 and two in Maven 3.10.
+root: a:1 b:1
+a:1 > x:[alpha]
+b:1 > x:[0]
+x:alpha
+x:0
+expect 3.9: a:1 b:1 x:alpha
+expect 3.10: ERR Unsolvable hard constraint combination; Could not resolve version conflict among [g:a:jar:1 -> g:x:jar:[alpha,alpha], g:b:jar:1 -> g:x:jar:[0,0]]
+expect 3.10-df: ERR Unsolvable hard constraint combination; Could not resolve version conflict among [g:a:jar:1 -> g:x:jar:[alpha,alpha], g:b:jar:1 -> g:x:jar:[0,0]]
+expect 3.9-bf: a:1 b:1 x:alpha
+
+## pooled-children-under-another-parent
+# m:1 below b:1 shares the children read below a:1, which then loses, so x
+# is declared through b:1. The dependency management of a:1 does not part
+# the two: Maven 3.10 manages from the root only.
+root: a:1 b:1 d:1
+a:1 > m:1 | z:2
+b:1 > m:1
+d:1 > a:[2,2]
+a:2
+m:1 > x:1
+x:1
+z:1
+z:2
+expect 3.9: a:2 b:1 d:1 m:1 x:1
+expect 3.10: a:2 b:1 d:1 m:1 x:1
+
+## system-first-shares-descriptor
+# Maven 3.10 reads one descriptor for both declarations of x:1, as the
+# system one asked first: none, so the winner keeps no dependency.
+root: a:1 b:1 d:1
+a:1 > x:1@system=/s.jar
+b:1 > x:1
+d:1 > a:[2,2]
+a:2
+x:1 > y:1
+y:1
+expect 3.9: a:2 b:1 d:1 x:1 y:1
+expect 3.10: a:2 b:1 d:1 x:1
+
+## remote-first-system-wins
+root: b:1 a:1 d:1
+b:1 > x:1
+a:1 > x:1@system=/s.jar
+d:1 > b:[2,2]
+b:2
+x:1 > y:1
+y:1
+expect 3.9: a:1 b:2 d:1 x:1@system
+expect 3.10: a:1 b:2 d:1 x:1@system
+
+## remote-first-deeper-system-wins
+root: a:1 b:1 d:1
+a:1 > m:1
+m:1 > x:1@system=/s.jar
+b:1 > x:1
+d:1 > b:[2,2]
+b:2
+x:1 > y:1
+y:1
+expect 3.9: a:1 b:2 d:1 m:1 x:1@system
+expect 3.10: a:1 b:2 d:1 m:1 x:1@system
+
+## co-direct
+# compile-only is a scope Maven 3.9 and 3.10 resolve without knowing it:
+# the dependency keeps it, its dependencies are runtime, and provided ones
+# below it are dropped.
+root: a:1@compile-only b:1
+a:1 > x:1 w:1@runtime v:1@provided
+b:1 > y:1@compile-only
+y:1 > z:1
+x:1
+w:1
+v:1
+z:1
+expect 3.9: a:1@compile-only b:1 w:1@runtime x:1@runtime y:1@compile-only z:1@runtime
+expect 3.10: a:1@compile-only b:1 w:1@runtime x:1@runtime y:1@compile-only z:1@runtime
+
+## co-conflict-nearer-compile
+# The direct declaration keeps its own scope.
+root: a:1@compile-only c:1
+c:1 > a:2
+a:1
+a:2
+expect 3.9: a:1@compile-only c:1
+expect 3.10: a:1@compile-only c:1
+
+## co-conflict-transitive
+# x:1 below c wins; any known scope wins over compile-only.
+root: c:1 a:1@compile-only
+c:1 > x:1
+a:1 > x:2
+x:1
+x:2
+expect 3.9: a:1@compile-only c:1 x:1
+expect 3.10: a:1@compile-only c:1 x:1
+
+## co-conflict-transitive-first
+# x:2 below a wins by order, and its scope derives from compile-only.
+root: a:1@compile-only c:1
+c:1 > x:1
+a:1 > x:2
+x:1
+x:2
+expect 3.9: a:1@compile-only c:1 x:2
+expect 3.10: a:1@compile-only c:1 x:2
+
+## co-managed
+# A managed compile-only scope applies to the transitive x.
+root: a:1
+manage: x:1@compile-only
+a:1 > x:1
+x:1 > y:1
+y:1
+expect 3.9: a:1 x:1@compile-only y:1@runtime
+expect 3.10: a:1 x:1@compile-only y:1@runtime
+
+## co-under-test
+# Below a test dependency, compile-only derives test.
+root: a:1@test
+a:1 > x:1@compile-only
+x:1
+expect 3.9: a:1@test x:1@test
+expect 3.10: a:1@test x:1@test
+
+## co-vs-test
+# x is runtime below compile-only and test below a; runtime wins.
+root: a:1@test b:1@compile-only
+a:1 > x:1
+b:1 > x:1
+x:1
+expect 3.9: a:1@test b:1@compile-only x:1@runtime
+expect 3.10: a:1@test b:1@compile-only x:1@runtime
+
+## unknown-direct
+# Maven keeps any other scope it does not know as it keeps compile-only.
+root: a:1@weird b:1
+a:1 > x:1 w:1@runtime v:1@provided t:1@test
+b:1 > y:1@weird
+y:1 > z:1
+x:1
+w:1
+v:1
+t:1
+z:1
+expect 3.9: a:1@weird b:1 w:1@runtime x:1@runtime y:1@weird z:1@runtime
+expect 3.10: a:1@weird b:1 w:1@runtime x:1@runtime y:1@weird z:1@runtime
+
+## unknown-case
+# Maven compares scopes with their case.
+root: leaf:1@RUNTIME
+leaf:1 > side:1
+side:1
+expect 3.9: leaf:1@RUNTIME side:1@runtime
+expect 3.10: leaf:1@RUNTIME side:1@runtime
+
+## unknown-optional-word
+# The invalid <scope>optional</scope> some POMs write is a scope too.
+root: a:1
+a:1 > x:1@optional
+x:1 > y:1
+y:1
+expect 3.9: a:1 x:1@optional y:1@runtime
+expect 3.10: a:1 x:1@optional y:1@runtime
+
+## unknown-managed
+root: a:1
+manage: x:1@weird
+a:1 > x:1
+x:1 > y:1
+y:1
+expect 3.9: a:1 x:1@weird y:1@runtime
+expect 3.10: a:1 x:1@weird y:1@runtime
+
+## unknown-conflict-transitive
+root: c:1 a:1@weird
+c:1 > x:1
+a:1 > x:2
+x:1
+x:2
+expect 3.9: a:1@weird c:1 x:1
+expect 3.10: a:1@weird c:1 x:1
+
+## unknown-vs-test
+root: a:1@test b:1@weird
+a:1 > x:1
+b:1 > x:1
+x:1
+expect 3.9: a:1@test b:1@weird x:1@runtime
+expect 3.10: a:1@test b:1@weird x:1@runtime
+
+## unknown-under-provided
+root: a:1@provided
+a:1 > x:1@weird
+x:1
+expect 3.9: a:1@provided x:1@provided
+expect 3.10: a:1@provided x:1@provided
+
+## unknown-two-empty
+# x is reached only in two scopes Maven does not know, so JavaScopeSelector
+# gives it the empty scope, below which its dependencies keep their own.
+root: a:1 b:1
+a:1 > x:1@weird
+b:1 > x:1@compile-only
+x:1 > y:1 w:1@runtime v:1@provided t:1@test
+y:1
+w:1
+v:1
+t:1
+expect 3.9: a:1 b:1 w:1@runtime x:1@ y:1
+expect 3.10: a:1 b:1 w:1@runtime x:1@ y:1
+
+## unknown-two-empty-managed-below
+root: a:1 b:1
+manage: y:1@weird
+a:1 > x:1@weird
+b:1 > x:1@compile-only
+x:1 > y:1
+y:1
+expect 3.9: a:1 b:1 x:1@ y:1@weird
+expect 3.10: a:1 b:1 x:1@ y:1@weird
+
+## import-direct
+# import is a scope JavaScopeDeriver does not know outside management: the
+# dependency stays, and its own dependencies are runtime.
+root: a:1@import b:1
+a:1 > x:1 v:1@provided
+x:1
+v:1
+b:1
+expect 3.9: a:1@import b:1 x:1@runtime
+expect 3.10: a:1@import b:1 x:1@runtime
+
+## import-transitive
+root: u:1
+u:1 > m:1@import
+m:1 > s:1
+s:1
+expect 3.9: m:1@import s:1@runtime u:1
+expect 3.10: m:1@import s:1@runtime u:1
+
+## import-managed
+root: a:1
+manage: x:1@import
+a:1 > x:1
+x:1 > y:1
+y:1
+expect 3.9: a:1 x:1@import y:1@runtime
+expect 3.10: a:1 x:1@import y:1@runtime
+
+## pool-keep-version-a-first
+# The relocated x:1.1 below b takes the children the managed x:1.1 below a
+# was expanded with, as maven-resolver 2's pool does.
+root: a:1 b:1 d:1
+manage: y:2
+a:1 > x:1.1
+b:1 > x:1.0
+x:1.0 => _:_:1.1
+x:1.1 > y:1
+d:1 > a:[2,2]
+a:2
+y:1
+y:2
+expect 3.9: a:2 b:1 d:1 x:1.1 y:2
+expect 3.10: a:2 b:1 d:1 x:1.1 y:2
+
+## pool-keep-version-b-first
+root: b:1 a:1 d:1
+manage: y:2
+a:1 > x:1.1
+b:1 > x:1.0
+x:1.0 => _:_:1.1
+x:1.1 > y:1
+d:1 > b:[2,2]
+b:2
+y:1
+y:2
+expect 3.9: a:1 b:2 d:1 x:1.1 y:2
+expect 3.10: a:1 b:2 d:1 x:1.1 y:1
+
+## hard-below-loser
+# The hard a:[2,2] sits below c:2, which loses to c:1; maven-resolver 1.9
+# collects it all the same and a:2 wins, taking c:2 with it.
+root: a:1 x:1
+a:1 > c:1
+a:2 > c:1
+c:1
+c:2 > m:1
+m:1 > a:[2,2]
+x:1 > c:2
+expect 3.9: a:2 c:2 m:1 x:1
+expect 3.10: a:1 c:1 x:1
+
+## soft-below-loser
+root: a:1 x:1
+a:1 > c:1
+a:2 > c:1
+c:1
+c:2 > m:1
+m:1 > a:[1,3)
+x:1 > c:2
+expect 3.9: a:1 c:1 x:1
+expect 3.10: a:1 c:1 x:1
+
+## deep-below-loser
+# c is settled before a, so the hard range goes with the losing c:2.
+root: c:1 p:1 x:1
+a:1
+a:2
+p:1 > q:1
+q:1 > a:1
+c:1
+c:2 > m:1
+m:1 > n:1
+n:1 > a:[2,2]
+x:1 > c:2
+expect 3.9: a:1 c:1 p:1 q:1 x:1
+expect 3.10: a:1 c:1 p:1 q:1 x:1
+
+## reloc-version-managed-children
+# Depth-first collection manages the children of a relocation within one
+# artifact; breadth-first collection leaves them as declared.
+root: p:1
+manage: x:2
+p:1 > a:1
+a:1 => _:_:1.1
+a:1.1 > x:1
+x:1
+x:2
+expect 3.9: a:1.1 p:1 x:2
+expect 3.10: a:1.1 p:1 x:1
+
+## range-sibling-order
+root: r:[1,2]
+r:1 > x:1
+r:2 > y:1
+x:1 > z:1
+y:1 > z:2
+z:1
+z:2
+expect 3.9: r:2 y:1 z:2
+expect 3.10: r:2 y:1 z:2
+
+## cyclic-keeps-winner-children
+# a:2 closes a cycle below a:1 and shares its children, so q:1 is never read.
+root: a:1 d:1
+a:1 > b:1
+d:1 > b:1
+b:1 > a:[2,2]
+a:2 > q:1
+q:1
+expect 3.9: a:2 b:1 d:1
+expect 3.10: a:2 b:1 d:1
+
+## df-conflict-order
+# Depth first, x:1 below a:1 wins and goes with it; breadth first, x:2 below
+# a:2 is met first.
+root: y:[1,2] z:1
+y:1 > x:0
+y:2
+x:0
+z:1 > a:[1,2]
+a:1 > x:1
+a:2 > x:2
+x:1 > a:1
+x:2 > a:1
+expect 3.9: a:2 y:2 z:1
+expect 3.10: a:2 x:2 y:2 z:1
+
+## cycle-shares-ancestor-children
+# Depth first, b:1 is first expanded below a:1, where a:2 closes a cycle;
+# the direct b:1 reuses those children.
+root: p:1 b:1
+p:1 > q:1
+q:1 > a:1
+a:1 > b:1
+b:1 > a:2
+a:2 > c:1
+c:1
+expect 3.9: a:2 b:1 p:1 q:1
+expect 3.10: a:2 b:1 c:1 p:1 q:1
+
+## union-bounds-one-version
+# maven-resolver 1.9 and 2.0 both bound a union by the ranges their HashSet
+# walks first, so this one is 1.0 without a version list in either order.
+root: a:1 b:1
+a:1 > x:[1.0,1.0),[1.0.0,1.0.0]
+b:1 > y:[1.0.0,1.0.0],[1.0,1.0)
+x:1.0
+y:1.0
+versions x
+versions y
+expect 3.9: a:1 b:1 x:1.0 y:1.0
+expect 3.10: a:1 b:1 x:1.0 y:1.0
+
+## exclusive-bounds-one-version
+# The range resolver takes bounds of one version as that version, even
+# exclusive ones, and mediation then refuses it against the range.
+root: a:1
+a:1 > x:(1.0,1.0)
+x:1.0
+expect 3.9: ERR conflict resolver did not select winner among [g:x:jar:1.0 (compile) @ 2 < g:a:jar:1]
+expect 3.10: ERR conflict resolver did not select winner among [g:x:jar:1.0 (compile) @ 2 < g:a:jar:1]

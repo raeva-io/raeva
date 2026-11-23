@@ -193,25 +193,34 @@ pub(super) struct RedirectGuard {
     pub(super) root_issuer: Option<String>,
     pub(super) exempt_hosts: ConfiguredHosts,
     pub(super) proxies: ProxySet,
+    /// Origins a proxied redirect may reach and nothing else: no issuer
+    /// authority, no address-screen exemption, no trust for requests.
+    pub(super) redirect_targets: HashSet<String>,
 }
 
 /// Collect the repository, mirror and proxy endpoints the guards screen against.
 pub(super) fn redirect_guard(config: &Config, proxies: &ProxySet) -> Result<RedirectGuard> {
     let mut origins = HashSet::new();
     let mut exempt_hosts: Vec<String> = config.proxies().iter().map(|p| p.host.clone()).collect();
-    let repositories = config
-        .repositories()
-        .iter()
-        .map(|repository| &repository.url);
+    let repositories = config.all_repositories().map(|repository| &repository.url);
+    // A settings.xml URL that does not parse names no origin; requests to
+    // it fail, as in Maven.
     for configured_url in repositories.chain(config.mirrors().iter().map(|mirror| &mirror.url)) {
-        let url = Url::parse(configured_url)?;
+        let Ok(url) = Url::parse(configured_url) else {
+            continue;
+        };
         if let Some(origin) = origin_key(&url) {
             origins.insert(origin);
             exempt_hosts.extend(url.host_str().map(str::to_string));
         }
     }
+    let mut redirect_targets = HashSet::new();
+    for target in config.redirect_origins() {
+        redirect_targets.extend(Url::parse(target).ok().as_ref().and_then(origin_key));
+    }
     Ok(RedirectGuard {
         origins,
+        redirect_targets,
         root_issuer: None,
         exempt_hosts: ConfiguredHosts::new(exempt_hosts),
         proxies: proxies.clone(),
@@ -330,7 +339,9 @@ impl RedirectGuard {
             return reject(
                 Kind::OriginNotConfigured,
                 format!(
-                    "redirect issuer {issuer_origin} is not a configured repository, mirror or root-model repository"
+                    "redirect issuer {} is not a configured repository, mirror or root-model \
+                     repository",
+                    issuer_origin
                 ),
             );
         }
@@ -338,9 +349,9 @@ impl RedirectGuard {
             return reject(
                 Kind::InsecureOrigin,
                 format!(
-                    "plain-http trusted origin {issuer_origin} may redirect only within its own \
-                     origin, not to {}; configure the repository or a mirror with the URL it \
-                     redirects to",
+                    "plain-http trusted origin {} may redirect only within its own origin, not \
+                     to {}; configure the repository or a mirror with the URL it redirects to",
+                    issuer_origin,
                     redact_url(target)
                 ),
             );
@@ -349,7 +360,8 @@ impl RedirectGuard {
             return reject(
                 Kind::HttpsDowngrade,
                 format!(
-                    "redirect from {issuer_origin} to {} would downgrade transport",
+                    "redirect from {} to {} would downgrade transport",
+                    issuer_origin,
                     redact_url(target)
                 ),
             );
@@ -383,11 +395,19 @@ impl RedirectGuard {
             return Ok(());
         }
         if self.proxies.carries(target) {
+            let origin = target.origin().ascii_serialization();
+            if self.redirect_targets.contains(&origin) {
+                return Ok(());
+            }
             return reject(
                 RedirectRejectionKind::ProxiedTargetNotConfigured,
                 format!(
                     "a proxy would resolve and connect to {} on raeva's behalf, so {issuer_origin} \
-                     may redirect only to a configured repository or mirror origin",
+                     may redirect only to a configured repository or mirror origin. To follow \
+                     it, trust {origin} with a mirror of no repository in config.toml \
+                     ([[mirrors]] with id = \"{domain}\", url = \"{origin}/\" and no mirror_of), \
+                     or, if this machine reaches {domain} without the proxy, add it to NO_PROXY \
+                     or the proxy's non_proxy_hosts",
                     redact_url(target)
                 ),
             );
@@ -402,8 +422,9 @@ impl RedirectGuard {
             return reject(
                 RedirectRejectionKind::ExemptHostOriginMismatch,
                 format!(
-                    "{domain} is exempt from the address screen because it is configured, but \
-                     {} is not a configured origin",
+                    "{} is exempt from the address screen because it is configured, but {} is \
+                     not a configured origin",
+                    domain,
                     redact_url(target)
                 ),
             );
@@ -503,7 +524,7 @@ pub(super) fn screen_resolved_addrs(
     {
         reject(
             RedirectRejectionKind::NonGlobalTarget,
-            format!("{host} resolves to non-global address {}", blocked.ip()),
+            format!("{} resolves to non-global address {}", host, blocked.ip()),
         )?;
     }
     Ok(addrs)

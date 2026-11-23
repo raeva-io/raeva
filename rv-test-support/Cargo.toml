@@ -10,6 +10,6 @@ publish = false
 workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

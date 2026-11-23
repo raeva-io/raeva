@@ -3,6 +3,22 @@ use rv_config::{Config, ResolvedPaths, SecurityConfig};
 use rv_store::Store;
 use std::str::FromStr;
 
+/// A dependency build whose lineage declared `repos` as written.
+fn declared_build(repos: impl IntoIterator<Item = Repository>) -> ModelBuild {
+    let added = (repos.into_iter())
+        .map(|repo| model_list::Added {
+            repo,
+            replace: false,
+            reach: model_list::Reach::Read,
+            implied: false,
+        })
+        .collect();
+    ModelBuild {
+        project: false,
+        added,
+    }
+}
+
 #[test]
 fn equal_spellings_keep_mavens_hash_map_order() {
     // Maven 3.9.12's DefaultVersionRangeResolver gives these orders.
@@ -21,14 +37,28 @@ fn equal_spellings_keep_mavens_hash_map_order() {
             "1-ga 1-final 1.ga 1.0.0 1.0 1 2 3 4 5 6 7 8 9 10 11 12 13",
             "1-ga 1.ga 1-final 1 1.0 1.0.0 2 3 4 5 6 7 8 9 10 11 12 13",
         ),
+        // All eleven share a bin, which turns into a tree at a capacity of
+        // 64 and iterates its root first.
+        (
+            "1-ga-ga.ga.0-0.ga.ga 1-ga-ga-0.ga-0.ga-0 1-ga-ga-0.ga-0-0-0 1-ga-ga-0-0-0.ga-0 \
+             1-ga-ga-0-ga.ga.ga.ga 1-ga-ga.0.ga.0.ga-ga 1-ga-ga.0.0-ga-0.ga \
+             1-ga-ga.0-ga.ga.ga-ga 1-ga-ga.0-ga.0-ga-0 1-ga-ga-ga.ga-0-ga-ga \
+             1-ga-ga-ga.ga-ga.ga.ga",
+            "1-ga-ga.0.0-ga-0.ga 1-ga-ga.ga.0-0.ga.ga 1-ga-ga-0.ga-0.ga-0 1-ga-ga-0.ga-0-0-0 \
+             1-ga-ga-0-0-0.ga-0 1-ga-ga-0-ga.ga.ga.ga 1-ga-ga.0.ga.0.ga-ga \
+             1-ga-ga.0-ga.ga.ga-ga 1-ga-ga.0-ga.0-ga-0 1-ga-ga-ga.ga-0-ga-ga \
+             1-ga-ga-ga.ga-ga.ga.ga",
+        ),
     ];
     for (listed, want) in cases {
         let mut versions: Vec<_> = listed
             .split(' ')
             .map(|v| Version::parse(v).unwrap())
             .collect();
-        let count = versions.len();
-        sort_as_maven_lists(&mut versions, count);
+        let spellings = (versions.iter())
+            .map(|version| version.as_str().to_string())
+            .collect();
+        sort_as_maven_lists(&mut versions, &spellings, MavenMode::Maven39);
         let got: Vec<_> = versions.iter().map(Version::as_str).collect();
         assert_eq!(got.join(" "), want, "{listed}");
     }
@@ -197,7 +227,12 @@ async fn snapshot_support_poms_take_the_newest_build_across_repositories() {
     let backend = ModelService::new(&ctx, repos.clone());
     let coord = Coord::parse("test:bom:1-SNAPSHOT:pom").unwrap();
     let pom = backend
-        .fetch_pom_bytes(&coord, &RepoContext::default(), &[])
+        .fetch_pom_bytes(
+            &coord,
+            &RepoContext::default(),
+            &ModelBuild::default(),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(pom.provenance.repo_id, "repo2");
@@ -217,7 +252,12 @@ async fn snapshot_support_poms_take_the_newest_build_across_repositories() {
     let backend = ModelService::new(&ctx, repos.clone());
     assert!(
         backend
-            .fetch_pom_bytes(&coord, &RepoContext::default(), &[])
+            .fetch_pom_bytes(
+                &coord,
+                &RepoContext::default(),
+                &ModelBuild::default(),
+                None
+            )
             .await
             .is_err()
     );
@@ -258,7 +298,12 @@ async fn snapshot_support_poms_take_the_newest_build_across_repositories() {
     let backend = ModelService::new(&ctx, repos.clone());
     let coord = Coord::parse("test:plain:1-SNAPSHOT:pom").unwrap();
     let pom = backend
-        .fetch_pom_bytes(&coord, &RepoContext::default(), &[])
+        .fetch_pom_bytes(
+            &coord,
+            &RepoContext::default(),
+            &ModelBuild::default(),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(pom.provenance.repo_id, "repo2");
@@ -341,7 +386,12 @@ fn a_snapshot_support_pom_past_a_refusal_is_reported() {
     let coord = Coord::parse("test:bom:1-SNAPSHOT:pom").unwrap();
     let logged = warnings(|| {
         let pom = runtime
-            .block_on(backend.fetch_pom_bytes(&coord, &RepoContext::default(), &[]))
+            .block_on(backend.fetch_pom_bytes(
+                &coord,
+                &RepoContext::default(),
+                &ModelBuild::default(),
+                None,
+            ))
             .unwrap();
         assert_eq!(pom.provenance.repo_id, "serving");
     });
@@ -517,7 +567,12 @@ async fn offline_model_fetches_try_later_repository_caches() {
     for version in ["1", "1-SNAPSHOT"] {
         let coord = Coord::parse(&format!("test:cached:{version}")).unwrap();
         backend
-            .fetch_pom_bytes(&coord, &RepoContext::default(), &[])
+            .fetch_pom_bytes(
+                &coord,
+                &RepoContext::default(),
+                &ModelBuild::default(),
+                None,
+            )
             .await
             .expect("cached parent/BOM in later repository");
         let project = backend
@@ -534,7 +589,7 @@ async fn offline_model_fetches_try_later_repository_caches() {
     assert_eq!(snapshot.version.as_str(), "1-20261011.010101-1");
     let absent = Coord::parse("test:absent:1").unwrap();
     assert!(
-        matches!(backend.fetch_pom_bytes(&absent, &RepoContext::default(), &[]).await,
+        matches!(backend.fetch_pom_bytes(&absent, &RepoContext::default(), &ModelBuild::default(), None).await,
         Err(ResolveError::Repo { source, searched, .. }) if matches!(*source, RepoError::OfflineNotCached(_)) && searched.len() == 2)
     );
 
@@ -602,6 +657,7 @@ async fn offline_model_fetches_try_later_repository_caches() {
 /// Maven keeps the artifact but discards all dependencies, including inherited ones.
 #[tokio::test]
 async fn invalid_remote_descriptor_discards_inherited_dependencies_without_retry() {
+    use crate::resolver::pom_source::MemoryPomSource;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Resolver {
@@ -628,14 +684,15 @@ async fn invalid_remote_descriptor_discards_inherited_dependencies_without_retry
     for inherited in [false, true] {
         let invalid = "<dependency><groupId>g</groupId><artifactId>broken</artifactId>
                 <version>1</version><scope>system</scope></dependency>";
-        let parent = Pom::parse(&format!(
+        let parent = format!(
             "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>
                 <dependencies><dependency><groupId>g</groupId><artifactId>x</artifactId>
                 <version>1</version></dependency>{}</dependencies></project>",
             if inherited { invalid } else { "" },
-        ))
-        .unwrap();
-        let pom = Pom::parse(&format!(
+        );
+        let parent_xml = parent;
+        let parent = Pom::parse(&parent_xml).unwrap();
+        let pom_xml = format!(
             "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>
                 <version>1</version></parent><artifactId>lib</artifactId>
                 <dependencies>{}</dependencies>
@@ -643,8 +700,8 @@ async fn invalid_remote_descriptor_discards_inherited_dependencies_without_retry
                 <dependencies><dependency><groupId>g</groupId><artifactId>profile-dep</artifactId>
                 <version>1</version></dependency></dependencies></profile></profiles></project>",
             if inherited { "" } else { invalid },
-        ))
-        .unwrap();
+        );
+        let pom = Pom::parse(&pom_xml).unwrap();
         let source = Resolver {
             parent,
             calls: AtomicUsize::new(0),
@@ -655,7 +712,27 @@ async fn invalid_remote_descriptor_discards_inherited_dependencies_without_retry
             .expect("an invalid remote descriptor is no resolution error")
             .expect_err("the model is invalid");
         assert!(matches!(error, PomError::InvalidSystemPath(_)), "{error}");
-        let project = invalid_descriptor(&coord);
+        // What a dependency's fetch gives the solver.
+        let files = std::collections::HashMap::from([
+            (
+                "g/parent/1/parent-1.pom".to_string(),
+                parent_xml.into_bytes(),
+            ),
+            ("g/lib/1/lib-1.pom".to_string(), pom_xml.into_bytes()),
+        ]);
+        let served = MemoryPomSource::new(rv_config::SecurityConfig::default())
+            .with_files("https://repo.example/", &files);
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_tmp.path()).expect("store"));
+        let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+        let ctx = ResolveContext::new(test_config(), Vec::new(), store, platform, None)
+            .with_pom_source(Arc::new(served));
+        let repo = Repository::new(None, "https://repo.example/", true, false);
+        let backend = ModelService::new(&ctx, vec![repo]);
+        let fetched = (backend.fetch_project_internal(&coord, false, &RepoContext::default()))
+            .await
+            .expect("an invalid descriptor is fetched");
+        let project = &fetched.project;
         assert!(project.dependencies.is_empty(), "inherited={inherited}");
         assert!(project.dependency_management.dependencies.is_empty());
         assert!(project.repositories.is_empty());
@@ -681,6 +758,50 @@ async fn invalid_remote_descriptor_discards_inherited_dependencies_without_retry
             .await,
             Err(ResolveError::Pom(PomError::InvalidSystemPath(_)))
         ));
+    }
+}
+
+/// A property cycle in a dependency POM makes it invalid, as Maven's
+/// descriptor reader takes every model problem but a missing parent or
+/// BOM, also when a model field or a `-D` value is part of the cycle.
+#[tokio::test]
+async fn a_property_cycle_makes_a_remote_descriptor_invalid() {
+    struct NoModels;
+    impl ModelSource for NoModels {
+        type Error = ResolveError;
+
+        async fn parent(
+            &self,
+            _: &mut rv_maven_model::Parent,
+            _: rv_maven_model::ParentLookup,
+        ) -> Result<Option<Pom>> {
+            Ok(None)
+        }
+
+        async fn import(&self, _: rv_maven_model::ImportCoord<'_>) -> Result<Option<Pom>> {
+            Ok(None)
+        }
+    }
+
+    let field = "<build><finalName>${a}</finalName></build>\
+        <properties><a>${project.build.finalName}</a></properties>";
+    let user = "<properties><b>${a}</b></properties>";
+    let mut defined = ActivationContext::default();
+    defined.properties.insert("a".into(), "${b}".into());
+    for (body, activation) in [(user, defined), (field, ActivationContext::default())] {
+        let mut pom = Pom::parse(&format!(
+            "<project><groupId>g</groupId><artifactId>lib</artifactId>\
+             <version>1</version>{body}<dependencies><dependency><groupId>g</groupId>\
+             <artifactId>x</artifactId><version>${{a}}</version></dependency>\
+             </dependencies></project>"
+        ))
+        .unwrap();
+        pom.set_provenance(rv_maven_model::Provenance::Dependency);
+        let error = build_remote_project(pom, &NoModels, &activation)
+            .await
+            .expect("a property cycle is no resolution error")
+            .expect_err("the model is invalid");
+        assert!(error.to_string().contains("cycle"), "{error}");
     }
 }
 
@@ -802,6 +923,74 @@ async fn a_pom_comes_from_the_first_repository_that_has_it() {
     );
 }
 
+/// A [`ModelService`] over `repos`, whose files `source` serves, with a
+/// prefetcher.
+fn prefetching_backend(
+    source: &Arc<crate::resolver::pom_source::MemoryPomSource>,
+    store_root: &std::path::Path,
+    repos: Vec<Repository>,
+) -> ModelService {
+    let store = Arc::new(Store::open(store_root).expect("store"));
+    let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+    let ctx = ResolveContext::new(test_config(), Vec::new(), store, platform, None)
+        .with_pom_source(Arc::clone(source) as Arc<dyn PomSource>);
+    ModelService::new(&ctx, repos)
+}
+
+fn project(gav: &str, body: &str) -> (String, Vec<u8>) {
+    let [group, artifact, version] = gav.split(':').collect::<Vec<_>>()[..] else {
+        panic!("{gav}");
+    };
+    let path = format!("{group}/{artifact}/{version}/{artifact}-{version}.pom");
+    let xml = format!(
+        "<project><groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
+         <version>{version}</version>{body}</project>"
+    );
+    (path, xml.into_bytes())
+}
+
+fn pairs(files: &[(String, Vec<u8>)]) -> impl Iterator<Item = (&String, &Vec<u8>)> {
+    files.iter().map(|(path, bytes)| (path, bytes))
+}
+
+/// A hinted POM's parent is prefetched from the repositories its own
+/// version allows, not only from those that allow the hinted version: a
+/// release's -SNAPSHOT parent comes from the snapshot repository.
+#[tokio::test(start_paused = true)]
+async fn a_hinted_release_prefetches_its_snapshot_parent() {
+    use crate::resolver::pom_source::MemoryPomSource;
+
+    let parent = "<parent><groupId>g</groupId><artifactId>par</artifactId>\
+                  <version>1-SNAPSHOT</version></parent>";
+    let source = Arc::new(
+        MemoryPomSource::new(SecurityConfig::default())
+            .prefetching()
+            .with_files(
+                "https://releases.example/",
+                pairs(&[project("g:app:1", parent)]),
+            )
+            .with_files(
+                "https://snapshots.example/",
+                pairs(&[project("g:par:1-SNAPSHOT", "")]),
+            ),
+    );
+    let store = tempfile::tempdir().unwrap();
+    let repos = vec![
+        Repository::new(None, "https://releases.example/", true, false),
+        Repository::new(None, "https://snapshots.example/", false, true),
+    ];
+    let backend = prefetching_backend(&source, store.path(), repos);
+    let app = Coord::from_str("g:app:1").unwrap();
+    backend.prefetch_pom(&app, &RepoContext::default(), None, false);
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let parent = "https://snapshots.example/g/par/1-SNAPSHOT/par-1-SNAPSHOT.pom";
+    assert!(
+        source.requests().iter().any(|url| url == parent),
+        "{:?}",
+        source.requests()
+    );
+}
+
 /// A relocated coordinate's POM is recorded as a support POM, since
 /// `mvn -o` reads it to follow the relocation and no lockfile row names
 /// it; a POM without a relocation is not.
@@ -895,7 +1084,12 @@ async fn refusals_do_not_hide_later_poms_or_metadata() {
             Some("https://second.example/")
         );
         let support = backend
-            .fetch_pom_bytes(&coord, &RepoContext::default(), &[])
+            .fetch_pom_bytes(
+                &coord,
+                &RepoContext::default(),
+                &ModelBuild::default(),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(support.provenance.repo_id, "second");
@@ -907,6 +1101,7 @@ async fn refusals_do_not_hide_later_poms_or_metadata() {
                 "a",
                 false,
                 false,
+                rv_repo::MetadataReader::VersionRange,
             )
             .await
             .unwrap();
@@ -974,6 +1169,7 @@ fn listings_report_the_repositories_they_left_out() {
                 "a",
                 false,
                 false,
+                rv_repo::MetadataReader::VersionRange,
             ));
             match code {
                 502 => assert!(listed.is_err()),
@@ -1016,6 +1212,7 @@ fn listings_report_the_repositories_they_left_out() {
             "a",
             false,
             true,
+            rv_repo::MetadataReader::VersionRange,
         ));
         assert!(listed.unwrap().is_empty());
     });
@@ -1023,6 +1220,72 @@ fn listings_report_the_repositories_they_left_out() {
     for (log, repository) in logged.iter().zip(["'first'", "'second'"]) {
         assert!(log.contains(repository), "{logged:?}");
     }
+}
+
+/// A repository whose version listing fails its checksum fails the range,
+/// as a file that fails its checksum stops the search, rather than leave
+/// the range to another repository's versions.
+#[tokio::test]
+async fn a_listing_that_fails_its_checksum_fails_the_range() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    for (name, version, sha1) in [
+        ("first", "2.0", Some("0".repeat(40))),
+        ("second", "1.0", None),
+    ] {
+        let dir = tmp.path().join(name).join("com/example/lib");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("maven-metadata.xml"),
+            format!(
+                "<metadata><versioning><versions><version>{version}</version></versions>\
+                 </versioning></metadata>"
+            ),
+        )
+        .unwrap();
+        if let Some(sha1) = sha1 {
+            std::fs::write(dir.join("maven-metadata.xml.sha1"), sha1).unwrap();
+        }
+        let mut repo = Repository::new(
+            Some(name.into()),
+            reqwest::Url::from_directory_path(tmp.path().join(name))
+                .unwrap()
+                .to_string(),
+            true,
+            false,
+        );
+        repo.releases_checksum_policy = rv_config::ChecksumPolicy::Fail;
+        repos.push(repo);
+    }
+    let config = Config::for_testing_with_repos(
+        tmp.path().to_owned(),
+        ResolvedPaths::from_raeva_home(tmp.path().join("home")),
+        Vec::new(),
+    );
+    let client = rv_repo::RepoClient::new(&config).await.unwrap();
+    let ctx = ResolveContext::new(
+        config,
+        repos.clone(),
+        Arc::new(Store::open(&tmp.path().join("store")).unwrap()),
+        rv_lock::Platform::new("linux", "x86_64").unwrap(),
+        Some(client),
+    );
+    let backend = ModelService::new(&ctx, repos);
+    let error = backend
+        .resolve_versions_internal(
+            "com.example",
+            "lib",
+            &VersionReq::parse("[1.0,3.0)").unwrap(),
+            &RepoContext::default(),
+            None,
+        )
+        .await
+        .expect_err("the first listing fails its checksum");
+    assert!(
+        matches!(&error, ResolveError::Repo { source, .. }
+            if matches!(source.cause(), RepoError::ChecksumMismatch { .. })),
+        "{error:?}"
+    );
 }
 
 /// A parent range lists the repositories the model being built declares,
@@ -1058,12 +1321,150 @@ async fn parent_ranges_list_the_models_own_repositories() {
             "p",
             &range,
             &RepoContext::default(),
-            &[declared],
+            &declared_build([declared]),
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(found.map(|v| v.to_string()).as_deref(), Some("1.5"));
+}
+
+/// Maven 3.10 lists nothing from metadata that names a version with a
+/// character no coordinate may hold; 3.9 lists the rest of it.
+#[test]
+fn maven_310_drops_metadata_with_an_invalid_version() {
+    use crate::resolver::pom_source::MemoryPomSource;
+
+    let listing = |versions: &str| {
+        std::collections::HashMap::from([(
+            "g/p/maven-metadata.xml".to_string(),
+            format!(
+                "<metadata><versioning><versions>{versions}</versions></versioning></metadata>"
+            )
+            .into_bytes(),
+        )])
+    };
+    let found = |mode: MavenMode| {
+        let source = MemoryPomSource::default()
+            .with_files(
+                "https://first.example/",
+                &listing("<version>1.5</version><version>1:9</version>"),
+            )
+            .with_files(
+                "https://second.example/",
+                &listing("<version>1.2</version>"),
+            );
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_tmp.path()).unwrap());
+        let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+        let mut config = test_config();
+        config.lock.maven.mode = mode;
+        let ctx = ResolveContext::new(config, Vec::new(), store, platform, None)
+            .with_pom_source(Arc::new(source));
+        let repos = ["first", "second"].map(|host| repo(host, &format!("https://{host}.example/")));
+        let backend = ModelService::new(&ctx, repos.to_vec());
+        let range = VersionReq::parse("[1,2)").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(backend.parent_range_version(
+                "g",
+                "p",
+                &range,
+                &RepoContext::default(),
+                &ModelBuild::default(),
+                false,
+            ))
+            .unwrap()
+            .0
+            .map(|version| version.to_string())
+    };
+    assert_eq!(found(MavenMode::Maven39).as_deref(), Some("1.5"));
+    assert_eq!(found(MavenMode::Maven310).as_deref(), Some("1.2"));
+}
+
+/// Maven 3.10 reads `RELEASE` through `DefaultVersionResolver`, which
+/// refuses a control character in `<release>`, `<latest>` or a snapshot
+/// field but not in `<versions>`, and a range through
+/// `DefaultVersionRangeResolver`, the other way round. Metadata it refuses
+/// reads as empty, so a range with no other listing names no version.
+#[test]
+fn maven_310_refuses_metadata_per_resolver() {
+    use crate::resolver::pom_source::MemoryPomSource;
+
+    let run = |mode: MavenMode, versioning: &str| {
+        let metadata = format!("<metadata><versioning>{versioning}</versioning></metadata>");
+        let files = std::collections::HashMap::from([(
+            "g/p/maven-metadata.xml".to_string(),
+            metadata.into_bytes(),
+        )]);
+        let source = MemoryPomSource::default().with_files("https://only.example/", &files);
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_tmp.path()).unwrap());
+        let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+        let mut config = test_config();
+        config.lock.maven.mode = mode;
+        let ctx = ResolveContext::new(config, Vec::new(), store, platform, None)
+            .with_pom_source(Arc::new(source));
+        let backend = ModelService::new(&ctx, vec![repo("only", "https://only.example/")]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let repos = RepoContext::default();
+            let release = backend
+                .resolve_dynamic_version_internal("g", "p", DynamicVersionToken::Release, &repos)
+                .await
+                .map(|version| version.version.to_string());
+            let range = VersionReq::parse("[1,2)").unwrap();
+            let listed = match backend
+                .resolve_versions_internal("g", "p", &range, &repos, None)
+                .await
+            {
+                Ok(versions) => Ok(versions.len()),
+                Err(ResolveError::VersionNotFound { .. }) => Err("no version"),
+                Err(error) => panic!("{error}"),
+            };
+            (release.ok(), listed)
+        })
+    };
+    let in_versions = "<release>1.5</release><versions><version>1.5</version>\
+                       <version>1.\u{7}</version></versions>";
+    let in_release = "<release>1.\u{7}</release><versions><version>1.5</version></versions>";
+    let in_timestamp = "<release>1.5</release><versions><version>1.5</version></versions>\
+                        <snapshot><timestamp>2024\u{7}</timestamp></snapshot>";
+    for (versioning, maven_39, maven_310) in [
+        (
+            in_versions,
+            (Some("1.5"), Ok(2)),
+            (Some("1.5"), Err("no version")),
+        ),
+        (
+            in_release,
+            (Some("1.\u{7}"), Ok(1)),
+            (None, Err("no version")),
+        ),
+        (in_timestamp, (Some("1.5"), Ok(1)), (None, Ok(1))),
+    ] {
+        let expect =
+            |(release, listed): (Option<&str>, std::result::Result<usize, &'static str>)| {
+                (release.map(str::to_string), listed)
+            };
+        assert_eq!(
+            run(MavenMode::Maven39, versioning),
+            expect(maven_39),
+            "{versioning}"
+        );
+        assert_eq!(
+            run(MavenMode::Maven310, versioning),
+            expect(maven_310),
+            "{versioning}"
+        );
+    }
 }
 
 #[test]
@@ -1081,7 +1482,7 @@ fn exhausted_auth_search_keeps_refusals_and_coordinate() {
                 false,
             );
             let error = if code == 404 {
-                RepoError::NotFound(repo.url.clone())
+                RepoError::NotFound(repo.url.clone().into())
             } else {
                 RepoError::Unauthorized {
                     status: reqwest::StatusCode::from_u16(code).unwrap(),
@@ -1639,6 +2040,110 @@ fn a_refused_repository_keeps_its_id_from_the_parent() {
     }
 }
 
+/// A remote parent's `central` replaces the default Central. The child's
+/// own `central`, which the effective model gives a plain HTTP URL that
+/// Maven's blocker refuses, overrides the parent's, and Maven's request
+/// Central is searched again, as Maven's blocked mirror keeps an id of its
+/// own.
+#[test]
+fn a_refused_effective_central_brings_back_the_default() {
+    let central = "https://repo1.maven.org/maven2/";
+    let store_tmp = tempfile::tempdir().unwrap();
+    let config = test_config();
+    let defaults = config.repositories().iter().map(Repository::from);
+    let backend = backend_in(store_tmp.path(), |_| {}, defaults.collect());
+    let central_at = |url: &str, local: bool| {
+        let mut pom = Pom::parse(&format!(
+            "<project><repositories><repository><id>central</id><url>{url}</url>\
+             </repository></repositories></project>"
+        ))
+        .unwrap();
+        if local {
+            pom.mark_root_repositories();
+        }
+        Repository::from(&pom.repositories[0])
+    };
+    let parent = central_at("https://proxy.example/central/", false);
+    backend.extend_root_lineage_repos([(parent, false)]);
+    assert_eq!(urls(&backend), ["https://proxy.example/central/"]);
+    backend.extend_root_effective_repos([central_at("http://plain.example/m2/", true)]);
+    assert_eq!(urls(&backend), [central]);
+}
+
+/// Maven dedupes the project's repositories against its request ones by
+/// the ids mirrors give them. A POM `central` on plain HTTP that a mirror
+/// of `external:http:*` serves keeps the default Central beside it; one
+/// mirror over both leaves one entry, the POM's. The child's `central`
+/// still holds the id against its parents', and an effective model's
+/// `central` retires a parent's.
+#[test]
+fn a_mirror_of_one_central_keeps_the_other() {
+    let central = "https://repo1.maven.org/maven2/";
+    let legacy = "http://repo1.maven.org/maven2/";
+    let custom = "https://custom.example/m2/";
+    let backend_with = |mirror_of: &str| {
+        let mut mirror = rv_config::MirrorConfig::new(Some("proxy"), "https://proxy.example/");
+        mirror.mirror_of = vec![mirror_of.into()];
+        let config = test_config().with_mirrors(vec![mirror]);
+        let defaults = config.repositories().iter().map(Repository::from).collect();
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_tmp.path()).expect("store"));
+        let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+        let ctx = ResolveContext::new(config, Vec::new(), store, platform, None);
+        ModelService::new(&ctx, defaults)
+    };
+    let central_at = |url: &str, local: bool| {
+        let mut pom = Pom::parse(&format!(
+            "<project><repositories><repository><id>central</id><url>{url}</url>\
+             </repository></repositories></project>"
+        ))
+        .unwrap();
+        if local {
+            pom.mark_root_repositories();
+        }
+        Repository::from(&pom.repositories[0])
+    };
+    for (mirror_of, listed) in [
+        ("external:http:*", vec![legacy, central]),
+        ("central", vec![legacy]),
+    ] {
+        let backend = backend_with(mirror_of);
+        backend.extend_root_lineage_repos([(central_at(legacy, true), false)]);
+        assert_eq!(urls(&backend), listed, "{mirror_of}");
+        backend.extend_root_lineage_repos([(central_at(custom, false), false)]);
+        assert_eq!(urls(&backend), listed, "{mirror_of}: a parent's central");
+    }
+
+    let backend = backend_with("external:http:*");
+    backend.extend_root_lineage_repos([(central_at(legacy, false), false)]);
+    assert_eq!(urls(&backend), [legacy, central]);
+    backend.extend_root_effective_repos([central_at(custom, true)]);
+    assert_eq!(urls(&backend), [custom]);
+
+    let backend = backend_with("external:http:*");
+    backend.extend_root_lineage_repos([(central_at(custom, false), false)]);
+    assert_eq!(urls(&backend), [custom]);
+    backend.extend_root_effective_repos([central_at(legacy, true)]);
+    assert_eq!(urls(&backend), [legacy, central]);
+}
+
+/// A child's repository first listed by its effective model, as one whose
+/// URL names a property its parent defines, is searched before the
+/// parent's, in the effective model's order.
+#[test]
+fn an_effective_model_keeps_its_order() {
+    let central = "https://repo1.maven.org/maven2/";
+    let (child, parent) = ("https://child.example/", "https://parent.example/");
+    let store_tmp = tempfile::tempdir().unwrap();
+    let config = test_config();
+    let defaults = config.repositories().iter().map(Repository::from);
+    let backend = backend_in(store_tmp.path(), |_| {}, defaults.collect());
+    backend.extend_root_lineage_repos([(repo("parent", parent), false)]);
+    assert_eq!(urls(&backend), [parent, central]);
+    backend.extend_root_effective_repos([repo("child", child), repo("parent", parent)]);
+    assert_eq!(urls(&backend), [child, parent, central]);
+}
+
 #[test]
 fn pom_http_repositories_do_not_enter_search_lists() {
     for local in [true, false] {
@@ -1809,7 +2314,7 @@ fn a_fetched_pom_cannot_override_a_project_repository() {
     let known = backend.repos_snapshot();
     assert_eq!(
         known[0].releases_checksum_policy,
-        rv_config::ChecksumPolicy::Fail
+        rv_config::ChecksumPolicy::Warn
     );
     assert_eq!(
         urls(&backend),
@@ -1820,10 +2325,10 @@ fn a_fetched_pom_cannot_override_a_project_repository() {
             "https://vendor2.example/m2/"
         ]
     );
-    let build = [
+    let build = declared_build([
         repo("corp", "https://elsewhere.example/m2/"),
         repo("parent", "https://parent.example/m2/"),
-    ];
+    ]);
     let searched: Vec<String> = backend
         .parent_search_list(&RepoContext::default(), &build)
         .into_iter()
@@ -1840,16 +2345,20 @@ fn a_fetched_pom_cannot_override_a_project_repository() {
 }
 
 /// A parent lookup's missing-parent key holds every repository the lookup
-/// searches. An import redeclaring the outer build's id on another URL is
-/// searched, so a build without that import must not share its misses.
+/// searches. An import's interpolated declaration of the outer build's id
+/// on another URL replaces it, so a build without that import must not
+/// share its misses.
 #[test]
 fn parent_search_context_keys_every_searched_repository() {
     let backend = backend(|_| {});
     let ctx = RepoContext::default();
-    let build = [
-        repo("corp", "https://corp.example/m2/"),
-        repo("corp", "https://imported.example/m2/"),
-    ];
+    let mut build = declared_build([repo("corp", "https://corp.example/m2/")]);
+    build.added.push(model_list::Added {
+        repo: repo("corp", "https://imported.example/m2/"),
+        replace: true,
+        reach: model_list::Reach::Read,
+        implied: false,
+    });
     let searched: Vec<String> = backend
         .parent_search_list(&ctx, &build)
         .into_iter()
@@ -1861,11 +2370,15 @@ fn parent_search_context_keys_every_searched_repository() {
         .iter()
         .map(|repo| repo.url.clone())
         .collect();
-    assert_eq!(
-        keyed,
-        ["https://corp.example/m2/", "https://imported.example/m2/"]
+    assert_eq!(keyed, searched);
+    assert!(
+        keyed.ends_with(&["https://imported.example/m2/".to_string()]),
+        "{keyed:?}"
     );
-    assert!(searched.ends_with(&keyed), "{searched:?}");
+    assert!(
+        !keyed.iter().any(|url| url.contains("corp.example")),
+        "{keyed:?}"
+    );
 }
 
 /// Not-found diagnostics retain ignored repositories with their declaring POMs.
@@ -2159,6 +2672,7 @@ async fn release_and_range_listings_use_their_own_update_policies() {
             "lib",
             &VersionReq::parse("[1.1,2.0)").unwrap(),
             &repos,
+            None,
         )
         .await
         .unwrap();
@@ -2168,7 +2682,7 @@ async fn release_and_range_listings_use_their_own_update_policies() {
 
 /// `RELEASE` considers each repository's versions only when that
 /// repository serves releases, so a snapshots-only mirror advertising a
-/// higher release cannot win.
+/// higher release in newer metadata cannot win.
 #[tokio::test(flavor = "multi_thread")]
 async fn dynamic_version_release_skips_snapshot_only_mirror() {
     use crate::context::MetadataKey;
@@ -2188,17 +2702,25 @@ async fn dynamic_version_release_skips_snapshot_only_mirror() {
     );
     let repos = vec![releases.clone(), snapshots.clone()];
     let ctx = ResolveContext::new(config, repos.clone(), store, platform, Some(client));
-    for (repo, version) in [(&snapshots, "2.0.0"), (&releases, "1.0.0")] {
+    for (repo, version, stamp) in [
+        (&snapshots, "2.0.0", "20240102000000"),
+        (&releases, "1.0.0", "20240101000000"),
+    ] {
         let mut metadata = Metadata::default();
+        metadata.last_updated = Some(stamp.to_string());
         metadata.release = Some(version.to_string());
         metadata.versions = vec![version.to_string()];
+        // Keyed as a listing that read the repository would key it.
+        let listing = repo.version_listing(true).unwrap().unwrap();
         ctx.insert_metadata(
             MetadataKey::new(
                 Arc::from(repo.url.as_str()),
                 Arc::from("com.example"),
                 Arc::from("lib"),
             )
-            .with_repo_id(repo.id.as_deref()),
+            .with_repo_id(repo.id.as_deref())
+            .with_checksum_policy(listing.releases_checksum_policy)
+            .with_update_policy(listing.releases_update_policy),
             metadata,
         );
     }
@@ -2289,6 +2811,227 @@ async fn dynamic_versions_read_the_newest_marker() {
             .await
             .expect("dynamic version resolves");
         assert_eq!(resolved.version.as_str(), expected, "{markers:?}");
+    }
+}
+
+/// The newest metadata's marker wins though it names a SNAPSHOT for
+/// `RELEASE`, or a SNAPSHOT for `LATEST` that its repository's policy
+/// leaves out, as in Maven, which applies the policy to the files only.
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_versions_take_the_newest_marker_whatever_it_names() {
+    use crate::context::MetadataKey;
+    use rv_repo::{Metadata, RepoClient};
+
+    let cases = [
+        (DynamicVersionToken::Release, true, "1.0-SNAPSHOT", "0.9"),
+        (
+            DynamicVersionToken::Integration,
+            false,
+            "1.2-SNAPSHOT",
+            "1.0",
+        ),
+    ];
+    for (token, snapshots, newer, older) in cases {
+        let first = Repository::new(
+            Some("first".to_string()),
+            "https://first.example/maven2/",
+            true,
+            snapshots,
+        );
+        let second = Repository::new(
+            Some("second".to_string()),
+            "https://second.example/maven2/",
+            true,
+            true,
+        );
+        let repos = vec![first.clone(), second.clone()];
+        let config = test_config();
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_tmp.path()).expect("store"));
+        let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+        let client = RepoClient::new(&config).await.expect("client");
+        let ctx = ResolveContext::new(config, repos.clone(), store, platform, Some(client));
+        for (repo, version, stamp) in [
+            (&first, newer, "20240102000000"),
+            (&second, older, "20200101000000"),
+        ] {
+            let mut metadata = Metadata::default();
+            metadata.release = Some(version.to_string());
+            metadata.latest = Some(version.to_string());
+            metadata.versions = vec![version.to_string()];
+            metadata.last_updated = Some(stamp.to_string());
+            ctx.insert_metadata(
+                MetadataKey::new(
+                    Arc::from(repo.url.as_str()),
+                    Arc::from("com.example"),
+                    Arc::from("lib"),
+                )
+                .with_repo_id(repo.id.as_deref()),
+                metadata,
+            );
+        }
+        let backend = ModelService::new(&ctx, repos);
+        let resolved = backend
+            .resolve_dynamic_version_internal("com.example", "lib", token, &RepoContext::default())
+            .await
+            .expect("dynamic version resolves");
+        assert_eq!(resolved.version.as_str(), newer, "{token:?}");
+    }
+}
+
+/// A `LATEST` that names a SNAPSHOT takes its build from the repository
+/// whose metadata named it, as Maven's version resolver does, though
+/// another repository has a newer build.
+#[tokio::test]
+async fn a_latest_snapshot_takes_the_build_of_the_repository_that_named_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repos = Vec::new();
+    for (name, latest, stamp, build) in [
+        (
+            "first",
+            "1.0-SNAPSHOT",
+            "20240102000000",
+            ("20240102.000000", 1),
+        ),
+        ("second", "0.9", "20200101000000", ("20240103.000000", 9)),
+    ] {
+        let dir = tmp.path().join(name).join("com/example/lib");
+        std::fs::create_dir_all(dir.join("1.0-SNAPSHOT")).unwrap();
+        std::fs::write(
+            dir.join("maven-metadata.xml"),
+            format!(
+                "<metadata><groupId>com.example</groupId><artifactId>lib</artifactId>\
+                 <versioning><latest>{latest}</latest><versions><version>{latest}</version>\
+                 </versions><lastUpdated>{stamp}</lastUpdated></versioning></metadata>"
+            ),
+        )
+        .unwrap();
+        let (timestamp, number) = build;
+        let updated = timestamp.replace('.', "");
+        std::fs::write(
+            dir.join("1.0-SNAPSHOT/maven-metadata.xml"),
+            format!(
+                "<metadata><groupId>com.example</groupId><artifactId>lib</artifactId>\
+                 <version>1.0-SNAPSHOT</version><versioning><snapshot>\
+                 <timestamp>{timestamp}</timestamp><buildNumber>{number}</buildNumber>\
+                 </snapshot><lastUpdated>{updated}</lastUpdated><snapshotVersions>\
+                 <snapshotVersion><extension>jar</extension>\
+                 <value>1.0-{timestamp}-{number}</value><updated>{updated}</updated>\
+                 </snapshotVersion></snapshotVersions></versioning></metadata>"
+            ),
+        )
+        .unwrap();
+        repos.push(Repository::new(
+            Some(name.into()),
+            reqwest::Url::from_directory_path(tmp.path().join(name))
+                .unwrap()
+                .to_string(),
+            true,
+            true,
+        ));
+    }
+    let config = Config::for_testing_with_repos(
+        tmp.path().to_owned(),
+        ResolvedPaths::from_raeva_home(tmp.path().join("home")),
+        Vec::new(),
+    );
+    let client = rv_repo::RepoClient::new(&config).await.unwrap();
+    let ctx = ResolveContext::new(
+        config,
+        repos.clone(),
+        Arc::new(Store::open(&tmp.path().join("store")).unwrap()),
+        rv_lock::Platform::new("linux", "x86_64").unwrap(),
+        Some(client),
+    );
+    let backend = ModelService::new(&ctx, repos.clone());
+    let context = RepoContext::default();
+    let latest = backend
+        .resolve_dynamic_version_internal(
+            "com.example",
+            "lib",
+            DynamicVersionToken::Integration,
+            &context,
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.version.as_str(), "1.0-SNAPSHOT");
+    let coord = Coord::from_str("com.example:lib:1.0-SNAPSHOT").unwrap();
+    let build = backend
+        .resolve_snapshot_version_internal(&coord, &context)
+        .await
+        .unwrap();
+    assert_eq!(build.version.as_str(), "1.0-20240102.000000-1");
+    assert!(build.repo.is_some_and(|repo| repo.is(&repos[0])));
+}
+
+/// With no marker in any repository, `RELEASE` and `LATEST` take the
+/// reactor's greatest version in the mode's order: `alpha` in Maven 3.9,
+/// `0.min` in 3.10.
+#[test]
+fn a_reactor_version_stands_in_for_a_marker_in_the_modes_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let pom = |coords: &str, body: &str| {
+        format!("<project><modelVersion>4.0.0</modelVersion>{coords}{body}</project>")
+    };
+    let files = [
+        (
+            "pom.xml",
+            pom(
+                "<groupId>g</groupId><artifactId>root</artifactId><version>1</version>",
+                "<packaging>pom</packaging><modules><module>a</module><module>b</module></modules>",
+            ),
+        ),
+        (
+            "a/pom.xml",
+            pom(
+                "<groupId>g</groupId><artifactId>lib</artifactId><version>alpha</version>",
+                "",
+            ),
+        ),
+        (
+            "b/pom.xml",
+            pom(
+                "<groupId>g</groupId><artifactId>lib</artifactId><version>0.min</version>",
+                "",
+            ),
+        ),
+    ];
+    for (path, text) in files {
+        let path = dir.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let workspace = Arc::new(crate::Workspace::discover(dir.path()).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for (mode, expected) in [
+        (MavenMode::Maven39, "alpha"),
+        (MavenMode::Maven310, "0.min"),
+    ] {
+        for token in [
+            DynamicVersionToken::Release,
+            DynamicVersionToken::Integration,
+        ] {
+            let store_tmp = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(store_tmp.path()).unwrap());
+            let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+            let mut config = test_config();
+            config.lock.maven.mode = mode;
+            let ctx = ResolveContext::new(config, Vec::new(), store, platform, None);
+            let backend =
+                ModelService::new(&ctx, Vec::new()).with_workspace(Arc::clone(&workspace));
+            let resolved = runtime
+                .block_on(backend.resolve_dynamic_version_internal(
+                    "g",
+                    "lib",
+                    token,
+                    &RepoContext::default(),
+                ))
+                .unwrap();
+            assert_eq!(resolved.version.as_str(), expected, "{mode:?} {token:?}");
+        }
     }
 }
 
@@ -2419,4 +3162,234 @@ async fn a_selected_invalid_pom_is_reported_whoever_read_it() {
         selector.report_pom_problem(&snapshot);
     });
     assert_eq!(logged.len(), 2, "{logged:?}");
+}
+
+/// Maven 3.10 sorts a version that starts with text below `0`, so a range
+/// up to `0` lists it; Maven 3.9 takes it as `0`, which `(,0)` leaves out.
+#[test]
+fn a_range_lists_its_versions_in_the_modes_order() {
+    use crate::resolver::pom_source::MemoryPomSource;
+
+    let found = |mode: MavenMode| {
+        let source = MemoryPomSource::default().with_files(
+            "https://first.example/",
+            &std::collections::HashMap::from([(
+                "g/a/maven-metadata.xml".to_string(),
+                b"<metadata><versioning><versions><version>alpha</version>\
+                  <version>1</version></versions></versioning></metadata>"
+                    .to_vec(),
+            )]),
+        );
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_tmp.path()).unwrap());
+        let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+        let mut config = test_config();
+        config.lock.maven.mode = mode;
+        let ctx = ResolveContext::new(config, Vec::new(), store, platform, None)
+            .with_pom_source(Arc::new(source));
+        let backend = ModelService::new(&ctx, vec![repo("first", "https://first.example/")]);
+        let range = VersionReq::parse("(,0)").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(backend.resolve_versions("g", "a", &range, &RepoContext::default()))
+            .map(|versions| {
+                (versions.into_iter())
+                    .map(|found| found.version.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .ok()
+    };
+    assert_eq!(found(MavenMode::Maven39), None);
+    assert_eq!(found(MavenMode::Maven310), Some(vec!["alpha".to_string()]));
+}
+
+/// Two modules of one reactor sharing their models: `m:1` reads `p:1`
+/// from `rb`, as its parent or as a BOM it imports, and `x:1`, asked for
+/// without `rb`, reads it alike.
+fn cached_parent_modules(import: bool) -> (tempfile::TempDir, ModelService, ModelService) {
+    use crate::resolver::pom_source::MemoryPomSource;
+
+    let p = "<groupId>g</groupId><artifactId>p</artifactId><version>1</version>";
+    let pom = |artifact: &str| {
+        let (parent, management) = match import {
+            false => (format!("<parent>{p}</parent>"), String::new()),
+            true => (
+                "<groupId>g</groupId>".to_string(),
+                format!(
+                    "<dependencyManagement><dependencies><dependency>{p}<type>pom</type>\
+                     <scope>import</scope></dependency></dependencies></dependencyManagement>"
+                ),
+            ),
+        };
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion>{parent}<artifactId>{artifact}\
+             </artifactId><version>1</version><dependencies><dependency><groupId>g</groupId>\
+             <artifactId>y</artifactId><version>1</version></dependency></dependencies>\
+             {management}</project>"
+        )
+        .into_bytes()
+    };
+    let r = std::collections::HashMap::from([
+        ("g/m/1/m-1.pom".to_string(), pom("m")),
+        ("g/x/1/x-1.pom".to_string(), pom("x")),
+    ]);
+    let rb = std::collections::HashMap::from([(
+        "g/p/1/p-1.pom".to_string(),
+        b"<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+          <artifactId>p</artifactId><version>1</version><packaging>pom</packaging></project>"
+            .to_vec(),
+    )]);
+    let source = MemoryPomSource::default()
+        .with_files("https://r.example/", &r)
+        .with_files("https://rb.example/", &rb);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(tmp.path()).unwrap());
+    let platform = rv_lock::Platform::new("linux", "x86_64").unwrap();
+    let ctx = ResolveContext::new(test_config(), Vec::new(), store, platform, None)
+        .with_pom_source(Arc::new(source));
+    let models = Arc::new(ReactorModels::default());
+    let module = || {
+        ModelService::new(
+            &ctx.for_module(ctx.config.clone()),
+            vec![repo("r", "https://r.example/")],
+        )
+        .with_reactor_models(Arc::clone(&models))
+    };
+    (tmp, module(), module())
+}
+
+async fn dependencies(backend: &ModelService, artifact: &str, repos: &RepoContext) -> usize {
+    let coord = Coord::parse(&format!("g:{artifact}:1")).unwrap();
+    (backend.fetch_project_internal(&coord, false, repos).await)
+        .map_or(0, |found| found.project.dependencies.len())
+}
+
+/// A module that takes `m:1` from another module's build takes the parent
+/// that build read into its model cache, as a build of its own would, and
+/// `x:1` finds it there.
+#[tokio::test]
+async fn a_reused_model_brings_the_parents_its_build_read() {
+    let (_tmp, first, second) = cached_parent_modules(false);
+    let rb = RepoContext::from_repos(vec![repo("rb", "https://rb.example/")]);
+    assert_eq!(dependencies(&first, "m", &rb).await, 1);
+    assert_eq!(dependencies(&second, "m", &rb).await, 1);
+    assert_eq!(dependencies(&second, "x", &RepoContext::default()).await, 1);
+}
+
+/// A model built from a parent the module read on another path is kept from
+/// the other modules, which have not read it.
+#[tokio::test]
+async fn a_model_built_from_the_model_cache_stays_with_its_module() {
+    let (_tmp, first, second) = cached_parent_modules(false);
+    let rb = RepoContext::from_repos(vec![repo("rb", "https://rb.example/")]);
+    assert_eq!(dependencies(&first, "m", &rb).await, 1);
+    assert_eq!(dependencies(&first, "x", &RepoContext::default()).await, 1);
+    assert_eq!(dependencies(&second, "x", &RepoContext::default()).await, 0);
+}
+
+/// An imported BOM read from the model cache is kept from the other
+/// modules too.
+#[tokio::test]
+async fn a_bom_imported_from_the_model_cache_stays_with_its_module() {
+    let (_tmp, first, second) = cached_parent_modules(true);
+    let rb = RepoContext::from_repos(vec![repo("rb", "https://rb.example/")]);
+    assert_eq!(dependencies(&first, "m", &rb).await, 1);
+    assert_eq!(dependencies(&first, "x", &RepoContext::default()).await, 1);
+    assert_eq!(dependencies(&second, "x", &RepoContext::default()).await, 0);
+}
+
+/// One id refuses only two URLs whose listings a read of it takes
+/// differently: Central's two names, one host in two cases, repositories
+/// without an id, and a `lastUpdated` nothing picks by do not.
+#[test]
+fn split_listings_need_two_urls_of_one_id_read_differently() {
+    let listing = |versions: &[&str], release: &str, stamp: &str| {
+        let mut metadata = Metadata::default();
+        metadata.versions = versions.iter().map(|v| v.to_string()).collect();
+        metadata.release = Some(release.to_string()).filter(|r| !r.is_empty());
+        metadata.last_updated = Some(stamp.to_string()).filter(|s| !s.is_empty());
+        metadata
+    };
+    let refused = |reads: &[(Option<&str>, &str, ListingRead, &Metadata)]| {
+        let listings = IdListings::default();
+        for (id, url, read, metadata) in reads {
+            let repo = Repository::new(id.map(str::to_string), *url, true, false);
+            record_listing(&listings, &repo, ("g", "a"), *read, metadata);
+        }
+        refuse_split_listings(&listings, MavenMode::Maven39)
+            .err()
+            .map(|e| e.to_string())
+    };
+    let one = listing(&["1"], "1", "2024");
+    let two = listing(&["1", "2"], "2", "2024");
+    let two_later = listing(&["1", "2"], "2", "2025");
+    let two_unstamped = listing(&["1", "2"], "2", "");
+    let none = Metadata::default();
+    let range = ListingRead::Range;
+    let release = |among_others| ListingRead::Marker {
+        latest: false,
+        among_others,
+    };
+    let plugin = ListingRead::Plugin {
+        among_others: false,
+    };
+    let (r, central) = (Some("r"), Some("central"));
+    let (a, b) = ("https://a.example/", "https://b.example/");
+    let kept = [
+        [
+            (
+                central,
+                "https://repo.maven.apache.org/maven2/",
+                range,
+                &one,
+            ),
+            (central, "https://repo1.maven.org/maven2/", range, &two),
+        ],
+        [
+            (r, "https://Repo.Example/m2/", range, &one),
+            (r, "https://repo.example/m2/", range, &two),
+        ],
+        [(None, a, range, &one), (None, b, range, &two)],
+        [(r, a, range, &two), (r, b, range, &two_later)],
+        [
+            (r, a, release(false), &two),
+            (r, b, release(false), &two_later),
+        ],
+        [(r, a, plugin, &two), (r, b, plugin, &two_later)],
+        // A listing of no version and no marker is a 404's empty one,
+        // whatever its `lastUpdated`.
+        [
+            (r, a, plugin, &none),
+            (r, b, plugin, &listing(&[], "", "2024")),
+        ],
+        [
+            (r, a, release(true), &none),
+            (r, b, release(true), &listing(&[], "", "2024")),
+        ],
+    ];
+    for reads in kept {
+        assert_eq!(refused(&reads), None, "{reads:?}");
+    }
+    let split = [
+        [(r, b, range, &two), (r, a, range, &one)],
+        [
+            (r, a, release(true), &two),
+            (r, b, release(true), &two_later),
+        ],
+        [
+            (r, a, range, &one),
+            (r, b, release(false), &listing(&["1"], "2", "2024")),
+        ],
+        [(r, a, plugin, &two), (r, b, plugin, &two_unstamped)],
+    ];
+    for reads in split {
+        let error = refused(&reads).expect("refused");
+        assert!(
+            error.contains("repository id r lists different versions of g:a at https://a.example/ and https://b.example/"),
+            "{error}"
+        );
+    }
 }

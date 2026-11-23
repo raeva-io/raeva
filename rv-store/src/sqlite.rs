@@ -31,9 +31,7 @@ pub(crate) struct Spec {
     /// [`write_transaction`]). A raeva that changes the schema or the
     /// meaning of its rows in a way an older one cannot read bumps it,
     /// under the bootstrap lock and in a transaction that holds the write
-    /// lock, with the change. Raeva 0.5.0 and older never check it, so that
-    /// raeva must also keep their writes out of what it reads, as with new
-    /// table names.
+    /// lock, with the change.
     pub(crate) generation: i64,
     /// Creates the schema, on open and again after a recreate.
     pub(crate) init: fn(&rusqlite::Connection) -> Result<()>,
@@ -95,17 +93,42 @@ pub fn recreated_mid_run() -> u64 {
 }
 
 /// The [`Db`] for the file at `path`, which this process shares: an open one
-/// if any, else a new one through [`enable_wal`]. Callers hold a
-/// cross-process bootstrap lock around this call, which also keeps two
-/// threads from opening one file at once.
+/// if any, else a new one through [`enable_wal`]. It holds the spec's
+/// cross-process lock, which also keeps two threads from opening one file
+/// at once.
+///
+/// A damaged file is recreated only once no other handle has it open, and
+/// a connection r2d2 has yet to drop counts as one, so a damaged file in
+/// use is tried again, with the lock released between tries, until
+/// [`PEER_WAIT`] has passed.
 pub(crate) fn open(path: &Path, spec: Spec) -> Result<Arc<Db>> {
+    let deadline = Instant::now() + PEER_WAIT;
+    loop {
+        let lock = (spec.lock)(path)?;
+        match open_locked(path, spec) {
+            Err(err) if err.is_corrupt() && Instant::now() < deadline => {
+                drop(lock);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The name under which handles on the file at `path` are shared, however
+/// `path` spells its directory.
+pub(crate) fn file_key(path: &Path) -> PathBuf {
     let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
-    let key = match path.file_name() {
+    match path.file_name() {
         Some(name) => fs::canonicalize(dir.unwrap_or(Path::new(".")))
             .map(|dir| dir.join(name))
             .unwrap_or_else(|_| path.to_path_buf()),
         None => path.to_path_buf(),
-    };
+    }
+}
+
+fn open_locked(path: &Path, spec: Spec) -> Result<Arc<Db>> {
+    let key = file_key(path);
     let registry = || {
         OPEN.get_or_init(Mutex::default)
             .lock()
@@ -277,8 +300,7 @@ impl Db {
         state.user = Arc::downgrade(&user);
         // A peer's new file may be a newer raeva's. A pooled connection's
         // pragmas load the schema, which may not parse, so this checks first.
-        let conn = rusqlite::Connection::open(&self.path)
-            .db_context(|| format!("failed to open {}", self.path.display()))?;
+        let conn = connect(&self.path)?;
         check_generation(&conn, &self.path, self.spec.generation)?;
         drop(conn);
         state.pool = Some(wal_pool(&self.path, user, self.spec)?);
@@ -290,6 +312,18 @@ impl Db {
         state.generation += 1;
         RECREATED.fetch_add(1, Ordering::Relaxed);
         Ok(true)
+    }
+}
+
+/// A dropped `Db` has closed its connections, and so checkpointed its
+/// `-wal` file and released its shared lock, unless one outlives the wait:
+/// r2d2's worker keeps the pool for a moment after handing out a connection
+/// it opened, and the next open in this process would otherwise find the
+/// file in use, or its rows still in the `-wal` file.
+impl Drop for Db {
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.release();
     }
 }
 
@@ -306,6 +340,12 @@ impl State {
         if std::mem::replace(&mut self.recreated, true) {
             return false;
         }
+        self.release()
+    }
+
+    /// Drops the pool and waits up to a second for its connections to
+    /// close, and whether they did.
+    fn release(&mut self) -> bool {
         drop(self.pool.take());
         let deadline = Instant::now() + Duration::from_secs(1);
         while self.user.strong_count() > 0 && Instant::now() < deadline {
@@ -339,13 +379,7 @@ impl Db {
 }
 
 fn open_users(path: &Path) -> Result<File> {
-    fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .io_context(|| format!("failed to open {}", path.display()))
+    rv_fs::open_lock_file(path).io_context(|| format!("failed to open {}", path.display()))
 }
 
 /// Switches the database at `path` to WAL journal mode with
@@ -362,9 +396,12 @@ fn open_users(path: &Path) -> Result<File> {
 /// SMB). Running without WAL would drop the concurrency the store and the
 /// metadata cache rely on.
 ///
-/// Both databases only speed up later runs, so a file that is damaged or is
-/// not SQLite, as a partial CI cache restore leaves, is deleted with its
-/// `-wal` and `-shm` files and created anew instead of failing every run.
+/// A file that is damaged or is not SQLite, as a partial CI cache restore
+/// leaves, is deleted with its `-wal` and `-shm` files and created anew
+/// instead of failing every run. A run gets back what it held by asking the
+/// repositories again: the metadata cache by fetching, and the store index
+/// by downloading, since only a repository's answer restores which one
+/// served a stored file. The stored files stay, named by digest.
 /// That happens only while no other handle, in this process or another,
 /// has the database open: the returned [`DbUser`] marks this one as open,
 /// and [`wal_pool`] keeps it until the last connection closes.
@@ -553,29 +590,6 @@ pub(crate) fn write_transaction<'a>(
     Ok(tx)
 }
 
-/// Whether the database `conn` opens has a table named `name`.
-pub(crate) fn has_table(conn: &rusqlite::Connection, name: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [name],
-        |row| row.get(0),
-    )
-    .db_context(|| "failed to read the database schema")
-}
-
-/// Reports that this raeva upgraded the database at `path` from an older
-/// raeva's and dropped `dropped`.
-pub(crate) fn warn_upgraded(path: &Path, dropped: &str) {
-    tracing::warn!(
-        sec_code = "DATABASE_UPGRADED",
-        path = %path.display(),
-        "upgraded {} from an older raeva and dropped {dropped}; the next resolution fetches \
-         what it needs again. raeva 0.5.1 refuses the file now, so give an older raeva its own \
-         RAEVA_HOME",
-        path.display()
-    );
-}
-
 /// Runs `spec.init` on `conn` to the database at `path`, then stamps it
 /// with the spec's generation, unless a newer raeva's generation is there.
 fn set_up(conn: &rusqlite::Connection, path: &Path, spec: Spec) -> Result<()> {
@@ -588,10 +602,20 @@ fn set_up(conn: &rusqlite::Connection, path: &Path, spec: Spec) -> Result<()> {
     Ok(())
 }
 
+/// A connection to the database at `path`, creating the file if absent. A
+/// symlink there or anything else that is not a regular file is refused,
+/// as a planted one would have SQLite create or write the file it names,
+/// or wait on a FIFO.
+fn connect(path: &Path) -> Result<rusqlite::Connection> {
+    rv_fs::open_lock_file(path).io_context(|| format!("failed to open {}", path.display()))?;
+    rusqlite::Connection::open(path).db_context(|| format!("failed to open {}", path.display()))
+}
+
 fn open_wal(path: &Path, generation: i64) -> Result<()> {
     // A file that is not SQLite would otherwise wait out the busy timeout.
-    // A shorter one is still being created by another process.
-    if fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() >= 16) {
+    // A shorter one is still being created by another process. A link is
+    // left to `connect` to refuse.
+    if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() >= 16) {
         let mut header = [0u8; 16];
         File::open(path)
             .and_then(|mut file| file.read_exact(&mut header))
@@ -604,8 +628,7 @@ fn open_wal(path: &Path, generation: i64) -> Result<()> {
             .db_context(|| format!("{} has no SQLite header", path.display()));
         }
     }
-    let conn = rusqlite::Connection::open(path)
-        .db_context(|| format!("failed to open {} for WAL bootstrap", path.display()))?;
+    let conn = connect(path)?;
     conn.busy_timeout(Duration::from_secs(5))
         .db_context(|| "failed to set busy_timeout on bootstrap connection")?;
     check_generation(&conn, path, generation)?;
@@ -692,7 +715,6 @@ mod tests {
     /// A database damaged past its schema page, and the shared lock of a
     /// peer process that has it open.
     fn damaged_in_use(path: &Path) -> File {
-        let lock = (SPEC.lock)(path).unwrap();
         let db = open(path, SPEC).unwrap();
         db.run(|conn| {
             conn.execute_batch(
@@ -702,7 +724,7 @@ mod tests {
             .db_context(|| "fill")
         })
         .unwrap();
-        drop((db, lock));
+        drop(db);
         damage_past_schema(path);
         let peer = open_users(&sibling(path, ".users")).unwrap();
         peer.lock_shared().unwrap();
@@ -716,15 +738,118 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite");
         let peer = damaged_in_use(&path);
-        let lock = (SPEC.lock)(&path).unwrap();
         let db = open(&path, SPEC).unwrap();
-        drop(lock);
         let closes = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             drop(peer);
         });
         assert_eq!(db.run(count).unwrap(), 0);
         closes.join().unwrap();
+    }
+
+    /// A file that is not SQLite while a peer, or a connection r2d2 has yet
+    /// to drop, has it open is kept at open while that lasts, and recreated
+    /// once it closes.
+    #[test]
+    fn a_damaged_database_in_use_is_recreated_at_open_once_its_peer_closes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        drop(damaged_in_use(&path));
+        fs::write(&path, [7u8; 8192]).unwrap();
+        let peer = open_users(&sibling(&path, ".users")).unwrap();
+        peer.lock_shared().unwrap();
+        let err = open(&path, SPEC).err().unwrap();
+        assert!(err.is_corrupt(), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), [7u8; 8192]);
+        let closes = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(peer);
+        });
+        let db = open(&path, SPEC).unwrap();
+        assert_eq!(db.run(count).unwrap(), 0);
+        closes.join().unwrap();
+    }
+
+    /// A `.users` link to another file, as a planted one, does not let a
+    /// sync think it alone has the database open and delete it, nor write
+    /// the epoch through the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_users_file_that_is_a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let users = sibling(&path, ".users");
+        let peer = damaged_in_use(&path);
+        fs::write(&path, [7u8; 8192]).unwrap();
+        fs::rename(&users, dir.path().join("held")).unwrap();
+        let decoy = dir.path().join("decoy");
+        fs::write(&decoy, "").unwrap();
+        std::os::unix::fs::symlink(&decoy, &users).unwrap();
+        let err = open(&path, SPEC).err().unwrap();
+        assert!(format!("{err:?}").contains("symbolic link"), "{err:?}");
+        assert_eq!(fs::read(&path).unwrap(), [7u8; 8192]);
+        assert!(fs::read(&decoy).unwrap().is_empty());
+        drop(peer);
+    }
+
+    /// A database path that is a link, dangling or not, or a FIFO is
+    /// refused, and nothing is written where the link points.
+    #[cfg(unix)]
+    #[test]
+    fn a_database_that_is_a_link_or_a_fifo_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let target = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let err = open(&path, SPEC).err().unwrap();
+        assert!(format!("{err:?}").contains("symbolic link"), "{err:?}");
+        assert!(!target.exists());
+        fs::write(&target, "").unwrap();
+        assert!(open(&path, SPEC).is_err());
+        assert!(fs::read(&target).unwrap().is_empty());
+        // A link to a file that is no database is refused, not replaced.
+        fs::write(&target, [7u8; 64]).unwrap();
+        let err = open(&path, SPEC).err().unwrap();
+        assert!(format!("{err:?}").contains("symbolic link"), "{err:?}");
+        assert!(fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), [7u8; 64]);
+        fs::remove_file(&path).unwrap();
+        // rustix has no mknodat on macOS.
+        let made = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let err = open(&path, SPEC).err().unwrap();
+        assert!(format!("{err:?}").contains("regular file"), "{err:?}");
+    }
+
+    /// A dropped database has closed every connection, even one that
+    /// outlived its pool, as r2d2's worker keeps one for a moment: its rows
+    /// are in the main file and no handle has it open.
+    #[test]
+    fn a_dropped_database_is_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite");
+        let db = open(&path, SPEC).unwrap();
+        let conn = db.conn();
+        conn.execute_batch(
+            "INSERT INTO t WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+             WHERE i < 500) SELECT randomblob(100) FROM n",
+        )
+        .unwrap();
+        let outlives = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(conn);
+        });
+        drop(db);
+        assert!(fs::metadata(&path).unwrap().len() > 2 * 4096);
+        assert!(!sibling(&path, "-wal").exists());
+        open_users(&sibling(&path, ".users"))
+            .unwrap()
+            .try_lock()
+            .expect("no handle has it open");
+        outlives.join().unwrap();
     }
 
     /// A peer that recreated the file while this process waited to is not
@@ -736,9 +861,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("db.sqlite");
             let peer = damaged_in_use(&path);
-            let lock = (SPEC.lock)(&path).unwrap();
             let db = open(&path, SPEC).unwrap();
-            drop(lock);
             let recreates = std::thread::spawn({
                 let path = path.clone();
                 move || {
@@ -807,10 +930,7 @@ mod tests {
     fn a_newer_generation_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite");
-        let opened = || {
-            let _lock = (SPEC.lock)(&path).unwrap();
-            open(&path, SPEC)
-        };
+        let opened = || open(&path, SPEC);
         let db = opened().unwrap();
         let insert = |conn: &mut rusqlite::Connection| {
             conn.execute("INSERT INTO t VALUES (x'00')", [])
@@ -864,6 +984,19 @@ mod tests {
             .unwrap();
         assert!(enable_wal(&path, 1).is_err());
         drop(conn);
-        enable_wal(&path, 1).expect("recreated once the connection is closed");
+        // A child another test of this process spawns holds a copy of the
+        // lock's descriptor until it runs its program, so this waits for
+        // that moment to pass.
+        let recreated = (0..100).find_map(|_| {
+            let opened = enable_wal(&path, 1).ok();
+            if opened.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            opened
+        });
+        assert!(
+            recreated.is_some(),
+            "recreated once the connection is closed"
+        );
     }
 }

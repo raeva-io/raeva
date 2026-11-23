@@ -3,6 +3,15 @@ use super::drift::lock_requires_snapshot_refresh;
 use clap::Parser;
 use rv_lock::{LockArtifact, LockModulePackage, LockPlatform, Lockfile, Platform};
 use rv_maven_types::{ArtifactCoord, Gav, SnapshotStamp};
+use rv_store::metadata_cache::{RowsDue, SnapshotCheck};
+
+/// A check made at `checked_at` that took no row from the cache.
+fn check(checked_at: i64) -> SnapshotCheck {
+    SnapshotCheck {
+        checked_at,
+        rows: RowsDue::default(),
+    }
+}
 
 fn empty_platform(os: &str, arch: &str) -> LockPlatform {
     LockPlatform::single_module(
@@ -74,9 +83,8 @@ fn a_shared_url_uses_the_first_snapshot_policy_of_each_id() {
                     ResolvedPaths::for_testing().unwrap(),
                     repos,
                 );
-                let file = std::fs::File::create(&config.lock_path).unwrap();
                 let written = SystemTime::now() - Duration::from_secs(20 * 60);
-                file.set_modified(written).unwrap();
+                let checked = chrono::DateTime::<chrono::Local>::from(written).timestamp();
                 let fresh = |policy| rv_repo::fresh_secs(policy, &written.into());
                 let mut lock = Lockfile::new();
                 let mut platform = empty_platform("linux", "x86_64");
@@ -100,7 +108,7 @@ fn a_shared_url_uses_the_first_snapshot_policy_of_each_id() {
                     fresh(second_policy)
                 };
                 assert_eq!(
-                    lock_requires_snapshot_refresh(&lock, &config, &[]),
+                    lock_requires_snapshot_refresh(&lock, &config, &[], |_| Some(check(checked))),
                     ttl <= 20 * 60,
                     "snapshots={snapshots:?}, first={first_policy:?}, second={second_policy:?}, reverse={reverse}, url={first_url}, ids={first_id}/{second_id}"
                 );
@@ -109,10 +117,11 @@ fn a_shared_url_uses_the_first_snapshot_policy_of_each_id() {
     }
 }
 
-/// As Maven's update check, a `daily` lock written before today's local
-/// midnight is due, however recently it was written.
+/// As Maven's update check, a `daily` check made before today's local
+/// midnight is due, however recent it was. A platform never checked, or
+/// checked in the future, is due; one checked now is not.
 #[test]
-fn a_daily_snapshot_lock_from_before_midnight_is_due() {
+fn a_daily_snapshot_check_from_before_midnight_is_due() {
     use rv_config::{Config, RepoConfig, ResolvedPaths, UpdatePolicy};
 
     let temp = tempfile::tempdir().unwrap();
@@ -130,14 +139,35 @@ fn a_daily_snapshot_lock_from_before_midnight_is_due() {
         .and_then(|midnight| midnight.and_local_timezone(chrono::Local).earliest())
         .unwrap();
     let written = midnight - chrono::Duration::minutes(1);
-    let file = std::fs::File::create(&config.lock_path).unwrap();
-    file.set_modified(written.into()).unwrap();
     let mut lock = Lockfile::new();
     let mut platform = empty_platform("linux", "x86_64");
     push_package(&mut platform, package("g", "a", "1-SNAPSHOT"));
     lock.platforms.push(platform);
     lock.platforms[0].artifacts[0].repo_url = "https://snapshots.example/".to_string();
-    assert!(lock_requires_snapshot_refresh(&lock, &config, &[]));
+    let now = chrono::Local::now().timestamp();
+    let due = |checked: Option<SnapshotCheck>| {
+        lock_requires_snapshot_refresh(&lock, &config, &[], |_| checked)
+    };
+    assert!(due(Some(check(written.timestamp()))));
+    assert!(due(None));
+    assert!(due(Some(check(now + 3600))));
+    assert!(!due(Some(check(now))));
+
+    // A check made now that took from the cache a row fetched before
+    // midnight, or one already expired, is due; one that expires later is
+    // not.
+    let took = |expire_at, daily_from| {
+        Some(SnapshotCheck {
+            checked_at: now,
+            rows: RowsDue {
+                expire_at,
+                daily_from,
+            },
+        })
+    };
+    assert!(due(took(None, Some(written.timestamp()))));
+    assert!(due(took(Some(now), None)));
+    assert!(!due(took(Some(now + 60), Some(now))));
 }
 
 #[test]
@@ -172,7 +202,6 @@ fn snapshot_policies_are_scoped_to_the_platform_and_module() {
         ResolvedPaths::for_testing().unwrap(),
         Vec::new(),
     );
-    std::fs::File::create(&config.lock_path).unwrap();
     let models: Vec<_> = ["linux", "windows"]
         .into_iter()
         .map(|os| discover_reactor_model(&config, &Platform::new(os, "x86_64").unwrap()).unwrap())
@@ -208,7 +237,9 @@ fn snapshot_policies_are_scoped_to_the_platform_and_module() {
             lock.platforms.push(platform);
         }
         assert_eq!(
-            lock_requires_snapshot_refresh(&lock, &config, &models),
+            lock_requires_snapshot_refresh(&lock, &config, &models, |_| {
+                Some(check(chrono::Local::now().timestamp()))
+            }),
             due,
             "snapshot in {snapshot_os}/{snapshot_module}"
         );
@@ -226,57 +257,6 @@ fn package(group: &str, artifact: &str, version: &str) -> LockArtifact {
         ArtifactCoord::new(group, artifact, version, "jar", None),
         "https://repo.example/",
     )
-}
-
-#[test]
-fn partial_sync_preserves_other_platforms() {
-    use std::collections::HashSet;
-
-    let mut previous = Lockfile::new();
-    let mut linux = empty_platform("linux", "x86_64");
-    push_package(&mut linux, package("com.example", "lib", "1.0"));
-    previous.platforms.push(linux);
-    let mut darwin = empty_platform("darwin", "aarch64");
-    push_package(&mut darwin, package("com.example", "lib", "1.0"));
-    previous.platforms.push(darwin);
-
-    let mut fresh = Lockfile::new();
-    let mut linux_new = empty_platform("linux", "x86_64");
-    push_package(&mut linux_new, package("com.example", "lib", "2.0"));
-    fresh.platforms.push(linux_new);
-
-    let resolved: HashSet<Platform> = fresh.platforms.iter().map(|p| p.platform.clone()).collect();
-    for prev_platform in &previous.platforms {
-        if !resolved.contains(&prev_platform.platform) {
-            fresh.platforms.push(prev_platform.clone());
-        }
-    }
-
-    assert_eq!(
-        fresh.platforms.len(),
-        2,
-        "merged lockfile must carry both platforms"
-    );
-    let linux_entry = fresh
-        .platforms
-        .iter()
-        .find(|p| p.platform.to_string() == "linux-x86_64")
-        .expect("linux entry present");
-    assert_eq!(
-        linux_entry.modules[0].packages[0].coordinate.version(),
-        "2.0",
-        "linux platform must carry the freshly resolved version"
-    );
-    let darwin_entry = fresh
-        .platforms
-        .iter()
-        .find(|p| p.platform.to_string() == "darwin-aarch64")
-        .expect("darwin entry preserved");
-    assert_eq!(
-        darwin_entry.modules[0].packages[0].coordinate.version(),
-        "1.0",
-        "un-resolved platform must keep its previous pin"
-    );
 }
 
 /// The on-disk lock is sorted with remapped edge indices, while a fresh
@@ -297,7 +277,7 @@ fn lock_resolution_matches_canonicalizes_package_order_and_edges() {
     push_package(&mut platform, package("com.example", "zeta", "1.0"));
     platform.modules[0]
         .edges
-        .push(LockEdge::new(0, 1, Some(rv_lock::Scope::Compile), false));
+        .push(LockEdge::new(0, 1, rv_lock::Scope::Compile, false));
     selected.platforms.push(platform);
     selected.config_hash = Some("abc123".to_string());
     selected.repo_ids.insert(
@@ -314,19 +294,23 @@ fn lock_resolution_matches_canonicalizes_package_order_and_edges() {
     push_package(&mut platform, refreshed);
     platform.modules[0]
         .edges
-        .push(LockEdge::new(1, 0, Some(rv_lock::Scope::Compile), false));
+        .push(LockEdge::new(1, 0, rv_lock::Scope::Compile, false));
     resolved.platforms.push(platform);
     resolved.config_hash = selected.config_hash.clone();
     resolved.repo_ids = selected.repo_ids.clone();
 
     assert!(
-        selected.resolution_drift(&resolved, |_, _| true).is_none(),
+        selected
+            .resolution_drift(&resolved, |_, _| true, |_, _, _| false)
+            .is_none(),
         "traversal order and remapped edge indices must not register as drift"
     );
 }
 
+/// The diff a frozen drift error lists names each changed, added and
+/// removed package.
 #[test]
-fn frozen_drift_error_includes_diff_entries() {
+fn formats_the_frozen_diff_entries() {
     use crate::commands::sync::diff::format_frozen_diff;
 
     let mut old = Lockfile::new();
@@ -389,7 +373,7 @@ fn frozen_local_excludes_unchanged_unrequested_repository_declarations() {
     lock.write_atomic(&config.lock_path).unwrap();
     let argv = ["sync", "--frozen", "--platforms", "linux-x86_64"];
     let args = Wrapper::parse_from(argv).args;
-    let checked = check_frozen_local(&config, &args, true).unwrap();
+    let checked = check_frozen_local(&config, &args, true, true).unwrap();
     assert!(
         checked
             .models
@@ -420,8 +404,83 @@ fn with_origins_of_copies_support_pom_urls() {
     );
     fresh.platforms.push(platform);
 
-    let copied = super::with_origins_of(&lock, &fresh);
+    let copied = super::with_origins_of(&lock, &fresh, false);
     let pin = &copied.platforms[0].support_poms["com.example:parent:1"];
     assert_eq!(pin.repo_url, "https://fresh.example/");
     assert_eq!(pin.sha256, sha('a'));
+}
+
+/// A file raeva.lock pins by SHA-1 alone is held to it: a resolution that
+/// put other bytes in the store is refused, and the pinned bytes pass.
+#[tokio::test]
+async fn a_sha1_pin_is_checked_against_the_resolved_bytes() {
+    use rv_maven_types::{BlobId, Digest, HashAlgorithm};
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = rv_store::Store::open(temp.path()).unwrap();
+    let lock_with = |checksum: Digest| {
+        let mut lock = Lockfile::new();
+        let mut platform = empty_platform("linux", "x86_64");
+        let mut artifact = package("g", "a", "1");
+        artifact.checksums = vec![checksum];
+        push_package(&mut platform, artifact);
+        lock.platforms.push(platform);
+        lock
+    };
+    let served = store.put_bytes(b"served").await.unwrap();
+    let fresh = lock_with(Digest::Sha256(served.clone()));
+    let sha1_of = |bytes: &[u8]| Digest::of_reader(HashAlgorithm::Sha1, bytes).unwrap();
+
+    let reviewed = lock_with(sha1_of(b"reviewed"));
+    let err = super::download::check_repinned(&reviewed, &fresh, &store)
+        .await
+        .unwrap_err()
+        .to_string();
+    let expected = format!(
+        "g/a/1/a-1.jar: expected sha1 {}, got {}",
+        sha1_of(b"reviewed").hex(),
+        sha1_of(b"served").hex()
+    );
+    assert!(err.contains(&expected), "{err}");
+
+    let same = lock_with(sha1_of(b"served"));
+    super::download::check_repinned(&same, &fresh, &store)
+        .await
+        .unwrap();
+    let gone = lock_with(Digest::Sha256(BlobId::from_bytes(b"gone")));
+    let missing = super::download::check_repinned(&same, &gone, &store).await;
+    assert!(
+        missing
+            .unwrap_err()
+            .to_string()
+            .contains("not in the store"),
+        "an unstored file cannot pass"
+    );
+}
+
+#[test]
+fn only_a_missing_listed_version_lets_a_failed_replay_report_drift() {
+    use crate::error::CliError;
+    use rv_resolver::ResolveError;
+    let not_listed = || ResolveError::VersionNotFound {
+        coord: "x:lib".into(),
+        requirement: "[1.0,2.0)".into(),
+    };
+    let declared = || ResolveError::Declared {
+        module: String::new(),
+        via: Vec::new(),
+        error: Box::new(not_listed()),
+    };
+    let plugin = ResolveError::Plugin {
+        plugin: "build plugin p:p:1".into(),
+        searched: Vec::new(),
+        error: Box::new(declared()),
+    };
+    for err in [not_listed(), declared(), plugin] {
+        assert!(super::resolve::no_locked_version(&CliError::Resolve(err)));
+    }
+    let other = ResolveError::InternalError("cancelled".into());
+    assert!(!super::resolve::no_locked_version(&CliError::Resolve(
+        other
+    )));
 }

@@ -23,6 +23,17 @@ use clap_complete::CompleteEnv;
 const STACK_SIZE: usize = 8 << 20;
 
 fn main() -> ExitCode {
+    // The shell that sourced the mavenrc files runs raeva to read back
+    // what they left.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == rv_maven_model::mavenrc::DUMP_ARG)
+    {
+        return match rv_maven_model::mavenrc::write_dump() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let cli = std::thread::Builder::new()
         .name("main".to_string())
         .stack_size(STACK_SIZE)
@@ -41,7 +52,17 @@ fn main() -> ExitCode {
 /// Owns the tokio runtime, signal handling, and final exit-envelope
 /// rendering.
 fn run() -> ExitCode {
-    CompleteEnv::with_factory(dispatch::command).complete();
+    // A shell asks for completions as `raeva -- <words>`; any other
+    // argument is a command to run, also with `COMPLETE` set.
+    if std::env::args_os().nth(1).is_none_or(|arg| arg == "--") {
+        CompleteEnv::with_factory(dispatch::command).complete();
+    }
+
+    // Before anything can fail and print one of them.
+    let args: Vec<String> = (std::env::args_os().skip(1))
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    rv_config::prime_secrets(&args);
 
     if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
         // A startup failure has its own status, so CI tooling can tell

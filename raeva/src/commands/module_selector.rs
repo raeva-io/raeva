@@ -8,12 +8,17 @@ pub(crate) struct ModuleSelector {
     #[arg(
         long,
         value_name = "MODULE",
-        help = "Select a module by root-relative pom.xml path or unique groupId:artifactId"
+        help = "Select a module by root-relative POM path or unique groupId:artifactId"
     )]
     module: Option<String>,
 }
 
 impl ModuleSelector {
+    /// Whether no `--module` narrows the selection.
+    pub(crate) fn is_all(&self) -> bool {
+        self.module.is_none()
+    }
+
     pub(crate) fn select<'a>(&self, platform: &'a LockPlatform) -> Result<ModuleSelection<'a>> {
         let Some(raw) = self.module.as_deref() else {
             return Ok(ModuleSelection {

@@ -156,10 +156,13 @@ pub(crate) fn render_repo_error(
         return out;
     }
     let unpinned = matches!(err, RepoError::UnpinnedLockRow(_));
+    let unproven = matches!(err, RepoError::UnprovenMissingPom(_));
     let mut out = Rendered::plain(match err {
         // Its text says "invalid configuration", which may name a proxy.
         RepoError::Config(_) => format!("{err}\n"),
-        RepoError::UnpinnedLockRow(_) => format!("Lockfile error: {err}\n"),
+        RepoError::UnpinnedLockRow(_) | RepoError::UnprovenMissingPom(_) => {
+            format!("Lockfile error: {err}\n")
+        }
         _ => format!("Repository error: {err}\n"),
     });
     append_searched_section(&mut out.message, searched);
@@ -167,6 +170,14 @@ pub(crate) fn render_repo_error(
         out.hint(
             "Run 'raeva sync --update' to resolve again and write a lock that pins every artifact",
         );
+    }
+    if unproven {
+        out.hint(format!(
+            "Run '{}' online once, or restore a seed saved after one: its repositories' 404 \
+             proves the POM missing. If raeva.lock was edited, it does not match the project",
+            crate::output::command_line("sync --frozen")
+        ));
+        return out;
     }
     if class == ErrorClass::Offline {
         out.hint(
@@ -241,6 +252,11 @@ fn render_metadata_cache_error(err: &CacheError, env: &HintEnv) -> Rendered {
             io = err.to_string();
             io.as_str()
         }
+        // The open takes the bootstrap lock, whose timeout says what to do.
+        CacheError::Setup(inner) if matches!(**inner, rv_store::StoreError::IoError(_)) => {
+            io = inner.to_string();
+            io.as_str()
+        }
         _ => "database error",
     };
     Rendered::plain(format!(
@@ -263,8 +279,17 @@ pub(crate) fn render_pom_error(err: &PomError) -> Rendered {
             }
             out.hint("If the parent is internal, add its repository to raeva.toml");
             out.hint(
+                "raeva does not search a file: repository that a fetched POM, a dependency's or \
+                 a plugin's, declares, even with allow_transitive_repositories",
+            );
+            out.hint(
                 "A local <relativePath> parent is read only inside the project directory, or \
                  one level above a single module; run raeva from a directory that contains it",
+            );
+        }
+        PomError::Unlockable(_) => {
+            out.message = format!(
+                "{err}\n\n  Maven builds this POM, but raeva cannot lock it the same way.\n"
             );
         }
         // `raeva doctor` cannot diagnose a missing or relative `<systemPath>`.
@@ -300,6 +325,7 @@ pub(crate) fn render_local_pom_error(path: &str, err: &rv_maven_model::PomError)
             out.hint("Check for XML syntax errors (unclosed tags, unescaped characters)");
             out.hint("Verify the file is valid XML by opening it in a browser or XML validator");
         }
+        PomError::Unlockable(_) => return out,
         _ => {}
     }
     out.hint("Run 'mvn validate' to check POM validity");
@@ -442,13 +468,13 @@ fn append_dropped_repo_hint(out: &mut String, dropped: &[DroppedRepo]) {
             let _ = writeln!(
                 out,
                 "    - {} (declared by {})",
-                redact_url(&repo.url),
+                rv_config::redact_repository_url(&repo.url),
                 repo.declared_by
             );
         }
         out.push_str(
-            "\n  To allow one, mirror it, or declare its URL in [[repositories]] in raeva.toml,\n  \
-             config.toml or settings.xml.\n",
+            "\n  To allow one, mirror it, or declare its URL in [[repositories]] in raeva.toml\n  \
+             or config.toml.\n",
         );
     }
     if ignored.is_empty() {
@@ -463,7 +489,7 @@ fn append_dropped_repo_hint(out: &mut String, dropped: &[DroppedRepo]) {
         let _ = writeln!(
             out,
             "    - {} (declared by {})",
-            redact_url(&repo.url),
+            rv_config::redact_repository_url(&repo.url),
             repo.declared_by
         );
         if !urls.contains(&repo.url.as_str()) {
@@ -480,7 +506,7 @@ fn append_dropped_repo_hint(out: &mut String, dropped: &[DroppedRepo]) {
         let _ = write!(
             out,
             "\n      [[repositories]]\n      id = \"{}\"\n      url = \"{redacted}\"\n",
-            suggested_repo_id(url, &mut used_ids)
+            suggested_repo_id(&redacted, &mut used_ids)
         );
     }
     out.push_str(
@@ -489,6 +515,11 @@ fn append_dropped_repo_hint(out: &mut String, dropped: &[DroppedRepo]) {
          downloads to another host still needs a [[repositories]] entry.\n",
     );
 }
+
+/// What to do about a repository a remote repository filter kept out.
+pub(crate) const FILTERED_HINT: &str = "A repository marked as not allowed was not asked: if it \
+     serves this artifact, list its groupId or path prefix in that repository's file of the \
+     aether.remoteRepositoryFilter rules";
 
 pub(crate) fn render_dependency_not_found(
     coord: &str,
@@ -522,22 +553,29 @@ pub(crate) fn render_dependency_not_found(
         ));
     }
     out.hint("Check the group, artifact and version, and that this version is published");
-    let configured = searched.iter().any(|entry| {
+    let filtered = |entry: &RepoSearchStatus| entry.status == RepoStatus::Filtered;
+    if searched.iter().any(filtered) {
+        out.hint(FILTERED_HINT);
+    }
+    let configured = |entry: &RepoSearchStatus| {
         let host = url::Url::parse(&entry.repo_url).ok();
         let host = host
             .as_ref()
             .and_then(url::Url::host_str)
             .unwrap_or_default();
         !matches!(host, "repo1.maven.org" | "repo.maven.apache.org")
-    });
-    let mirrors: Option<std::collections::BTreeSet<String>> = (searched.iter())
+    };
+    let asked: Vec<_> = searched.iter().filter(|entry| !filtered(entry)).collect();
+    let mirrors: Option<std::collections::BTreeSet<String>> = (asked.iter())
         .map(|entry| entry.served_by.as_deref().map(redact_url))
         .collect();
-    if configured {
+    if asked.iter().any(|entry| configured(entry)) {
         out.hint(
             "Check the URLs of the repositories searched, including the path (such as an \
              organization name), and that their credentials can read the artifact",
         );
+    } else if searched.iter().any(configured) {
+        // Only the filter kept a configured repository from answering.
     } else if let Some(mirrors) = mirrors.filter(|mirrors| !mirrors.is_empty()) {
         let (noun, through) = match mirrors.len() {
             1 => ("mirror", "it too if the mirror's"),
@@ -610,7 +648,25 @@ fn render_auth_error(
         return out;
     }
 
-    let refused = refused_repositories(searched.unwrap_or_default());
+    let mut refused = refused_repositories(searched.unwrap_or_default());
+    // A download names no search, only the refused URL and what it carried:
+    // the credential's id, which need not be the repository's.
+    let downloaded;
+    let from_download = refused.is_empty();
+    if from_download
+        && let RepoError::Unauthorized {
+            status,
+            url,
+            sent: Some(sent),
+        } = err
+    {
+        downloaded = CredentialTarget {
+            id: sent.id.clone(),
+            url: url.clone(),
+            sent: Some((**sent).clone()),
+        };
+        refused.push((&downloaded, status.as_u16()));
+    }
     let all_sent = !refused.is_empty() && refused.iter().all(|(target, _)| target.sent.is_some());
     let message = &mut out.message;
     let _ = writeln!(
@@ -630,7 +686,15 @@ fn render_auth_error(
     if !refused.is_empty() {
         message.push_str("\n  Refused by:\n");
         for (target, code) in &refused {
+            let withheld = |id: &str| env.scope_withholds(id, &target.url);
             let reason = match &target.sent {
+                None if target.id.as_deref().is_some_and(withheld) => {
+                    "Maven 3.10's credential scope withheld the credentials".to_string()
+                }
+                None if (target.id.as_deref()).is_some_and(|id| env.password_dropped(id)) => {
+                    "no credentials were sent: the settings.xml password could not be decrypted"
+                        .to_string()
+                }
                 None => "no credentials were sent".to_string(),
                 Some(sent) => {
                     let outcome = if *code == 403 {
@@ -653,7 +717,10 @@ fn render_auth_error(
                 .id
                 .as_deref()
                 .map(|id| format!("'{}'", crate::output::inline_text(id)))
-                .unwrap_or_else(|| "repository without an id".to_string());
+                .unwrap_or_else(|| match from_download {
+                    true => "the repository".to_string(),
+                    false => "repository without an id".to_string(),
+                });
             let _ = writeln!(
                 message,
                 "    - {name} at {} (HTTP {code}: {reason})",
@@ -682,10 +749,44 @@ fn render_auth_error(
         .filter(|target| target.sent.is_none())
         .collect();
     let mut ids: Vec<&str> = Vec::new();
-    for id in unsent.iter().filter_map(|target| target.id.as_deref()) {
-        if !ids.contains(&id) {
-            ids.push(id);
+    let mut withheld: Vec<&str> = Vec::new();
+    let mut dropped: Vec<&str> = Vec::new();
+    for target in &unsent {
+        let Some(id) = target.id.as_deref() else {
+            continue;
+        };
+        let list = if env.scope_withholds(id, &target.url) {
+            &mut withheld
+        } else if env.password_dropped(id) {
+            &mut dropped
+        } else {
+            &mut ids
+        };
+        if !list.contains(&id) {
+            list.push(id);
         }
+    }
+    // The origin is not shown: sync's ID_CREDENTIAL_WITHHELD warning names
+    // it masked.
+    for id in withheld {
+        out.hint(format!(
+            "The username and password of the settings.xml server '{}' were withheld, as \
+             Maven 3.10 binds them to the origins of the mirrors and repositories \
+             settings.xml gives that id and of the server's <repositoryOrigins>; add this \
+             repository's origin there if they belong to it, or set \
+             maven.repository.credentialScope=id",
+            crate::output::inline_text(id)
+        ));
+    }
+    for id in dropped {
+        out.hint(format!(
+            "The encrypted password of the settings.xml server '{}' could not be decrypted \
+             (see CREDENTIAL_DROPPED). Give raeva the settings-security.xml with the master \
+             password that encrypted it, as ~/.m2/settings-security.xml in the user home, or \
+             as the file a command-line -Dsettings.security names, which replaces that one; \
+             or write the password as ${{env.NAME}}",
+            crate::output::inline_text(id)
+        ));
     }
     if refused.is_empty() {
         ids.push("repository-id");
@@ -734,7 +835,7 @@ fn render_auth_error(
              token = \"...\" only for HTTP Bearer authentication.\n",
         );
         out.hint(auth);
-    } else if !unsent.is_empty() {
+    } else if unsent.iter().any(|target| target.id.is_none()) {
         out.hint(format!(
             "Give the repository an id to configure its credentials in {} or the user \
              config.toml",
@@ -897,7 +998,7 @@ fn render_network_error(
         let host = url::Url::parse(url)
             .ok()
             .and_then(|url| url.host_str().map(str::to_string))
-            .unwrap_or_else(|| url.clone());
+            .unwrap_or_else(|| rv_config::redact_url(url));
         let _ = writeln!(
             out.message,
             "\n  {host} answered {status}, as a busy or rate-limited server does. When \
@@ -963,7 +1064,7 @@ fn render_invalid_metadata(err: &RepoError, searched: Option<&[RepoSearchStatus]
     out
 }
 
-fn append_searched_section(out: &mut String, searched: Option<&[RepoSearchStatus]>) {
+pub(crate) fn append_searched_section(out: &mut String, searched: Option<&[RepoSearchStatus]>) {
     let Some(searched) = searched else {
         return;
     };
@@ -982,7 +1083,7 @@ fn append_searched_section(out: &mut String, searched: Option<&[RepoSearchStatus
             .as_deref()
             .map(|mirror| format!(" through mirror {}", redact_url(mirror)))
             .unwrap_or_default();
-        let url = redact_url(&entry.repo_url);
+        let url = rv_config::redact_repository_url(&entry.repo_url);
         let _ = writeln!(out, "    - {url}{mirror} ({})", entry.status);
     }
 }
@@ -1158,6 +1259,66 @@ mod tests {
         );
     }
 
+    /// A URL with no http, https or file scheme, which settings.xml may
+    /// have expanded with a variable's value, is not shown.
+    #[test]
+    fn the_searched_section_hides_a_url_the_lock_does_not_record() {
+        let searched = vec![
+            RepoSearchStatus::new("ftp://host.example/zqVALUEzq/", RepoStatus::Http(404)),
+            RepoSearchStatus::new("zqVALUEzq/x", RepoStatus::Http(404)),
+            RepoSearchStatus::new("https://repo1.maven.org/maven2/", RepoStatus::Http(404)),
+        ];
+        let mut rendered = String::new();
+        super::append_searched_section(&mut rendered, Some(&searched));
+        assert!(!rendered.contains("zqVALUEzq"), "{rendered}");
+        assert!(
+            rendered.contains("https://repo1.maven.org/maven2/"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches(rv_config::UNRECORDED_URL).count(),
+            2,
+            "{rendered}"
+        );
+    }
+
+    /// A configured repository the filter kept out gets the filter's hint,
+    /// not advice to add a repository that is already configured or to check
+    /// a URL it was never asked at.
+    #[test]
+    fn a_filtered_repository_is_not_one_to_add() {
+        let searched = vec![
+            RepoSearchStatus::new("https://private.example.com/maven/", RepoStatus::Filtered),
+            RepoSearchStatus::new("https://repo1.maven.org/maven2/", RepoStatus::Http(404)),
+        ];
+        let hints = super::render_dependency_not_found("g:a:1", &searched, &[], None).hints;
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("aether.remoteRepositoryFilter")),
+            "{hints:?}"
+        );
+        assert!(
+            !(hints.iter()).any(|hint| hint.contains("add that repository")
+                || hint.contains("Check the URLs")),
+            "{hints:?}"
+        );
+    }
+
+    /// A filter that kept the request from the one repository, behind a
+    /// mirror, does not count as a request that went through the mirror.
+    #[test]
+    fn a_filtered_request_did_not_go_through_the_mirror() {
+        let mut central =
+            RepoSearchStatus::new("https://repo1.maven.org/maven2/", RepoStatus::Filtered);
+        central.served_by = Some("https://mirror.example/m2/".to_string());
+        let hints = super::render_dependency_not_found("g:a:1", &[central], &[], None).hints;
+        assert!(
+            !hints.iter().any(|hint| hint.contains("went through")),
+            "{hints:?}"
+        );
+    }
+
     fn refused(url: &str, code: u16, id: Option<&str>, served_by: &str) -> RepoSearchStatus {
         let mut status = RepoSearchStatus::new(url, RepoStatus::Http(code));
         status.refused_by = Some(rv_resolver::CredentialTarget {
@@ -1214,6 +1375,64 @@ mod tests {
             "must not suggest secrets in the project raeva.toml: {rendered}"
         );
         assert!(rendered.contains("'raeva doctor'"), "{rendered}");
+    }
+
+    /// A 401 from a repository Maven 3.10's credential scope kept a
+    /// settings.xml password from names the scope, not a missing <server>;
+    /// one with no credential for its id still gets that suggestion.
+    #[test]
+    fn unauthorized_names_the_credential_scope_that_withheld_a_password() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join(".m2")).expect(".m2");
+        std::fs::write(
+            root.path().join(".m2/settings.xml"),
+            "<settings><servers><server><id>corp</id><username>u</username>\
+             <password>private-password</password><repositoryOrigins><repositoryOrigin>\
+             https://elsewhere.example</repositoryOrigin></repositoryOrigins></server>\
+             </servers></settings>",
+        )
+        .expect("settings.xml");
+        std::fs::write(root.path().join("raeva.toml"), "[lock]\nmaven = \"3.10\"\n")
+            .expect("raeva.toml");
+        let config = temp_env::with_vars(
+            [
+                ("HOME", Some(root.path())),
+                ("USERPROFILE", Some(root.path())),
+                ("RAEVA_HOME", Some(root.path())),
+                (rv_config::MAVEN_USER_HOME_TEST_ENV, Some(root.path())),
+            ],
+            || rv_config::Config::load(root.path()).expect("config"),
+        );
+        let env = HintEnv::for_config(&config);
+        let corp = "https://corp.example/maven/";
+        let other = "https://other.example/maven/";
+        let err = auth_failure(
+            401,
+            vec![
+                refused(corp, 401, Some("corp"), corp),
+                refused(other, 401, Some("other"), other),
+            ],
+        );
+        let rendered = crate::error::diagnose::diagnose_resolve(&err, &env).human();
+        assert!(
+            rendered.contains(
+                "'corp' at https://corp.example/maven/ (HTTP 401: Maven 3.10's \
+                 credential scope withheld the credentials)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("settings.xml server 'corp' were withheld")
+                && rendered.contains("maven.repository.credentialScope=id"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("<id>corp</id>"), "{rendered}");
+        assert!(rendered.contains("<id>other</id>"), "{rendered}");
+        assert!(!rendered.contains("private-password"), "{rendered}");
+        assert!(!rendered.contains("elsewhere"), "{rendered}");
+
+        let rendered = render_resolve_error(&err);
+        assert!(rendered.contains("<id>corp</id>"), "{rendered}");
     }
 
     #[test]

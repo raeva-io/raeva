@@ -61,6 +61,9 @@ pub struct Response {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// How long the server waits before it sends the response, while it
+    /// goes on serving other connections.
+    pub delay: Option<std::time::Duration>,
 }
 
 impl Response {
@@ -69,7 +72,13 @@ impl Response {
             status,
             headers: Vec::new(),
             body: body.into(),
+            delay: None,
         }
+    }
+
+    pub fn delayed(mut self, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
+        self
     }
 
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
@@ -87,6 +96,11 @@ struct State {
 
 /// Runs on its own thread so synchronous tests and subprocesses can use it too.
 /// Dropping the fixture stops the listener and all open connections, then joins.
+///
+/// Connections stay open between requests unless the request or the response
+/// says `Connection: close`. A host's packet filter can keep state for every
+/// loopback connection until a while after it closes; once that table is
+/// full, new connections hang for seconds or time out.
 pub struct StubServer {
     addr: SocketAddr,
     state: Arc<State>,
@@ -235,8 +249,8 @@ async fn serve(
             .expect("request log")
             .push(request.clone());
         let response = handler(&request);
-        let keep_alive = header(&response.headers, "Connection")
-            .is_some_and(|value| value.eq_ignore_ascii_case("keep-alive"))
+        let keep_alive = !header(&response.headers, "Connection")
+            .is_some_and(|value| value.eq_ignore_ascii_case("close"))
             && !request
                 .header("Connection")
                 .is_some_and(|value| value.eq_ignore_ascii_case("close"));
@@ -247,10 +261,10 @@ async fn serve(
         if header(&response.headers, "Content-Length").is_none() {
             head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
         }
-        if header(&response.headers, "Connection").is_none() {
-            head.push_str("Connection: close\r\n");
-        }
         head.push_str("\r\n");
+        if let Some(delay) = response.delay {
+            tokio::time::sleep(delay).await;
+        }
         // Counted before writing: a client that has read the response must
         // already see it in `answered()`.
         state.answered.fetch_add(1, Ordering::SeqCst);

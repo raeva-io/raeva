@@ -39,12 +39,8 @@ impl LockfileGuard {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let mut file = rv_fs::open_lock_file(&path)
+            .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", path.display())))?;
         match file.try_lock() {
             Ok(()) => return Ok(Self { _file: file }),
             Err(fs::TryLockError::WouldBlock) => on_wait(),
@@ -97,6 +93,26 @@ mod tests {
     use std::time::Duration;
 
     use super::{LockfileGuard, guard_path};
+
+    /// A guard file that is a link, as a poisoned cache restore can plant,
+    /// is refused with its path, and creates nothing where it points.
+    #[cfg(unix)]
+    #[test]
+    fn a_guard_that_is_a_link_is_refused() {
+        let cache = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let path = guard_path(cache.path(), project.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let victim = cache.path().join("victim");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        let err = LockfileGuard::acquire(cache.path(), project.path(), Duration::ZERO, || {})
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(!victim.exists());
+    }
 
     #[test]
     fn the_guard_excludes_a_second_holder_and_lives_outside_the_project() {

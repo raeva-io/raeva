@@ -404,3 +404,95 @@ fn lock_verify_download_falls_back_to_a_repository_the_pom_declares() {
         "{parsed}"
     );
 }
+
+/// A home that `lock verify --download` filled answers `--offline sync
+/// --frozen`, whose resolution reads more than the pins: the version listing
+/// of a range, the POM of a version that lost to a nearer one, and the
+/// answer of a repository that lacks the files. Online, the check then asks
+/// for nothing either.
+#[test]
+fn lock_verify_download_prepares_an_offline_frozen_sync() {
+    let parent = "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+<artifactId>parent</artifactId><version>1</version><packaging>pom</packaging></project>";
+    let lib = |version: &str| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+<artifactId>parent</artifactId><version>1</version></parent><artifactId>lib</artifactId>\
+<version>{version}</version></project>"
+        )
+    };
+    let (lib1, lib09) = (lib("1"), lib("0.9"));
+    let other = common::pom(
+        "other",
+        "<dependencies><dependency><groupId>t</groupId><artifactId>lib</artifactId>\
+         <version>0.9</version></dependency></dependencies>",
+    );
+    let listing = "<metadata><groupId>t</groupId><artifactId>lib</artifactId><versioning>\
+<versions><version>0.9</version><version>1</version></versions></versioning></metadata>";
+    // Only `second` has the files; `first` answers 404 to everything.
+    let server = StubServer::start(move |request: &Request| {
+        let path = request.path.strip_prefix("/second").unwrap_or("/none");
+        common::with_sha256(
+            path,
+            [
+                ("/t/parent/1/parent-1.pom", parent.as_bytes()),
+                ("/t/lib/1/lib-1.pom", lib1.as_bytes()),
+                ("/t/lib/1/lib-1.jar", b"lib jar".as_slice()),
+                ("/t/lib/0.9/lib-0.9.pom", lib09.as_bytes()),
+                ("/t/lib/0.9/lib-0.9.jar", b"old lib jar".as_slice()),
+                ("/t/other/1/other-1.pom", other.as_bytes()),
+                ("/t/other/1/other-1.jar", b"other jar".as_slice()),
+                ("/t/lib/maven-metadata.xml", listing.as_bytes()),
+            ],
+        )
+    });
+    let (project, home) = temp_project();
+    let toml: String = ["first", "second", "central"]
+        .iter()
+        .map(|id| {
+            format!(
+                "[[repositories]]\nid = \"{id}\"\nurl = \"http://{}/{id}/\"\n\n",
+                server.addr()
+            )
+        })
+        .collect();
+    fs::write(project.path().join("raeva.toml"), toml).unwrap();
+    fs::write(
+        project.path().join("pom.xml"),
+        common::pom(
+            "app",
+            "<dependencies><dependency><groupId>t</groupId><artifactId>lib</artifactId>\
+             <version>[1,2)</version></dependency><dependency><groupId>t</groupId>\
+             <artifactId>other</artifactId><version>1</version></dependency></dependencies>",
+        ),
+    )
+    .unwrap();
+    assert_success(&run_raeva(project.path(), home.path(), &["sync"]), "sync");
+
+    let empty = tempfile::TempDir::new().unwrap();
+    assert_success(
+        &run_raeva(
+            project.path(),
+            empty.path(),
+            &["lock", "verify", "--download"],
+        ),
+        "lock verify --download",
+    );
+    let before = server.requests().len();
+    assert_success(
+        &run_raeva(
+            project.path(),
+            empty.path(),
+            &["--offline", "sync", "--frozen"],
+        ),
+        "offline frozen sync after lock verify --download",
+    );
+    assert_success(
+        &run_raeva(project.path(), empty.path(), &["sync", "--frozen"]),
+        "frozen sync after lock verify --download",
+    );
+    let after: Vec<_> = (server.requests().into_iter().skip(before))
+        .map(|request| request.path)
+        .collect();
+    assert!(after.is_empty(), "requests after verify: {after:?}");
+}

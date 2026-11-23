@@ -7,23 +7,17 @@ use std::process::Output;
 
 use tempfile::TempDir;
 
-use crate::common::{assert_success, raeva_command, run_raeva, sha1_hex, sha256_hex};
+use crate::common::{
+    assert_status, assert_success, raeva_command, run_raeva, sha1_hex, sha256_hex,
+    write_with_sha256,
+};
 
 pub(crate) fn publish_lib(repository: &Path) {
     let dir = repository.join("org/test/lib/1.0");
-    fs::create_dir_all(&dir).expect("create repository");
-    let files: [(&str, &[u8]); 2] = [
-        (
-            "lib-1.0.pom",
-            b"<project><modelVersion>4.0.0</modelVersion>\
-<groupId>org.test</groupId><artifactId>lib</artifactId><version>1.0</version></project>",
-        ),
-        ("lib-1.0.jar", b"lib jar bytes"),
-    ];
-    for (name, bytes) in files {
-        fs::write(dir.join(name), bytes).expect("write file");
-        fs::write(dir.join(format!("{name}.sha256")), sha256_hex(bytes)).expect("write sidecar");
-    }
+    let pom = b"<project><modelVersion>4.0.0</modelVersion>\
+<groupId>org.test</groupId><artifactId>lib</artifactId><version>1.0</version></project>";
+    write_with_sha256(&dir.join("lib-1.0.pom"), pom);
+    write_with_sha256(&dir.join("lib-1.0.jar"), b"lib jar bytes");
 }
 
 /// A project at `<base>/project` that depends on `org.test:lib:1.0` from its
@@ -37,6 +31,13 @@ impl Project {
     /// A project whose files are `files`, paths relative to its root, with
     /// `org.test:lib:1.0` published in `repository/`, synced offline.
     pub(crate) fn synced_with(files: &[(&str, &str)]) -> Self {
+        let project = Self::with(files);
+        assert_success(&project.raeva(&["sync", "--offline"]), "offline sync");
+        project
+    }
+
+    /// The same project, not synced.
+    pub(crate) fn with(files: &[(&str, &str)]) -> Self {
         let project = Self {
             base: TempDir::new().expect("base"),
             home: TempDir::new().expect("home"),
@@ -47,7 +48,6 @@ impl Project {
             fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
             fs::write(path, text).expect("write project file");
         }
-        assert_success(&project.raeva(&["sync", "--offline"]), "offline sync");
         project
     }
 
@@ -66,6 +66,11 @@ impl Project {
 </project>
 "#,
         )])
+    }
+
+    /// The `HOME` and `USERPROFILE` of its raeva runs.
+    pub(crate) fn home(&self) -> &Path {
+        self.home.path()
     }
 
     pub(crate) fn root(&self) -> std::path::PathBuf {
@@ -98,6 +103,49 @@ impl Project {
     pub(crate) fn raeva(&self, args: &[&str]) -> Output {
         self.raeva_with(&[], args)
     }
+
+    /// [`crate::common::publish`] into the project's `repository/`.
+    pub(crate) fn publish(&self, coordinate: &str, body: &str) {
+        crate::common::publish(&self.root().join("repository"), coordinate, body);
+    }
+}
+
+/// A range lists its versions in every repository, Maven Central too,
+/// which raeva adds after the project's. The test harness answers for
+/// Central, so a sync that is not offline still never leaves the machine.
+#[test]
+fn central_answers_from_the_test_harness() {
+    let project = Project::synced_with(&[
+        (
+            "pom.xml",
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.test</groupId><artifactId>root</artifactId><version>1</version>
+  <repositories>
+    <repository><id>project-local</id><url>file://${project.basedir}/repository/</url></repository>
+  </repositories>
+  <dependencies><dependency>
+    <groupId>org.test</groupId><artifactId>lib</artifactId><version>[1.0,2)</version>
+  </dependency></dependencies>
+</project>
+"#,
+        ),
+        (
+            "repository/org/test/lib/maven-metadata.xml",
+            "<metadata><groupId>org.test</groupId><artifactId>lib</artifactId>\
+             <versioning><versions><version>1.0</version></versions></versioning></metadata>",
+        ),
+    ]);
+    fs::remove_file(project.root().join("raeva.lock")).expect("remove lock");
+    assert_success(&project.raeva(&["sync"]), "sync");
+    let listing = "/maven2/org/test/lib/maven-metadata.xml";
+    let requested: Vec<_> = (crate::common::central_stand_in().requests().into_iter())
+        .map(|request| request.path)
+        .collect();
+    assert!(
+        requested.iter().any(|path| path == listing),
+        "{requested:?}"
+    );
 }
 
 #[test]
@@ -238,7 +286,10 @@ fn a_hidden_environment_variable_is_named() {
     );
     let message = hidden[0]["message"].as_str().expect("message");
     assert!(
-        message.contains("allow_env_substitution in config.toml"),
+        message.contains(
+            "allow_env_substitution in config.toml; this is part of raeva.lock's \
+             configuration, so set it on every machine that syncs, or on none"
+        ),
         "{message}"
     );
 }
@@ -251,7 +302,7 @@ fn a_failed_module_graph_hides_what_later_graphs_logged() {
         format!(
             "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
              <artifactId>{name}</artifactId><version>1</version><repositories><repository>\
-             <id>local</id><url>file://${{project.basedir}}/../repository/</url></repository>\
+             <id>files</id><url>file://${{project.basedir}}/../repository/</url></repository>\
              </repositories><dependencies><dependency><groupId>org.test</groupId>{dependency}\
              </dependency></dependencies></project>"
         )
@@ -278,13 +329,7 @@ fn a_failed_module_graph_hides_what_later_graphs_logged() {
     )
     .unwrap();
     let jar = root.join("repository/org/test/nopom/1.0/nopom-1.0.jar");
-    fs::create_dir_all(jar.parent().unwrap()).unwrap();
-    fs::write(&jar, b"jar without a POM").unwrap();
-    fs::write(
-        jar.with_extension("jar.sha256"),
-        sha256_hex(b"jar without a POM"),
-    )
-    .unwrap();
+    write_with_sha256(&jar, b"jar without a POM");
     for (name, dependency) in [
         (
             "a",
@@ -325,8 +370,7 @@ fn a_republished_release_file_is_locked_again_only_by_update() {
         let project = Project::synced();
         let root = project.root();
         let dir = root.join("repository/org/test/lib/1.0");
-        fs::write(dir.join(file), replaced).unwrap();
-        fs::write(dir.join(format!("{file}.sha256")), sha256_hex(replaced)).unwrap();
+        write_with_sha256(&dir.join(file), replaced);
         let pom = fs::read_to_string(root.join("pom.xml")).unwrap();
         fs::write(
             root.join("pom.xml"),
@@ -456,8 +500,7 @@ fn another_repository_is_held_to_the_pin() {
     let jar = root.join("first/org/test/lib/1.0/lib-1.0.jar");
     let original = fs::read(&jar).unwrap();
     let replaced = b"other jar bytes";
-    fs::write(&jar, replaced).unwrap();
-    fs::write(jar.with_extension("jar.sha256"), sha256_hex(replaced)).unwrap();
+    write_with_sha256(&jar, replaced);
     let pom = fs::read_to_string(root.join("pom.xml")).unwrap();
     let edited = pom.replace("<version>1</version>", "<version>1</version><name>e</name>");
     fs::write(root.join("pom.xml"), edited).unwrap();
@@ -466,8 +509,7 @@ fn another_repository_is_held_to_the_pin() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(7), "{stderr}");
 
-    fs::write(&jar, &original).unwrap();
-    fs::write(jar.with_extension("jar.sha256"), sha256_hex(&original)).unwrap();
+    write_with_sha256(&jar, &original);
     assert_success(&project.raeva(&["sync", "--offline", "--update"]), "update");
     let updated = fs::read_to_string(root.join("raeva.lock")).unwrap();
     assert!(updated.contains(&sha256_hex(&original)), "{updated}");
@@ -536,6 +578,58 @@ fn a_pinned_sources_jar_is_exported_only_as_pinned() {
     );
 }
 
+/// A sources jar `--with-sources` would refuse to replace stops the export,
+/// and its dry run, before the locked jar is written.
+#[test]
+fn a_refused_sources_jar_stops_the_export_before_any_write() {
+    let project = Project::synced_with(&[
+        (
+            "repository/org/test/lib/1.0/lib-1.0-sources.jar",
+            "lib sources",
+        ),
+        (
+            "repository/org/test/lib/1.0/lib-1.0-sources.jar.sha256",
+            &sha256_hex(b"lib sources"),
+        ),
+        (
+            "pom.xml",
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.test</groupId><artifactId>root</artifactId><version>1</version>
+  <repositories>
+    <repository><id>project-local</id><url>file://${project.basedir}/repository/</url></repository>
+  </repositories>
+  <dependencies><dependency>
+    <groupId>org.test</groupId><artifactId>lib</artifactId><version>1.0</version>
+  </dependency></dependencies>
+</project>
+"#,
+        ),
+    ]);
+    let m2 = project.m2();
+    let directory = m2.join("org/test/lib/1.0");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("lib-1.0-sources.jar"), "other sources").unwrap();
+    let m2_path = m2.to_str().unwrap();
+    // The dry run goes first: it judges a jar no export has fetched yet.
+    for dry_run in [&["--dry-run"][..], &[][..]] {
+        let args = [
+            &["export-m2", "--with-sources", "--m2-path", m2_path][..],
+            dry_run,
+        ]
+        .concat();
+        let output = project.raeva(&args);
+        crate::common::assert_status(&output, 1, "refused sources jar");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("lib-1.0-sources.jar"), "{stderr}");
+        let names: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["lib-1.0-sources.jar"], "{dry_run:?}");
+    }
+}
+
 /// A row that pins only a SHA-1 digest binds the file as a SHA-256 pin does.
 #[test]
 fn a_sha1_pin_refuses_other_bytes() {
@@ -557,8 +651,7 @@ fn a_sha1_pin_refuses_other_bytes() {
     .unwrap();
     let lock = fs::read(root.join("raeva.lock")).unwrap();
     let replaced = b"other jar bytes";
-    fs::write(&path, replaced).unwrap();
-    fs::write(path.with_extension("jar.sha256"), sha256_hex(replaced)).unwrap();
+    write_with_sha256(&path, replaced);
     let pom = fs::read_to_string(root.join("pom.xml")).unwrap();
     let edited = pom.replace("<version>1</version>", "<version>1</version><name>e</name>");
     fs::write(root.join("pom.xml"), edited).unwrap();
@@ -660,12 +753,7 @@ fn a_module_group_a_remote_parent_decides_keeps_its_consumers_trusted() {
         <properties><g>org.test</g></properties></project>";
     let dir = root.join("repository/org/test/remote/1");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("remote-1.pom"), remote).unwrap();
-    fs::write(
-        dir.join("remote-1.pom.sha256"),
-        sha256_hex(remote.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&dir.join("remote-1.pom"), remote.as_bytes());
     let repositories = format!(
         "<repositories><repository><id>project-local</id>\
          <url>file://{}/repository/</url></repository></repositories>",
@@ -732,12 +820,7 @@ fn a_module_version_a_remote_parent_decides_keeps_the_lock_trusted() {
         <properties><p.version>2</p.version></properties></project>";
     let dir = root.join("repository/org/test/remote/1");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("remote-1.pom"), remote).unwrap();
-    fs::write(
-        dir.join("remote-1.pom.sha256"),
-        sha256_hex(remote.as_bytes()),
-    )
-    .unwrap();
+    write_with_sha256(&dir.join("remote-1.pom"), remote.as_bytes());
     fs::write(
         root.join("pom.xml"),
         "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
@@ -785,4 +868,307 @@ fn a_module_version_a_remote_parent_decides_keeps_the_lock_trusted() {
         "{:?}",
         lock.platforms
     );
+}
+
+/// Maven orders the spellings a range admits that compare equal by its map
+/// of every version listed, in the range or not: with thirteen listed it
+/// takes `1.0-ga` over `1.0`, with two it would take `1.0`.
+#[test]
+fn equal_spellings_in_a_range_follow_every_version_listed() {
+    let listed: String = ["1.0", "1.0-ga"]
+        .into_iter()
+        .map(str::to_string)
+        .chain((2..=12).map(|major| major.to_string()))
+        .map(|version| format!("<version>{version}</version>"))
+        .collect();
+    let metadata = format!(
+        "<metadata><groupId>g</groupId><artifactId>a</artifactId>\
+         <versioning><versions>{listed}</versions></versioning></metadata>"
+    );
+    let project = Project::with(&[
+        (
+            "pom.xml",
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.test</groupId><artifactId>root</artifactId><version>1</version>
+  <repositories>
+    <repository><id>project-local</id><url>file://${project.basedir}/repository/</url></repository>
+  </repositories>
+  <dependencies><dependency>
+    <groupId>g</groupId><artifactId>a</artifactId><version>[1,2)</version>
+  </dependency></dependencies>
+</project>
+"#,
+        ),
+        ("repository/g/a/maven-metadata.xml", &metadata),
+    ]);
+    let on = |name: &str| {
+        format!(
+            "<dependencies><dependency><groupId>g</groupId><artifactId>{name}</artifactId>\
+             <version>1</version></dependency></dependencies>"
+        )
+    };
+    project.publish("g:a:1.0", &on("left"));
+    project.publish("g:a:1.0-ga", &on("right"));
+    project.publish("g:left:1", "");
+    project.publish("g:right:1", "");
+    assert_success(&project.raeva(&["sync", "--offline"]), "offline sync");
+    let lock = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
+    let packages = "packages = \"\"\"\ng:a:1.0-ga\\tjar\\tcompile\ng:right:1\\tjar\"\"\"";
+    assert!(lock.contains(packages), "{lock}");
+}
+
+/// A parent range takes the last of the versions Maven sorts, so of two
+/// spellings that compare equal it takes the one the map orders last,
+/// `1.0.0`, whichever the metadata lists first.
+#[test]
+fn a_parent_range_takes_the_spelling_maven_sorts_last() {
+    let project = Project::with(&[
+        (
+            "pom.xml",
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <parent><groupId>g</groupId><artifactId>p</artifactId><version>[1,2)</version><relativePath/></parent>
+  <groupId>org.test</groupId><artifactId>root</artifactId><version>1</version>
+  <repositories>
+    <repository><id>project-local</id><url>file://${project.basedir}/repository/</url></repository>
+  </repositories>
+  <dependencies><dependency><groupId>g</groupId><artifactId>lib</artifactId></dependency></dependencies>
+</project>
+"#,
+        ),
+        (
+            "repository/g/p/maven-metadata.xml",
+            "<metadata><groupId>g</groupId><artifactId>p</artifactId><versioning><versions>\
+             <version>1.0</version><version>1.0.0</version></versions></versioning></metadata>",
+        ),
+    ]);
+    // The repository that serves the parent names its full path.
+    let pom = project.root().join("pom.xml");
+    let repository = format!("file://{}/repository/", project.root().display());
+    let text = fs::read_to_string(&pom).unwrap();
+    fs::write(
+        &pom,
+        text.replace("file://${project.basedir}/repository/", &repository),
+    )
+    .unwrap();
+    for (parent, lib) in [("1.0", "1"), ("1.0.0", "2")] {
+        project.publish(
+            &format!("g:p:{parent}"),
+            &format!(
+                "<packaging>pom</packaging><dependencyManagement><dependencies><dependency>\
+                 <groupId>g</groupId><artifactId>lib</artifactId><version>{lib}</version>\
+                 </dependency></dependencies></dependencyManagement>"
+            ),
+        );
+        project.publish(&format!("g:lib:{lib}"), "");
+    }
+    assert_success(&project.raeva(&["sync", "--offline"]), "offline sync");
+    let lock = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
+    assert!(
+        lock.contains("packages = \"g:lib:2\\tjar\\tcompile\""),
+        "{lock}"
+    );
+    assert!(lock.contains("parents = \"g:p:1.0.0\""), "{lock}");
+}
+
+/// A reactor module's version counts among the versions a dependency's
+/// parent range lists, in the range or not: with `p:par:12` in the reactor
+/// thirteen are listed, and Maven 3.9.12 and 3.10.0 take `1.0` over
+/// `1.0-ga`, which twelve would order the other way.
+#[test]
+fn a_parent_range_counts_the_reactor_versions() {
+    let listed: String = ["1.0", "1.0-ga"]
+        .into_iter()
+        .map(str::to_string)
+        .chain((2..=11).map(|major| major.to_string()))
+        .map(|version| format!("<version>{version}</version>"))
+        .collect();
+    let metadata = format!(
+        "<metadata><groupId>p</groupId><artifactId>par</artifactId>\
+         <versioning><versions>{listed}</versions></versioning></metadata>"
+    );
+    let project = Project::with(&[
+        (
+            "pom.xml",
+            r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.test</groupId><artifactId>root</artifactId><version>1</version>
+  <packaging>pom</packaging>
+  <repositories>
+    <repository><id>project-local</id><url>file://${project.basedir}/repository/</url></repository>
+  </repositories>
+  <modules><module>par</module><module>app</module></modules>
+</project>
+"#,
+        ),
+        (
+            "par/pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>p</groupId>\
+             <artifactId>par</artifactId><version>12</version><packaging>pom</packaging></project>",
+        ),
+        (
+            "app/pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.test</groupId>\
+             <artifactId>root</artifactId><version>1</version></parent><artifactId>app</artifactId>\
+             <dependencies><dependency><groupId>g</groupId><artifactId>wrapper</artifactId>\
+             <version>1</version></dependency></dependencies></project>",
+        ),
+        ("repository/p/par/maven-metadata.xml", &metadata),
+    ]);
+    let pom = project.root().join("pom.xml");
+    let repository = format!("file://{}/repository/", project.root().display());
+    let text = fs::read_to_string(&pom).unwrap();
+    fs::write(
+        &pom,
+        text.replace("file://${project.basedir}/repository/", &repository),
+    )
+    .unwrap();
+    for (parent, leaf) in [("1.0", "1"), ("1.0-ga", "2")] {
+        project.publish(
+            &format!("p:par:{parent}"),
+            &format!(
+                "<packaging>pom</packaging><dependencyManagement><dependencies><dependency>\
+                 <groupId>p</groupId><artifactId>leaf</artifactId><version>{leaf}</version>\
+                 </dependency></dependencies></dependencyManagement>"
+            ),
+        );
+        project.publish(&format!("p:leaf:{leaf}"), "");
+    }
+    let wrapper = project.root().join("repository/g/wrapper/1/wrapper-1.pom");
+    project.publish(
+        "g:wrapper:1",
+        "<dependencies><dependency><groupId>p</groupId><artifactId>leaf</artifactId>\
+         </dependency></dependencies>",
+    );
+    let text = fs::read_to_string(&wrapper).unwrap().replacen(
+        "<groupId>g</groupId>",
+        "<parent><groupId>p</groupId><artifactId>par</artifactId><version>[1,2)</version>\
+         <relativePath/></parent><groupId>g</groupId>",
+        1,
+    );
+    crate::common::write_with_sha256(&wrapper, text.as_bytes());
+    assert_success(&project.raeva(&["sync", "--offline"]), "offline sync");
+    let lock = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
+    assert!(lock.contains("p:leaf:1\\t"), "{lock}");
+    assert!(!lock.contains("p:leaf:2"), "{lock}");
+}
+
+/// Maven 3.9.12 and 3.10.0 read the project's POMs, the reactor's and the
+/// file at a `<relativePath>`, with the strict model reader and fail the
+/// build with "Malformed POM" on `<profiles>` inside `<profiles>`, also
+/// when the file there declares another parent than the one asked for. A
+/// POM from a repository, as a dependency, a parent or an imported BOM, is
+/// read leniently, which skips the element, and the project file its
+/// parent's `<relativePath>` names is not read.
+#[test]
+fn a_project_pom_is_read_strictly_and_a_repository_pom_leniently() {
+    const NESTED: &str = "<profiles><profiles><profile><id>p</id></profile></profiles></profiles>";
+    let project = |parent: &str, body: &str, files: &[(&str, &str)]| {
+        let pom = format!(
+            "<project><modelVersion>4.0.0</modelVersion>{parent}<groupId>org.test</groupId>\
+             <artifactId>root</artifactId><version>1</version><repositories><repository>\
+             <id>project-local</id><url>file://${{project.basedir}}/repository/</url>\
+             </repository></repositories>{body}</project>"
+        );
+        Project::with(&[&[("pom.xml", pom.as_str())], files].concat())
+    };
+    let parent = |artifact: &str, path: &str| {
+        format!(
+            "<parent><groupId>org.test</groupId><artifactId>{artifact}</artifactId>\
+             <version>1</version><relativePath>{path}</relativePath></parent>"
+        )
+    };
+    let local_parent = format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\
+         {NESTED}</project>"
+    );
+    let module = format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>m</artifactId><version>1</version>{NESTED}</project>"
+    );
+    let reactor = "<packaging>pom</packaging><modules><module>m</module></modules>";
+    for (case, parent, body, files, file) in [
+        ("root", String::new(), NESTED, &[][..], "pom.xml"),
+        (
+            "module",
+            String::new(),
+            reactor,
+            &[("m/pom.xml", module.as_str())][..],
+            "m/pom.xml",
+        ),
+        (
+            "local parent",
+            parent("parent", "p/pom.xml"),
+            "",
+            &[("p/pom.xml", local_parent.as_str())][..],
+            "p/pom.xml",
+        ),
+        (
+            "another project at the parent's path",
+            parent("other", "p"),
+            "",
+            &[("p/pom.xml", local_parent.as_str())][..],
+            "p/pom.xml",
+        ),
+    ] {
+        let project = project(&parent, body, files);
+        project.publish("org.test:other:1", "<packaging>pom</packaging>");
+        let output = project.raeva(&["sync", "--offline"]);
+        assert_status(&output, 3, case);
+        let message = crate::common::stderr(&output);
+        assert!(
+            message.contains("Malformed POM")
+                && message.contains("Unrecognised tag: 'profiles' at line 1")
+                && message.replace('\\', "/").contains(file)
+                && !message.contains(r"\\?\"),
+            "{case}: {message}"
+        );
+    }
+
+    let project = project("", "", &[]);
+    for coordinate in ["org.test:dep:1", "org.test:bom:1", "org.test:base:1"] {
+        let packaging = if coordinate.ends_with("dep:1") {
+            ""
+        } else {
+            "<packaging>pom</packaging>"
+        };
+        project.publish(coordinate, &format!("{packaging}{NESTED}"));
+    }
+    // Maven never opens the project file a repository POM's parent names.
+    project.publish("org.test:gp:1", "<packaging>pom</packaging>");
+    project.publish(
+        "org.test:dep:1",
+        &format!(
+            "<parent><groupId>org.test</groupId><artifactId>gp</artifactId><version>1</version>\
+             <relativePath>sub/pom.xml</relativePath></parent>{NESTED}"
+        ),
+    );
+    let bad_gp = format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>gp</artifactId><version>1</version><packaging>pom</packaging>{NESTED}\
+         </project>"
+    );
+    fs::create_dir_all(project.root().join("sub")).unwrap();
+    fs::write(project.root().join("sub/pom.xml"), bad_gp).unwrap();
+    let pom = "<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.test</groupId>\
+         <artifactId>base</artifactId><version>1</version><relativePath/></parent>\
+         <artifactId>root</artifactId><repositories><repository><id>project-local</id>\
+         <url>file://${project.basedir}/repository/</url></repository></repositories>\
+         <dependencyManagement><dependencies><dependency><groupId>org.test</groupId>\
+         <artifactId>bom</artifactId><version>1</version><type>pom</type>\
+         <scope>import</scope></dependency></dependencies></dependencyManagement>\
+         <dependencies><dependency><groupId>org.test</groupId><artifactId>dep</artifactId>\
+         <version>1</version></dependency></dependencies></project>";
+    fs::write(project.root().join("pom.xml"), pom).unwrap();
+    let url = url::Url::from_directory_path(project.root().join("repository")).unwrap();
+    fs::write(
+        project.root().join("raeva.toml"),
+        format!("[[repositories]]\nid = \"project-local\"\nurl = \"{url}\"\n"),
+    )
+    .unwrap();
+    assert_success(&project.raeva(&["sync", "--offline"]), "repository POMs");
+    let lock = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
+    assert!(lock.contains("org.test:dep:1"), "{lock}");
 }

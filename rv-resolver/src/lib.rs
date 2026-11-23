@@ -27,6 +27,7 @@ mod parsed_pom_cache;
 mod resolver;
 mod solver;
 mod util;
+mod version_caps;
 mod workspace;
 
 pub use error::{
@@ -34,7 +35,8 @@ pub use error::{
 };
 pub use output::{ModuleResolution, ResolvedArtifact, ResolvedPackage};
 pub use resolver::{
-    Resolver, SupportPomProvenance, WorkspaceModuleResolution, WorkspaceResolution,
+    PluginRequest, Resolver, RootRepositories, SetReads, SupportPomProvenance,
+    WorkspaceModuleResolution, WorkspaceResolution, locked_artifact_types, plugin_goals,
 };
 pub use rv_config::maven_config::MavenConfigError;
 pub use workspace::{ModuleContext, Workspace, WorkspaceError, WorkspaceModule};

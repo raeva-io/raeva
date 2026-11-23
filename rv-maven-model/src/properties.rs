@@ -1,8 +1,9 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use indexmap::IndexMap;
+use rv_maven_types::MavenMode;
 
 use crate::pom::Build;
 use crate::{ActivationContext, HostInput, ModelEnvironment, PomError, PropertySource};
@@ -88,8 +89,8 @@ impl Eq for PropertyMap {}
 #[derive(Default)]
 struct Walk {
     path: Vec<String>,
-    resolved: HashMap<String, (String, bool)>,
-    /// The value of each `<build>` field expanded so far, by name.
+    resolved: HashMap<String, String>,
+    /// The value of each model field expanded so far, by name.
     build: HashMap<String, String>,
     /// The bytes `resolved` and `build` hold, against
     /// [`PropertyMap::MAX_RESOLVED_LENGTH`].
@@ -98,12 +99,16 @@ struct Walk {
     names: Option<std::collections::BTreeSet<String>>,
     public_names: Option<BTreeSet<String>>,
     external_depth: usize,
-    external_values: usize,
-    private_key: bool,
     private_names: bool,
     private_host: bool,
     /// The parent fields looked up that a system property would replace.
     below_system: BTreeSet<String>,
+    /// Whether the value expanded last starts at a directory of the
+    /// project, as [`PropertyMap::interpolate_from_project`] reports it.
+    project_start: bool,
+    /// The keys in `resolved`, and `field:` and a field in `build`, whose
+    /// value starts at a directory of the project.
+    project_starts: HashSet<String>,
 }
 
 #[derive(
@@ -153,7 +158,9 @@ impl ModelLookup {
                 artifact_id: p.artifact_id.clone(),
                 version: p.version.clone(),
             }),
-            build: pom.build.clone(),
+            // The plain text fields stay out of the record, which the lock
+            // keeps: an external value that reads one replays without it.
+            build: Box::new(pom.build.without_project_text()),
             prerequisites_maven: (pom.prerequisites.as_ref())
                 .and_then(|prerequisites| prerequisites.maven.clone()),
             base_dir,
@@ -210,6 +217,9 @@ pub(crate) struct ProjectInfo {
     pub packaging: String,
     pub parent: Option<ParentInfo>,
     pub basedir: Option<PathBuf>,
+    /// Maven 3.10's `${project.rootDirectory}`, for a project POM in the
+    /// 3.10 mode ([`crate::ActivationContext::root_directory`]).
+    pub root_directory: Option<PathBuf>,
     /// The effective `<build>` values, not interpolated.
     pub build: Build,
     /// The `os.*` system properties of the platform being resolved for. They
@@ -279,6 +289,10 @@ impl PropertyMap {
 
     fn is_below_system(&self, key: &str) -> bool {
         (self.inputs.as_ref()).is_some_and(|inputs| inputs.below_system.contains(key))
+    }
+
+    pub(crate) fn remove(&mut self, key: &str) {
+        self.props.shift_remove(key);
     }
 
     /// Whether the map has no entries.
@@ -424,6 +438,31 @@ impl PropertyMap {
         )
     }
 
+    /// [`Self::interpolate_str`], and each name it looked up, through
+    /// other properties too.
+    pub(crate) fn interpolate_str_reading(
+        &self,
+        input: &str,
+        project: &ProjectInfo,
+    ) -> Result<(String, BTreeSet<String>), PomError> {
+        if input.len() <= Self::MAX_INTERPOLATION_LENGTH && !input.contains("${") {
+            return Ok((input.to_owned(), BTreeSet::new()));
+        }
+        let lookup = || Lookup::new(Some(project), None, None, true);
+        let (value, mut names) = self.interpolate_names(input, lookup(), false);
+        // A coordinate is expanded before, and a lookup of it answers that
+        // value: what its text read counts too.
+        let mut traced = BTreeSet::new();
+        while let Some(text) = (names.iter())
+            .filter(|name| !traced.contains(*name))
+            .find_map(|name| Some((name.clone(), coordinate_text(name, project)?)))
+        {
+            traced.insert(text.0);
+            names.extend(self.interpolate_names(&text.1, lookup(), false).1);
+        }
+        Ok((value?, names))
+    }
+
     pub(crate) fn interpolate_opt(
         &self,
         input: Option<&str>,
@@ -433,13 +472,37 @@ impl PropertyMap {
     }
 
     fn interpolate_str_with(&self, input: &str, lookup: Lookup<'_>) -> Result<String, PomError> {
+        self.interpolate_traced(input, lookup)
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::interpolate_str`], and whether the value starts at a
+    /// directory of the project: `${project.basedir}`, Maven 3.10's
+    /// `${project.rootDirectory}`, or a path Maven's path translator aligns
+    /// to the project directory, such as `${project.build.directory}` or a
+    /// property holding one, after any expressions that expand to nothing.
+    /// Maven's value for such a path is absolute on every OS, whatever OS
+    /// the host's is.
+    pub(crate) fn interpolate_from_project(
+        &self,
+        input: &str,
+        project: &ProjectInfo,
+    ) -> Result<(String, bool), PomError> {
+        self.interpolate_traced(input, Lookup::new(Some(project), None, None, true))
+    }
+
+    fn interpolate_traced(
+        &self,
+        input: &str,
+        lookup: Lookup<'_>,
+    ) -> Result<(String, bool), PomError> {
         if input.len() <= Self::MAX_INTERPOLATION_LENGTH && !input.contains("${") {
-            return Ok(input.to_owned());
+            return Ok((input.to_owned(), false));
         }
         let mut walk = Walk::default();
         let result = self.expand(input, lookup, &mut walk);
         self.record_private_reads(input, lookup, &walk);
-        result
+        Ok((result?, walk.project_start))
     }
 
     fn record_private_reads(&self, input: &str, lookup: Lookup<'_>, walk: &Walk) {
@@ -514,8 +577,6 @@ impl PropertyMap {
         walk: &mut Walk,
         depth: usize,
     ) -> Result<String, PomError> {
-        // Counted per call, not by `path`: nested keys such as `${${${a}}}`
-        // recurse without entering a property.
         if depth >= Self::MAX_INTERPOLATION_DEPTH {
             return Err(PomError::InvalidModel(format!(
                 "property interpolation depth limit exceeded (max: {})",
@@ -532,31 +593,26 @@ impl PropertyMap {
             }
         };
         let mut output = String::with_capacity(input.len() * 2);
+        // Whether the output starts at a project directory, decided by what
+        // first makes it non-empty.
+        let mut project_start = None;
         let mut rest = input;
         while let Some(start) = rest.find("${") {
             let after = &rest[start + 2..];
-            let Some(end) = find_matching_brace(after) else {
+            // Plexus closes an expression at the first `}`, so the key of
+            // `${a.${b}}` is `a.${b`, looked up as it is.
+            let Some(end) = after.find('}') else {
                 break;
             };
             output.push_str(&rest[..start]);
-            let before = walk.external_values;
-            let written_key = &after[..end];
-            let expanded_key;
-            // A borrowed key still counts toward the interpolation limits.
-            let key = if depth + 1 < Self::MAX_INTERPOLATION_DEPTH
-                && written_key.len() <= Self::MAX_INTERPOLATION_LENGTH
-                && !written_key.contains("${")
-            {
-                written_key
-            } else {
-                expanded_key = self.interpolate_str_inner(written_key, lookup, walk, depth + 1)?;
-                &expanded_key
-            };
-            let previous_private = walk.private_key;
-            walk.private_key = walk.external_depth > 0 || walk.external_values != before;
-            walk.private_names |= walk.private_key;
-            let detached = walk
-                .private_key
+            if !output.is_empty() {
+                project_start.get_or_insert(false);
+            }
+            let written = &after[..end];
+            let key = rv_maven_types::expression_key(written);
+            let private_key = walk.external_depth > 0;
+            walk.private_names |= private_key;
+            let detached = private_key
                 .then(|| lookup.environment().map(ModelEnvironment::detached))
                 .flatten();
             let private_lookup = Lookup {
@@ -567,12 +623,17 @@ impl PropertyMap {
             if let Some(detached) = detached {
                 walk.private_host |= detached.take_reads().iter().any(HostInput::is_host_read);
             }
-            walk.private_key = previous_private;
             match value? {
-                Some(value) => output.push_str(&value),
+                Some(value) => {
+                    if !value.is_empty() {
+                        project_start.get_or_insert(walk.project_start);
+                    }
+                    output.push_str(&value);
+                }
                 None => {
+                    project_start.get_or_insert(false);
                     output.push_str("${");
-                    output.push_str(key);
+                    output.push_str(written);
                     output.push('}');
                 }
             }
@@ -583,6 +644,7 @@ impl PropertyMap {
         }
         output.push_str(rest);
         too_large(&output)?;
+        walk.project_start = project_start.unwrap_or(false);
         Ok(output)
     }
 
@@ -593,23 +655,38 @@ impl PropertyMap {
         walk: &mut Walk,
         depth: usize,
     ) -> Result<Option<String>, PomError> {
-        if let Some(field) = key
-            .strip_prefix("project.build.")
-            .or_else(|| key.strip_prefix("pom.build."))
-            && let Some(value) = self.resolve_build(field, lookup, walk, depth)?
+        // `${}` names no property and stays as written.
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let original_key = key;
+        let unprefixed = (key.strip_prefix("project."))
+            .or_else(|| key.strip_prefix("pom."))
+            .unwrap_or(key);
+        if unprefixed != key
+            && let Some(value) = self.resolve_build(unprefixed, lookup, walk, depth)?
         {
-            walk.external_values += 1;
             return Ok(Some(value));
         }
         if let Some(value) = resolve_builtin(key, lookup.project) {
-            walk.external_values += 1;
+            // For [`Self::interpolate_str_reading`], which reads its text.
+            if let Some(names) = walk.names.as_mut()
+                && (lookup.project).is_some_and(|project| coordinate_text(key, project).is_some())
+            {
+                names.insert(key.to_string());
+            }
+            let field = key.strip_prefix("pom.").unwrap_or(key);
+            let field = field.strip_prefix("project.").unwrap_or(field);
+            walk.project_start = matches!(field, "basedir" | "rootDirectory");
             return Ok(Some(value));
         }
         if let Some(value) = self.resolve_prerequisite(key, lookup, walk, depth)? {
-            walk.external_values += 1;
             return Ok(Some(value));
         }
-        let unprefixed_build = key.strip_prefix("build.");
+        if lookup.model && unprefixed != key && crate::pom::is_unread_model_field(unprefixed) {
+            walk.project_start = false;
+            return Ok(None);
+        }
         // Maven's bean path `project.properties.X` (and `pom.`) reads the
         // `<X>` property, once, through the same cycle detector as a direct
         // lookup.
@@ -627,11 +704,15 @@ impl PropertyMap {
             && (self.inputs.as_ref()).is_some_and(|inputs| inputs.source == PropertySource::System)
             && !below_system;
         if lookup.model
-            && !walk.private_key
+            && walk.external_depth == 0
             && !hidden
             && let Some(environment) = lookup.environment()
         {
-            environment.record_user_property(key);
+            // The model's own value ranks above the system properties.
+            match self.props.contains_key(key) && !below_system {
+                true => environment.record_user_override(key),
+                false => environment.record_user_property(key),
+            }
             if key.starts_with("os.detected.") && self.props.get(key).is_none() {
                 environment.record_user_property("os.name");
                 environment.record_user_property("os.arch");
@@ -642,33 +723,63 @@ impl PropertyMap {
         {
             names.insert(key.to_string());
         }
-        if !walk.private_key
+        if walk.external_depth == 0
             && let Some(names) = walk.public_names.as_mut()
         {
             names.insert(key.to_string());
         }
+        // Maven's path post-processor aligns the values of its translated
+        // expressions to the project directory whatever source gives them,
+        // a property included.
+        let translated = Build::model_field(unprefixed).is_some_and(|field| field.translated);
+        let post_process = |value: String, walk: &mut Walk| match lookup.project {
+            Some(ProjectInfo {
+                basedir: Some(basedir),
+                environment,
+                ..
+            }) if lookup.model && translated => {
+                walk.project_start = true;
+                align_to_base_directory(&value, basedir, environment)
+            }
+            _ => value,
+        };
         let Some(raw_value) = self.props.get(key) else {
+            walk.project_start = false;
             if let Some(value) = Self::os_detected_on_linux(key, lookup) {
-                walk.external_values += 1;
                 return Ok(Some(value));
             }
             if let Some(value) = resolve_system_property(key, lookup) {
-                walk.external_values += 1;
+                // Maven interpolates a system property's value too, as a
+                // `.mvn/jvm.config` value that reads `${MAVEN_PROJECTBASEDIR}`.
+                if !value.contains("${") {
+                    return Ok(Some(post_process(value, walk)));
+                }
+                let cycle = walk.path.iter().any(|name| name == key);
+                walk.path.push(key.to_string());
+                if cycle {
+                    return Err(PomError::PropertyCycle(walk.path.clone()));
+                }
+                let resolved = self.interpolate_str_inner(&value, lookup, walk, depth)?;
+                walk.path.pop();
+                return Ok(Some(post_process(resolved, walk)));
+            }
+            if let Some(value) = self.resolve_build(original_key, lookup, walk, depth)? {
                 return Ok(Some(value));
             }
-            if let Some(field) = unprefixed_build
-                && let Some(value) = self.resolve_build(field, lookup, walk, depth)?
+            if key == "prerequisites.maven"
+                && let Some(value) =
+                    self.resolve_prerequisite("project.prerequisites.maven", lookup, walk, depth)?
             {
-                walk.external_values += 1;
                 return Ok(Some(value));
             }
-            let value = resolve_unprefixed_model_field(key, lookup.project);
-            walk.external_values += usize::from(value.is_some());
-            return Ok(value);
+            walk.project_start = false;
+            return Ok(resolve_unprefixed_model_field(key, lookup.project)
+                .or_else(|| maven_repo_central(key, lookup)));
         };
-        if let Some((value, external)) = walk.resolved.get(key) {
-            walk.external_values += usize::from(*external);
-            return Ok(Some(value.clone()));
+        if let Some(value) = walk.resolved.get(key) {
+            let value = value.clone();
+            walk.project_start = walk.project_starts.contains(key);
+            return Ok(Some(post_process(value, walk)));
         }
         let cycle = walk.path.iter().any(|name| name == key);
         walk.path.push(key.to_string());
@@ -676,8 +787,6 @@ impl PropertyMap {
             return Err(PomError::PropertyCycle(walk.path.clone()));
         }
         let external = self.is_external(key);
-        let before = walk.external_values;
-        walk.external_values += usize::from(external);
         walk.external_depth += usize::from(external);
         let resolved = self.interpolate_str_inner(raw_value, lookup, walk, depth);
         walk.external_depth -= usize::from(external);
@@ -689,19 +798,19 @@ impl PropertyMap {
                 "property interpolation too large".to_string(),
             ));
         }
-        walk.resolved.insert(
-            key.to_string(),
-            (resolved.clone(), walk.external_values != before),
-        );
-        Ok(Some(resolved))
+        walk.resolved.insert(key.to_string(), resolved.clone());
+        if walk.project_start {
+            walk.project_starts.insert(key.to_string());
+        }
+        Ok(Some(post_process(resolved, walk)))
     }
 
-    /// The `<build>` field `field` of the project, or the super POM's
-    /// default for it, interpolated. A directory of a project with a base
-    /// directory is aligned to it, as Maven's interpolation post-processor
-    /// aligns `${project.build.directory}` and the other build
-    /// directories. `None` when the field is unknown or neither the
-    /// lineage nor the super POM sets it, so the lookup goes on.
+    /// The model field `field` of the project ([`Build::FIELDS`]), or the
+    /// super POM's default for it, interpolated. A directory of a project
+    /// with a base directory is aligned to it, as Maven's interpolation
+    /// post-processor aligns `${project.build.directory}` and the other
+    /// translated directories. `None` when the field is unknown or neither
+    /// the lineage nor the super POM sets it, so the lookup goes on.
     /// Maven's expression evaluator reads `prerequisites.maven` from the
     /// model, ahead of any property of that name.
     fn resolve_prerequisite(
@@ -741,18 +850,22 @@ impl PropertyMap {
         let Some(project) = lookup.project else {
             return Ok(None);
         };
-        let Some(raw) = project.build.field(field) else {
+        let Some(known) = Build::model_field(field) else {
             return Ok(None);
         };
-        let Some(raw) = raw.as_deref().or_else(|| super_pom_build(field)) else {
+        let Some(raw) = project.build.value(known).as_deref().or(known.super_pom) else {
             return Ok(None);
         };
+        let aligned = project.basedir.is_some() && known.translated;
+        let start_key = format!("field:{field}");
         if let Some(value) = walk.build.get(field) {
-            return Ok(Some(value.clone()));
+            let value = value.clone();
+            walk.project_start = aligned || walk.project_starts.contains(&start_key);
+            return Ok(Some(value));
         }
         // `${build.x}` and `${project.build.x}` are one field to Maven's
         // recursion check.
-        let name = format!("project.build.{field}");
+        let name = format!("project.{field}");
         let cycle = walk.path.contains(&name);
         walk.path.push(name);
         if cycle {
@@ -760,11 +873,12 @@ impl PropertyMap {
         }
         let mut resolved = self.interpolate_str_inner(raw, lookup, walk, depth)?;
         walk.path.pop();
-        if let Some(basedir) = &project.basedir
-            && field != "finalName"
-            && field != "defaultGoal"
-        {
-            resolved = align_to_base_directory(&resolved, basedir);
+        if let Some(basedir) = project.basedir.as_ref().filter(|_| aligned) {
+            resolved = align_to_base_directory(&resolved, basedir, &project.environment);
+            walk.project_start = true;
+        }
+        if walk.project_start {
+            walk.project_starts.insert(start_key);
         }
         walk.resolved_len += field.len() + resolved.len();
         if walk.resolved_len > Self::MAX_RESOLVED_LENGTH {
@@ -822,38 +936,22 @@ impl PropertyMap {
     }
 }
 
+/// The names the `${...}` expressions of `input` look up, in order.
 pub(crate) fn expression_names(input: &str) -> Vec<&str> {
     let mut names = Vec::new();
     let mut rest = input;
     while let Some(start) = rest.find("${") {
         let after = &rest[start + 2..];
-        let Some(end) = find_matching_brace(after) else {
+        let Some(end) = after.find('}') else {
             break;
         };
-        names.push(&after[..end]);
+        let name = rv_maven_types::expression_key(&after[..end]);
+        if !name.is_empty() {
+            names.push(name);
+        }
         rest = &after[end + 1..];
     }
     names
-}
-
-/// Find the position of the closing `}` that matches the opening `{` implied at position -1.
-/// Handles nested `${}` expressions by counting brace depth. Returns the index
-/// of the matching `}` in the input string, or None if not found.
-fn find_matching_brace(s: &str) -> Option<usize> {
-    let mut depth = 1;
-    for (i, c) in s.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn resolve_builtin(key: &str, project: Option<&ProjectInfo>) -> Option<String> {
@@ -866,6 +964,9 @@ fn resolve_builtin(key: &str, project: Option<&ProjectInfo>) -> Option<String> {
     let basedir = project.basedir.as_deref();
     match key {
         "project.basedir" | "basedir" => basedir.map(path_to_string),
+        "project.rootDirectory" | "rootDirectory" => {
+            project.root_directory.as_deref().map(path_to_string)
+        }
         "project.baseUri" => basedir.map(directory_uri),
         _ => resolve_unprefixed_model_field(key.strip_prefix("project.")?, Some(project)),
     }
@@ -881,6 +982,12 @@ fn resolve_system_property(key: &str, lookup: Lookup<'_>) -> Option<String> {
     // sysprops (`user.home`, `user.dir`, `java.home`) are never interpolated:
     // a transitive POM could otherwise copy the host's layout into raeva.lock,
     // and the value differs between machines.
+    let restricted = lookup
+        .environment()
+        .is_some_and(ModelEnvironment::is_restricted);
+    if restricted && !crate::activation::is_safe_external_property(key) {
+        return None;
+    }
     let platform = lookup
         .system_properties
         .or(lookup.project.map(|project| &project.system_properties));
@@ -889,7 +996,33 @@ fn resolve_system_property(key: &str, lookup: Lookup<'_>) -> Option<String> {
     }
     let environment = lookup.environment()?;
     if key == "java.version" {
-        return Some(environment.java_version().to_string());
+        // A `[lock] jdks` entry names a feature release, whose patch
+        // releases each report their own; text that keeps it refuses where
+        // it can change the lock.
+        return (environment.target_jdk().is_none())
+            .then(|| environment.java_version().to_string());
+    }
+    // `mvn`'s project directory, the system property it passes and the
+    // variable it exports, for a model of the project only: a fetched one
+    // does not read the host's layout, as it does not read `user.dir`.
+    let launcher = key == "maven.multiModuleProjectDirectory"
+        || key == "env.MAVEN_PROJECTBASEDIR"
+        || (lookup.model && key == "MAVEN_PROJECTBASEDIR");
+    if launcher
+        && lookup
+            .project
+            .is_some_and(|project| project.basedir.is_some())
+    {
+        return environment.launcher_root().map(str::to_string);
+    }
+    // One a JVM option may set in a way raeva does not read stays as
+    // written.
+    if key == "java.specification.version" && !environment.unread_system_property(key) {
+        let version = environment.java_version();
+        return Some(crate::activation::java_specification_version(version).to_string());
+    }
+    if restricted {
+        return None;
     }
 
     // Maven's model interpolation looks an unprefixed name up as
@@ -907,11 +1040,49 @@ fn resolve_system_property(key: &str, lookup: Lookup<'_>) -> Option<String> {
     // gate, any transitive POM author can exfiltrate host env vars (like
     // AWS_SECRET_ACCESS_KEY or GITHUB_TOKEN) by interpolating them into
     // a value that lands in the lockfile, error messages, or cache keys.
+    // A variable `mvn` sets itself holds no host secret.
+    if environment.launcher_set(name).is_some() {
+        return environment.env_var(name).map(str::to_string);
+    }
     if !environment.allows_env(name) {
         environment.warn_hidden_env(name);
         return None;
     }
+    // The host's `JAVA_HOME` is not that of a `[lock] jdks` JDK other than
+    // its own, whatever the allowlist says.
+    if name == "JAVA_HOME"
+        && environment.target_jdk().is_some()
+        && environment.host_java_home().is_none()
+    {
+        return None;
+    }
     environment.env_var(name).map(str::to_string)
+}
+
+/// Maven 3.10's last value source: Maven Central's URL as
+/// `maven.repo.central`, which its super POM names Central by.
+fn maven_repo_central(key: &str, lookup: Lookup<'_>) -> Option<String> {
+    (key == "maven.repo.central"
+        && (lookup.environment()).is_some_and(|env| env.maven_mode() == MavenMode::Maven310))
+    .then(|| "https://repo.maven.apache.org/maven2".to_string())
+}
+
+/// The POM text of the coordinate `${name}` reads, as written.
+fn coordinate_text(name: &str, project: &ProjectInfo) -> Option<String> {
+    let field = (name.strip_prefix("project.")).or_else(|| name.strip_prefix("pom."))?;
+    let model = project.model_lookup.as_deref()?;
+    let parent = model.parent.as_ref();
+    let text = match field {
+        "groupId" => &model.group_id,
+        "artifactId" => &model.artifact_id,
+        "version" => &model.version,
+        "packaging" => &model.packaging,
+        "parent.groupId" => &parent?.group_id,
+        "parent.artifactId" => &parent?.artifact_id,
+        "parent.version" => &parent?.version,
+        _ => return None,
+    };
+    text.contains("${").then(|| text.clone())
 }
 
 /// Maven's last value source reads the model itself without a prefix, after
@@ -934,41 +1105,21 @@ fn resolve_unprefixed_model_field(key: &str, project: Option<&ProjectInfo>) -> O
     }
 }
 
-/// The super POM's `<build>` value for `field`, which every lineage
-/// inherits where none of its POMs sets one. It has no `defaultGoal`.
-pub(crate) fn super_pom_build(field: &str) -> Option<&'static str> {
-    Some(match field {
-        "directory" => "${project.basedir}/target",
-        "finalName" => "${project.artifactId}-${project.version}",
-        "outputDirectory" => "${project.build.directory}/classes",
-        "testOutputDirectory" => "${project.build.directory}/test-classes",
-        "sourceDirectory" => "${project.basedir}/src/main/java",
-        "testSourceDirectory" => "${project.basedir}/src/test/java",
-        "scriptSourceDirectory" => "${project.basedir}/src/main/scripts",
-        _ => return None,
-    })
-}
-
 /// Maven's `DefaultPathTranslator.alignToBaseDirectory`: `path`, with
-/// either slash as the separator, as it is when absolute, under the drive
-/// of `basedir` when it starts at a root without one (Windows), and
-/// otherwise joined to `basedir` with `.` and `..` segments resolved.
-/// Like Java's `File`, the result has no repeated or trailing separator.
-fn align_to_base_directory(path: &str, basedir: &std::path::Path) -> String {
-    use std::path::{Component, MAIN_SEPARATOR, Path};
-    let path: String = path
-        .chars()
-        .map(|c| {
-            if c == '/' || c == '\\' {
-                MAIN_SEPARATOR
-            } else {
-                c
-            }
-        })
-        .collect();
+/// either slash as the separator, as [`java_absolute_path`] gives it when
+/// it starts at a root, and otherwise joined to `basedir` with `.` and `..`
+/// segments resolved. Like Java's `File`, the result has no repeated or
+/// trailing separator.
+fn align_to_base_directory(
+    path: &str,
+    basedir: &std::path::Path,
+    environment: &ModelEnvironment,
+) -> String {
+    use std::path::{Component, Path};
+    let path = with_host_separators(path);
     let path = Path::new(&path);
-    if path.is_absolute() || path.has_root() {
-        return java_file_path(&path_to_string(&basedir.join(path)));
+    if let Some(absolute) = java_absolute_path(path, basedir, environment) {
+        return java_file_path(&path_to_string(&absolute));
     }
     let mut aligned = PathBuf::new();
     for component in basedir.join(path).components() {
@@ -983,6 +1134,57 @@ fn align_to_base_directory(path: &str, basedir: &std::path::Path) -> String {
         }
     }
     path_to_string(&aligned)
+}
+
+/// `path` with either slash as the host's separator, as Maven's path
+/// translator reads it.
+pub(crate) fn with_host_separators(path: &str) -> String {
+    use std::path::MAIN_SEPARATOR;
+    (path.chars())
+        .map(|c| {
+            if c == '/' || c == '\\' {
+                MAIN_SEPARATOR
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `path` made absolute as `java.io.File.getAbsolutePath` makes it, when
+/// it starts at a root; `None` when it is relative. On Windows a path that
+/// starts at a root without a drive, such as `\marker`, is on the drive of
+/// Maven's `user.dir`, the directory raeva was started in, and not on the
+/// project's, or under that directory when it is a UNC path. Without a
+/// working directory, as in an environment made without a host snapshot,
+/// it is `basedir`'s drive. Elsewhere such a path is absolute already: the
+/// root of a Unix file system stands in for the drive, also when the
+/// platform raeva locks is Windows, as a `<file>` condition is tested on
+/// the machine raeva runs on.
+pub(crate) fn java_absolute_path(
+    path: &std::path::Path,
+    basedir: &std::path::Path,
+    environment: &ModelEnvironment,
+) -> Option<PathBuf> {
+    use std::path::{Component, MAIN_SEPARATOR, Path, Prefix};
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    if !path.has_root() {
+        return None;
+    }
+    let directory = environment.working_directory().unwrap_or(basedir);
+    Some(match directory.components().next() {
+        Some(Component::Prefix(prefix))
+            if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)) =>
+        {
+            let directory = path_to_string(directory);
+            let directory = directory.trim_end_matches(MAIN_SEPARATOR);
+            PathBuf::from(format!("{directory}{}", path_to_string(path)))
+        }
+        Some(Component::Prefix(prefix)) => Path::new(prefix.as_os_str()).join(path),
+        _ => directory.join(path),
+    })
 }
 
 /// `path` as Java's `File` keeps it: runs of separators collapsed, except
@@ -1008,8 +1210,12 @@ fn java_file_path(path: &str) -> String {
 /// project directory, such as `file:///home/me/app/` or
 /// `file:///C:/work/app/`. Bytes outside the characters Java leaves in a
 /// URI path are percent-encoded, and a directory ends with `/`.
-fn directory_uri(path: &std::path::Path) -> String {
-    let text = path.to_string_lossy().replace('\\', "/");
+pub fn directory_uri(path: &std::path::Path) -> String {
+    let mut text = path.to_string_lossy().into_owned();
+    // On unix a `\` is a character of a name, which `File.toURI` encodes.
+    if cfg!(windows) {
+        text = text.replace('\\', "/");
+    }
     let mut uri = String::from("file://");
     if !text.starts_with('/') {
         uri.push('/');
@@ -1145,6 +1351,31 @@ mod tests {
                 && !properties.contains_key("alias") && !properties.contains_key("private-key"))));
     }
 
+    /// Plexus drops one leading `.` from every expression before looking it
+    /// up, in model, activation and command-line interpolation alike; one
+    /// that names nothing stays as written.
+    #[test]
+    fn a_leading_dot_names_the_same_property() {
+        let mut props = PropertyMap::new();
+        props.insert("v", "1");
+        props.insert(".w", "2");
+        let environment = ModelEnvironment::default();
+        let (value, names) = props.interpolate_str_exact_names("${.v}-${..w}", &environment);
+        assert_eq!(value.unwrap(), "1-2");
+        assert_eq!(names, ["v".to_string(), ".w".to_string()].into());
+        for kept in ["${.}", "${.none}", "${..v}"] {
+            assert_eq!(props.interpolate_str_no_project(kept).unwrap(), kept);
+        }
+        let project = project_in(ModelEnvironment::default());
+        assert_eq!(
+            props
+                .interpolate_str("${.project.groupId}", &project)
+                .unwrap(),
+            "g"
+        );
+        assert_eq!(expression_names("${.v}${..w}${.}"), ["v", ".w"]);
+    }
+
     /// Maven's bean path reads the properties map once; a repeated prefix
     /// names a property of that name, not a chain of lookups.
     #[test]
@@ -1171,6 +1402,7 @@ mod tests {
             packaging: "jar".to_string(),
             parent: None,
             basedir: None,
+            root_directory: None,
             build: Build::default(),
             system_properties: Default::default(),
             environment,
@@ -1199,9 +1431,10 @@ mod tests {
     }
 
     /// Maven reads properties, then the project's fields, then unprefixed
-    /// model fields such as `${groupId}` or `${parent.version}` last;
-    /// expressions nest, and one that resolves to nothing, `${settings.*}`
-    /// included, stays as written.
+    /// model fields such as `${groupId}` or `${parent.version}` last; an
+    /// expression ends at the first `}`, and one that resolves to nothing,
+    /// `${settings.*}` and the outer name of `${a.${b}}` included, stays as
+    /// written.
     #[test]
     fn interpolates_like_maven() {
         let project = ProjectInfo {
@@ -1268,13 +1501,8 @@ mod tests {
             ),
             (
                 &[("env", "prod"), ("config.prod.url", "https://prod/")],
-                "${config.${env}.url}",
-                "https://prod/",
-            ),
-            (
-                &[("level", "one"), ("one", "two"), ("value.two", "success")],
-                "${value.${${level}}}",
-                "success",
+                "${config.${env}.url}|${a${env}}-${env}",
+                "${config.${env}.url}|${a${env}}-prod",
             ),
             (&[("a", "x")], "ab${c", "ab${c"),
             (&[("a", "x")], "${a}-${a", "x-${a"),
@@ -1282,6 +1510,11 @@ mod tests {
             let value = map(properties).interpolate_str(input, &project).unwrap();
             assert_eq!(value, expected, "{input} with {properties:?}");
         }
+        // `${}` stays, and consults no property, which a lock could not name.
+        let environment = ModelEnvironment::default();
+        let value = map(&[]).interpolate_str("a${}b", &project_in(environment.clone()));
+        assert_eq!(value.unwrap(), "a${}b");
+        assert!(environment.take_reads().is_empty());
         let mut props = map(&[("version", "1.0.0")]);
         assert_eq!(
             props.interpolate_str_no_project("${version}").unwrap(),
@@ -1345,14 +1578,149 @@ mod tests {
                 "${project.baseUri}",
                 "file:///tmp/k(1)~;@$,=+&!*'/",
             ),
-            (
-                "C:\\work\\app",
-                "${project.baseUri}",
-                "file:///C:/work/app/",
-            ),
+            // A `\\` is a separator on Windows and a name's character on
+            // unix.
+            match cfg!(windows) {
+                true => (
+                    "C:\\work\\app",
+                    "${project.baseUri}",
+                    "file:///C:/work/app/",
+                ),
+                false => ("/tmp/a\\b", "${project.baseUri}", "file:///tmp/a%5Cb/"),
+            },
         ] {
             let value = props.interpolate_str(expression, &in_dir(basedir)).unwrap();
             assert_eq!(value, expected, "{basedir}");
+        }
+    }
+
+    /// A path written to start at a directory of the project, through
+    /// properties too, is told from one that only expands to the same text,
+    /// and names resolve in Maven's order.
+    #[test]
+    fn a_path_starts_at_a_project_directory_only_as_written() {
+        let environment = ModelEnvironment::builder()
+            .env("EMPTY", Some(""))
+            .env("FULL", Some("x"))
+            .build();
+        let project = ProjectInfo {
+            basedir: Some(PathBuf::from("/w/m")),
+            build: Build {
+                final_name: Some("${project.basedir}/fn".to_string()),
+                ..Build::default()
+            },
+            ..project_in(environment)
+        };
+        let props = map(&[
+            ("lib", "${project.basedir}/lib"),
+            ("deep", "${lib}/deeper"),
+            ("written", "/w/m/lib"),
+            ("cycle", "${cycle}"),
+            ("empty", ""),
+            ("project.basedir", "/w/m"),
+            ("build.directory", "/w/m/target"),
+            ("reporting.outputDirectory", "/w/m/lib"),
+        ]);
+        for (input, starts) in [
+            ("${project.basedir}/x.jar", true),
+            ("${basedir}", true),
+            ("${pom.basedir}/x.jar", true),
+            ("${lib}/x.jar", true),
+            ("${deep}/x.jar", true),
+            ("${lib}${deep}", true),
+            ("${project.properties.lib}/x.jar", true),
+            ("${project.build.directory}/x.jar", true),
+            ("${pom.build.outputDirectory}", true),
+            ("${project.build.finalName}", true),
+            ("${build.directory}/x.jar", true),
+            ("${reporting.outputDirectory}/x.jar", true),
+            // The model's, the super POM's `${project.build.directory}/site`.
+            ("${project.reporting.outputDirectory}/x.jar", true),
+            ("${pom.reporting.outputDirectory}", true),
+            ("${empty}${project.basedir}/x.jar", true),
+            ("${env.EMPTY}${project.basedir}/x.jar", true),
+            ("${EMPTY}${project.basedir}/x.jar", true),
+            ("${env.FULL}${project.basedir}/x.jar", false),
+            ("${empty}${empty}", false),
+            ("${empty}x${project.basedir}", false),
+            ("${build.sourceDirectory}", true),
+            ("${written}/x.jar", false),
+            ("${written}${lib}", false),
+            ("/w/m/lib/x.jar", false),
+            (" ${lib}/x.jar", false),
+            ("x${project.basedir}", false),
+            ("${project.baseUri}", false),
+            ("${project.groupId}", false),
+            ("${missing}/x.jar", false),
+            ("${}", false),
+        ] {
+            let (_, from_project) = props.interpolate_from_project(input, &project).unwrap();
+            assert_eq!(from_project, starts, "{input}");
+        }
+        assert!(
+            props
+                .interpolate_from_project("${cycle}", &project)
+                .is_err()
+        );
+        let without_base = project_in(ModelEnvironment::default());
+        for input in ["${project.build.directory}", "${build.directory}"] {
+            let (_, from_project) = props
+                .interpolate_from_project(input, &without_base)
+                .unwrap();
+            assert!(!from_project, "{input}");
+        }
+    }
+
+    /// `java.io.File` puts a Windows build directory that starts at a root
+    /// without a drive on the drive Maven was started on, which need not be
+    /// the project's.
+    #[cfg(windows)]
+    #[test]
+    fn a_rooted_build_directory_is_on_the_working_drive() {
+        let working = std::env::current_dir().unwrap();
+        let drive = working.to_string_lossy()[..2].to_string();
+        let other = if drive.eq_ignore_ascii_case("Q:") {
+            "P:"
+        } else {
+            "Q:"
+        };
+        let project = ProjectInfo {
+            basedir: Some(PathBuf::from(format!(r"{other}\work\app"))),
+            build: Build {
+                directory: Some("/out".to_string()),
+                output_directory: Some(r"\out\classes".to_string()),
+                ..Build::default()
+            },
+            ..project_in(crate::HostSnapshot::for_testing(&[]).host_environment())
+        };
+        let props = PropertyMap::new();
+        for (expression, expected) in [
+            ("${project.build.directory}", format!(r"{drive}\out")),
+            (
+                "${project.build.outputDirectory}",
+                format!(r"{drive}\out\classes"),
+            ),
+        ] {
+            let value = props.interpolate_str(expression, &project).unwrap();
+            assert!(
+                value.eq_ignore_ascii_case(&expected),
+                "{expression}: {value}"
+            );
+        }
+    }
+
+    /// A Unix root stands in for a Windows drive, for a locked Windows
+    /// platform too: a `<file>` condition is tested on the host.
+    #[cfg(unix)]
+    #[test]
+    fn a_rooted_path_is_absolute_on_unix_for_every_platform() {
+        let environment = ModelEnvironment::builder()
+            .platform("windows", "x86_64")
+            .build();
+        for path in [r"\marker", "/marker"] {
+            let path = with_host_separators(path);
+            let absolute = java_absolute_path(path.as_ref(), "/w/m".as_ref(), &environment);
+            assert_eq!(absolute, Some(PathBuf::from("/marker")));
         }
     }
 
@@ -1376,7 +1744,18 @@ mod tests {
             build: build.clone(),
             ..project_in(ModelEnvironment::default())
         };
-        let props = map(&[("name", "n"), ("build.finalName", "prop")]);
+        let props = map(&[
+            ("name", "n"),
+            ("build.finalName", "prop"),
+            ("build.testSourceDirectory", "rel//p/"),
+            ("reporting.outputDirectory", "site/"),
+            ("project.reporting.outputDirectory", "lib"),
+            ("project.reporting.outputEncoding", "UTF-8"),
+            ("project.build.sourceEncoding", "UTF-16"),
+            ("project.name", "P"),
+            ("pom.build.plugins", "P"),
+            ("project.parent.relativePath", "P"),
+        ]);
         for (expression, expected) in [
             ("${project.build.directory}", "/w/out/n/x"),
             ("${project.build.finalName}", "a-fn"),
@@ -1389,6 +1768,26 @@ mod tests {
                 "${project.build.defaultGoal}",
             ),
             ("${build.resources}", "${build.resources}"),
+            // Maven aligns a build directory a property gives too, but not
+            // through `project.properties`.
+            ("${build.testSourceDirectory}", "/w/m/rel/p"),
+            ("${project.properties.build.testSourceDirectory}", "rel//p/"),
+            ("${reporting.outputDirectory}", "/w/m/site"),
+            // The model's value wins over a property of the prefixed name,
+            // here the super POM's below the build directory.
+            ("${project.reporting.outputDirectory}", "/w/out/n/x/site"),
+            // No model field has these names, so the properties give them.
+            ("${project.reporting.outputEncoding}", "UTF-8"),
+            ("${project.build.sourceEncoding}", "UTF-16"),
+            // An unset model field gives way to the property; Maven reads
+            // these from the model, which raeva does not.
+            ("${project.name}", "P"),
+            ("${pom.build.plugins}", "${pom.build.plugins}"),
+            (
+                "${project.parent.relativePath}",
+                "${project.parent.relativePath}",
+            ),
+            ("${name}", "n"),
         ] {
             let value = props.interpolate_str(expression, &reactor).unwrap();
             assert_eq!(value, expected, "{expression}");
@@ -1408,9 +1807,27 @@ mod tests {
                 "${project.build.sourceDirectory}",
                 "${project.basedir}/src/main/java",
             ),
+            ("${build.testSourceDirectory}", "rel//p/"),
+            ("${reporting.outputDirectory}", "site/"),
+            ("${pom.reporting.outputDirectory}", "pdir/site"),
         ] {
             let value = props.interpolate_str(expression, &dependency).unwrap();
             assert_eq!(value, expected, "{expression}");
+        }
+        let reporting = ProjectInfo {
+            basedir: Some(PathBuf::from("/w/m")),
+            build: Build {
+                reporting_output_directory: Some("${name}/./r/".to_string()),
+                ..Build::default()
+            },
+            ..project_in(ModelEnvironment::default())
+        };
+        for expression in [
+            "${project.reporting.outputDirectory}",
+            "${pom.reporting.outputDirectory}",
+        ] {
+            let value = props.interpolate_str(expression, &reporting).unwrap();
+            assert_eq!(value, "/w/m/n/r", "{expression}");
         }
         let cyclic = ProjectInfo {
             build: Build {
@@ -1522,13 +1939,14 @@ mod tests {
     /// Recorded with `help:effective-pom` from Maven 3.9.11: `${os.name}`
     /// and `${os.arch}` are the JVM's values on the build platform, and a
     /// model property of the same name wins over them. `${java.version}` is
-    /// the known JDK, or a stand-in, and raeva does not know `os.version`.
+    /// the known JDK, or a stand-in, and raeva does not know `os.version`,
+    /// nor the Windows `os.name`, which each Windows release reports its own.
     #[test]
     fn os_and_java_sysprops_follow_the_target_below_model_properties() {
         for (rust_os, rust_arch, name, arch) in [
             ("linux", "x86_64", "Linux", "amd64"),
             ("macos", "aarch64", "Mac OS X", "aarch64"),
-            ("windows", "x86_64", "Windows 11", "amd64"),
+            ("windows", "x86_64", "${os.name}", "amd64"),
         ] {
             let project = on_platform(rust_os, rust_arch, &[]);
             let mut props = PropertyMap::new();
@@ -1551,6 +1969,15 @@ mod tests {
         assert_eq!(
             props.interpolate_str("${java.version}", &project).unwrap(),
             "21.0.4"
+        );
+        assert_eq!(
+            (props.interpolate_str("${java.specification.version}", &project)).unwrap(),
+            "21"
+        );
+        let project = on_platform("linux", "x86_64", &[]);
+        assert_eq!(
+            props.interpolate_str("${maven.version}", &project).unwrap(),
+            "3.9.12"
         );
         let project = project_in(ModelEnvironment::default());
         assert_eq!(
@@ -1767,16 +2194,12 @@ mod tests {
             Err(PomError::PropertyCycle(_))
         ));
 
-        // Large values the output drops still count against the limit.
-        let name = "n".repeat(256 * 1024);
-        props.insert(name.as_str(), "");
-        props.insert("base", name.as_str());
-        let mut input = String::new();
-        for i in 0..32 {
-            props.insert(format!("a{i}"), "${base}");
-            input.push_str(&format!("${{${{a{i}}}}}"));
+        // The values kept for reuse count against a limit of their own.
+        props.insert("c0", "n".repeat(256 * 1024));
+        for i in 1..=16 {
+            props.insert(format!("c{i}"), format!("${{c{}}}", i - 1));
         }
-        let error = props.interpolate_str_no_project(&input).unwrap_err();
+        let error = props.interpolate_str_no_project("${c16}").unwrap_err();
         assert!(
             matches!(&error, PomError::InvalidModel(message) if message.contains("too large")),
             "{error:?}"

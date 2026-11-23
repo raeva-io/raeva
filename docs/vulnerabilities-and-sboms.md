@@ -55,7 +55,7 @@ Without `--baseline`, the threshold applies to every unsuppressed finding.
 
 A finding is one exact dependency purl paired with one OSV advisory ID.
 The purl includes the version, type, and classifier. A finding is existing
-when that pair occurs anywhere in the baseline, in any of its platform/JDK
+when its purl occurs anywhere in the baseline, in any of its platform/JDK
 sections and modules. Module names, paths, targets, reachability, and VEX
 statements do not change its identity. `--module`, `--platform` and `--jdk`
 select from the current inventory only. Dependencies reached only at test
@@ -222,6 +222,22 @@ components, licenses, VEX analyses, and `raeva` version produce the same
 bytes and document identity. Changing coverage changes the identity even
 when the component inventory stays the same.
 
+Each library component records the Maven scope it resolves to in the
+selected modules that reach it as `raeva:maven:scope` properties. When
+those modules agree, one property holds the scope, such as `compile`.
+When they disagree, there is one property per module, such as `test
+app/pom.xml` and `compile lib/pom.xml`. A module that resolves the
+component to no scope, as Maven does for one it reaches only in scopes it
+does not know, adds no property. CycloneDX has no registered property
+for the Maven scope, so the name is in the `raeva` namespace. The CycloneDX
+`scope` is `excluded` when every one of those modules resolves the
+component to `test`, and then the registered `cdx:maven:package:test`
+property is `true`. Otherwise `scope` is `required`, also for `provided`
+and `system`: the Maven scope does not tell an API the runtime supplies
+from a compile-only jar. A component that is test scope in one module and
+compile scope in another is `required`. So is a reactor module that no
+selected module depends on, which has no `raeva:maven:scope` property.
+
 Licenses come from each component's effective POM, including inherited
 licenses and target-specific property interpolation. This includes the
 root component in `metadata.component`. An unambiguous SPDX name,
@@ -229,6 +245,11 @@ identifier, or known URL becomes `license.id` when CycloneDX 1.5 accepts
 that identifier. Otherwise, `license.name` keeps the supplied name. Unknown URLs without a name are retained as names.
 Components with no declared licenses omit `licenses`. Dependencies locked
 without a POM, including system-path dependencies, also omit licenses.
+A module's own artifact taken from a repository is a component apart from
+the module, with the licenses of the repository's POM. Maven builds that
+artifact with the module's model, so the lock does not pin the repository
+POM's parents, and the component omits licenses when the POM inherits from
+a parent the lock pins for no other use.
 
 License extraction needs local reactor POMs and the SHA-256-pinned
 dependency and parent POMs in the content store. It reads the locked bytes,
@@ -248,7 +269,10 @@ impact statement as `analysis.detail`. Justifications map to
 `code_not_reachable`, `requires_environment` (cannot be controlled by an
 adversary), and `protected_by_mitigating_control`. Statements whose names
 or aliases overlap, directly or through another statement, are about one
-vulnerability and are exported once.
+vulnerability and are exported once. A statement names the dependency by
+its purl, which a module shares with the repository's artifact of its
+coordinates: it is about the component the module's graph holds, and the
+entry `affects` that component only.
 
 A dependency appears once across the selected modules. An `affected`
 assessment takes precedence over every other status. Otherwise, a missing

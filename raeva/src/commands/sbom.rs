@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use clap::Args;
@@ -66,7 +66,7 @@ pub(crate) fn run(args: &SbomArgs, session: &Session) -> Result<Report> {
     let config = session.config()?;
     let output = session.output();
     // The freshness check's reactor models also give the license evidence.
-    let (lock, models, _) = session.fresh_lockfile(&config)?;
+    let (lock, models, _) = session.fresh_lockfile(&config, false)?;
     let selected_targets = args.targets.select(&lock)?;
     let targets = selected_targets.targets();
     let platform = selected_targets.sbom_platform(&args.module)?;
@@ -79,10 +79,15 @@ pub(crate) fn run(args: &SbomArgs, session: &Session) -> Result<Report> {
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    let adapted = crate::commands::lock_adapter::adapt_sbom_modules(&platform, selection.modules())
-        .map_err(|err| CliError::LockfileDefect {
-            details: err.to_string(),
-        })?;
+    // The modules the document lists, which decide each component's
+    // bom-ref on every target.
+    let listed =
+        crate::commands::lock_adapter::listed_module_purls(&platform, selection.modules())?;
+    let adapted = crate::commands::lock_adapter::adapt_sbom_modules_listing(
+        &platform,
+        selection.modules(),
+        &listed,
+    )?;
     let vulnerabilities = vulnerability_analyses(&vex, &adapted.modules)?;
     vex.warn_unused(output, |product| {
         (adapted.modules.iter())
@@ -113,13 +118,15 @@ pub(crate) fn run(args: &SbomArgs, session: &Session) -> Result<Report> {
             original,
             &model.workspace,
             &modules,
+            &listed,
             &mut licenses,
         )?;
     }
 
     for component in std::iter::once(&mut root).chain(&mut components) {
         component.licenses = licenses
-            .remove(&component.purl)
+            .get(component.reference())
+            .cloned()
             .expect("every merged component has original target evidence");
     }
     let identity = document_identity(&targets, &root, &components, &vulnerabilities)?;
@@ -138,6 +145,9 @@ pub(crate) fn run(args: &SbomArgs, session: &Session) -> Result<Report> {
             .collect::<Vec<_>>(),
     )?;
 
+    // A file gets what stdout would: no value of a secret the
+    // configuration took.
+    let document = crate::output::redact_secrets_in_json(&document).into_owned();
     let Some(path) = &args.output else {
         return Ok(Report::document(document));
     };
@@ -169,26 +179,30 @@ impl CommandOutput for SbomWritten {
 }
 
 /// The `--vex` statements about the selected modules' packages, one entry
-/// per vulnerability and package. Statements whose names or aliases
-/// overlap, directly or through another statement, are about one
-/// vulnerability. A combined analysis never treats an unassessed module
-/// as unaffected. Conflicting statements within one module remain errors.
+/// per vulnerability and package component. A statement names a package by
+/// its purl, which a module and a repository file of its coordinates share:
+/// it is about the component the module's graph holds. Statements whose
+/// names or aliases overlap, directly or through another statement, are
+/// about one vulnerability. A combined analysis never treats an unassessed
+/// module as unaffected. Conflicting statements within one module remain
+/// errors.
 fn vulnerability_analyses(
     vex: &VexSet,
-    modules: &[(String, String, BTreeSet<String>)],
+    modules: &[(String, String, BTreeMap<String, String>)],
 ) -> Result<Vec<VulnerabilityAnalysis>> {
-    let packages: BTreeSet<&str> = (modules.iter())
-        .flat_map(|(_, _, packages)| packages.iter().map(String::as_str))
+    let packages: BTreeMap<&str, &str> = (modules.iter())
+        .flat_map(|(_, _, packages)| packages.iter())
+        .map(|(reference, purl)| (reference.as_str(), purl.as_str()))
         .collect();
     let mut analyses = Vec::new();
-    for package in packages {
+    for (package, purl) in packages {
         let holders: Vec<(&str, &str)> = (modules.iter())
-            .filter(|(_, _, packages)| packages.contains(package))
+            .filter(|(_, _, packages)| packages.contains_key(package))
             .map(|(path, product, _)| (path.as_str(), product.as_str()))
             .collect();
         let statements: Vec<(usize, &[String], &Assessment)> = (holders.iter().enumerate())
             .flat_map(|(holder, &(_, product))| {
-                (vex.statements(product, package))
+                (vex.statements(product, purl))
                     .map(move |(names, assessment)| (holder, names, assessment))
             })
             .collect();
@@ -228,7 +242,7 @@ fn vulnerability_analyses(
             for (holder, &(path, _)) in holders.iter().enumerate() {
                 let mut distinct = Vec::<&Assessment>::new();
                 for (_, _, assessment) in members.iter().filter(|(h, _, _)| *h == holder) {
-                    if !distinct.contains(assessment) {
+                    if !distinct.iter().any(|kept| kept.agrees(assessment)) {
                         distinct.push(assessment);
                     }
                 }
@@ -392,7 +406,7 @@ fn document_identity(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::BTreeMap;
     use std::fs;
 
     use tempfile::TempDir;
@@ -415,9 +429,12 @@ mod tests {
             version: "1.0.0".to_string(),
             group: Some("com.example".to_string()),
             purl: "pkg:maven/com.example/demo@1.0.0".to_string(),
+            bom_ref: None,
             hashes: Vec::new(),
             licenses: Vec::new(),
             dependencies: Vec::new(),
+            scope: None,
+            properties: Vec::new(),
         };
 
         let first =
@@ -565,7 +582,7 @@ mod tests {
         });
         fs::write(&path, document.to_string()).expect("write");
         let vex = crate::commands::vex::VexSet::load(&[path]).map_err(|err| err.to_string())?;
-        let packages = BTreeSet::from([UTIL.to_string()]);
+        let packages = BTreeMap::from([(UTIL.to_string(), UTIL.to_string())]);
         let modules = [
             ("app/pom.xml".to_string(), APP.to_string(), packages.clone()),
             ("lib/pom.xml".to_string(), LIB.to_string(), packages),
@@ -601,5 +618,13 @@ mod tests {
                 "{error}"
             );
         }
+        // Statements that differ in their impact text alone agree.
+        let impact = |text: &str| {
+            let mut statement = cve(APP);
+            statement["impact_statement"] = text.into();
+            statement
+        };
+        let agreeing = vec![impact("parser not called"), impact("parser not reachable")];
+        assert_eq!(analyses(agreeing), Ok(vec!["CVE-X".to_string()]));
     }
 }

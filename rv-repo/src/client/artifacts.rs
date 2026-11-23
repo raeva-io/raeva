@@ -6,10 +6,12 @@ use std::sync::{Arc, Mutex};
 use tracing::warn;
 
 use rv_maven_types::{ArtifactCoord, BlobId, Digest};
+use rv_store::metadata_cache::CacheTable;
 use rv_store::{Origin, PinCheck, Staged, Store};
 
+use super::models::PomRead;
 use super::requests::DeferredWarnings;
-use super::{RepoClient, file_path};
+use super::{RepoClient, file_path, filter_path};
 use crate::artifact::ArtifactRequest;
 use crate::error::{RepoError, Result};
 use crate::fetch::{ArtifactChecks, Transfer, fetch_artifact_staged, publish_artifact};
@@ -53,6 +55,9 @@ pub(super) type ArtifactPrefetches =
 pub(super) struct Prefetched {
     /// The sidecar probe's answer, `None` when a lock pin made it unneeded.
     checksum: Option<Result<Option<Digest>>>,
+    /// The credential generation it was asked under: a later credential
+    /// may get another answer.
+    generation: u64,
     warnings: DeferredWarnings,
     staged: Staged,
 }
@@ -64,36 +69,87 @@ pub(super) struct Prefetched {
 pub(super) type ArtifactFetches =
     Arc<Mutex<HashMap<String, Arc<tokio::sync::OnceCell<(BlobId, bool)>>>>>;
 
+/// The files a client admitted, by repository path: true once a checksum
+/// file verified the bytes, false when the repository published none and
+/// neither a lock pin nor a `file:` repository vouched for them. Shared by
+/// a client's clones.
+pub(super) type Admissions = Arc<Mutex<HashMap<String, bool>>>;
+
 impl RepoClient {
+    /// The files this client and its clones admitted, by repository path:
+    /// `true` for a file a checksum file verified, `false`
+    /// for one accepted without any (`--allow-missing-checksums`). A file
+    /// a lock pin or a `file:` repository admitted is not listed.
+    pub fn admissions(&self) -> HashMap<String, bool> {
+        (self.admissions.lock())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(super) fn note_admission(&self, path: &str, verified: bool) {
+        let mut admissions =
+            (self.admissions.lock()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        *admissions.entry(path.to_string()).or_insert(verified) |= verified;
+    }
+
+    /// [`Self::note_admission`] for `blob`, stored bytes of `path` from
+    /// `repo`: a lock pin or a `file:` repository vouches for unverified
+    /// bytes.
+    /// Whether `--update` downloads the file at `path` again instead of
+    /// taking stored bytes no checksum file verified: raeva.lock marks it
+    /// as accepted without one, and the download asks for one again.
+    fn rechecks(&self, path: &str) -> bool {
+        self.updates() && self.lock_unverified.contains(path)
+    }
+
+    fn note_stored(&self, repo: &crate::Repository, path: &str, blob: &BlobId, verified: bool) {
+        let pinned = || self.lock_pin(path).and_then(Digest::as_sha256) == Some(blob);
+        if verified || !(repo.is_local() || pinned()) {
+            self.note_admission(path, verified);
+        }
+    }
+
     /// Download the artifact of `req` from `repo`, with its checksum
     /// sidecar, ahead of a [`Self::fetch_artifact`] for it. The bytes wait
     /// in a private temporary file of `store`; that later call checks them
     /// as it checks its own download and publishes them only if they pass.
-    /// Warnings wait for that call too. Offline, for a local repository or
-    /// a `-SNAPSHOT`, and on any failure this keeps nothing, and the later
-    /// call downloads the artifact itself.
+    /// Warnings wait for that call too. A `-SNAPSHOT` is the build its
+    /// metadata names, read as a POM prefetch reads it. Offline, for a local
+    /// repository, and when the file fails this keeps nothing, and the later
+    /// call downloads the artifact itself. A checksum file that failed, once
+    /// retried, is kept with the file: the later call fails as its own
+    /// probe would have, without downloading the file again. `slot` is
+    /// dropped once the file has arrived, before the checksum files it
+    /// waits for.
     pub async fn prefetch_artifact(
         &self,
         repo: &crate::Repository,
         req: &ArtifactRequest,
         store: &Store,
+        slot: impl Send,
     ) {
-        if self.offline || req.validate().is_err() || req.is_snapshot() {
+        if self.offline || req.validate().is_err() {
             return;
         }
         self.prefetching(async {
             let route = self.router.route(repo);
-            let repo = &route.endpoint;
-            if repo.is_local() || self.ensure_repo_allows_version(repo, &req.version).is_err() {
+            if route.endpoint.is_local() {
                 return;
             }
-            let path = req.to_path();
-            if self.known_absent(&route, &path).is_some() {
+            let Ok(path) = self
+                .artifact_path(&route, req, PomRead::Prefetch, None)
+                .await
+            else {
+                return;
+            };
+            if self.known_absent(&route, &path).is_some()
+                || self.twin_fetched(&route, &path).is_some()
+            {
                 return;
             }
             let cell = self.artifact_prefetch_cell(&route, &path);
             cell.get_or_init(|| async {
-                Mutex::new(self.download_for_later(&route, &path, store).await)
+                Mutex::new(self.download_for_later(&route, &path, store, slot).await)
             })
             .await;
         })
@@ -105,6 +161,7 @@ impl RepoClient {
         route: &Route<'_>,
         path: &str,
         store: &Store,
+        slot: impl Send,
     ) -> Option<Prefetched> {
         let repo = &route.endpoint;
         let url = repo.url_for_path(path).ok()?;
@@ -112,42 +169,61 @@ impl RepoClient {
         let repository_root = repo.base_url().ok()?;
         let generation = self.credential_generation();
         let auth = route.auth().ok()?;
+        // The route may have picked its credential earlier, for the metadata.
+        let generation = route.picked_under(generation);
         let mut warnings = DeferredWarnings::default();
-        let pinned = self.lock_pin(path).and_then(Digest::as_sha256).is_some();
+        let pinned = self.pin_skips_checksum(path);
+        let file_first = self.sidecar_hints.file_first(&repo.url);
         let (checksum, staged) = {
             let probe = std::pin::pin!(async {
                 if pinned {
                     return Ok(None);
                 }
-                self.probe_checksum(route, path, &mut warnings)
+                self.probe_checksum(route, path, &mut warnings, None)
                     .await
                     .map(Some)
             });
-            let download = std::pin::pin!(fetch_artifact_staged(
-                client.as_ref(),
-                &url,
-                Some(&repository_root),
-                auth,
-                &self.fetch,
-                None,
-                store,
-                None,
-                true,
-            ));
-            match futures::future::select(probe, download).await {
-                futures::future::Either::Left((checksum, download)) => (checksum, download.await),
-                futures::future::Either::Right((staged, probe)) => match staged {
-                    // A missing file has no checksum file either.
+            let download = std::pin::pin!(async {
+                let staged = fetch_artifact_staged(
+                    client.as_ref(),
+                    &url,
+                    Some(&repository_root),
+                    auth,
+                    &self.fetch,
+                    None,
+                    store,
+                    None,
+                    true,
+                )
+                .await;
+                drop(slot);
+                staged
+            });
+            if file_first {
+                match download.await {
                     Err(err) => (Ok(None), Err(err)),
                     staged => (probe.await, staged),
-                },
+                }
+            } else {
+                match futures::future::select(probe, download).await {
+                    futures::future::Either::Left((checksum, download)) => {
+                        (checksum, download.await)
+                    }
+                    futures::future::Either::Right((staged, probe)) => match staged {
+                        // A missing file has no checksum file either.
+                        Err(err) => (Ok(None), Err(err)),
+                        staged => (probe.await, staged),
+                    },
+                }
             }
         };
+        self.sidecar_hints.note_file(&repo.url, &staged);
         let staged = staged
             .inspect_err(|err| self.remember_absent(route, path, err, generation))
             .ok()?
             .0;
         Some(Prefetched {
+            generation,
             checksum: checksum.transpose(),
             warnings: warnings.after_logged(),
             staged,
@@ -183,6 +259,7 @@ impl RepoClient {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
+            .filter(|prefetched| prefetched.generation == self.credential_generation())
     }
 
     /// Download an artifact from `repo`, or the mirror that serves it, into
@@ -203,7 +280,7 @@ impl RepoClient {
     ) -> Result<Fetched> {
         req.validate().map_err(RepoError::InvalidCoord)?;
         let route = self.router.route(repo);
-        let path = self.artifact_path(&route, req).await?;
+        let path = (self.artifact_path(&route, req, PomRead::Use, options.pin)).await?;
         let (blob, checksum_verified) = self
             .fetch_artifact_attempt(&route, &path, store, options)
             .await?;
@@ -240,32 +317,12 @@ impl RepoClient {
         repo: &crate::Repository,
         key: &ArtifactCoord,
     ) -> std::result::Result<Option<BlobId>, rv_store::StoreError> {
-        let Some(endpoint) = self.unblocked_endpoint(repo) else {
-            return Ok(None);
-        };
-        let lookup = |unverified, recorded| {
-            store.lookup_artifact_from(key, &repo.url, &endpoint.url, unverified, recorded)
-        };
-        if let Some(blob) = lookup(!self.require_checksums, false).await?
-            && self.holds_release_pin(store, key, &blob).await?
-        {
-            return Ok(Some(blob));
-        }
-        // `--update` fetches bytes a restore took without a checksum file
-        // again.
-        let Some(pin) = self.lock_pin(&file_path(key)).filter(|_| !self.updates()) else {
-            return Ok(None);
-        };
-        match lookup(true, true).await? {
-            Some(blob) if holds_pin(store, &blob, pin).await? => Ok(Some(blob)),
-            _ => Ok(None),
-        }
+        let found = self.stored_from(store, repo, key, true).await?;
+        Ok(found.map(|(blob, _)| blob))
     }
 
-    /// The blob `store` holds for `key` as `repo` serves it now, and whether
-    /// a repository checksum verified it: only bytes this route served, and
-    /// unverified ones only when the run accepts missing checksums. A hint,
-    /// as [`Store::lookup_artifact_from`] is.
+    /// [`Self::stored_artifact`], of only the bytes this route served, and
+    /// whether a repository checksum verified them.
     ///
     /// # Errors
     ///
@@ -276,23 +333,47 @@ impl RepoClient {
         repo: &crate::Repository,
         key: &ArtifactCoord,
     ) -> std::result::Result<Option<(BlobId, bool)>, rv_store::StoreError> {
-        let Some(endpoint) = self.unblocked_endpoint(repo) else {
+        self.stored_from(store, repo, key, false).await
+    }
+
+    /// The stored blob for `key` as `repo` serves it, and whether a checksum
+    /// verified it. Bytes raeva.lock pins count without a checksum, and with
+    /// `recorded` also ones a lockfile recorded rather than the route served.
+    async fn stored_from(
+        &self,
+        store: &Store,
+        repo: &crate::Repository,
+        key: &ArtifactCoord,
+        recorded: bool,
+    ) -> std::result::Result<Option<(BlobId, bool)>, rv_store::StoreError> {
+        let Some(endpoint) = self.unblocked_endpoint(repo, key) else {
             return Ok(None);
         };
+        let lookup = |unverified, recorded| {
+            store.lookup_artifact_from(key, &repo.url, &endpoint.url, unverified, recorded)
+        };
         for verified in [true, false] {
-            if !verified && self.require_checksums {
+            if !verified && (self.require_checksums || self.rechecks(&file_path(key))) {
                 break;
             }
-            let found = store
-                .lookup_artifact_from(key, &repo.url, &endpoint.url, !verified, false)
-                .await?;
-            if let Some(blob) = found
+            if let Some(blob) = lookup(!verified, false).await?
                 && self.holds_release_pin(store, key, &blob).await?
             {
+                self.note_stored(&endpoint, &file_path(key), &blob, verified);
                 return Ok(Some((blob, verified)));
             }
         }
-        Ok(None)
+        // `--update` downloads again the bytes raeva.lock marks as accepted
+        // without a checksum file; the others its pins verified when locked.
+        let Some(pin) =
+            (self.lock_pin(&file_path(key))).filter(|_| !self.rechecks(&file_path(key)))
+        else {
+            return Ok(None);
+        };
+        match lookup(true, recorded).await? {
+            Some(blob) if holds_pin(store, &blob, pin).await? => Ok(Some((blob, false))),
+            _ => Ok(None),
+        }
     }
 
     /// Whether stored `blob` may stand for `key`: it matches the pin
@@ -311,11 +392,18 @@ impl RepoClient {
         }
     }
 
-    /// The endpoint that serves `repo`, or `None` behind a blocked mirror,
-    /// whose stored answers count no more than its live ones.
-    fn unblocked_endpoint(&self, repo: &crate::Repository) -> Option<crate::Repository> {
+    /// The endpoint that serves `repo`, or `None` behind a blocked mirror
+    /// or when the remote repository filters keep `key` from it, whose
+    /// stored answers count no more than its live ones.
+    fn unblocked_endpoint(
+        &self,
+        repo: &crate::Repository,
+        key: &ArtifactCoord,
+    ) -> Option<crate::Repository> {
         let route = self.router.route(repo);
-        (!route.mirror.is_some_and(|mirror| mirror.blocked)).then_some(route.endpoint)
+        (!route.mirror.as_ref().is_some_and(|mirror| mirror.blocked)
+            && self.filters_admit(repo, key))
+        .then_some(route.endpoint)
     }
 
     /// [`RepoClient::fetch_artifact`] without a pin or an index row.
@@ -347,15 +435,22 @@ impl RepoClient {
     }
 
     /// The repository path of `req` on `route`, with a snapshot version
-    /// resolved through the endpoint's metadata.
+    /// resolved through the endpoint's metadata as `read` reads it, or to
+    /// the build raeva.lock pins to `pin`.
     pub(super) async fn artifact_path(
         &self,
         route: &Route<'_>,
         req: &ArtifactRequest,
+        read: PomRead,
+        pin: Option<&Digest>,
     ) -> Result<String> {
         self.ensure_repo_allows_version(&route.endpoint, &req.version)?;
-        let snapshot = self.resolve_snapshot_for_request(route, req).await?;
-        Ok(req.to_path_with_versions(&snapshot.dir_version, &snapshot.file_version))
+        self.ensure_filters_admit(route, &req.group_id, &filter_path(req))?;
+        let snapshot = (self.resolve_snapshot_for_request(route, req, read, pin)).await?;
+        let path = req.to_path_with_versions(&snapshot.dir_version, &snapshot.file_version);
+        // Maven judges a snapshot by the build its metadata resolves to.
+        self.ensure_filters_admit(route, &req.group_id, &path)?;
+        Ok(path)
     }
 
     /// The blob for `path` on `route` in `store`, and whether a repository
@@ -391,7 +486,7 @@ impl RepoClient {
 
     fn remember_absent(&self, route: &Route<'_>, path: &str, err: &RepoError, generation: u64) {
         if let Some(key) = self.miss_key(route, path) {
-            self.record_miss(route, key, err, generation);
+            self.record_miss(route, key, err, generation, false);
         }
     }
 
@@ -418,13 +513,19 @@ impl RepoClient {
             Arc::clone(fetches.entry(self.artifact_key(route, path)).or_default())
         };
         let downloaded = std::sync::atomic::AtomicBool::new(false);
-        let (blob, verified) = cell
-            .get_or_try_init(|| async {
-                downloaded.store(true, std::sync::atomic::Ordering::Relaxed);
-                self.download_artifact(route, path, store, options).await
-            })
-            .await?
-            .clone();
+        let (blob, verified) = match self.twin_fetched(route, path) {
+            Some(fetched) if !cell.initialized() => fetched,
+            _ => cell
+                .get_or_try_init(|| async {
+                    if let Some(blob) = self.cached_pom(route, path, store, options).await? {
+                        return Ok((blob, false));
+                    }
+                    downloaded.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.download_artifact(route, path, store, options).await
+                })
+                .await?
+                .clone(),
+        };
         if downloaded.into_inner() {
             return Ok((blob, verified));
         }
@@ -446,6 +547,45 @@ impl RepoClient {
             store.add_artifact(key, &blob).await?;
         }
         Ok((blob, verified))
+    }
+
+    /// What this run fetched for `path` under Central's other name, which
+    /// a fetch here takes as it would join its own earlier one
+    /// ([`crate::routing::Router::central_twin`]).
+    fn twin_fetched(&self, route: &Route<'_>, path: &str) -> Option<(BlobId, bool)> {
+        let key = self.artifact_key(&self.router.central_twin(route)?, path);
+        let fetches =
+            (self.artifact_fetches.lock()).unwrap_or_else(|poisoned| poisoned.into_inner());
+        fetches.get(&key)?.get().cloned()
+    }
+
+    /// The POM at `path`, put in the store, when a model read cached the
+    /// bytes the pin requires for this repository or under Central's other
+    /// name, which would serve this fetch ([`Self::twin_fetched`]).
+    async fn cached_pom(
+        &self,
+        route: &Route<'_>,
+        path: &str,
+        store: &Store,
+        options: FetchArtifact<'_>,
+    ) -> Result<Option<BlobId>> {
+        let Some(pin @ Digest::Sha256(sha256)) = self.required_pin(path, options) else {
+            return Ok(None);
+        };
+        if !path.ends_with(".pom") {
+            return Ok(None);
+        }
+        let twin = self.router.central_twin(route);
+        for scope in std::iter::once(&route.scope).chain(twin.as_ref().map(|twin| &twin.scope)) {
+            let cached =
+                self.cache_get_entry(CacheTable::Pom, scope, path, Some(pin), PomRead::Use);
+            if let Some((bytes, _)) = cached.await?
+                && BlobId::from_bytes(&bytes) == *sha256
+            {
+                return Ok(Some(store.put_bytes(&bytes).await?));
+            }
+        }
+        Ok(None)
     }
 
     async fn download_artifact(
@@ -481,6 +621,22 @@ impl RepoClient {
         {
             return Err(miss);
         }
+        let fresh = prefetched.is_none();
+        let download = || {
+            fetch_artifact_staged(
+                client.as_ref(),
+                &url,
+                Some(&repository_root),
+                auth,
+                &self.fetch,
+                self.progress.as_ref(),
+                store,
+                options.index,
+                true,
+            )
+        };
+        // What a sidecar probe beside the file logs waits for the file.
+        let mut probed = DeferredWarnings::default();
         let (checksum, staged) = match prefetched {
             Some(prefetched) => {
                 prefetched.warnings.emit();
@@ -490,33 +646,21 @@ impl RepoClient {
                     Transfer::arrived(self.progress.as_ref(), &url, prefetched.staged.size());
                 (prefetched.checksum, Ok((prefetched.staged, transfer)))
             }
-            None if pin.is_some() => {
-                let staged = fetch_artifact_staged(
-                    client.as_ref(),
-                    &url,
-                    Some(&repository_root),
-                    auth,
-                    &self.fetch,
-                    self.progress.as_ref(),
-                    store,
-                    options.index,
-                    true,
-                );
-                (None, staged.await)
+            None if pin.is_some() && !self.lock_unverified.contains(path) => {
+                (None, download().await)
+            }
+            // At an origin that mostly misses, the sidecar waits for the file.
+            None if self.sidecar_hints.file_first(&repo.url) => {
+                let staged = download().await;
+                let checksum = match staged {
+                    Ok(_) => Some(self.probe_checksum(route, path, &mut probed, None).await),
+                    Err(_) => None,
+                };
+                (checksum, staged)
             }
             None => {
-                let sidecar = std::pin::pin!(self.fetch_checksum(route, path));
-                let download = std::pin::pin!(fetch_artifact_staged(
-                    client.as_ref(),
-                    &url,
-                    Some(&repository_root),
-                    auth,
-                    &self.fetch,
-                    self.progress.as_ref(),
-                    store,
-                    options.index,
-                    true,
-                ));
+                let sidecar = std::pin::pin!(self.probe_checksum(route, path, &mut probed, None));
+                let download = std::pin::pin!(download());
                 match futures::future::select(sidecar, download).await {
                     futures::future::Either::Left((checksum, download)) => {
                         (Some(checksum), download.await)
@@ -531,9 +675,13 @@ impl RepoClient {
             }
         };
 
+        if fresh {
+            self.sidecar_hints.note_file(&repo.url, &staged);
+        }
         // A file that failed to download reports that failure, before any
         // of its sidecar: a missing file has no checksum file either.
         let (staged, transfer) = staged?;
+        probed.emit();
         let checksum = checksum.transpose()?;
         // A pin verifies or refuses the bytes without a sidecar: the
         // required one, or the one raeva.lock records when the bytes match it.
@@ -560,10 +708,13 @@ impl RepoClient {
         };
         let verified = publish_artifact(&url, transfer, store, staged, checks).await?;
 
+        if checksum.is_some() || unverified {
+            self.note_admission(path, checksum.is_some());
+        }
         if unverified {
             warn!(
                 sec_code = "CHECKSUM_MISSING",
-                repository_url = %rv_config::redact_url(&repo.url),
+                repository_url = %rv_config::redact_repository_url(&repo.url),
                 path, "the repository has no checksum file for this download"
             );
         }

@@ -13,7 +13,7 @@ mod component;
 mod cyclonedx;
 mod license;
 
-pub use component::{Component, Hash, HashAlgorithm};
+pub use component::{Component, ComponentScope, Hash, HashAlgorithm, Property};
 pub use cyclonedx::CycloneDxGenerator;
 pub use license::License;
 
@@ -29,7 +29,8 @@ pub struct VulnerabilityAnalysis {
     pub justification: Option<AnalysisJustification>,
     /// `analysis.detail`, left out when `None`.
     pub detail: Option<String>,
-    /// Purls of the components assessed, written as `affects` refs.
+    /// The references of the components assessed, written as the
+    /// `affects` refs.
     pub affects: Vec<String>,
 }
 

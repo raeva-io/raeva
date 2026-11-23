@@ -52,8 +52,8 @@ fn identical_locks_exit_zero_and_keep_supplied_paths() {
     assert_eq!(
         data,
         json!({
-            "old": "old.lock", "new": "./new.lock", "changed": false,
-            "changes": [], "edge_changes": [], "pom_changes": [], "changed_inputs": [],
+            "old": "old.lock", "new": "./new.lock", "changed": false, "causes": [],
+            "changes": [], "edge_changes": [], "pom_changes": [], "plugin_changes": [], "checksum_markers": [], "changed_inputs": [],
             "platforms_added": [], "platforms_removed": [],
             "module_changes": [], "profile_changes": [],
             "via_limited": false, "warnings": [],
@@ -191,7 +191,7 @@ fn lock_with_versions(versions: &[&str]) -> rv_lock::Lockfile {
             package.direct_scope = None;
             module
                 .edges
-                .push(LockEdge::new(parent, index, Some(Scope::Compile), false));
+                .push(LockEdge::new(parent, index, Scope::Compile, false));
         }
     }
     lock
@@ -338,7 +338,7 @@ fn edges_between_existing_versions_are_compared_separately() {
                 } else {
                     (endpoint, index)
                 };
-                LockEdge::new(from, to, Some(Scope::Compile), false)
+                LockEdge::new(from, to, Scope::Compile, false)
             })
             .collect();
         let removed = module

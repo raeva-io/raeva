@@ -54,6 +54,43 @@ fn lock_schema_rejects_hostile_rows() {
     });
     let schema = validator(RAEVA_LOCK_SCHEMA);
     assert!(schema.is_valid(&document));
+    let mut evicted = document.clone();
+    evicted["platforms"][0]["modules"][0]["evicted_ranges"] = json!(
+        "g:a\t[1,3)\t./repo/\t1 2\ng:a\t[1,3)\thttps://r.example/\t2\ng:b\t[1.0,2),[3,)\thttps://r.example/\t3.1"
+    );
+    assert!(schema.is_valid(&evicted), "evicted ranges");
+    let mut extensions = document.clone();
+    extensions["platforms"][0]["modules"][0]["extensions"] = json!(format!(
+        "t:ext:1\t{}\nt:ext:1:no_aop\t{}\nt:other:2.0-x\t{}",
+        "a".repeat(64),
+        "c".repeat(64),
+        "b".repeat(64)
+    ));
+    assert!(schema.is_valid(&extensions), "extensions");
+    let mut scopes = document.clone();
+    scopes["platforms"][0]["modules"][0]["packages"] = json!(format!(
+        "g:a:1\tjar\t\truntime\ng:b:1\tjar\tRUNTIME\ng:c:1\tjar\t\t?\ng:d:1\tjar\tcompile-only\n\
+         g:e:1\tjar\tfoo:bar\tx/y\ng:f:1\tjar\t\t{}",
+        "é".repeat(255)
+    ));
+    scopes["platforms"][0]["modules"][0]["edges"] =
+        json!("0 1 optional\n1 2 ${scope} optional\n2 3 compile\n3 4 foo:bar");
+    assert!(schema.is_valid(&scopes), "scopes");
+    let mut read = document.clone();
+    read["platforms"][0]["modules"][0]["metadata_versions"] =
+        json!("g:a\tlatest\t2-SNAPSHOT\ng:a\trelease\t1.0\ng:b\trange\t1.0-ga");
+    assert!(schema.is_valid(&read), "metadata versions");
+    let mut taken = document.clone();
+    taken["platforms"][0]["modules"][0]["range_versions"] =
+        json!("g:a\t1-SNAPSHOT\t./repo/\ng:a\t2\thttps://r.example/");
+    assert!(schema.is_valid(&taken), "range versions");
+    // The empty origin: a mirror served a repository the lock cannot record.
+    taken["platforms"][0]["modules"][0]["range_versions"] = json!("g:a\t2\t");
+    taken["platforms"][0]["modules"][0]["evicted_ranges"] = json!("g:a\t[1,3)\t\t1");
+    assert!(
+        schema.is_valid(&taken),
+        "range versions with the empty origin"
+    );
 
     // Each row merges its fields into the table its JSON pointer names.
     let digest = "a".repeat(64);
@@ -72,8 +109,11 @@ fn lock_schema_rejects_hostile_rows() {
         ["/platforms/0/artifacts/0/coordinate", { "artifact": "a\u{1b}[31m" }],
         ["/platforms/0/artifacts/0/coordinate", { "packaging": "jar;x" }],
         ["/platforms/0/artifacts/0", { "repo_url": "https://a.example/\u{202e}/" }],
-        ["/platforms/0/modules/0", { "packages": "com.example:lib:1.0\tjar\tmerged" }],
-        ["/platforms/0/modules/0", { "packages": "com.example:lib:1.0\tjar\t\tmerged" }],
+        ["/platforms/0/modules/0", { "packages": "com.example:lib:1.0\tjar\tmer ged" }],
+        ["/platforms/0/modules/0", { "packages": "com.example:lib:1.0\tjar\t\tmer ged" }],
+        ["/platforms/0/modules/0", { "packages": "com.example:lib:1.0\tjar\t?" }],
+        ["/platforms/0/modules/0", { "edges": "0 0 ?" }],
+        ["/platforms/0/modules/0", { "edges": "0 0" }],
         ["/inputs/0", { "profiles": ["ci\u{1b}]0;x"] }],
         ["/inputs/0", { "profiles": ["ci\u{3164}"] }],
         ["/platforms/0", { "targets": [" linux-x86_64"] }],
@@ -112,6 +152,29 @@ fn lock_schema_rejects_hostile_rows() {
         ["/platforms/0/modules/0", { "parent_ranges": [{ "model": "g:a:1", "parent": "g:p:[1,3)" }] }],
         ["/platforms/0/modules/0", { "parent_ranges": [{ "model": "g:a:1", "parent": "g:p:[1,3)", "selected": "g:parent.:2" }] }],
         ["/platforms/0/modules/0", { "parent_ranges": [{ "model": "g:a:1", "parent": "g:p:[1,\n3)", "selected": "g:p:2" }] }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a\t[1,3)\t./repo/\t1\u{1b}[31m" }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a\t[1,3)\t./repo/\t" }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a\t1.0\t./repo/\t1.0" }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a:1\t[1,3)\t./repo/\t1" }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a\t[1,3)\t./repo/\t1\n" }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a\t[1,3)\t1" }],
+        ["/platforms/0/modules/0", { "metadata_versions": "g:a\tRELEASE\t1.0" }],
+        ["/platforms/0/modules/0", { "metadata_versions": "g:a\trelease\t1.0\n" }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a\t[1,3)\thttps://r\u{202e}/\t1" }],
+        ["/platforms/0/modules/0", { "evicted_ranges": "g:a\t[1,3)\t./repo/ https://r.example/\t1" }],
+        ["/platforms/0/modules/0", { "range_versions": "g:a\t2\thttps://r\u{202e}/" }],
+        ["/platforms/0/modules/0", { "range_versions": "g:a\t2" }],
+        ["/platforms/0/modules/0", { "range_versions": "g:a:2\t2\t./repo/" }],
+        ["/platforms/0/modules/0", { "range_versions": "g:a\t2\t./repo/\n" }],
+        ["/platforms/0/modules/0", { "extensions": "t:ext:1" }],
+        ["/platforms/0/modules/0", { "extensions": format!("t:ext:1\t{}", "A".repeat(64)) }],
+        ["/platforms/0/modules/0", { "extensions": format!("t:ext:1:\t{}", "a".repeat(64)) }],
+        ["/platforms/0/modules/0", { "extensions": format!("t:ext:1:a:b\t{}", "a".repeat(64)) }],
+        ["/platforms/0/modules/0", { "extensions": format!("t:ext:1:a.\t{}", "a".repeat(64)) }],
+        ["/platforms/0/modules/0", { "extensions": format!("t..x:ext:1\t{}", "a".repeat(64)) }],
+        ["/platforms/0/modules/0", { "extensions": format!("t:ext:1\t{}\n", "a".repeat(64)) }],        ["/platforms/0/modules/0", { "edges": "0 0 a\u{200b}b" }],
+        ["/platforms/0/modules/0", { "packages": "com.example:lib:1.0\tjar\ta\u{a0}b" }],
+        ["/platforms/0/modules/0", { "edges": format!("0 0 {}", "é".repeat(256)) }],
     ]);
     let read_mutations = json!([
         ["/inputs/0", { "ambient_inputs": ["java.version"] }],

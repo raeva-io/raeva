@@ -1,0 +1,10 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "key": "<string>",
+      "warnings": []
+    },
+    "success": true
+  }
+}

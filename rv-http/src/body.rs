@@ -14,13 +14,22 @@ pub enum BodyError {
         /// byte was read. `None` when the streamed bytes went over.
         declared: Option<u64>,
     },
+    /// The body ended short of its Content-Length, as an HTTP/2 stream a
+    /// `NO_ERROR` reset ends does without a transport error.
+    Truncated {
+        /// The Content-Length.
+        declared: u64,
+        /// The bytes that arrived.
+        read: u64,
+    },
     /// The connection failed while the body was read.
     Transport(reqwest::Error),
 }
 
 /// Read `response`'s body, failing as soon as it would exceed `limit` bytes.
 /// A Content-Length over the limit fails before any byte is read, and the
-/// buffer never grows past the limit. `on_chunk` sees each chunk's length.
+/// buffer never grows past the limit. A body short of its Content-Length
+/// fails too. `on_chunk` sees each chunk's length.
 pub async fn read_limited(
     response: reqwest::Response,
     limit: u64,
@@ -46,5 +55,9 @@ pub async fn read_limited(
         body.extend_from_slice(&chunk);
         on_chunk(chunk.len());
     }
-    Ok(Bytes::from(body))
+    let read = body.len() as u64;
+    match declared {
+        Some(declared) if declared != read => Err(BodyError::Truncated { declared, read }),
+        _ => Ok(Bytes::from(body)),
+    }
 }

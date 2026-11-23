@@ -17,6 +17,11 @@ pub(crate) trait PomSource: Send + Sync {
 
     fn effective_repository(&self, repo: &Repository) -> Repository;
 
+    /// Whether a request to `repo` would carry a credential.
+    fn sends_credential(&self, _repo: &Repository) -> bool {
+        false
+    }
+
     fn pom<'a>(
         &'a self,
         repo: &'a Repository,
@@ -68,6 +73,10 @@ impl PomSource for RepoPomSource {
 
     fn effective_repository(&self, repo: &Repository) -> Repository {
         self.0.effective_repository(repo)
+    }
+
+    fn sends_credential(&self, repo: &Repository) -> bool {
+        self.0.sends_credential(repo)
     }
 
     fn pom<'a>(
@@ -131,6 +140,8 @@ mod memory {
         files: HashMap<(String, String), Bytes>,
         refusals: HashMap<String, reqwest::StatusCode>,
         delays: HashMap<String, std::time::Duration>,
+        credentialed: Vec<String>,
+        prefetches: bool,
         requests: Mutex<Vec<String>>,
     }
 
@@ -171,6 +182,18 @@ mod memory {
             self
         }
 
+        /// Count every request to this repository as sent with a credential.
+        pub(crate) fn with_credential(mut self, repo_url: &str) -> Self {
+            self.credentialed.push(key(repo_url, "").0);
+            self
+        }
+
+        /// Serve prefetches too.
+        pub(crate) fn prefetching(mut self) -> Self {
+            self.prefetches = true;
+            self
+        }
+
         /// Answer every request for `path` only after `delay`.
         pub(crate) fn with_delay(mut self, path: &str, delay: std::time::Duration) -> Self {
             self.delays
@@ -207,11 +230,15 @@ mod memory {
             self.files
                 .get(&key)
                 .cloned()
-                .ok_or_else(|| RepoError::NotFound(key.1))
+                .ok_or_else(|| RepoError::NotFound(key.1.into()))
         }
     }
 
     impl PomSource for MemoryPomSource {
+        fn sends_credential(&self, repo: &Repository) -> bool {
+            self.credentialed.contains(&key(&repo.url, "").0)
+        }
+
         fn admit(&self, repos: Vec<Repository>, from: Declaration) -> Admission {
             RepositoryPolicy::screen(
                 &rv_config::Config::for_testing_with(
@@ -245,6 +272,20 @@ mod memory {
             })
         }
 
+        fn prefetch_pom<'a>(
+            &'a self,
+            repo: &'a Repository,
+            request: &'a ArtifactRequest,
+        ) -> BoxFuture<'a, Result<Option<Bytes>, RepoError>> {
+            let read = self.prefetches.then(|| self.pom(repo, request));
+            Box::pin(async move {
+                match read {
+                    Some(read) => read.await.map(|(bytes, _)| Some(bytes)),
+                    None => Ok(None),
+                }
+            })
+        }
+
         fn metadata<'a>(
             &'a self,
             repo: &'a Repository,
@@ -268,7 +309,7 @@ mod memory {
             coord: &'a Coord,
         ) -> BoxFuture<'a, Result<SnapshotResolution, RepoError>> {
             let coord = coord.to_string();
-            Box::pin(async move { Err(RepoError::NotFound(coord)) })
+            Box::pin(async move { Err(RepoError::NotFound(coord.into())) })
         }
     }
 }

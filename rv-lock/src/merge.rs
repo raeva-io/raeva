@@ -10,10 +10,10 @@
 //! [`preservation`] leaves open and passes the survivors to
 //! [`carry_forward`].
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use rv_maven_types::{Gav, Sha256, resolves_through_snapshot_metadata};
+use rv_maven_types::{Gav, Sha256, SnapshotStamp, resolves_through_snapshot_metadata};
 
 use crate::error::LockError;
 use crate::lock::{LockPlatform, Lockfile, SupportPom, TargetReads, split_support_pom_coord};
@@ -52,6 +52,9 @@ pub enum DropReason {
         /// The file's path relative to the directory that holds raeva.lock.
         path: String,
     },
+    /// The platform lacks the plugin tables raeva.toml asks for, or holds
+    /// tables resolved from other inputs.
+    PluginsChanged,
     /// The platform's reactor model could not be discovered again.
     ModelUnavailable {
         /// Why discovery failed, as the caller reports it.
@@ -76,6 +79,9 @@ impl fmt::Display for DropReason {
                  resolved, and Maven has one local-repository path per coordinate"
             ),
             Self::ModelChanged => f.write_str("reactor model changed"),
+            Self::PluginsChanged => f.write_str(
+                "it has no plugin tables or holds tables of other inputs or another trace",
+            ),
             Self::SystemFileChanged { path } => {
                 write!(f, "the system-scoped file {path} changed or cannot be read")
             }
@@ -84,15 +90,6 @@ impl fmt::Display for DropReason {
             }
         }
     }
-}
-
-/// A platform of the previous lockfile that is left out, and why.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DroppedPlatform {
-    /// The platform left out.
-    pub platform: Platform,
-    /// Why it is left out.
-    pub reason: DropReason,
 }
 
 /// The verdict [`preservation`] reaches on one platform of the previous
@@ -105,6 +102,34 @@ pub struct Candidate {
     /// `None` when its pins agree with the fresh resolution: it survives if
     /// its reactor model is unchanged. `Some` when it is dropped regardless.
     pub dropped: Option<DropReason>,
+}
+
+impl Candidate {
+    /// The platform for [`carry_forward`], or the reason it is dropped.
+    /// When its pins agree, `check` decides what this crate cannot see, such
+    /// as whether its reactor model and system-scoped files are unchanged,
+    /// and returns why it is dropped otherwise.
+    pub fn keep(
+        self,
+        check: impl FnOnce(&Platform) -> Option<DropReason>,
+    ) -> Result<Kept, (Platform, DropReason)> {
+        match self.dropped.or_else(|| check(&self.platform)) {
+            None => Ok(Kept(self.platform)),
+            Some(reason) => Err((self.platform, reason)),
+        }
+    }
+}
+
+/// A platform [`preservation`] and the caller's check found no reason to
+/// drop, which only [`Candidate::keep`] makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept(Platform);
+
+impl Kept {
+    /// The platform kept.
+    pub fn platform(&self) -> &Platform {
+        &self.0
+    }
 }
 
 /// Decide, for every platform of `previous` that `fresh` does not hold, in
@@ -125,7 +150,18 @@ pub fn preservation(fresh: &Lockfile, previous: &Lockfile, config_hash: &str) ->
         .as_deref()
         .is_some_and(|stored| stored == config_hash);
     let fresh_pom_pins = companion_pom_pins(fresh);
+    // A fresh row read without a POM agrees with a kept support POM, as in
+    // one resolution of every platform.
+    let fresh_pinned: PomPins = (fresh_pom_pins.iter())
+        .filter(|(_, pin)| pin.is_some())
+        .map(|(gav, pin)| (gav.clone(), pin.clone()))
+        .collect();
     let fresh_support = fresh.support_poms();
+    // The support POMs the previous lock pinned as this run does, from the
+    // same repository: its rows without a POM already read beside them.
+    let previous_support: BTreeMap<String, SupportPom> = (previous.support_poms().into_iter())
+        .filter(|(coord, pin)| fresh_support.get(coord) == Some(pin))
+        .collect();
     let fresh_pom_builds: PomBuilds = fresh
         .platforms
         .iter()
@@ -146,7 +182,7 @@ pub fn preservation(fresh: &Lockfile, previous: &Lockfile, config_hash: &str) ->
         } else if let Some(coord) =
             conflicting_support_pom(&prev_platform.support_poms, &fresh_support)
                 .or_else(|| {
-                    conflicting_support_companion_pin(&prev_platform.support_poms, &fresh_pom_pins)
+                    conflicting_support_companion_pin(&prev_platform.support_poms, &fresh_pinned)
                 })
                 .or_else(|| conflicting_snapshot_pom(&prev_platform.support_poms, &fresh.platforms))
                 .or_else(|| conflicting_snapshot_pom(&fresh_support, [prev_platform]))
@@ -169,17 +205,17 @@ pub fn preservation(fresh: &Lockfile, previous: &Lockfile, config_hash: &str) ->
             // that moved since the preserved platform was locked is the
             // usual case: this run pins the new build, and the old one names
             // another file under the same coordinate.
-            Some(DropReason::ConflictingArtifact {
-                coord: coordinate.to_string(),
-            })
+            Some(DropReason::ConflictingArtifact { coord: coordinate })
         } else {
             // The same one-path-per-GAV rule across the two maps: a
             // preserved platform's artifact row and this run's support-POM
             // closure can name the same `.pom` from independent
-            // observations.
+            // observations. A kept row without a POM agrees with one the
+            // previous lock pinned as a support POM too, on any platform:
+            // that lock already held the two side by side.
             conflicting_support_companion_pin(
                 &fresh_support,
-                &platform_companion_pom_pins(prev_platform),
+                &companion_pom_pins_beside(prev_platform, &previous_support),
             )
             .map(|coord| DropReason::ConflictingPom { coord })
         };
@@ -196,14 +232,17 @@ pub fn preservation(fresh: &Lockfile, previous: &Lockfile, config_hash: &str) ->
 pub fn carry_forward(
     fresh: &mut Lockfile,
     previous: &Lockfile,
-    kept: &[Platform],
+    kept: &[Kept],
 ) -> Result<(), LockError> {
     let mut reads: HashMap<Platform, TargetReads> = (fresh.platforms.iter())
         .map(|entry| entry.platform.clone())
         .zip(fresh.target_reads())
         .collect();
+    let resolved: HashSet<Platform> = reads.keys().cloned().collect();
     for (platform, read) in previous.platforms.iter().zip(previous.target_reads()) {
-        if kept.contains(&platform.platform) {
+        if kept.iter().any(|kept| kept.0 == platform.platform)
+            && !reads.contains_key(&platform.platform)
+        {
             fresh.platforms.push(platform.clone());
             reads.insert(platform.platform.clone(), read);
         }
@@ -214,7 +253,63 @@ pub fn carry_forward(
     let reads: Vec<_> = (fresh.platforms.iter())
         .map(|entry| reads.remove(&entry.platform).unwrap_or_default())
         .collect();
+    // A freshly resolved row read without its POM takes the one a kept
+    // platform read, as one resolution of every platform would give it. A
+    // kept row keeps what its own resolution read.
+    adopt_into(&mut fresh.platforms, |platform| resolved.contains(platform));
     fresh.set_target_reads(&reads)
+}
+
+/// Pins, on a row read without its POM, the POM another row of the
+/// coordinate was read with, from the repositories that served it. Maven's
+/// local repository holds that one POM, under those repositories, and a
+/// module whose repositories lack it reads none, online or offline.
+pub fn adopt_served_poms(platforms: &mut [LockPlatform]) {
+    adopt_into(platforms, |_| true);
+}
+
+/// [`adopt_served_poms`] into the rows of the platforms `into` accepts.
+fn adopt_into(platforms: &mut [LockPlatform], into: impl Fn(&Platform) -> bool) {
+    type Served = (Sha256, bool, Option<SnapshotStamp>, BTreeSet<String>);
+    let mut served: BTreeMap<Gav, Served> = BTreeMap::new();
+    for row in platforms.iter().flat_map(|platform| &platform.artifacts) {
+        if let Some(sha256) = &row.pom_sha256 {
+            let origins = match row.pom_repo_urls.is_empty() {
+                true => std::iter::once(&row.repo_url)
+                    .chain(&row.other_repo_urls)
+                    .collect(),
+                false => row.pom_repo_urls.iter().collect::<Vec<_>>(),
+            };
+            let (.., served) = (served.entry(row.coordinate.gav.clone())).or_insert_with(|| {
+                let build = row.pom_build().cloned();
+                (sha256.clone(), row.pom_base, build, BTreeSet::new())
+            });
+            served.extend(origins.into_iter().cloned());
+        }
+    }
+    for platform in platforms
+        .iter_mut()
+        .filter(|platform| into(&platform.platform))
+    {
+        for row in &mut platform.artifacts {
+            if row.pom_sha256.is_none()
+                && let Some((sha256, base, build, origins)) = served.get(&row.coordinate.gav)
+            {
+                row.pom_sha256 = Some(sha256.clone());
+                row.pom_base = *base;
+                row.pom_snapshot = (build.as_ref())
+                    .filter(|build| !*base && Some(*build) != row.snapshot.as_ref())
+                    .cloned();
+                let own: BTreeSet<_> = std::iter::once(&row.repo_url)
+                    .chain(&row.other_repo_urls)
+                    .cloned()
+                    .collect();
+                if *origins != own {
+                    row.pom_repo_urls = origins.iter().cloned().collect();
+                }
+            }
+        }
+    }
 }
 
 impl Lockfile {
@@ -225,8 +320,17 @@ impl Lockfile {
     /// (Maven keeps one `.pom` per GAV) from two independent observations, so
     /// the two agreeing is what makes the lockfile describe a `~/.m2` that
     /// can exist. Writing refuses a lockfile where they do not.
+    ///
+    /// A row that pins none agrees: within one resolution it was read from
+    /// repositories that lack the POM, and the local repository holds the
+    /// support POM under the repository that served it.
     pub fn support_companion_conflict(&self) -> Option<String> {
-        conflicting_support_companion_pin(&self.support_poms(), &companion_pom_pins(self))
+        let pinned: PomPins = (self.platforms.iter())
+            .flat_map(|platform| &platform.artifacts)
+            .filter(|artifact| artifact.pom_sha256.is_some())
+            .map(|artifact| (artifact.pom_gav(), artifact.pom_sha256.clone()))
+            .collect();
+        conflicting_support_companion_pin(&self.support_poms(), &pinned)
     }
 }
 
@@ -253,21 +357,40 @@ fn conflicting_support_pom(
         .map(|(coord, _)| coord.clone())
 }
 
+/// The companion POM each row pins, `None` for a row read without one.
 pub(crate) fn companion_pom_pins(lock: &Lockfile) -> PomPins {
-    lock.platforms
-        .iter()
-        .flat_map(platform_companion_pom_pins)
-        .collect()
-}
-
-pub(crate) fn platform_companion_pom_pins(platform: &LockPlatform) -> PomPins {
-    platform
-        .artifacts
-        .iter()
+    (lock.platforms.iter())
+        .flat_map(|platform| &platform.artifacts)
         .map(|artifact| (artifact.pom_gav(), artifact.pom_sha256.clone()))
         .collect()
 }
 
+/// The companion POM each row of `platform` pins, and for a row that pins
+/// none, the one `support_poms` pins for that file, if any.
+///
+/// Across runs, a row read without its POM agrees with a support POM only
+/// where the previous lock pinned that support POM from the same
+/// repository: a repository that lacked the POM then may serve it now, and
+/// the export would label it for the row's module.
+fn companion_pom_pins_beside(
+    platform: &LockPlatform,
+    support_poms: &BTreeMap<String, SupportPom>,
+) -> PomPins {
+    let support: HashMap<Gav, &Sha256> = (support_poms.iter())
+        .filter_map(|(coord, pin)| Some((pin.file_gav(coord)?, &pin.sha256)))
+        .collect();
+    (platform.artifacts.iter())
+        .map(|artifact| {
+            let gav = artifact.pom_gav();
+            let pin = (artifact.pom_sha256.clone())
+                .or_else(|| support.get(&gav).map(|sha256| (*sha256).clone()));
+            (gav, pin)
+        })
+        .collect()
+}
+
+/// The first support POM whose file an artifact row pins other bytes for,
+/// or none.
 pub(crate) fn conflicting_support_companion_pin(
     support_poms: &BTreeMap<String, SupportPom>,
     companions: &PomPins,
@@ -314,15 +437,22 @@ pub(crate) fn conflicting_companion_pom_pin(
     candidate: &LockPlatform,
 ) -> Option<String> {
     candidate.artifacts.iter().find_map(|artifact| {
-        let digest = artifact.pom_sha256.as_ref();
         let gav = artifact.pom_gav();
+        // A kept row read without a POM beside a fresh one with it drops
+        // the platform: its repository may serve the POM now.
+        let digest = artifact.pom_sha256.as_ref();
         if fresh_builds
             .get(&artifact.coordinate.gav)
             .is_some_and(|build| *build != gav)
         {
             return Some(artifact.coordinate.gav.to_string());
         }
-        (fresh.get(&gav)?.as_ref() != digest).then(|| gav.to_string())
+        // A fresh row read without the POM takes this one when the
+        // platform is carried forward (`adopt_served_poms`).
+        match (fresh.get(&gav)?.as_ref(), digest) {
+            (None, Some(_)) => None,
+            (fresh, kept) => (fresh != kept).then(|| gav.to_string()),
+        }
     })
 }
 

@@ -2,6 +2,7 @@
 //! configuration chose.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rv_config::Config;
@@ -19,6 +20,8 @@ pub(crate) struct Session(Arc<Inner>);
 struct Inner {
     project_root: PathBuf,
     offline: bool,
+    /// settings.xml `<offline>`, from the configuration last loaded.
+    config_offline: AtomicBool,
     maven_options: CommandLine,
     output: Output,
     /// What error hints may name from the loaded configuration.
@@ -51,10 +54,23 @@ impl Session {
         Ok(Self(Arc::new(Inner {
             project_root,
             offline,
+            config_offline: AtomicBool::new(false),
             maven_options,
             output,
             hints: Mutex::new(None),
         })))
+    }
+
+    /// This session printing to `output`.
+    pub(crate) fn with_output(&self, output: Output) -> Self {
+        Self(Arc::new(Inner {
+            project_root: self.0.project_root.clone(),
+            offline: self.0.offline,
+            config_offline: AtomicBool::new(self.0.config_offline.load(Ordering::Relaxed)),
+            maven_options: self.0.maven_options.clone(),
+            output,
+            hints: Mutex::new(self.0.hints.lock().ok().and_then(|hints| hints.clone())),
+        }))
     }
 
     pub(crate) fn project_root(&self) -> &Path {
@@ -66,16 +82,22 @@ impl Session {
         &self.0.output
     }
 
-    /// `--offline`: use cached data and file repositories only.
+    /// `--offline`, or the offline mode a loaded configuration sets
+    /// (`Config::offline`): use cached data and file repositories only.
     pub(crate) fn offline(&self) -> bool {
-        self.0.offline
+        self.0.offline || self.0.config_offline.load(Ordering::Relaxed)
     }
 
-    /// Refuse `--offline` for a command whose whole job is a network call.
+    /// Refuse `--offline`, or the offline mode of a loaded configuration,
+    /// for a command whose whole job is a network call.
     pub(crate) fn require_network(&self, command: &str, what: &str) -> Result<()> {
         if self.offline() {
+            let by = match self.0.offline {
+                true => "--offline",
+                false => "offline mode set in settings.xml or .mvn/maven.config",
+            };
             return Err(CliError::Usage(format!(
-                "{} {what} and cannot run with --offline",
+                "{} {what} and cannot run with {by}",
                 crate::output::command_line(command)
             )));
         }
@@ -103,7 +125,8 @@ impl Session {
     }
 
     /// [`Session::config`] for a command that reads only raeva.lock and the
-    /// store, which an invalid `.mvn/maven.config` does not stop.
+    /// store, which an invalid `.mvn/maven.config` or Maven wrapper does
+    /// not stop.
     pub(crate) fn lock_config(&self) -> Result<Config> {
         let config = Config::load_for_lock(self.project_root(), &self.0.maven_options)
             .map_err(config_error)?;
@@ -111,6 +134,7 @@ impl Session {
     }
 
     fn remember_paths(&self, config: Config) -> Result<Config> {
+        (self.0.config_offline).store(config.offline(), Ordering::Relaxed);
         if let Ok(mut hints) = self.0.hints.lock() {
             *hints = Some(HintEnv::for_config(&config));
         }
@@ -122,14 +146,18 @@ impl Session {
     /// local reactor model changes, for a command that acts on the project
     /// from the lock alone. Also returns the reactor model of each locked
     /// platform the check discovered, and the repositories a resolution the
-    /// check ran trusted. Call on the blocking pool: the check may drive
-    /// async resolution through the current runtime.
+    /// check ran trusted. A command that `builds` on this machine's JDK also
+    /// needs it named; see [`crate::commands::read_fresh_lockfile`]. Call on
+    /// the blocking pool: the check may drive async resolution through the
+    /// current runtime.
     pub(crate) fn fresh_lockfile(
         &self,
         config: &Config,
+        builds: bool,
     ) -> Result<(Lockfile, Vec<ReactorModel>, Vec<rv_repo::Repository>)> {
         tokio::runtime::Handle::current().block_on(crate::commands::read_fresh_lockfile(
             config,
+            builds,
             self.offline(),
             self.output(),
         ))

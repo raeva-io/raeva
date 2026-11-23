@@ -20,7 +20,6 @@ const OSV_BASE_URL_ENV: &str = "RAEVA_OSV_BASE_URL";
 
 #[derive(Debug, Args)]
 #[command(
-    args_conflicts_with_subcommands = true,
     after_long_help = format!(
         "\
 Formats:
@@ -49,9 +48,9 @@ suppressed and does not count toward --fail-on. The Fixed column is the
 nearest version above the locked one that the advisory names as fixed.
 
 With --baseline, only new findings count toward --fail-on. A finding is
-existing when the same exact dependency purl and OSV id occur anywhere in
-the baseline, in any of its targets and modules. Only the current inventory
-is queried. Every current finding is shown as New or Existing. A record
+existing when its exact dependency purl occurs anywhere in the baseline, in
+any of its targets and modules. Only the current inventory is queried, so a
+new advisory on an unchanged dependency is existing. Every current finding is shown as New or Existing. A record
 fetch failure fails the scan. The baseline does not need to match the
 current project POMs or targets.
 
@@ -210,6 +209,33 @@ impl SeverityThreshold {
     }
 }
 
+/// Refuses a scan option before `vuln triage`. Clap's
+/// `args_conflicts_with_subcommands` would refuse the global and Maven
+/// options there too, which every command level takes.
+pub(crate) fn refuse_scan_options(
+    matches: &clap::ArgMatches,
+) -> std::result::Result<(), clap::Error> {
+    let Some(("vuln", vuln)) = matches.subcommand() else {
+        return Ok(());
+    };
+    let Some((name, _)) = vuln.subcommand() else {
+        return Ok(());
+    };
+    for arg in VulnArgs::augment_args(clap::Command::new("vuln")).get_arguments() {
+        let id = arg.get_id().as_str();
+        if vuln.value_source(id) == Some(clap::parser::ValueSource::CommandLine) {
+            let flag = arg
+                .get_long()
+                .map_or_else(|| id.to_string(), |long| format!("--{long}"));
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!("the subcommand '{name}' cannot be used with '{flag}'"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn run(args: &VulnArgs, session: &Session) -> Result<Report> {
     if let Some(VulnCommand::Triage(triage_args)) = &args.command {
         return triage(triage_args, session).await;
@@ -285,7 +311,8 @@ async fn scan(
                 })
                 .transpose()?;
             let config = session.config()?;
-            let lock = session.fresh_lockfile(&config)?.0;
+            session.require_network("vuln", "queries the OSV vulnerability database")?;
+            let lock = session.fresh_lockfile(&config, false)?.0;
             let selected = target_selector.select(&lock)?;
             let targets = selected.targets();
             let modules = selected
@@ -298,10 +325,7 @@ async fn scan(
                 .flat_map(|selection| selection.modules().iter().copied())
                 .collect::<Vec<_>>();
             let adapted =
-                crate::commands::lock_adapter::adapt_vulnerability_modules(&modules, include_test)
-                    .map_err(|err| CliError::LockfileDefect {
-                        details: err.to_string(),
-                    })?;
+                crate::commands::lock_adapter::adapt_vulnerability_modules(&modules, include_test)?;
             let baseline = baseline_path
                 .as_ref()
                 .zip(baseline_lock.as_ref())
@@ -891,7 +915,7 @@ fn render_table(
         }
         let mut table = Table::new(columns);
         let first = &report.vulnerabilities[rows[0].2.result].purl;
-        let why = purl_parts(first).map(|parts| format!("{}:{}", parts.group, parts.artifact));
+        let why = rv_maven_types::maven_purl_name_version(first).map(|(name, _)| name);
         for (band, score, finding, vulnerability) in rows {
             let purl = &report.vulnerabilities[finding.result].purl;
             let mut summary = vulnerability.summary.clone();
@@ -1049,53 +1073,10 @@ fn paint_severity(line: &str) -> String {
     line.to_string()
 }
 
-/// The coordinates of a Maven purl as raeva writes it.
-struct PurlParts<'a> {
-    group: &'a str,
-    artifact: &'a str,
-    version: &'a str,
-    kind: Option<&'a str>,
-    classifier: Option<&'a str>,
-}
-
-fn purl_parts(purl: &str) -> Option<PurlParts<'_>> {
-    let rest = purl.strip_prefix("pkg:maven/")?;
-    let (name, qualifiers) = rest.split_once('?').unwrap_or((rest, ""));
-    let (path, version) = name.split_once('@')?;
-    let (group, artifact) = path.split_once('/')?;
-    let mut parts = PurlParts {
-        group,
-        artifact,
-        version,
-        kind: None,
-        classifier: None,
-    };
-    for pair in qualifiers.split('&') {
-        match pair.split_once('=') {
-            Some(("type", value)) => parts.kind = Some(value),
-            Some(("classifier", value)) => parts.classifier = Some(value),
-            _ => {}
-        }
-    }
-    Some(parts)
-}
-
 /// `group:artifact:version` for a Maven purl, with the type and classifier
 /// its qualifiers name, or the purl as it is.
 fn purl_coordinate(purl: &str) -> String {
-    let Some(parts) = purl_parts(purl) else {
-        return purl.to_string();
-    };
-    let mut coordinate = format!("{}:{}:{}", parts.group, parts.artifact, parts.version);
-    if parts.kind.is_some() || parts.classifier.is_some() {
-        coordinate.push(':');
-        coordinate.push_str(parts.kind.unwrap_or("jar"));
-        if let Some(classifier) = parts.classifier {
-            coordinate.push(':');
-            coordinate.push_str(classifier);
-        }
-    }
-    coordinate
+    rv_maven_types::maven_purl_coordinate(purl).unwrap_or_else(|| purl.to_string())
 }
 
 /// The nearest version of the dependency `purl` that `vulnerability` names
@@ -1280,7 +1261,15 @@ fn scan_metadata(query_timestamp: &str) -> serde_json::Value {
 mod tests {
     use rv_vuln::Vulnerability;
 
-    use super::{SeverityThreshold, fixed_version, sarif_level};
+    use super::{SeverityThreshold, fixed_version, purl_coordinate, sarif_level};
+
+    /// A purl's coordinates are shown and matched decoded.
+    #[test]
+    fn purl_coordinates_are_decoded() {
+        let purl = rv_maven_types::maven_purl("g", "a", "1.0+2").unwrap();
+        assert_eq!(purl_coordinate(&purl), "g:a:1.0+2");
+        assert_eq!(purl_coordinate("not a purl"), "not a purl");
+    }
 
     /// The purl's version is percent-encoded; the fix is chosen against the
     /// version itself.

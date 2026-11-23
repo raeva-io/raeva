@@ -1,14 +1,15 @@
-use std::collections::{BTreeMap, HashMap, btree_map::Entry};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Mutex;
 
 use rv_config::Config;
 use rv_lock::{LockModule, LockPlatform};
 use rv_maven_model::{ImportCoord, ModelSource, Parent, ParentLookup, Pom, PomError};
-use rv_maven_types::{BlobId, Sha256, Version};
+use rv_maven_types::{BlobId, MavenMode, Sha256, Version};
 use rv_sbom::License;
 use rv_store::Store;
 
+use crate::commands::lock_adapter::ComponentModel;
 use crate::error::{CliError, Result};
 
 pub(crate) fn populate(
@@ -16,6 +17,7 @@ pub(crate) fn populate(
     platform: &LockPlatform,
     workspace: &rv_resolver::Workspace,
     modules: &[&LockModule],
+    listed: &std::collections::BTreeSet<String>,
     licenses: &mut BTreeMap<String, Vec<License>>,
 ) -> Result<()> {
     let config = &config.for_platforms([(
@@ -48,31 +50,29 @@ pub(crate) fn populate(
         &effective
     };
     let evidence = PinnedPoms::new(config, platform)?;
-    let mut module_by_gav = HashMap::new();
-    for module in &platform.modules {
-        module_by_gav
-            .entry(module.gav.to_string())
-            .or_insert(module);
-    }
+    let module_by_path: HashMap<&str, &LockModule> = (platform.modules.iter())
+        .map(|module| (module.path.as_str(), module))
+        .collect();
     // Each module's components, with the effective model to build for each
     // one that has a Maven descriptor. A component's effective licenses depend
-    // only on its coordinates and the parent range selections recorded for
-    // them, so modules that share a component build it once.
+    // only on its model, its coordinates and the parent range selections
+    // recorded for them, so modules that share a component build it once.
     let mut inventories = Vec::with_capacity(modules.len());
     let mut keys = Vec::new();
     let mut first_use = HashMap::new();
     for module in modules {
-        let inventory =
-            match crate::commands::lock_adapter::adapt_sbom_modules(platform, &[*module]) {
-                Ok(inventory) => inventory,
-                Err(err) => {
-                    // Reported in turn, after what the modules before it give.
-                    inventories.push(Err(CliError::LockfileDefect {
-                        details: err.to_string(),
-                    }));
-                    break;
-                }
-            };
+        let inventory = match crate::commands::lock_adapter::adapt_sbom_modules_listing(
+            platform,
+            &[*module],
+            listed,
+        ) {
+            Ok(inventory) => inventory,
+            Err(err) => {
+                // Reported in turn, after what the modules before it give.
+                inventories.push(Err(CliError::from(err)));
+                break;
+            }
+        };
         let mut components = Vec::new();
         for component in std::iter::once(inventory.root).chain(inventory.components) {
             let gav = format!(
@@ -81,65 +81,74 @@ pub(crate) fn populate(
                 component.name,
                 component.version
             );
-            let reactor = module_by_gav.get(&gav).copied();
-            // A locked dependency may legitimately have no Maven descriptor.
-            let build = (evidence.pins.contains_key(&gav) || reactor.is_some()).then(|| {
+            let reference = component.reference().to_string();
+            let model = match inventory.models.get(&reference) {
+                Some(ComponentModel::Module(path)) => (module_by_path.get_key_value(path.as_str()))
+                    .map(|(path, _)| Model::Module(path)),
+                // A locked dependency may legitimately have no Maven descriptor.
+                Some(ComponentModel::Pinned) if evidence.pins.contains_key(&gav) => {
+                    Some(Model::Pinned)
+                }
+                Some(ComponentModel::OwnPinned) if evidence.pins.contains_key(&gav) => {
+                    Some(Model::OwnPinned)
+                }
+                _ => None,
+            };
+            let build = model.map(|model| {
                 // A reactor module's model is its own, whichever module
                 // depends on it.
-                let selections: BTreeMap<&str, &str> = reactor
-                    .unwrap_or(module)
-                    .parent_ranges
-                    .iter()
+                let owner = match model {
+                    Model::Module(path) => Some(module_by_path[path]),
+                    Model::Pinned => Some(*module),
+                    // The module's selections of these coordinates are its
+                    // own model's.
+                    Model::OwnPinned => None,
+                };
+                let selections: BTreeMap<&str, &str> = (owner.into_iter())
+                    .flat_map(|owner| &owner.parent_ranges)
                     .filter(|selection| selection.model == gav)
                     .map(|selection| (selection.parent.as_str(), selection.selected.as_str()))
                     .collect();
                 *first_use
-                    .entry((gav.clone(), selections))
+                    .entry((model, gav.clone(), selections))
                     .or_insert_with_key(|key| {
                         keys.push(key.clone());
                         keys.len() - 1
                     })
             });
-            components.push((gav, component.purl, build));
+            components.push((reference, build));
         }
         inventories.push(Ok(components));
     }
     let mut built: Vec<_> = rv_maven_model::held::par_map_held(&keys, |key| {
-        effective_licenses(
-            config,
-            platform,
-            workspace,
-            &evidence,
-            module_by_gav.get(&key.0).copied(),
-            key,
-        )
+        let reactor = match key.0 {
+            Model::Module(path) => Some(module_by_path[path]),
+            Model::Pinned | Model::OwnPinned => None,
+        };
+        effective_licenses(config, platform, workspace, &evidence, reactor, key)
     })
     .into_iter()
     .map(|(mapped, held)| Some((mapped, held)))
     .collect();
     let mut shown = vec![None; keys.len()];
     for components in inventories {
-        let mut model_licenses = BTreeMap::new();
-        for (gav, purl, build) in components? {
-            if let Entry::Vacant(entry) = model_licenses.entry(gav.clone()) {
-                entry.insert(match build {
-                    None => Vec::new(),
-                    Some(index) => {
-                        if let Some((mapped, held)) = built[index].take() {
-                            held.show();
-                            shown[index] = Some(mapped?);
-                        }
-                        shown[index].clone().expect("a shown build succeeded")
+        for (reference, build) in components? {
+            let mapped = match build {
+                None => Vec::new(),
+                Some(index) => {
+                    if let Some((mapped, held)) = built[index].take() {
+                        held.show();
+                        shown[index] = Some(mapped?);
                     }
-                });
-            }
-            let mapped = model_licenses[&gav].clone();
-            if let Some(previous) = licenses.insert(purl.clone(), mapped.clone())
+                    shown[index].clone().expect("a shown build succeeded")
+                }
+            };
+            if let Some(previous) = licenses.insert(reference.clone(), mapped.clone())
                 && (previous.len() != mapped.len()
                     || previous.iter().any(|license| !mapped.contains(license)))
             {
                 return Err(CliError::Usage(format!(
-                    "cannot combine the selected SBOM modules or targets: {purl} has different effective licenses; pass --module, --platform and --jdk to select one context"
+                    "cannot combine the selected SBOM modules or targets: {reference} has different effective licenses; pass --module, --platform and --jdk to select one context"
                 )));
             }
         }
@@ -147,19 +156,32 @@ pub(crate) fn populate(
     Ok(())
 }
 
-/// The licenses of `gav`'s effective model: a reactor module's from its local
-/// POM, a dependency's from its pinned POM.
+/// Whose effective model gives a component's licenses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Model<'a> {
+    /// The reactor module's at this path, built from its local POM.
+    Module(&'a str),
+    /// A repository file's, built from the POM raeva.lock pins for its
+    /// coordinates.
+    Pinned,
+    /// [`ComponentModel::OwnPinned`]: built from the pinned POM where the
+    /// lock holds its lineage, else none.
+    OwnPinned,
+}
+
+/// The licenses of `gav`'s effective `model`.
 fn effective_licenses(
     config: &Config,
     platform: &LockPlatform,
     workspace: &rv_resolver::Workspace,
     evidence: &PinnedPoms,
     reactor_module: Option<&LockModule>,
-    (gav, selections): &(String, BTreeMap<&str, &str>),
+    (model, gav, selections): &(Model<'_>, String, BTreeMap<&str, &str>),
 ) -> Result<Vec<License>> {
     let source = PinnedModel {
         evidence,
         selections: selections.clone(),
+        mode: config.lock.maven.mode,
         dependency: reactor_module.is_none(),
     };
     let licenses = if let Some(module) = reactor_module {
@@ -181,16 +203,16 @@ fn effective_licenses(
         .licenses
     } else {
         match evidence.read(gav) {
-            Ok(pom) => {
-                rv_maven_model::ready(workspace.dependency_metadata(
-                    pom,
-                    config,
-                    &platform.platform,
-                    &source,
-                ))
-                .map_err(|error| failure(gav, None, error))?
-                .licenses
-            }
+            Ok(pom) => match rv_maven_model::ready(workspace.dependency_metadata(
+                pom,
+                config,
+                &platform.platform,
+                &source,
+            )) {
+                Ok(metadata) => metadata.licenses,
+                Err(EvidenceError::Defect(_)) if *model == Model::OwnPinned => Vec::new(),
+                Err(error) => return Err(failure(gav, None, error)),
+            },
             // Resolution keeps such a dependency without its model.
             Err(EvidenceError::Model(error))
                 if error.is_malformed_xml() || error.is_deserialize() =>
@@ -216,12 +238,20 @@ fn effective_licenses(
 fn failure(gav: &str, module: Option<&str>, error: EvidenceError) -> CliError {
     let details = |reason: String| format!("cannot read SBOM license evidence for {gav}: {reason}");
     match error {
-        EvidenceError::Model(source) => match module {
-            Some(path) => CliError::Resolve(rv_resolver::ResolveError::LocalPom {
+        // As sync tells them apart: the model layer names a fetched POM in
+        // the other errors, including a property cycle it holds.
+        EvidenceError::Model(source) => match (module, &source) {
+            (
+                Some(path),
+                PomError::InvalidSystemPath(_)
+                | PomError::InvalidProject(_)
+                | PomError::PropertyCycle(_)
+                | PomError::ParentExpression(_),
+            ) => CliError::Resolve(rv_resolver::ResolveError::LocalPom {
                 path: path.to_string(),
                 source,
             }),
-            None => CliError::Resolve(rv_resolver::ResolveError::Pom(source)),
+            _ => CliError::Resolve(rv_resolver::ResolveError::Pom(source)),
         },
         EvidenceError::Unstored(reason) => CliError::lockfile_mismatch_with(
             details(reason),
@@ -314,8 +344,8 @@ impl PinnedPoms {
             EvidenceError::Defect(format!("POM {gav} has no SHA-256 pin in raeva.lock"))
         })?;
         let id: BlobId = pin.to_string().parse().expect("a SHA-256 is a blob id");
-        let file = std::fs::File::open(self.store.get_path(&id))
-            .map_err(|_| unstored("is unavailable in the content store"))?;
+        let file = (self.store.open_blob(&id).ok().flatten())
+            .ok_or_else(|| unstored("is unavailable in the content store"))?;
         let mut bytes = Vec::new();
         file.take(5 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
@@ -339,6 +369,8 @@ impl PinnedPoms {
 struct PinnedModel<'a> {
     evidence: &'a PinnedPoms,
     selections: BTreeMap<&'a str, &'a str>,
+    /// The Maven line the lock was resolved as.
+    mode: MavenMode,
     /// Whether the model is a dependency's, whose parents resolution reads
     /// from the reactor first.
     dependency: bool,
@@ -352,7 +384,7 @@ impl ModelSource for PinnedModel<'_> {
         parent: &mut Parent,
         _lookup: ParentLookup,
     ) -> std::result::Result<Option<Pom>, Self::Error> {
-        if let Some(range) = rv_maven_model::parent_version_range(parent) {
+        if let Some(range) = rv_maven_model::parent_version_range(parent, self.mode) {
             let requested = format!(
                 "{}:{}:{}",
                 parent.group_id, parent.artifact_id, parent.version
@@ -366,7 +398,8 @@ impl ModelSource for PinnedModel<'_> {
                 })?;
             if group != parent.group_id
                 || artifact != parent.artifact_id
-                || !Version::parse(version).is_ok_and(|version| range.matches(&version))
+                || !Version::parse(version)
+                    .is_ok_and(|version| range.matches_in(&version, self.mode))
             {
                 return Err(EvidenceError::Defect(format!(
                     "parent selection {selected} does not match {requested}"

@@ -1,9 +1,5 @@
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use petgraph::graph::NodeIndex;
 use rv_maven_model::{Dependency, Exclusion};
 use rv_maven_types::{ArtifactId, Coord, GroupId, Version};
 
@@ -23,6 +19,8 @@ const MAX_DECLARATIONS: u64 = 1_000_000;
 pub(crate) struct ExclusionKey {
     group_id: GroupId,
     artifact_id: ArtifactId,
+    /// The artifact id is a prefix: only Maven's WagonExcluder matches so.
+    prefix: bool,
 }
 
 impl From<&Exclusion> for ExclusionKey {
@@ -30,8 +28,28 @@ impl From<&Exclusion> for ExclusionKey {
         Self {
             group_id: exclusion.group_id.as_str().into(),
             artifact_id: exclusion.artifact_id.as_str().into(),
+            prefix: false,
         }
     }
+}
+
+impl ExclusionKey {
+    /// What Maven's WagonExcluder drops below a Maven 2 core artifact when
+    /// it collects a plugin's dependencies.
+    fn wagon_providers() -> Self {
+        Self {
+            group_id: "org.apache.maven.wagon".into(),
+            artifact_id: "wagon-".into(),
+            prefix: true,
+        }
+    }
+}
+
+/// Whether Maven's WagonExcluder drops wagon providers below `coord`.
+pub(crate) fn is_legacy_core(coord: &Coord) -> bool {
+    coord.group_id.as_str() == "org.apache.maven"
+        && coord.artifact_id.as_str().starts_with("maven-")
+        && coord.version.as_str().starts_with("2.")
 }
 
 /// Ancestor chain from root down to the current item. The linked list of
@@ -78,14 +96,6 @@ impl PathNode {
         })
     }
 
-    /// Whether `key` is on the path below the root. maven-resolver cuts a
-    /// cycle only at an ancestor that has a dependency, which the root does
-    /// not have, so a dependency on the root's own group and artifact id is
-    /// collected like any other.
-    pub(crate) fn contains(&self, key: &CoordKey) -> bool {
-        self.keys().any(|ancestor| ancestor == key)
-    }
-
     pub(crate) fn format_cycle(&self, next: &CoordKey) -> String {
         let mut parts = Vec::with_capacity(self.depth + 2);
         parts.push(format!("{}:{}", next.group_id, next.artifact_id));
@@ -120,10 +130,6 @@ impl PathNode {
             .filter(|node| node.parent.is_some())
             .map(|node| (&node.key, &*node.version))
     }
-
-    pub(crate) fn keys(&self) -> impl Iterator<Item = &CoordKey> {
-        self.below_root().map(|(key, _)| key)
-    }
 }
 
 impl Drop for PathNode {
@@ -136,163 +142,25 @@ impl Drop for PathNode {
     }
 }
 
-/// Where a declaration sits in Maven's dependency tree: the index of each
-/// declaration on the way down from the root, sharing its ancestors' with
-/// their other descendants. Depth-first order is the lexicographic order of
-/// these.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct TreeOrder(Option<Arc<OrderNode>>);
-
-#[derive(Debug)]
-pub(crate) struct OrderNode {
-    index: u32,
-    len: usize,
-    parent: TreeOrder,
-}
-
-impl TreeOrder {
-    pub(crate) fn child(&self, index: usize) -> Self {
-        Self(Some(Arc::new(OrderNode {
-            index: u32::try_from(index).unwrap_or(u32::MAX),
-            len: self.len() + 1,
-            parent: self.clone(),
-        })))
-    }
-
-    /// The order without its last index; the root's own for the root.
-    pub(crate) fn parent(&self) -> &Self {
-        self.0.as_ref().map_or(self, |node| &node.parent)
-    }
-
-    fn len(&self) -> usize {
-        self.0.as_ref().map_or(0, |node| node.len)
-    }
-}
-
-impl Ord for TreeOrder {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let by_len = self.len().cmp(&other.len());
-        let (mut a, mut b) = (self, other);
-        while a.len() > b.len() {
-            a = a.parent();
-        }
-        while b.len() > a.len() {
-            b = b.parent();
-        }
-        // Equal lengths: the topmost index that differs decides, and a
-        // shared ancestor ends the walk.
-        let mut first = Ordering::Equal;
-        while let (Some(x), Some(y)) = (&a.0, &b.0) {
-            if Arc::ptr_eq(x, y) {
-                break;
-            }
-            first = x.index.cmp(&y.index).then(first);
-            (a, b) = (&x.parent, &y.parent);
-        }
-        first.then(by_len)
-    }
-}
-
-impl PartialOrd for TreeOrder {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for TreeOrder {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for TreeOrder {}
-
-impl Hash for TreeOrder {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut order = self;
-        while let Some(node) = &order.0 {
-            node.index.hash(state);
-            order = &node.parent;
-        }
-    }
-}
-
-impl Drop for OrderNode {
-    fn drop(&mut self) {
-        let mut next = self.parent.0.take();
-        while let Some(mut node) = next.and_then(Arc::into_inner) {
-            next = node.parent.0.take();
-        }
-    }
-}
-
-/// A shadow declaration: one Maven gathers below a losing candidate of the
-/// group `group`, because the group's winner sits below the key the
-/// declaration targets, which therefore was mediated first. It lives as long
-/// as that candidate does.
-#[derive(Debug, Clone)]
-pub(crate) struct ShadowOrigin {
-    pub(crate) group: CoordKey,
-    pub(crate) instance: u64,
-    pub(crate) coord: Coord,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct QueueItem {
-    pub(crate) parent: NodeIndex,
-    /// The parent's generation when it declared this item; an item from an
-    /// older generation is stale.
-    pub(crate) parent_generation: u64,
     pub(crate) dependency: Arc<Dependency>,
     /// Management set the dependency's scope.
     pub(crate) managed_scope: bool,
     pub(crate) depth: usize,
-    pub(crate) order: TreeOrder,
     pub(crate) declared_at: u64,
     pub(crate) exclusions: Arc<[ExclusionKey]>,
     pub(crate) path: Arc<PathNode>,
-    pub(crate) shadow: Option<Arc<ShadowOrigin>>,
 }
 
-pub(crate) type SortKey = (usize, TreeOrder, u64);
-
-impl QueueItem {
-    /// Breadth-first, then Maven's depth-first order within a depth.
-    pub(crate) fn sort_key(&self) -> SortKey {
-        (self.depth, self.order.clone(), self.declared_at)
-    }
-}
-
-impl Ord for QueueItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (other.depth, &other.order, other.declared_at).cmp(&(
-            self.depth,
-            &self.order,
-            self.declared_at,
-        ))
-    }
-}
-
-impl PartialOrd for QueueItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for QueueItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for QueueItem {}
-
-pub(crate) fn push_queue(queue: &mut BinaryHeap<QueueItem>, item: QueueItem) -> Result<()> {
-    let exceeded = if queue.len() >= MAX_QUEUE_SIZE {
+/// Fail past a bound of the walk with `queued` items queued and `counted`
+/// declarations read before `item`.
+pub(crate) fn check_bounds(queued: usize, counted: u64, item: &QueueItem) -> Result<()> {
+    let exceeded = if queued >= MAX_QUEUE_SIZE {
         Some(("declarations queued at once", MAX_QUEUE_SIZE as u64))
     } else if item.depth > MAX_DEPTH {
         Some(("levels of depth", MAX_DEPTH as u64))
-    } else if item.declared_at >= MAX_DECLARATIONS {
+    } else if counted >= MAX_DECLARATIONS {
         Some(("declarations", MAX_DECLARATIONS))
     } else {
         None
@@ -307,7 +175,6 @@ pub(crate) fn push_queue(queue: &mut BinaryHeap<QueueItem>, item: QueueItem) -> 
             ),
         });
     }
-    queue.push(item);
     Ok(())
 }
 
@@ -323,90 +190,46 @@ pub(crate) fn excludes(exclusions: &[ExclusionKey], group_id: &str, artifact_id:
         let ex_artifact = ex.artifact_id.as_str().trim();
         // Maven coordinates are case-sensitive; `*` is the only wildcard.
         let group_match = ex_group == "*" || ex_group == dep_group;
-        let artifact_match = ex_artifact == "*" || ex_artifact == dep_artifact;
+        let artifact_match = ex_artifact == "*"
+            || ex_artifact == dep_artifact
+            || (ex.prefix && dep_artifact.starts_with(ex_artifact));
         group_match && artifact_match
     })
 }
 
+/// The exclusions below a node: its parent's, its declaration's, and the
+/// wagon providers when `drops_wagons`.
 pub(crate) fn extend_exclusions(
     parent: &Arc<[ExclusionKey]>,
     current: &[Exclusion],
+    drops_wagons: bool,
 ) -> Arc<[ExclusionKey]> {
-    if current.is_empty() {
+    let wagons =
+        (drops_wagons && !parent.iter().any(|key| key.prefix)).then(ExclusionKey::wagon_providers);
+    if current.is_empty() && wagons.is_none() {
         return Arc::clone(parent);
     }
 
-    let mut merged = Vec::with_capacity(parent.len() + current.len());
+    let mut merged = Vec::with_capacity(parent.len() + current.len() + 1);
     merged.extend_from_slice(parent);
     merged.extend(current.iter().map(ExclusionKey::from));
+    merged.extend(wagons);
     Arc::from(merged)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-
-    /// Shared orders sort, compare and hash as the index lists they stand
-    /// for, whether or not two of them share nodes.
-    #[test]
-    fn tree_order_follows_its_index_lists() {
-        let lists: Vec<Vec<u32>> = vec![
-            vec![],
-            vec![0],
-            vec![1],
-            vec![0, 0],
-            vec![0, 1],
-            vec![0, 1, 2],
-            vec![0, 2, 0],
-            vec![1, 0],
-            vec![2, 1, 0],
-            vec![2, 1, 1],
-        ];
-        let build = |list: &[u32]| {
-            list.iter().fold(TreeOrder::default(), |order, &index| {
-                order.child(index as usize)
-            })
-        };
-        let mut shared: HashMap<Vec<u32>, TreeOrder> = HashMap::new();
-        for list in &lists {
-            let parent = shared.get(&list[..list.len().saturating_sub(1)]).cloned();
-            let order = match (parent, list.last()) {
-                (Some(parent), Some(&last)) => parent.child(last as usize),
-                _ => build(list),
-            };
-            shared.insert(list.clone(), order);
-        }
-        let hash = |order: &TreeOrder| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            order.hash(&mut hasher);
-            hasher.finish()
-        };
-        for a in &lists {
-            for b in &lists {
-                for (x, y) in [(&shared[a], &shared[b]), (&shared[a], &build(b))] {
-                    assert_eq!(x.cmp(y), a.cmp(b), "{a:?} vs {b:?}");
-                    if a == b {
-                        assert_eq!(hash(x), hash(y), "{a:?}");
-                    }
-                }
-            }
-            assert_eq!(shared[a].parent(), &build(&a[..a.len().saturating_sub(1)]));
-        }
-    }
 
     /// A long chain drops without recursing down it.
     #[test]
     fn long_chains_drop_iteratively() {
         let coord = Coord::parse("g:a:1").unwrap();
         let mut path = PathNode::root(&coord);
-        let mut order = TreeOrder::default();
         for _ in 0..1_000_000 {
             path = PathNode::extend(&path, &coord, &coord.version, RepoContext::default());
-            order = order.child(0);
         }
-        drop((path, order));
+        drop(path);
     }
 
     /// Past each bound, a declaration fails naming what it counts.
@@ -414,8 +237,6 @@ mod tests {
     fn bounds_name_what_they_count() {
         let coord = Coord::parse("g:a:1").unwrap();
         let item = |depth, declared_at| QueueItem {
-            parent: NodeIndex::new(0),
-            parent_generation: 0,
             dependency: Arc::new(Dependency {
                 group_id: "g".into(),
                 artifact_id: "a".into(),
@@ -426,17 +247,16 @@ mod tests {
                 optional: None,
                 exclusions: Vec::new(),
                 system_path: None,
+                system_path_from_project: Default::default(),
+                origin: Default::default(),
             }),
             managed_scope: false,
             depth,
-            order: TreeOrder::default(),
             declared_at,
             exclusions: Arc::from(Vec::new()),
             path: PathNode::root(&coord),
-            shadow: None,
         };
-        let mut queue = BinaryHeap::new();
-        push_queue(&mut queue, item(MAX_DEPTH, MAX_DECLARATIONS - 1)).unwrap();
+        check_bounds(0, MAX_DECLARATIONS - 1, &item(MAX_DEPTH, 0)).unwrap();
         for (item, message) in [
             (
                 item(MAX_DEPTH + 1, 0),
@@ -447,7 +267,7 @@ mod tests {
                 "dependency graph exceeds 1000000 declarations at g:a",
             ),
         ] {
-            let err = push_queue(&mut queue, item).unwrap_err();
+            let err = check_bounds(0, item.declared_at, &item).unwrap_err();
             assert_eq!(err.to_string(), message);
         }
     }

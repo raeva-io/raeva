@@ -22,6 +22,8 @@ struct Cache {
 
 pub(crate) struct ParsedPomCache {
     inner: Mutex<Cache>,
+    /// Keep each POM's plugin sections, for plugin models.
+    plugins: bool,
 }
 
 impl std::fmt::Debug for ParsedPomCache {
@@ -39,26 +41,64 @@ impl Default for ParsedPomCache {
                 entries: LruCache::new(NonZeroUsize::new(MAX_PARSED_POM_ENTRIES).unwrap()),
                 source_bytes: 0,
             }),
+            plugins: false,
         }
     }
 }
 
 impl ParsedPomCache {
+    pub(crate) fn with_plugin_sections() -> Self {
+        Self {
+            plugins: true,
+            ..Self::default()
+        }
+    }
+
+    /// An empty cache that keeps plugin sections as this one does.
+    pub(crate) fn emptied(&self) -> Self {
+        Self {
+            plugins: self.plugins,
+            ..Self::default()
+        }
+    }
+
     // The digest must identify the original bytes, including any UTF-8 BOM.
     // A coordinate index can change independently of the bytes being parsed.
     // Callers that mutate must clone the Arc's contents once; the cache keeps
     // the shared model.
     pub(crate) fn parse(&self, blob: &BlobId, bytes: &[u8]) -> Result<Arc<Pom>, PomError> {
+        self.parse_keeping(blob, bytes, self.plugins)
+    }
+
+    /// [`Self::parse`] for a POM of the project, whose plugin sections a
+    /// project build checks in either Maven line.
+    pub(crate) fn parse_project(&self, blob: &BlobId, bytes: &[u8]) -> Result<Arc<Pom>, PomError> {
+        self.parse_keeping(blob, bytes, true)
+    }
+
+    fn parse_keeping(
+        &self,
+        blob: &BlobId,
+        bytes: &[u8],
+        plugins: bool,
+    ) -> Result<Arc<Pom>, PomError> {
         let cached = {
             let mut cache = lock(&self.inner);
             cache.entries.get(blob).map(|entry| Arc::clone(&entry.pom))
         };
-        if let Some(pom) = cached {
+        if let Some(pom) = cached
+            && (!plugins || pom.keeps_plugin_sections())
+        {
             return Ok(pom);
         }
 
         let xml = rv_maven_model::decode_pom(bytes)?;
-        let pom = Arc::new(Pom::parse(&xml)?);
+        let pom = if plugins {
+            Pom::parse_with_plugins(&xml)?
+        } else {
+            Pom::parse(&xml)?
+        };
+        let pom = Arc::new(pom);
         self.insert(blob.clone(), Arc::clone(&pom), bytes.len());
         Ok(pom)
     }

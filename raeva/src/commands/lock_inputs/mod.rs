@@ -17,7 +17,7 @@ use rv_lock::inputs::{
     ConfigDrift, CurrentModel, CurrentModule, LocalParentInput, ModuleInput, ReactorInputs,
     RepositoryInputs, ResolutionInputs, SettingsProfileInput, config_hash, model_hash,
 };
-use rv_lock::{AmbientInput, HostCondition, Lockfile, Platform};
+use rv_lock::{AmbientInput, HostCondition, Lockfile, PackageSource, Platform};
 use rv_maven_model::{HostInput, HostReads, HostSnapshot};
 use rv_repo::Repository;
 use rv_resolver::{Workspace, WorkspaceError};
@@ -37,66 +37,53 @@ pub(crate) fn resolution_inputs(
     config: &Config,
     ambient: &BTreeSet<AmbientInput>,
 ) -> Result<ResolutionInputs> {
+    let ambient = &with_filter_properties(config, ambient);
     let explicit = config.for_platforms([]);
-    let names = ambient
-        .iter()
-        .filter_map(|input| match input {
-            AmbientInput::UserProperty(name) => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
+    let (names, overrides) = user_property_names(ambient);
     let user_properties = config.user_property_inputs(&names);
-    Ok(ResolutionInputs {
+    let user_overrides = config.user_override_inputs(&overrides);
+    let inputs = ResolutionInputs {
         profile_selections: config.maven_profile_selections(),
         active_profiles: explicit.active_profiles().to_vec(),
         inactive_profiles: config.inactive_profiles.clone(),
         repositories: explicit
             .repositories()
             .iter()
-            .map(|repo| RepositoryInputs {
-                id: repo.id.clone(),
-                url: repo.url.clone(),
-                releases: repo.releases,
-                snapshots: repo.snapshots,
-                snapshots_update_policy: repo
-                    .snapshots_update_policy
-                    .unwrap_or_default()
-                    .to_string(),
-                releases_update_policy: repo
-                    .releases_update_policy
-                    .unwrap_or(UpdatePolicy::Daily)
-                    .to_string(),
-                releases_checksum_policy: format!(
-                    "{:?}",
-                    repo.releases_checksum_policy.unwrap_or_default()
-                ),
-                snapshots_checksum_policy: format!(
-                    "{:?}",
-                    repo.snapshots_checksum_policy.unwrap_or_default()
-                ),
-            })
+            .map(|repo| repository_inputs(config, repo))
+            .collect(),
+        plugin_repositories: (explicit.profile_plugin_repositories().iter())
+            .chain(explicit.named_plugin_repositories())
+            .map(|repo| repository_inputs(config, repo))
             .collect(),
         allow_transitive_repositories: config.security.allow_transitive_repositories,
         allow_env_substitution: config.security.allow_env_substitution.clone(),
         transitive_repository_allowlist: config.security.transitive_repository_allowlist.clone(),
         jdks: config.lock.jdks.clone(),
+        maven: config.lock.maven.mode,
         settings_profiles: config
             .conditional_settings_profiles()
             .into_iter()
             .map(|(id, content)| SettingsProfileInput { id, content })
             .collect(),
+        settings_model_repositories: config.settings_model_repository_inputs(),
         // An active settings.xml profile sets a listed property that no `-D`
         // sets, whether or not the lock lists it as a settings property. It
         // ranks above `.mvn/jvm.config`, so a value from there alone still
         // leaves it to check.
         ambient: (ambient.iter())
             .flat_map(|name| {
-                let (value, overridden) = match name {
-                    AmbientInput::UserProperty(name) => match user_properties.get(name) {
-                        Some(inputs) => (inputs.hash_value(), inputs.defined()),
-                        None => (None, false),
-                    },
-                    _ => (current_value(config, name), false),
+                let (value, overridden) = match name.user_property_name() {
+                    Some((property, system)) => {
+                        let inputs = match system {
+                            true => &user_properties,
+                            false => &user_overrides,
+                        };
+                        match inputs.get(property) {
+                            Some(inputs) => (inputs.hash_value(), inputs.defined()),
+                            None => (None, false),
+                        }
+                    }
+                    None => (current_value(config, name), false),
                 };
                 let settings = settings_companion(name)
                     .filter(|settings| !overridden && !ambient.contains(settings))
@@ -107,7 +94,81 @@ pub(crate) fn resolution_inputs(
                 std::iter::once((name.clone(), value)).chain(settings)
             })
             .collect(),
-    })
+        repository_filters: filter_rule_input(config),
+    };
+    Ok(inputs)
+}
+
+/// What the configuration hash covers of the repository filters: the
+/// host's rule input, or, where a platform's `${os.*}` or `java.version`
+/// gives another, each distinct one, sorted, so that every host of the
+/// lock's platforms hashes alike.
+fn filter_rule_input(config: &Config) -> Option<String> {
+    let listed = |name: &str| AmbientInput::user_property(name).is_ok();
+    let host = config.repository_filters().rule_input(listed);
+    let mut inputs: BTreeSet<String> = (config.platform_repository_filters().iter())
+        .filter_map(|filters| filters.rule_input(listed))
+        .filter(|input| Some(input) != host.as_ref())
+        .collect();
+    if inputs.is_empty() {
+        return host;
+    }
+    inputs.extend(host);
+    let lines: Vec<String> = (inputs.into_iter())
+        .map(|input| format!("platform\n{input}"))
+        .collect();
+    Some(lines.join("\n"))
+}
+
+fn repository_inputs(config: &Config, repo: &rv_config::RepoConfig) -> RepositoryInputs {
+    RepositoryInputs {
+        id: repo.id.clone(),
+        // As written: Maven 3.10's repository filters read that spelling.
+        // The project's and the user's home directories in it are markers.
+        url: config.portable_location(repo.declared_url.as_deref().unwrap_or(&repo.url)),
+        releases: repo.releases,
+        snapshots: repo.snapshots,
+        snapshots_update_policy: repo.snapshots_update_policy.unwrap_or_default().to_string(),
+        releases_update_policy: (repo.releases_update_policy)
+            .unwrap_or(UpdatePolicy::Daily)
+            .to_string(),
+        releases_checksum_policy: format!(
+            "{:?}",
+            repo.releases_checksum_policy.unwrap_or_default()
+        ),
+        snapshots_checksum_policy: format!(
+            "{:?}",
+            repo.snapshots_checksum_policy.unwrap_or_default()
+        ),
+    }
+}
+
+/// `ambient` with the remote repository filter properties in effect, which
+/// decide which repository serves a file whether or not a model reads
+/// them, so a lock written without them sees them once they are set.
+fn with_filter_properties(
+    config: &Config,
+    ambient: &BTreeSet<AmbientInput>,
+) -> BTreeSet<AmbientInput> {
+    let mut ambient = ambient.clone();
+    ambient.extend(filter_properties(config));
+    ambient
+}
+
+/// The user properties in effect that resolution reads without a recorded
+/// read, as raeva.lock lists them: the remote repository filter properties
+/// it can list (`config_hash` covers the others by value), and a
+/// `path.separator` a `-D` or `.mvn/jvm.config` sets, which an `<os>`
+/// family `dos` or `unix` tests in place of the target platform's.
+fn filter_properties(config: &Config) -> impl Iterator<Item = AmbientInput> + '_ {
+    const SEPARATOR: &str = "path.separator";
+    let separator = (config.user_property_inputs(&BTreeSet::from([SEPARATOR.to_string()])))
+        .values()
+        .any(rv_config::PropertyInputs::is_set)
+        .then_some(SEPARATOR);
+    (config.repository_filters().property_names())
+        .chain(separator)
+        .filter_map(|name| AmbientInput::user_property(name).ok())
 }
 
 /// The lockfile's top-level configuration hash for `config`, with the
@@ -120,25 +181,94 @@ pub(crate) fn resolution_config_hash(
     Ok(config_hash(&resolution_inputs(config, ambient)?))
 }
 
-/// [`resolution_config_hash`] with each condition in `ambient` at the
-/// outcome recorded there: what the configuration alone decides. A check
-/// whose models changed uses it, since its resolution compares again the
+/// [`resolution_inputs`] with each condition in `ambient` at the outcome
+/// recorded there: what the configuration alone decides. A check whose
+/// models changed uses it, since its resolution compares again the
 /// conditions both sides consulted.
-pub(crate) fn recorded_outcome_config_hash(
+fn recorded_outcome_inputs(
     config: &Config,
     ambient: &BTreeSet<AmbientInput>,
-) -> Result<String> {
+) -> Result<ResolutionInputs> {
     let mut inputs = resolution_inputs(config, ambient)?;
     for (input, value) in inputs.ambient.iter_mut() {
         if let AmbientInput::Condition { holds, .. } = input {
             *value = Some(holds.to_string());
         }
     }
-    Ok(config_hash(&inputs))
+    Ok(inputs)
+}
+
+/// The most JDK-home `<file>` lookups [`jdk_home_lookups_answer`] tries
+/// each outcome of, as it hashes every combination.
+const MAX_JDK_HOME_LOOKUPS: usize = 10;
+
+/// Whether `lock`'s `config_hash` holds for `inputs` with some outcome of
+/// each `<file>` path on the JDK's home that `lock` records, on a host
+/// with no JDK home to test them. raeva.lock keeps no outcome of its own
+/// for these, only the hash.
+fn jdk_home_lookups_answer(config: &Config, lock: &Lockfile, mut inputs: ResolutionInputs) -> bool {
+    if config.host().java_home().is_some() {
+        return false;
+    }
+    let lookups: Vec<(AmbientInput, [String; 2])> = (inputs.ambient.keys())
+        .filter_map(|input| match input {
+            AmbientInput::UserPropertyLookup(template) => {
+                Some((input.clone(), config.jdk_home_lookup_values(template)?))
+            }
+            _ => None,
+        })
+        .collect();
+    if lookups.is_empty() || lookups.len() > MAX_JDK_HOME_LOOKUPS {
+        return false;
+    }
+    (0..1u32 << lookups.len()).any(|outcomes| {
+        for (bit, (input, values)) in lookups.iter().enumerate() {
+            let value = values[((outcomes >> bit) & 1) as usize].clone();
+            inputs.ambient.insert(input.clone(), Some(value));
+        }
+        lock.config_drift(&config_hash(&inputs)).is_none()
+    })
 }
 
 pub(crate) fn recorded_ambient(lock: &Lockfile) -> BTreeSet<AmbientInput> {
     lock.resolution.ambient_inputs.clone()
+}
+
+/// Whether `lock` records a read of a variable that is now set where Maven
+/// reads it but hidden here. The lock records no value for it, so only a
+/// resolution tells whether the value changes a profile's activation. A
+/// `<file>` path that takes `${env.JAVA_HOME}` reads the JDK's home
+/// instead, and the lookup it records keeps what the path tested; the bare
+/// read it also records is taken as that one wherever such a lookup is.
+pub(crate) fn reads_hidden_env(config: &Config, lock: &Lockfile) -> bool {
+    let environment = config.host().host_environment();
+    let mut lookups = Vec::new();
+    let mut names = Vec::new();
+    for input in &lock.resolution.ambient_inputs {
+        match input {
+            AmbientInput::UserPropertyLookup(template) => {
+                lookups.extend(config.user_property_lookup_env_reads(template));
+            }
+            input => names.extend(
+                (input.user_property_name())
+                    .and_then(|(name, _)| name.strip_prefix("env."))
+                    .map(str::to_string),
+            ),
+        }
+    }
+    let answered = |name: &str| (lookups.iter()).any(|(read, answered)| *answered && read == name);
+    let hidden = |name: &str| environment.hides_env(name);
+    (lookups.iter()).any(|(name, answered)| !answered && hidden(name))
+        || (names.iter()).any(|name| hidden(name) && !answered(name))
+}
+
+/// Whether the lock hash of `lock`'s inputs reads a host directory as a
+/// marker: there a copy keeps the hash while a value a POM compares names
+/// another directory, which only a resolution sees.
+pub(crate) fn hides_host_directories(config: &Config, lock: &Lockfile) -> Result<bool> {
+    let ambient = recorded_ambient(lock);
+    Ok(resolution_config_hash(&config.with_host_paths(), &ambient)?
+        != resolution_config_hash(config, &ambient)?)
 }
 
 /// Past this many `<jdk>` and `<property>` conditions, a lock lists the host
@@ -174,6 +304,107 @@ pub(crate) fn consulted_ambient(
             .into_iter()
             .map(HostInput::UserProperty),
     );
+    consulted.extend(
+        host.consulted_user_overrides()
+            .into_iter()
+            .map(HostInput::UserOverride),
+    );
+    let (mut ambient, by_input) = recorded_inputs(config, consulted, sources)?;
+    ambient.extend(filter_properties(config));
+    let settings = config.consulted_settings_conditions();
+    ambient.extend(settings.iter().filter_map(|key| {
+        let (_, holds) = config.settings_condition(key)?;
+        AmbientInput::settings(key, holds).ok()
+    }));
+    Ok((ambient, by_input))
+}
+
+/// Whether the property `name`, `!` and all, is the JDK version.
+fn is_java_version_name(name: &str) -> bool {
+    matches!(
+        name.trim_start_matches('!'),
+        "java.version" | "java.specification.version"
+    )
+}
+
+/// Whether the recorded `input` takes the JDK version: itself, a `<jdk>`
+/// or JDK version condition of a POM or settings.xml, or a user property
+/// whose `-D` value expands it.
+fn reads_jdk(config: &Config, input: &AmbientInput) -> bool {
+    match input {
+        AmbientInput::JavaVersion => true,
+        AmbientInput::Condition { condition, .. } => match condition {
+            HostCondition::Jdk(_) => true,
+            HostCondition::Property { name, .. } => is_java_version_name(name),
+            HostCondition::Settings(key) => {
+                config.settings_condition(key).is_some_and(|(text, _)| {
+                    text.starts_with("jdk:")
+                        || (text.strip_prefix("property:")).is_some_and(|rest| {
+                            is_java_version_name(rest.split('=').next().unwrap_or(rest))
+                        })
+                })
+            }
+            HostCondition::File(_) => false,
+        },
+        AmbientInput::UserProperty(name) => config.user_property_reads_jdk(name),
+        _ => false,
+    }
+}
+
+/// Whether `ambient` takes the JDK version where neither the JDK nor
+/// `JAVA_VERSION` names it, so its values are those of the stand-in 17.
+pub(crate) fn reads_unnamed_jdk(config: &Config, ambient: &BTreeSet<AmbientInput>) -> bool {
+    unnamed_jdk(config) && ambient.iter().any(|input| reads_jdk(config, input))
+}
+
+fn unnamed_jdk(config: &Config) -> bool {
+    config.host().named_java_version().is_none() && config.lock.jdks.is_empty()
+}
+
+/// [`refuse_unnamed_jdk`] for a lock whose recorded inputs are `ambient`.
+pub(crate) fn refuse_unnamed_jdk_reads(
+    config: &Config,
+    ambient: &BTreeSet<AmbientInput>,
+) -> Result<()> {
+    refuse_unnamed_jdk(config, reads_unnamed_jdk(config, ambient))
+}
+
+/// Refuse a resolution that `reads_version` of the JDK, a `<jdk>`
+/// condition, `java.version` or `java.specification.version`, where
+/// neither the JDK nor `JAVA_VERSION` names it: raeva would lock what the
+/// stand-in 17 selects where Maven reads the JDK it runs on.
+fn refuse_unnamed_jdk(config: &Config, reads_version: bool) -> Result<()> {
+    if !reads_version || !unnamed_jdk(config) {
+        return Ok(());
+    }
+    Err(CliError::InvalidProjectInput {
+        path: config.project_root.join("pom.xml"),
+        reason: "the resolution depends on the JDK version (a <jdk> condition, java.version or \
+                 java.specification.version), and neither the release file of the JDK from \
+                 JAVA_HOME or PATH nor JAVA_VERSION names it; set JAVA_HOME to the JDK the \
+                 build uses, or list the JDKs in [lock] jdks in raeva.toml"
+            .to_string(),
+    })
+}
+
+/// `consulted`, host inputs a model build read, as raeva.lock records
+/// them; see [`consulted_ambient`].
+pub(crate) fn recorded_inputs(
+    config: &Config,
+    consulted: BTreeSet<HostInput>,
+    sources: bool,
+) -> Result<(
+    BTreeSet<AmbientInput>,
+    foldhash::HashMap<HostInput, AmbientInput>,
+)> {
+    let host = config.host();
+    let reads_version = consulted.iter().any(|input| match input {
+        HostInput::JavaVersion | HostInput::Jdk(_) => true,
+        HostInput::Property { name, .. } => is_java_version_name(name),
+        HostInput::UserProperty(name) => config.user_property_reads_jdk(name),
+        _ => false,
+    });
+    refuse_unnamed_jdk(config, reads_version)?;
     let conditions = consulted
         .iter()
         .filter(|input| matches!(input, HostInput::Jdk(_) | HostInput::Property { .. }))
@@ -269,8 +500,12 @@ pub(crate) fn consulted_ambient(
                 }
                 file => file.flatten(),
             },
-            HostInput::UserProperty(name) => {
-                Some(AmbientInput::user_property(name).map_err(|_| {
+            HostInput::UserProperty(name) | HostInput::UserOverride(name) => {
+                let recorded = match input {
+                    HostInput::UserProperty(_) => AmbientInput::user_property(name),
+                    _ => AmbientInput::user_override(name),
+                };
+                Some(recorded.map_err(|_| {
                     refuse(
                         "a consulted user-property name cannot be recorded in raeva.lock"
                             .to_string(),
@@ -316,11 +551,6 @@ pub(crate) fn consulted_ambient(
              project, which raeva.lock does not record"
         )));
     }
-    let settings = config.consulted_settings_conditions();
-    ambient.extend(settings.iter().filter_map(|key| {
-        let (_, holds) = config.settings_condition(key)?;
-        AmbientInput::settings(key, holds).ok()
-    }));
     Ok((ambient, by_input))
 }
 
@@ -426,6 +656,7 @@ fn ambient_input(host: &HostSnapshot, input: &HostInput, conditions: bool) -> Op
         HostInput::Env(name) => return AmbientInput::env(name).ok(),
         HostInput::SettingsProperty(name) => return AmbientInput::settings_property(name).ok(),
         HostInput::UserProperty(name) => return AmbientInput::user_property(name).ok(),
+        HostInput::UserOverride(name) => return AmbientInput::user_override(name).ok(),
         HostInput::UserPropertyLookup {
             expression,
             properties,
@@ -455,7 +686,7 @@ fn ambient_input(host: &HostSnapshot, input: &HostInput, conditions: bool) -> Op
             let name = name.strip_prefix('!').unwrap_or(name);
             match name {
                 "java.home" => Some(AmbientInput::JavaHome),
-                "java.version" => Some(AmbientInput::JavaVersion),
+                "java.version" | "java.specification.version" => Some(AmbientInput::JavaVersion),
                 _ => AmbientInput::env(name.strip_prefix("env.")?).ok(),
             }
         }
@@ -466,14 +697,16 @@ fn ambient_input(host: &HostSnapshot, input: &HostInput, conditions: bool) -> Op
 /// The settings property of the name a user property reads.
 fn settings_companion(name: &AmbientInput) -> Option<AmbientInput> {
     match name {
-        AmbientInput::UserProperty(name) => Some(AmbientInput::SettingsProperty(name.clone())),
+        AmbientInput::UserProperty(name) | AmbientInput::UserOverride(name) => {
+            Some(AmbientInput::SettingsProperty(name.clone()))
+        }
         _ => None,
     }
 }
 
 /// What `config_hash` covers for `name` in `config`: a value, or for a
 /// condition its current outcome.
-fn current_value(config: &Config, name: &AmbientInput) -> Option<String> {
+pub(crate) fn current_value(config: &Config, name: &AmbientInput) -> Option<String> {
     let host = config.host();
     match name {
         AmbientInput::JavaVersion => host.value(&HostInput::JavaVersion),
@@ -484,6 +717,10 @@ fn current_value(config: &Config, name: &AmbientInput) -> Option<String> {
         AmbientInput::UserPropertyLookup(template) => config.user_property_lookup_value(template),
         AmbientInput::UserProperty(name) => config
             .user_property_inputs(&BTreeSet::from([name.clone()]))
+            .remove(name)
+            .and_then(|inputs| inputs.hash_value()),
+        AmbientInput::UserOverride(name) => config
+            .user_override_inputs(&BTreeSet::from([name.clone()]))
             .remove(name)
             .and_then(|inputs| inputs.hash_value()),
         AmbientInput::Condition { condition, .. } => {
@@ -507,35 +744,53 @@ fn condition_holds(config: &Config, condition: &HostCondition) -> Option<bool> {
     config.host().holds(&input)
 }
 
-/// The `-D` overrides of the user properties `ambient` lists and the command
-/// line's `-P` options by name,
+/// The `-D` overrides of the user properties `ambient` lists and the `-P`
+/// options of the command line and `.mvn/maven.config` by name,
 /// as raeva.lock records them in `[resolution] command_line`. A name raeva.lock cannot hold is left
 /// out; `config_hash` still covers it.
 pub(crate) fn command_line_names(
     config: &Config,
     ambient: &BTreeSet<AmbientInput>,
 ) -> BTreeSet<String> {
-    let names = (ambient.iter())
-        .filter_map(|input| match input {
-            AmbientInput::UserProperty(name) => Some(name.clone()),
-            _ => None,
-        })
-        .collect();
-    option_names(config, &names)
+    let (names, overrides) = user_property_names(ambient);
+    option_names(config, &names, &overrides)
 }
 
-fn option_names(config: &Config, names: &BTreeSet<String>) -> BTreeSet<String> {
-    let command_line = config.command_line();
-    let properties = config.user_property_inputs(names);
+/// The names of the user properties `ambient` lists: those a system
+/// property answers where no user property does, and those the model
+/// defines ([`AmbientInput::UserOverride`]).
+fn user_property_names(ambient: &BTreeSet<AmbientInput>) -> (BTreeSet<String>, BTreeSet<String>) {
+    let (mut names, mut overrides) = (BTreeSet::new(), BTreeSet::new());
+    for (name, system) in ambient.iter().filter_map(AmbientInput::user_property_name) {
+        match system {
+            true => names.insert(name.to_string()),
+            false => overrides.insert(name.to_string()),
+        };
+    }
+    (names, overrides)
+}
+
+fn option_names(
+    config: &Config,
+    names: &BTreeSet<String>,
+    overrides: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let command_line = config.maven_command_line();
+    let mut properties = config.user_override_inputs(overrides);
+    properties.extend(config.user_property_inputs(names));
     let defines = properties
         .iter()
         .filter(|(_, inputs)| inputs.is_set())
         .map(|(name, _)| format!("-D{name}"));
+    // As Maven reads them, so equivalent spellings record the same names.
     let profiles = (command_line.profiles.iter())
-        .flat_map(|list| list.split(','))
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(|id| format!("-P{id}"));
+        .flat_map(|list| rv_config::maven_config::profile_actions(list))
+        .map(|(inactive, id)| {
+            format!(
+                "-P{}",
+                rv_config::maven_config::profile_action(inactive, id)
+            )
+        });
     defines
         .chain(profiles)
         .filter(|option| rv_lock::is_command_line_name(option))
@@ -544,17 +799,11 @@ fn option_names(config: &Config, names: &BTreeSet<String>) -> BTreeSet<String> {
 
 /// The options added and removed since raeva.lock was written, by name.
 fn command_line_change(config: &Config, lock: &Lockfile) -> Option<String> {
-    let mut names = config.host().consulted_user_properties();
-    names.extend(
-        lock.resolution
-            .ambient_inputs
-            .iter()
-            .filter_map(|input| match input {
-                AmbientInput::UserProperty(name) => Some(name.clone()),
-                _ => None,
-            }),
-    );
-    let now = option_names(config, &names);
+    let (mut names, mut overrides) = user_property_names(&lock.resolution.ambient_inputs);
+    names.extend(config.host().consulted_user_properties());
+    names.extend((config.repository_filters().property_names()).map(str::to_string));
+    overrides.extend(config.host().consulted_user_overrides());
+    let now = option_names(config, &names, &overrides);
     let then = &lock.resolution.command_line;
     // Both sides hold only terminal-safe names.
     let list = |names: Vec<&String>| crate::commands::util::join_and(names.into_iter().cloned());
@@ -596,6 +845,13 @@ const SHOWN_CONDITIONS: usize = 5;
 /// or the active profiles `models` changed. Value-bearing inputs have no
 /// separate diagnostic hashes.
 pub(crate) fn config_changed(config: &Config, lock: &Lockfile, models: &[ReactorModel]) -> String {
+    let selection = &config.lock.maven;
+    if lock.maven != selection.mode {
+        return format!(
+            "{CONFIG_CHANGED}: raeva.lock was resolved as Maven {}, and {} selects Maven {}",
+            lock.maven, selection.source, selection.mode
+        );
+    }
     let flipped: Vec<String> = recorded_ambient(lock)
         .iter()
         .filter_map(|input| {
@@ -628,7 +884,9 @@ pub(crate) fn config_changed(config: &Config, lock: &Lockfile, models: &[Reactor
         changed.push(conditions);
     }
     if let Some(options) = options {
-        changed.push(format!("{COMMAND_LINE} or .mvn/jvm.config"));
+        changed.push(format!(
+            "{COMMAND_LINE}, .mvn/jvm.config or a JVM option variable"
+        ));
         return format!(
             "{CONFIG_CHANGED} in {}: {options}",
             crate::commands::util::join_and(changed)
@@ -645,8 +903,8 @@ pub(crate) fn config_changed(config: &Config, lock: &Lockfile, models: &[Reactor
         ),
         (true, None) => format!(
             "{CONFIG_CHANGED} since raeva.lock was written; raeva.lock covers the repositories, \
-             profiles, [lock] jdks, [security], .mvn/maven.config, .mvn/jvm.config, {COMMAND_LINE} and \
-             {HOST_VALUES}"
+             profiles, [lock] jdks, [security], .mvn/maven.config, .mvn/jvm.config, the remote \
+             repository filter files, {COMMAND_LINE} and {HOST_VALUES}"
         ),
         (false, profiles) => format!(
             "{CONFIG_CHANGED} in {}{}",
@@ -691,6 +949,16 @@ impl ReactorModel {
             .map(Repository::from)
     }
 
+    /// The same of their `<pluginRepositories>`, the super POM's `central`
+    /// included, from which raeva.lock's plugin rows come. A dependency is
+    /// never searched for in these.
+    pub(crate) fn declared_plugin_repositories(&self) -> impl Iterator<Item = Repository> + '_ {
+        (self.workspace.modules().iter())
+            .flat_map(|module| &module.descriptor.plugin_repositories)
+            .filter(|repo| repo.root_declared)
+            .map(Repository::from)
+    }
+
     /// Whether `lock`'s graph of this platform can be trusted; see
     /// [`frozen_models_match`]. A platform `lock` does not record matches.
     pub(crate) fn matches(&self, lock: &Lockfile) -> bool {
@@ -700,6 +968,7 @@ impl ReactorModel {
         };
         if !entry.graphs_match(
             lock.config_hash.as_deref(),
+            lock.maven,
             &lock.resolution.ambient_inputs,
             &lock.repo_ids,
         ) || !lock.models_match(&[self.current(lock)])
@@ -729,12 +998,15 @@ impl ReactorModel {
                 module
                     .packages
                     .iter()
-                    .all(|package| match &package.workspace_module {
-                        Some(path) => covers
-                            .is_none_or(|covers| *path == module.path || covers.contains(path)),
-                        None => {
+                    .all(|package| match package.source() {
+                        PackageSource::Module(path) => {
+                            covers.is_none_or(|covers| path == module.path || covers.contains(path))
+                        }
+                        PackageSource::System(_) => true,
+                        // A module takes its own coordinates from a repository.
+                        PackageSource::Repository => {
                             let gav = &package.coordinate.gav;
-                            package.system_sha256.is_some()
+                            module.owns(gav)
                                 || !is_reactor(&gav.group, &gav.artifact, gav.version())
                         }
                     })
@@ -820,34 +1092,143 @@ impl ReactorModel {
     }
 }
 
-/// Refuse a project whose POMs declare a repository URL with userinfo, a
-/// query or a fragment, as configuration with one is refused, or whose path
-/// holds the value of one of `secrets` ([`Config::secret_named_inputs`]):
-/// raeva.lock would record it. The message names the module and the input,
-/// never the URL, which may be inherited from a local parent, or the value.
-fn refuse_secret_repository_urls(
+/// Refuse a project whose POMs declare a repository or plugin repository
+/// URL with userinfo, a query or a fragment, as configuration with one is
+/// refused, or whose path or id holds the value of one of `secrets`
+/// ([`Config::secret_named_inputs`]): raeva.lock would record it, or whose
+/// id takes a `${...}` raeva does not follow
+/// ([`rv_repo::expression_id_refusal`]), a plugin repository's only when
+/// `[plugins]` locks the plugins. The message names the module and the
+/// input, never the URL, which may be inherited from a local parent, or the
+/// value.
+fn refuse_secret_repositories(
     root: &Path,
+    config: &Config,
     modules: &[&rv_resolver::WorkspaceModule],
     secrets: &[(String, String)],
+    names: &[(String, String)],
 ) -> Result<()> {
     for module in modules {
-        let declared = module
-            .descriptor
+        let descriptor = &module.descriptor;
+        let declared = (descriptor
             .repositories
             .iter()
-            .filter(|repo| repo.root_declared);
-        for repo in declared {
-            let Some(refusal) = rv_repo::secret_url_refusal(&repo.url, secrets) else {
-                continue;
-            };
+            .map(|repo| ("repository", repo)))
+        .chain((descriptor.plugin_repositories.iter()).map(|repo| ("plugin repository", repo)));
+        // A fetched parent's URL or secret id leaves the repository ignored;
+        // an id Maven reads apart from raeva fails the build wherever the
+        // lineage declares it.
+        for (kind, repo) in declared {
+            let own = repo.root_declared;
+            let refusal = (own.then(|| {
+                rv_repo::secret_url_refusal(&repo.url, &repo.url_reads, secrets, names).or_else(
+                    || {
+                        let declared = repo.declared_url.as_deref()?;
+                        rv_maven_model::file_transport::host_refusal(declared)
+                    },
+                )
+            }))
+            .flatten();
             let entry = repo.id.as_deref().map_or_else(
-                || "a repository without an id".to_string(),
+                || format!("a {kind} without an id"),
                 |id| {
-                    let id = rv_config::without_secret_values(id, secrets);
-                    format!("repository '{}'", rv_maven_types::bounded(id))
+                    let id = rv_repo::shown_id(id, &repo.id_reads, secrets, names);
+                    format!("{kind} '{}'", rv_maven_types::bounded(&id))
                 },
             );
-            let reason = format!("the URL of {entry} it declares or inherits {refusal}");
+            let reason = if let Some(refusal) = refusal {
+                format!("the URL of {entry} it declares or inherits {refusal}")
+            } else if let Some(refusal) = (own.then(|| {
+                rv_repo::secret_id_refusal(repo.id.as_deref(), &repo.id_reads, secrets, names)
+            }))
+            .flatten()
+            .or_else(|| {
+                // A plugin repository serves only the plugins, which only
+                // `[plugins]` locks.
+                let read = kind == "repository" || config.plugins.is_some();
+                let declared = rv_repo::Repository::from(repo.clone());
+                (read.then(|| rv_repo::expression_id_refusal(config, &declared)))
+                    .flatten()
+                    .map(String::from)
+            }) {
+                format!("the id of a {kind} it declares or inherits {refusal}")
+            } else {
+                continue;
+            };
+            return Err(CliError::InvalidProjectInput {
+                path: root.join(&module.pom_path),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a settings.xml repository of `ids` that the projects of the
+/// reactor fill in differently, or one leaves unfilled: Maven fills it in
+/// once, from the first project its build order reaches, and every project
+/// reads that one.
+fn refuse_settings_repositories_filled_apart(
+    root: &Path,
+    modules: &[&rv_resolver::WorkspaceModule],
+    ids: &[String],
+) -> Result<()> {
+    for id in ids {
+        let filled = |module: &rv_resolver::WorkspaceModule| {
+            (module.descriptor.repositories.iter())
+                .rfind(|repo| repo.root_declared && repo.id.as_deref() == Some(id))
+                .map(|repo| {
+                    (
+                        repo.url.clone(),
+                        repo.declared_url.clone(),
+                        repo.layout.clone(),
+                        [repo.releases_enabled, repo.snapshots_enabled],
+                        [
+                            repo.releases_update_policy.clone(),
+                            repo.snapshots_update_policy.clone(),
+                            repo.releases_checksum_policy.clone(),
+                            repo.snapshots_checksum_policy.clone(),
+                        ],
+                    )
+                })
+        };
+        let shown = rv_maven_types::bounded(id);
+        let filled: Vec<_> = modules.iter().map(|module| filled(module)).collect();
+        let unfilled = (modules.iter().zip(&filled)).find(|(_, repo)| {
+            // Maven 3.10 reads a URL without a scheme as a `file:` one.
+            repo.as_ref().is_none_or(|(url, declared, ..)| {
+                [Some(url), declared.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|url| url.contains("${"))
+            })
+        });
+        let reason = if let Some((module, _)) = unfilled {
+            Some((
+                module,
+                format!(
+                    "the settings.xml repository '{shown}' takes a ${{...}} that this project \
+                     leaves unfilled, while Maven fills it in once for the whole build; set the \
+                     property in the settings.xml profile, or write the URL out"
+                ),
+            ))
+        } else {
+            (modules.iter().zip(&filled))
+                .find(|(_, repo)| *repo != &filled[0])
+                .map(|(module, _)| {
+                    (
+                        module,
+                        format!(
+                            "the settings.xml repository '{shown}' takes a ${{...}} that this \
+                             project fills in otherwise than {} does, while Maven fills it in \
+                             once for the whole build and every project reads that one; set the \
+                             property in the settings.xml profile, or write the URL out",
+                            modules[0].pom_path
+                        ),
+                    )
+                })
+        };
+        if let Some((module, reason)) = reason {
             return Err(CliError::InvalidProjectInput {
                 path: root.join(&module.pom_path),
                 reason,
@@ -907,7 +1288,16 @@ pub(crate) fn discover_reactor_model(config: &Config, platform: &Platform) -> Re
 
     let mut modules: Vec<_> = workspace.modules().iter().collect();
     modules.sort_by(|left, right| left.pom_path.cmp(&right.pom_path));
-    refuse_secret_repository_urls(workspace.root(), &modules, &secrets)?;
+    refuse_secret_repositories(
+        workspace.root(),
+        config,
+        &modules,
+        &secrets,
+        &config.secret_input_names(),
+    )?;
+    let environment = config.model_environment(platform.os(), platform.arch(), platform.jdk());
+    let ids = config.settings_model_repository_ids(&environment);
+    refuse_settings_repositories_filled_apart(workspace.root(), &modules, &ids)?;
 
     // The settings.xml profiles a condition activates add only repositories,
     // which config_hash covers, so only the explicit ids count.
@@ -999,14 +1389,21 @@ fn discovery_error(project_root: &Path, err: WorkspaceError) -> CliError {
     }
 }
 
-/// The URLs the project's own POMs declare in `models`.
+/// The URLs the project's own POMs declare in `models`, their plugin
+/// repositories' included.
 pub(crate) fn declared_repository_urls<'a>(
     config: &Config,
     models: &'a [ReactorModel],
 ) -> impl Iterator<Item = String> + 'a {
+    let plugins = models
+        .iter()
+        .flat_map(ReactorModel::declared_plugin_repositories);
     rv_repo::RepositoryPolicy::screen(
         config,
-        models.iter().flat_map(ReactorModel::declared_repositories),
+        models
+            .iter()
+            .flat_map(ReactorModel::declared_repositories)
+            .chain(plugins),
         rv_repo::Declaration::LocalPom,
     )
     .admitted
@@ -1039,7 +1436,7 @@ pub(crate) fn local_project(
             .modules()
             .iter()
             .map(|module| rv_export::ProjectPom {
-                local_parent: !module.local_parents().is_empty(),
+                local_parents: module.local_parents().to_vec(),
                 path: model.workspace.root().join(&module.pom_path),
             })
             .collect(),
@@ -1124,31 +1521,39 @@ pub(crate) fn model_change_note(
 /// external dependency, which the module's own record does not cover, unless
 /// the records cover the whole reactor. A locked external artifact or support
 /// POM that now has a reactor module's coordinates would resolve to that
-/// module.
+/// module, except the module's own artifacts, which its graph takes from a
+/// repository. The plugin tables are no graph: a plugin's support POM at a
+/// reactor module's coordinates was read from a repository.
 pub(crate) fn frozen_models_match(lock: &Lockfile, models: &[ReactorModel]) -> bool {
-    models.iter().all(|model| model.matches(lock))
+    let lock = lock.without_plugins();
+    models.iter().all(|model| model.matches(&lock))
 }
 
 /// `config_hash` and recorded system files still match. `unrecorded` is the
-/// mismatch when raeva.lock stores no hash.
+/// mismatch when raeva.lock stores no hash. A command that `builds` on this
+/// machine's JDK compares the `<file>` paths on the JDK's home too; a report
+/// of the lock on a host with no JDK home takes them as raeva.lock has them.
 pub(crate) fn check_recorded_freshness(
     config: &Config,
     lock: &Lockfile,
     models: &[ReactorModel],
     models_match: bool,
+    builds: bool,
     unrecorded: &str,
 ) -> Result<()> {
+    // `config_hash` covers the configured line, not the lock's record of it.
+    if lock.maven != config.lock.maven.mode {
+        return Err(config_mismatch(config, lock, models));
+    }
     let ambient = recorded_ambient(lock);
-    let config_hash = if models_match {
-        resolution_config_hash(config, &ambient)?
-    } else {
-        recorded_outcome_config_hash(config, &ambient)?
-    };
-    match lock.config_drift(&config_hash) {
+    let inputs = match models_match {
+        true => resolution_inputs(config, &ambient),
+        false => recorded_outcome_inputs(config, &ambient),
+    }?;
+    match lock.config_drift(&config_hash(&inputs)) {
         None => {}
-        Some(ConfigDrift::Changed) => {
-            return Err(config_mismatch(config, lock, models));
-        }
+        Some(ConfigDrift::Changed) if !builds && jdk_home_lookups_answer(config, lock, inputs) => {}
+        Some(ConfigDrift::Changed) => return Err(config_mismatch(config, lock, models)),
         Some(ConfigDrift::Unrecorded) => {
             return Err(CliError::lockfile_mismatch(unrecorded));
         }
@@ -1163,9 +1568,12 @@ pub(crate) fn check_recorded_freshness(
 /// again using the same comparison as `sync --frozen`. Also returns the
 /// reactor model it checked the lock against for each locked platform, in
 /// lock order, and the repositories a resolution trusted, a remote parent's
-/// included; none when the check did not resolve.
+/// included; none when the check did not resolve. A command that `builds`
+/// on this machine's JDK refuses a lock that reads a JDK version neither
+/// the JDK nor `JAVA_VERSION` names; a report of the lock needs no JDK.
 pub(crate) async fn read_fresh_lockfile(
     config: &Config,
+    builds: bool,
     offline: bool,
     output: &crate::output::Output,
 ) -> Result<(Lockfile, Vec<ReactorModel>, Vec<Repository>)> {
@@ -1183,31 +1591,61 @@ pub(crate) async fn read_fresh_lockfile(
             .iter()
             .map(|platform| (platform.os(), platform.arch(), platform.jdk())),
     );
+    config.settings_activation()?;
     let models = discover_reactor_models(&config, &platforms)?;
     let models_match = frozen_models_match(&lock, &models);
+    if builds {
+        refuse_unnamed_jdk_reads(&config, &recorded_ambient(&lock))?;
+    }
     check_recorded_freshness(
         &config,
         &lock,
         &models,
         models_match,
+        builds,
         "raeva.lock has no config_hash and cannot be checked for staleness",
     )?;
+    crate::commands::sync::check_plugin_tables(&config, Some(&lock), &platforms)?;
+    crate::commands::sync::check_plugin_trace(&config, &lock, &platforms)?;
     // Match `sync --frozen`: resolve again for model drift or an undeclared
     // origin, keeping the locked SNAPSHOT builds.
+    // A lock hash that reads a host directory as a marker holds in a copy
+    // too, so the lock stands without one only where this home wrote or
+    // checked it.
     let mut trusted = Vec::new();
-    if crate::commands::sync::lock_needs_fresh_resolution(&lock, &config, &models) {
+    let drift = crate::commands::sync::lock_needs_fresh_resolution(&lock, &config, &models);
+    let client = match drift || hides_host_directories(&config, &lock)? {
+        true => Some(
+            (crate::commands::sync::Mode::check(offline).client(&config))
+                .await?
+                .with_progress(output.progress())
+                .with_lock_pins(&lock),
+        ),
+        false => None,
+    };
+    let client = client.filter(|client| {
+        drift || !crate::commands::sync::checked_here(&config, client, &platforms)
+    });
+    if let Some(client) = client {
         let store = std::sync::Arc::new(rv_store::Store::open(&config.paths.store_dir)?);
-        let client = rv_repo::RepoClient::new(&config)
-            .await?
-            .with_progress(output.progress())
-            .with_offline(offline)
-            .with_pinned_snapshots(true)
-            .with_lock_pins(&lock);
         let fresh;
         (fresh, trusted) = crate::commands::sync::validate_frozen_resolution(
-            &config, store, client, &lock, &models, output,
+            &config,
+            std::sync::Arc::clone(&store),
+            client.clone(),
+            &lock,
+            &models,
+            models_match,
+            output,
         )
         .await?;
+        // A POM edit can move a plugin and leave every dependency.
+        if config.plugins.is_some() {
+            crate::commands::sync::check_resolved_plugins(
+                &config, store, client, &lock, &models, &platforms,
+            )
+            .await?;
+        }
         // Reports name the modules as the POMs do now.
         lock.adopt_module_versions(&fresh);
     }
@@ -1256,9 +1694,10 @@ pub(crate) fn jdk_hint(config: &Config, lock: &Lockfile) -> Option<String> {
         };
         let on_jdk = match &condition {
             HostCondition::Jdk(_) => true,
-            HostCondition::Property { name, .. } => {
-                name.strip_prefix('!').unwrap_or(name) == "java.version"
-            }
+            HostCondition::Property { name, .. } => matches!(
+                name.strip_prefix('!').unwrap_or(name),
+                "java.version" | "java.specification.version"
+            ),
             _ => false,
         };
         (on_jdk && condition_holds(config, &condition)? != holds).then(|| condition.to_string())

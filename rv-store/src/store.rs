@@ -13,7 +13,9 @@ use crate::index;
 use crate::paths;
 use crate::pin::StoredBlob;
 use crate::sqlite;
-use rv_fs::lock_exclusive_until;
+use rv_fs::{
+    is_nofollow_symlink, lock_exclusive_until, open_lock_file, opened_is_regular, unfollowed,
+};
 use rv_maven_types::{ArtifactCoord, BlobId};
 
 const INDEX_DB: &str = "index.sqlite";
@@ -44,12 +46,14 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Remove stale files from `tmp/`, unless another writer holds the store
 /// lock; the next open retries then. Dropping the file releases the lock.
+/// A `tmp` that is a link is left alone, as it may lead out of the store.
 fn sweep_temp_dir(root: &Path) {
     let Ok(lock) = open_lock_file(&root.join(LOCK_FILE)) else {
         return;
     };
-    if lock.try_lock().is_ok() {
-        sweep_stale(&root.join(TMP_DIR));
+    let tmp = root.join(TMP_DIR);
+    if lock.try_lock().is_ok() && fs::symlink_metadata(&tmp).is_ok_and(|meta| meta.is_dir()) {
+        sweep_stale(&tmp);
     }
 }
 
@@ -79,15 +83,6 @@ fn sweep_stale(dir: &Path) {
             let _ = fs::remove_file(&path);
         }
     }
-}
-
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
 }
 
 fn verify_blob_at_path(path: &Path, expected: &BlobId) -> Result<()> {
@@ -131,49 +126,7 @@ pub(crate) fn is_regular_file(path: &Path) -> bool {
 
 /// Open `path` without following a final symlink or reparse point.
 fn open_unfollowed(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(
-        &mut options,
-        (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
-    );
-    #[cfg(windows)]
-    {
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        std::os::windows::fs::OpenOptionsExt::custom_flags(
-            &mut options,
-            FILE_FLAG_OPEN_REPARSE_POINT,
-        );
-    }
-    options.open(path)
-}
-
-fn opened_is_regular(meta: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-        meta.is_file() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
-    }
-    #[cfg(not(windows))]
-    {
-        meta.is_file()
-    }
-}
-
-/// `O_NOFOLLOW` on a symlink is `ELOOP` (`ErrorKind::FilesystemLoop` is
-/// unstable on the MSRV).
-fn is_nofollow_symlink(err: &std::io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        rustix::io::Errno::from_io_error(err) == Some(rustix::io::Errno::LOOP)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = err;
-        false
-    }
+    unfollowed(OpenOptions::new().read(true)).open(path)
 }
 
 fn is_absent_or_symlink(err: &std::io::Error) -> bool {
@@ -328,7 +281,8 @@ pub struct Origin {
     /// The repository URL as raeva.lock records it: the declared repository,
     /// not a mirror that served it.
     pub repo_url: String,
-    /// The repository or mirror URL that served the bytes.
+    /// The repository or mirror URL that served the bytes. The index keeps
+    /// both URLs as [`rv_config::stored_urls`] names them.
     pub endpoint_url: String,
     /// Whether the bytes matched the repository's checksum file.
     pub checksum_verified: bool,
@@ -356,14 +310,10 @@ impl Store {
                 .io_context(|| format!("failed to create {what} directory {}", dir.display()))?;
         }
 
-        let db_path = path.join(INDEX_DB);
         // Two processes must not race on switching to WAL or creating the
-        // schema.
-        let bootstrap_lock = StoreLock::acquire(path)?;
-
-        let pool = sqlite::open(&db_path, INDEX)?;
-        // The sweep takes the lock with a try-lock of its own.
-        drop(bootstrap_lock);
+        // schema, so this takes the store lock; the sweep takes it with a
+        // try-lock of its own.
+        let pool = sqlite::open(&path.join(INDEX_DB), INDEX)?;
         sweep_temp_dir(path);
         tracing::debug!(path = %path.display(), "store opened");
 
@@ -427,6 +377,31 @@ impl Store {
     /// Returns the filesystem path for a blob by its content hash.
     pub fn get_path(&self, id: &BlobId) -> PathBuf {
         self.root.join(paths::blob_path(id))
+    }
+
+    /// The file of blob `id`, opened as [`open_unfollowed_regular`] opens
+    /// it, `None` when the store holds no regular file for it. Every read of
+    /// a blob's bytes goes through this or that, so a FIFO or link put in
+    /// the store neither blocks the read nor leads out of the store.
+    pub fn open_blob(&self, id: &BlobId) -> Result<Option<File>> {
+        open_regular_file(&self.get_path(id))
+    }
+
+    /// [`Self::read_blob`] on the blocking pool.
+    pub async fn read_blob_async(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
+        let (store, id) = (self.clone(), id.clone());
+        blocking(move || store.read_blob(&id)).await
+    }
+
+    /// The bytes of blob `id`, read through [`Self::open_blob`].
+    pub fn read_blob(&self, id: &BlobId) -> Result<Option<Vec<u8>>> {
+        let Some(mut file) = self.open_blob(id)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .io_context(|| format!("failed to read blob {}", self.get_path(id).display()))?;
+        Ok(Some(bytes))
     }
 
     /// Whether the blob's file exists. The bytes are not re-hashed.
@@ -674,8 +649,8 @@ impl Store {
     /// Lookup that takes the store lock for the index query and a stat of
     /// the file: `Some(id)` only if a row names a blob that exists on disk at
     /// lookup time. Another process can still remove the file after the lock
-    /// is released, but raeva removes a blob file only when its bytes fail
-    /// verification.
+    /// is released: raeva removes a blob file when its bytes fail
+    /// verification, and when the sync of a batch that published it fails.
     pub async fn lookup_artifact_locked(&self, key: &ArtifactCoord) -> Result<Option<BlobId>> {
         let pool = self.pool.clone();
         let root = self.root.clone();
@@ -876,6 +851,22 @@ mod tests {
 
     fn coord(artifact: &str, classifier: Option<&str>) -> ArtifactCoord {
         ArtifactCoord::new("com.example", artifact, "1.0.0", "jar", classifier)
+    }
+
+    /// A store lock that is a link is not followed, so the holder record
+    /// does not overwrite the file it names.
+    #[cfg(unix)]
+    #[test]
+    fn a_store_lock_that_is_a_link_is_refused() {
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "keep").unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(LOCK_FILE)).unwrap();
+        let err = StoreLock::acquire_with_timeout(&root, Duration::from_millis(100)).err();
+        assert!(format!("{err:?}").contains("symbolic link"), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
     }
 
     /// Another handle holding the file lock, as a second `raeva` process does,
@@ -1095,7 +1086,8 @@ mod tests {
         std::fs::write(&index, b"not a sqlite database").unwrap();
         let started = std::time::Instant::now();
         let store = Store::open(dir.path()).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // A wait for the 5 s busy timeout would take longer.
+        assert!(started.elapsed() < Duration::from_secs(5));
         let id = store.put_bytes(b"bytes").await.unwrap();
         for n in 0..500 {
             store
@@ -1367,6 +1359,30 @@ mod tests {
         Store::open(&root).unwrap();
         assert!(!stale.exists() && !stale.parent().unwrap().exists());
         assert!(fresh.exists());
+    }
+
+    /// A link in place of `tmp/` is not swept: it could lead the sweep to
+    /// files outside the store.
+    #[cfg(unix)]
+    #[test]
+    fn open_does_not_sweep_through_a_linked_temp_dir() {
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let old_file = outside.join("old.txt");
+        std::fs::write(&old_file, b"x").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(48 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old_file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let root = dir.path().join("store");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(TMP_DIR)).unwrap();
+        Store::open(&root).unwrap();
+        assert!(old_file.exists());
     }
 
     async fn put(

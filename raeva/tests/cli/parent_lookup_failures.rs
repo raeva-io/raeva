@@ -4,7 +4,7 @@
 //! dependencies, as in Maven.
 
 use crate::common::{
-    assert_status, assert_success, raeva_command, sha1_hex, with_sha1, write_repo_toml,
+    assert_status, assert_success, lib_project, raeva_command, sha1_hex, with_sha1, write_repo_toml,
 };
 use rv_test_support::http::{Response, StubServer};
 use tempfile::TempDir;
@@ -38,23 +38,9 @@ fn spawn_repository(lib_pom: &'static str, parent: fn(&str) -> Response) -> (Str
     (format!("http://{}/maven/", server.addr()), server)
 }
 
-fn project(repository: &str) -> TempDir {
-    let dir = tempfile::tempdir().expect("project dir");
-    std::fs::write(
-        dir.path().join("pom.xml"),
-        "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
-<artifactId>app</artifactId><version>1.0</version><dependencies><dependency>\
-<groupId>org.example</groupId><artifactId>lib</artifactId><version>1.0</version>\
-</dependency></dependencies></project>",
-    )
-    .expect("write pom.xml");
-    write_repo_toml(dir.path(), "fixture", repository);
-    dir
-}
-
 fn sync_lib(lib_pom: &'static str, parent: fn(&str) -> Response) -> std::process::Output {
     let (repository, _server) = spawn_repository(lib_pom, parent);
-    let project = project(&repository);
+    let project = lib_project(&repository);
     let home = tempfile::tempdir().expect("home");
     raeva_command(project.path(), home.path())
         .env("RAEVA_RETRIES", "0")
@@ -97,7 +83,8 @@ fn a_parent_failing_its_sidecar_is_an_integrity_failure() {
 /// A parent with no checksum file needs `--allow-missing-checksums`, which
 /// warns `CHECKSUM_MISSING`. From then on its raeva.lock pin verifies it:
 /// `--frozen` and a plain sync, with a warm or an empty raeva home, need
-/// neither the flag nor a warning.
+/// neither the flag nor that warning. `--frozen` warns
+/// `CHECKSUM_MISSING_LOCKED` for the parent the lock marks.
 #[test]
 fn a_locked_parent_needs_no_checksum_file() {
     let (repository, _server) = spawn_repository(LIB_POM, |rest| {
@@ -107,7 +94,7 @@ fn a_locked_parent_needs_no_checksum_file() {
             Response::new(404, "")
         }
     });
-    let project = project(&repository);
+    let project = lib_project(&repository);
     let sync = |home: &TempDir, args: &[&str]| {
         raeva_command(project.path(), home.path())
             .env("RAEVA_RETRIES", "0")
@@ -136,7 +123,10 @@ fn a_locked_parent_needs_no_checksum_file() {
         let output = sync(home, args);
         assert_success(&output, &format!("{args:?}"));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(!stderr.contains("CHECKSUM_MISSING"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("CHECKSUM_MISSING:"), "{args:?}: {stderr}");
+        // The lock marks the parent, which --frozen names.
+        let locked = stderr.contains("CHECKSUM_MISSING_LOCKED");
+        assert_eq!(locked, args == ["--frozen"], "{args:?}: {stderr}");
     }
 }
 
@@ -149,7 +139,7 @@ fn fresh_commands_use_the_locked_parent_pin_after_a_pom_edit() {
             Response::new(404, "")
         }
     });
-    let project = project(&repository);
+    let project = lib_project(&repository);
     let home = tempfile::tempdir().expect("home");
     let run = |args: &[&str]| {
         raeva_command(project.path(), home.path())
@@ -187,7 +177,7 @@ fn fresh_commands_use_the_locked_parent_pin_after_a_pom_edit() {
             let output = run(&args);
             assert_success(&output, &format!("{args:?}"));
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!stderr.contains("CHECKSUM_MISSING"), "{args:?}: {stderr}");
+            assert!(!stderr.contains("CHECKSUM_MISSING:"), "{args:?}: {stderr}");
             assert_eq!(std::fs::read(&lock_path).unwrap(), locked);
         }
     }
@@ -202,6 +192,31 @@ fn a_parent_no_repository_has_fails_the_sync() {
     // The parent is lib's, which the error names.
     assert!(
         stderr.contains("In pom.xml, through org.example:lib:1.0\n"),
+        "{stderr}"
+    );
+}
+
+/// A parent only a `file:` repository the dependency's POM declares holds,
+/// which Maven searches: raeva never does, and the error says so.
+#[test]
+fn a_parent_in_a_file_repository_a_dependency_declares_is_not_searched() {
+    let local = tempfile::tempdir().expect("file repository");
+    let dir = local.path().join("org/example/lib-parent/1.0");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("lib-parent-1.0.pom"), LIB_PARENT_POM).unwrap();
+    let pom = LIB_POM.replace(
+        "<artifactId>lib</artifactId>",
+        &format!(
+            "<artifactId>lib</artifactId><repositories><repository><id>local</id>\
+             <url>file://{}/</url></repository></repositories>",
+            local.path().display()
+        ),
+    );
+    let output = sync_lib(pom.leak(), |_| Response::new(404, ""));
+    assert_status(&output, 5, "parent in a file: repository");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("raeva does not search a file: repository that a fetched POM"),
         "{stderr}"
     );
 }
@@ -258,7 +273,7 @@ fn a_dependency_without_a_pom_is_locked_without_one() {
         }
         _ => Response::new(404, ""),
     });
-    let project = project(&format!("http://{}/maven/", server.addr()));
+    let project = lib_project(&format!("http://{}/maven/", server.addr()));
     let home = tempfile::tempdir().expect("home");
     let empty = tempfile::tempdir().expect("empty home");
     let run = |home: &TempDir, args: &[&str]| {
@@ -317,7 +332,7 @@ fn a_snapshot_without_a_pom_is_locked_without_one() {
             ],
         )
     });
-    let project = project(&format!("http://{}/maven/", server.addr()));
+    let project = lib_project(&format!("http://{}/maven/", server.addr()));
     let pom = project.path().join("pom.xml");
     let xml = std::fs::read_to_string(&pom).unwrap();
     std::fs::write(
@@ -445,7 +460,8 @@ fn a_dependency_with_a_reactor_parent_exports_by_the_recorded_coordinates() {
 
 /// A lone module reads its `../pom.xml` parent also when a dependency names
 /// the module itself, as Maven's reactor serves the project's own model for
-/// that edge.
+/// that edge. The module has built nothing yet, so its jar comes from the
+/// repository, which has no POM for it.
 #[test]
 fn a_lone_module_a_dependency_names_reads_the_parent_above_it() {
     const LIB: &str = "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>\
@@ -458,6 +474,7 @@ fn a_lone_module_a_dependency_names_reads_the_parent_above_it() {
             [
                 ("/org/example/lib/1.0/lib-1.0.pom", LIB),
                 ("/org/example/lib/1.0/lib-1.0.jar", LIB_JAR),
+                ("/com/example/app/2.5.0/app-2.5.0.jar", LIB_JAR),
             ],
         )
     });
@@ -488,6 +505,7 @@ fn a_lone_module_a_dependency_names_reads_the_parent_above_it() {
     assert_success(&output, "lone module sync");
     let lock = std::fs::read_to_string(module.join("raeva.lock")).expect("read raeva.lock");
     assert!(lock.contains("1 0 compile"), "{lock}");
+    assert!(lock.contains("com.example:app:2.5.0\\tjar\n"), "{lock}");
 }
 
 /// A relocation target whose parent is missing is named after the
@@ -508,7 +526,7 @@ fn a_relocation_target_with_a_missing_parent_is_named() {
         )
     });
     let repository = format!("http://{}/maven/", server.addr());
-    let project = project(&repository);
+    let project = lib_project(&repository);
     let pom = project.path().join("pom.xml");
     let text = std::fs::read_to_string(&pom).expect("pom.xml");
     std::fs::write(
@@ -562,7 +580,7 @@ fn a_managed_relocation_target_with_a_missing_parent_is_named() {
         )
     });
     let repository = format!("http://{}/maven/", server.addr());
-    let project = project(&repository);
+    let project = lib_project(&repository);
     let pom = project.path().join("pom.xml");
     let text = std::fs::read_to_string(&pom).expect("pom.xml");
     let text = text

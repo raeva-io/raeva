@@ -7,35 +7,41 @@
         {
           "check": "TLS trust roots",
           "class": null,
+          "code": null,
           "details": "operating system trust store",
           "status": "info"
         },
         {
           "check": "store directory",
           "class": null,
+          "code": null,
           "details": "<tmp>/home/store",
           "status": "info"
         },
         {
           "check": "unreachable",
           "class": "network",
+          "code": null,
           "details": "error sending request: connection refused (cannot establish connection; verify URL, network, and firewall)",
           "status": "fail"
         },
         {
           "check": "central",
           "class": "network",
+          "code": null,
           "details": "error sending request: connection refused (cannot establish connection; verify URL, network, and firewall)",
           "status": "fail"
         },
         {
           "check": "project repositories",
           "class": null,
+          "code": null,
           "details": "no pom.xml in the project directory; only configured repositories were probed",
           "status": "info"
         }
       ],
       "issues": 2,
+      "snippets": [],
       "warnings": []
     },
     "error": "2 check(s) failed",

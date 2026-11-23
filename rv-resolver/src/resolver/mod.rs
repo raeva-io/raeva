@@ -1,8 +1,12 @@
 mod backend;
+mod extension_types;
+mod model_list;
+mod plugins;
 pub(crate) mod pom_source;
 pub(crate) mod prefetch;
 mod reactor_models;
 mod scope;
+mod session_models;
 mod utils;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -13,7 +17,7 @@ use std::time::Duration;
 
 use foldhash::{HashMap, HashMapExt};
 use futures::FutureExt;
-use futures::future::{Either, select};
+use futures::future::{BoxFuture, Either, select};
 use futures::stream::{self, StreamExt};
 use petgraph::graph::NodeIndex;
 use rv_config::Config;
@@ -31,16 +35,20 @@ use crate::output::ModuleResolution;
 use crate::parent_resolver::LocalParents;
 use crate::solver::{Management, Solver, SolverRoot};
 use crate::util::lock;
+use crate::version_caps::VersionCaps;
 use crate::workspace::Workspace;
 
 pub use backend::SupportPomProvenance;
 pub(crate) use backend::pom_digest_text;
 use backend::{ModelService, WorkspaceSupportPomBuffer};
+pub use extension_types::locked_artifact_types;
+pub use plugins::{PluginRequest, SetReads, plugin_goals};
 use reactor_models::{KeptImports, ReactorModels};
 use scope::ModelScope;
 pub(crate) use scope::parent_coord;
+use session_models::{ModuleTurn, PluginEdges, SessionModels};
 use utils::{FetchError, build_lock_data, fetch_artifact_from_repos};
-pub(crate) use utils::{filter_repos_for_version, merge_repos};
+pub(crate) use utils::{filter_repos_for_version, merge_project_repos};
 
 /// Evidence rows for [`rv_store::Store::record_served`]: a key, its blob,
 /// and the repository and endpoint that served it.
@@ -60,7 +68,22 @@ pub struct Resolver {
     client: RepoClient,
     stall_timeout: Option<Duration>,
     state: Arc<ResolveState>,
+    version_caps: Vec<(Platform, Arc<VersionCaps>)>,
+    root_repositories: Option<RootRepositories>,
 }
+
+/// Called with a platform and the repositories a module of the root
+/// project searches, in the order it searches them, each time a remote
+/// parent declares one: what a resolution learns only once it has read
+/// that parent. Once the module's graph is solved, before any of its files
+/// is fetched, it is called with every repository the resolution trusts,
+/// those dependency POMs declare included, and with each support POM an
+/// imported BOM's build read, by `g:a:v`, beside a repository only imported
+/// BOMs declare that the read searched; under replayed versions, only for a
+/// graph of the lock's artifact rows. The repositories carry the provenance
+/// and policies their admission gave them.
+pub type RootRepositories =
+    Arc<dyn Fn(&Platform, &[Repository], &[(String, Repository)]) + Send + Sync>;
 
 impl std::fmt::Debug for Resolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,13 +97,62 @@ impl Resolver {
     /// A resolver for the project `config` describes, writing to `store`
     /// and reading repositories through `client`.
     pub fn new(config: Arc<Config>, store: Arc<Store>, client: RepoClient) -> Self {
+        // Maven 3.10 validates the plugin sections of the project's POMs.
+        let state = match config.lock.maven.mode {
+            rv_maven_types::MavenMode::Maven310 => ResolveState::with_plugin_sections(),
+            _ => ResolveState::new(),
+        };
         Self {
             config,
             store,
             client,
             stall_timeout: Some(WORKSPACE_STALL_TIMEOUT),
-            state: ResolveState::new(),
+            state,
+            version_caps: Vec::new(),
+            root_repositories: None,
         }
+    }
+
+    /// Tell `observer` the root repositories as remote parents add to them;
+    /// see [`RootRepositories`].
+    pub fn observing_root_repositories(mut self, observer: Option<RootRepositories>) -> Self {
+        self.root_repositories = observer;
+        self
+    }
+
+    /// Replay the version choices of `lock`: on a platform the lock
+    /// records, a version listing for a range, `LATEST` or `RELEASE` offers
+    /// no version above the highest one the lock records for that
+    /// `groupId:artifactId` and the request admits. A frozen check of
+    /// unchanged inputs sets it, so a version published since the lock was
+    /// written moves nothing.
+    pub fn with_locked_versions(mut self, lock: &rv_lock::Lockfile) -> Self {
+        self.version_caps = (lock.platforms.iter())
+            .map(|entry| (entry.platform.clone(), Arc::new(VersionCaps::of(entry))))
+            .collect();
+        self
+    }
+
+    /// [`Self::with_locked_versions`] for a plugin resolution, from the
+    /// plugin tables of `lock`: what they took is all a range, `LATEST` or
+    /// `RELEASE` of a plugin's own dependencies offers, and a plugin or
+    /// build extension without a version is held at the version it took.
+    pub fn with_locked_plugin_versions(mut self, lock: &rv_lock::Lockfile) -> Self {
+        self.version_caps = (lock.platforms.iter())
+            .map(|entry| {
+                (
+                    entry.platform.clone(),
+                    Arc::new(VersionCaps::of_plugins(entry)),
+                )
+            })
+            .collect();
+        self
+    }
+
+    fn caps_of(&self, platform: &Platform) -> Option<Arc<VersionCaps>> {
+        (self.version_caps.iter())
+            .find(|(capped, _)| capped == platform)
+            .map(|(_, caps)| Arc::clone(caps))
     }
 
     /// How long a reactor resolution may make no progress before it fails
@@ -89,6 +161,12 @@ impl Resolver {
     pub fn with_stall_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.stall_timeout = timeout;
         self
+    }
+
+    /// Whether [`Self::with_locked_versions`] changed what a version listing
+    /// offered: a version above a locked one was listed, or marked.
+    pub fn replayed_locked_versions(&self) -> bool {
+        (self.version_caps.iter()).any(|(_, caps)| caps.was_applied())
     }
 
     /// Resolve every active module of `workspace` for `platform`, which
@@ -102,22 +180,60 @@ impl Resolver {
     /// watchdog fails the resolution with [`ResolveError::WorkspaceStalled`]
     /// when nothing at all happens for the stall timeout, so a scheduling
     /// bug fails a build with the stuck modules named instead of hanging it.
+    ///
+    /// A POM whose `.sha1` matches is read without waiting for its
+    /// `.sha256`, which is checked before the support POMs are written; see
+    /// [`RepoClient::checking_sha256_late`]. When one fails, the resolution
+    /// runs again from nothing read, waiting for each, so that it fails
+    /// where the read did, as it would have.
     pub async fn resolve_workspace(
         &self,
         workspace: &Workspace,
         platform: &Platform,
     ) -> Result<WorkspaceResolution> {
-        let ctx = ResolveContext::from_config_with_state(
-            self.config
-                .for_platforms([(platform.os(), platform.arch(), platform.jdk())]),
+        let late = self.client.clone().checking_sha256_late();
+        let state = Arc::clone(&self.state);
+        let resolved = self.resolve_workspace_with(late.clone(), state, workspace, platform);
+        let resolved = resolved.await;
+        // A pass that failed before it settled may have failed on such a POM.
+        let late_failed = resolved.is_err()
+            && (late.late_check_failed() || late.settle_checksums().await.is_err());
+        if !late_failed {
+            return resolved;
+        }
+        // Nothing built from the bytes that failed is kept, nor what they
+        // logged.
+        let (client, state) = (self.client.clone(), self.state.emptied());
+        (self.resolve_workspace_with(client, state, workspace, platform)).await
+    }
+
+    async fn resolve_workspace_with(
+        &self,
+        client: RepoClient,
+        state: Arc<ResolveState>,
+        workspace: &Workspace,
+        platform: &Platform,
+    ) -> Result<WorkspaceResolution> {
+        let config =
+            (self.config).for_platforms([(platform.os(), platform.arch(), platform.jdk())]);
+        let client = client.for_platform(&config);
+        let mut ctx = ResolveContext::from_config_with_state(
+            config,
             Arc::clone(&self.store),
             platform.clone(),
-            Some(self.client.clone()),
-            Arc::clone(&self.state),
+            Some(client),
+            state,
         );
-        PlatformResolver::new(ctx)
+        ctx.version_caps = self.caps_of(platform);
+        ctx.root_repositories.clone_from(&self.root_repositories);
+        let misses = Arc::clone(&ctx.model_misses);
+        let listings = Arc::clone(&ctx.id_listings);
+        let resolution = PlatformResolver::new(ctx)
             .resolve_workspace_with_stall_timeout(workspace, self.stall_timeout)
             .await
+            .map_err(|error| ResolveContext::naming_filtered_models(&misses, error))?;
+        backend::refuse_split_listings(&listings, self.config.lock.maven.mode)?;
+        Ok(resolution)
     }
 }
 
@@ -191,6 +307,9 @@ const REACTOR_WIDE: usize = usize::MAX;
 /// Cost on the hot path is one relaxed `fetch_add`.
 pub(crate) struct WorkspaceProgress {
     events: AtomicU64,
+    /// Until when the work in flight is known to make no move, as while a
+    /// request waits out a busy answer.
+    quiet_until: Mutex<Option<tokio::time::Instant>>,
     /// Work currently in flight, keyed by module index (or [`REACTOR_WIDE`])
     /// so the diagnostic can name exactly what was stuck and in which phase.
     in_flight: Mutex<BTreeMap<usize, InFlight>>,
@@ -200,8 +319,25 @@ impl WorkspaceProgress {
     fn new() -> Self {
         Self {
             events: AtomicU64::new(0),
+            quiet_until: Mutex::new(None),
             in_flight: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// [`Self::note`], for work that may then make no move for `quiet`.
+    fn note_quiet(&self, quiet: Duration) {
+        let until = tokio::time::Instant::now() + quiet;
+        let mut quiet_until = lock(&self.quiet_until);
+        if quiet_until.is_none_or(|quiet_until| quiet_until < until) {
+            *quiet_until = Some(until);
+        }
+        drop(quiet_until);
+        self.note();
+    }
+
+    /// Whether the work in flight is known to make no move now.
+    fn quiet(&self) -> bool {
+        lock(&self.quiet_until).is_some_and(|until| tokio::time::Instant::now() < until)
     }
 
     /// Record that the resolution moved. Called from fetch paths in
@@ -275,6 +411,8 @@ fn complete_resolution(
         module_packaging,
         root_support_pom_provenance,
         root_parent_ranges,
+        parents,
+        losers,
     } = pending;
     let (packages, edges) =
         build_lock_data(&graph, |gav, repos| backend.companion_pom(gav, repos))?;
@@ -299,6 +437,25 @@ fn complete_resolution(
     // load_root_project on a separate backend).
     let mut merged = backend.support_pom_provenance_snapshot();
     merged.extend(root_support_pom_provenance);
+    if let Some(types) = &backend.extension_types {
+        merged.extend(types.read_poms());
+    }
+    // `mvn -o` warns of a POM missing for a losing node. A version a range
+    // lists is read only where the export lists it, and a snapshot's POM
+    // would need the build the repository named.
+    let locked: std::collections::HashSet<&Gav> =
+        (packages.iter().map(|package| &package.coordinate.gav))
+            .chain([&module_gav])
+            .collect();
+    merged.extend(
+        (backend.read_poms(true).into_iter())
+            .filter(|(gav, _)| {
+                losers
+                    && !locked.contains(gav)
+                    && rv_maven_types::snapshot_base_version(gav.version()).is_none()
+            })
+            .map(|(gav, provenance)| (gav.to_string(), provenance)),
+    );
     let support_pom_provenance = merge_support_pom_provenance(merged)?;
 
     let mut parent_ranges: std::collections::BTreeSet<_> = root_parent_ranges.into_iter().collect();
@@ -318,6 +475,40 @@ fn complete_resolution(
             }
         }
     }
+    let (evicted_ranges, mut range_versions) = range_outcomes(
+        &graph,
+        &lock(&backend.range_listings),
+        &lock(&backend.range_reads),
+        backend.mode(),
+    );
+    range_versions.extend(
+        range_outcomes(
+            &graph,
+            &lock(&backend.reactor_range_listings),
+            &backend::RangeReads::new(),
+            backend.mode(),
+        )
+        .1,
+    );
+    range_versions.extend(parent_range_versions(&lock(&backend.read_models)));
+    range_versions.sort();
+    range_versions.dedup();
+    let metadata_versions = metadata_versions(&graph, &backend);
+    let mut pom_reads = backend.pom_reads();
+    for (key, provenance) in &support_pom_provenance {
+        let mut parts = key.splitn(3, ':');
+        let (Some(group), Some(artifact), Some(version)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(pom) = provenance.sha256.parse() else {
+            continue;
+        };
+        (pom_reads.read)
+            .entry(Gav::new(group, artifact, version))
+            .or_insert(Some(pom));
+    }
     Ok(ModuleResolution {
         graph,
         platform,
@@ -327,10 +518,171 @@ fn complete_resolution(
         module_packaging,
         repositories,
         trusted_repositories,
+        import_repositories: backend.import_repositories(),
         support_pom_provenance,
         parent_ranges: parent_ranges.into_iter().collect(),
+        parents,
+        evicted_ranges,
+        metadata_versions,
+        range_versions,
+        extensions: (backend.extension_types.as_ref())
+            .map(|types| types.read_jars())
+            .unwrap_or_default(),
         host_reads: Default::default(),
+        pom_reads,
     })
+}
+
+/// The version each parent range in `models` took, by each origin whose
+/// list named it: the module's own, and those in the lineage of a
+/// dependency or an imported BOM it read. A range a reactor module took,
+/// or one naming a single version, read no list.
+fn parent_range_versions(models: &backend::ModelCache) -> Vec<rv_lock::RangeVersion> {
+    let mut taken = Vec::new();
+    for (key, listing) in &models.range_listings {
+        let Some(version) = models.range_version(&(key.clone(), backend::ModelTag::Parent)) else {
+            continue;
+        };
+        let (group, artifact, _) = key;
+        taken.extend(
+            (listing.iter())
+                .filter(|(_, listed)| listed.contains(&version))
+                .map(|(origin, _)| rv_lock::RangeVersion {
+                    group: group.to_string(),
+                    artifact: artifact.to_string(),
+                    version: version.clone(),
+                    origin: origin.clone(),
+                }),
+        );
+    }
+    taken
+}
+
+/// The ranges of `listings` whose highest listed version, in `mode`'s
+/// order, is no version of that `group:artifact` in `graph`, and the
+/// highest version each origin listed for a range where the graph holds
+/// it. A range read through repositories that list different versions
+/// takes the highest of the lists it read, so every node's pick is the
+/// highest version of one of its origins. A read whose own highest version
+/// the graph does not hold, such as one through fewer repositories than
+/// another read of the range, evicts its origins' lists too.
+fn range_outcomes(
+    graph: &Graph,
+    listings: &backend::RangeListings,
+    reads: &backend::RangeReads,
+    mode: rv_maven_types::MavenMode,
+) -> (Vec<rv_lock::EvictedRange>, Vec<rv_lock::RangeVersion>) {
+    if listings.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    // A SNAPSHOT node holds its build, which the listing names by its base
+    // version; two spellings that compare equal are one version.
+    let mut held: BTreeMap<(&str, &str), Vec<(Version, String)>> = BTreeMap::new();
+    for index in graph.reachable() {
+        if index != graph.root()
+            && let Some(node) = graph.node(index)
+        {
+            let coord = &node.coord;
+            let spelling = rv_maven_types::snapshot_base_version(coord.version.as_str())
+                .unwrap_or_else(|| coord.version.as_str().to_string());
+            let version = Version::parse(&spelling).unwrap_or_else(|_| coord.version.clone());
+            (held
+                .entry((&coord.group_id, &coord.artifact_id))
+                .or_default())
+            .push((version, spelling));
+        }
+    }
+    let mut evicted = Vec::new();
+    let mut taken = Vec::new();
+    for ((group, artifact, range), by_origin) in listings {
+        let mut versions: Vec<String> = by_origin.values().flatten().cloned().collect();
+        versions.sort_unstable();
+        versions.dedup();
+        rv_lock::EvictedRange::sort_versions(&mut versions, mode);
+        let Some(highest) = versions.last().and_then(|v| Version::parse(v).ok()) else {
+            continue;
+        };
+        let holds = |highest: &Version| {
+            (held.get(&(group.as_str(), artifact.as_str())))
+                .and_then(|held| held.iter().find(|(v, _)| v.cmp_in(highest, mode).is_eq()))
+        };
+        for (origin, listed) in by_origin {
+            let mut own: Vec<String> = listed.iter().cloned().collect();
+            rv_lock::EvictedRange::sort_versions(&mut own, mode);
+            let Some((own_top, own_highest)) =
+                own.last().and_then(|v| Some((v, Version::parse(v).ok()?)))
+            else {
+                continue;
+            };
+            // Of spellings that compare equal, the one the graph holds.
+            let version = match holds(&own_highest) {
+                Some((_, spelling)) if listed.contains(spelling) => spelling,
+                Some(_) => own_top,
+                None => continue,
+            };
+            taken.push(rv_lock::RangeVersion {
+                group: group.clone(),
+                artifact: artifact.clone(),
+                version: version.clone(),
+                origin: origin.clone(),
+            });
+        }
+        let evicts = |origin: &String| {
+            holds(&highest).is_none()
+                || (reads.get(&(group.clone(), artifact.clone(), range.clone())))
+                    .into_iter()
+                    .flatten()
+                    .filter(|read| read.contains(origin))
+                    .any(|read| {
+                        let top = (read.iter())
+                            .filter_map(|origin| by_origin.get(origin))
+                            .flatten()
+                            .filter_map(|version| Version::parse(version).ok())
+                            .max_by(|left, right| left.cmp_in(right, mode));
+                        top.is_some_and(|top| holds(&top).is_none())
+                    })
+        };
+        for (origin, versions) in by_origin.iter().filter(|(origin, _)| evicts(origin)) {
+            let mut versions: Vec<String> = versions.iter().cloned().collect();
+            rv_lock::EvictedRange::sort_versions(&mut versions, mode);
+            evicted.push(rv_lock::EvictedRange {
+                group: group.clone(),
+                artifact: artifact.clone(),
+                range: range.clone(),
+                origin: origin.clone(),
+                versions,
+            });
+        }
+    }
+    taken.sort();
+    taken.dedup();
+    (evicted, taken)
+}
+
+/// The markers `backend` read, and the spellings `graph` holds that a
+/// range took among listed versions that compare equal, sorted.
+fn metadata_versions(graph: &Graph, backend: &ModelService) -> Vec<rv_lock::MetadataVersion> {
+    let mut read: Vec<_> = lock(&backend.markers).iter().cloned().collect();
+    let ties = lock(&backend.range_ties);
+    for index in graph.reachable() {
+        if let Some(node) = graph.node(index)
+            && (ties.get(&(
+                node.coord.group_id.to_string(),
+                node.coord.artifact_id.to_string(),
+            )))
+            .is_some_and(|tied| tied.contains(node.coord.version.as_str()))
+        {
+            read.push(rv_lock::MetadataVersion {
+                group: node.coord.group_id.to_string(),
+                artifact: node.coord.artifact_id.to_string(),
+                kind: rv_lock::MetadataVersionKind::Range,
+                version: node.coord.version.as_str().to_string(),
+            });
+        }
+    }
+    read.sort();
+    read.dedup();
+    read
 }
 
 /// Resolve once `progress` has been idle for `timeout`, naming what was in
@@ -348,7 +700,7 @@ async fn watch_for_stall(progress: Arc<WorkspaceProgress>, timeout: Duration) ->
     loop {
         interval.tick().await;
         let seen = progress.events();
-        if seen != last_seen {
+        if seen != last_seen || progress.quiet() {
             last_seen = seen;
             idle = Duration::ZERO;
             continue;
@@ -418,6 +770,19 @@ impl WorkspaceStoreState {
     }
 }
 
+/// A module's own project as its build reads it, and what reading it
+/// added to the resolution.
+struct RootProject {
+    coord: Coord,
+    project: Project,
+    /// The repositories its lineage declared.
+    observed_repos: Vec<Repository>,
+    /// What the builds of the BOMs it imported searched.
+    import_repos: Vec<(String, Repository)>,
+    support_pom_provenance: Vec<(String, SupportPomProvenance)>,
+    models: backend::ReadModels,
+}
+
 struct PendingModuleResolution {
     backend: ModelService,
     graph: Graph,
@@ -425,6 +790,10 @@ struct PendingModuleResolution {
     module_packaging: String,
     root_support_pom_provenance: Vec<(String, SupportPomProvenance)>,
     root_parent_ranges: Vec<rv_lock::ParentRange>,
+    parents: Vec<String>,
+    /// Pin the POMs of nodes that lost; a plugin set pins every dependency
+    /// POM its collections read but its files' own.
+    losers: bool,
 }
 
 /// The classifier likes of a platform pass, and what finding them read.
@@ -553,6 +922,12 @@ impl PlatformResolver {
         let reactor_reads = rv_maven_model::HostReads::default();
         let reactor = Self::new(self.ctx.recording_into(reactor_reads.clone()));
         let store_state = Arc::new(WorkspaceStoreState::with_progress(progress));
+        // A `.sha256` left running moves the pass on too, and a busy answer
+        // to it holds back the other requests to its server.
+        if let Some(client) = &self.ctx.client {
+            let progress = Arc::clone(&store_state.progress);
+            client.report_late_checks(move |quiet| progress.note_quiet(quiet));
+        }
         // The support POMs these models read are written with the modules'.
         let support_poms = &store_state.support_poms;
         let workspace =
@@ -602,7 +977,11 @@ impl PlatformResolver {
                 let workspace = Arc::clone(&workspace);
                 let store_state = Arc::clone(&store_state);
                 let imports = Arc::clone(&imports);
-                let resolver = PlatformResolver::new(module_ctx());
+                // Whether a check runs at all depends on download timing,
+                // so it records nothing for the lock: the module's graph
+                // makes every read the lock needs, and in the 3.9 mode it
+                // takes an earlier module's import that this builds afresh.
+                let resolver = PlatformResolver::new(module_ctx().apart());
                 let check = async move {
                     let support_poms = &store_state.support_poms;
                     let check = resolver.check_own_dependencies(
@@ -632,9 +1011,37 @@ impl PlatformResolver {
         // Once a graph fails the pass fails, so no other module starts or
         // downloads its artifacts.
         let graph_failed = Arc::new(AtomicBool::new(false));
+        let plugin_edges: PluginEdges = {
+            // What these builds read, the modules' own builds read.
+            let resolver = Self::new(self.ctx.recording_only_into(Default::default()));
+            let workspace = Arc::clone(&workspace);
+            // Nor what they log, such as the JDK stand-in a plugin
+            // repository's `${java.version}` reads.
+            let holds = Holds::default();
+            Box::new(move |index, read| {
+                let (resolver, workspace) = (resolver.clone(), Arc::clone(&workspace));
+                let holds = holds.clone();
+                Box::pin(async move {
+                    let edges = resolver.plugin_edges(&workspace, index, read);
+                    holds.hold(edges).await.0
+                })
+            })
+        };
+        let session = SessionModels::new(Arc::clone(&workspace), module_concurrency, plugin_edges);
         let graphs = stream::iter(module_specs)
-            .take_while(|_| std::future::ready(!graph_failed.load(Ordering::Relaxed)))
-            .map(|(index, pom_path, absolute_pom)| {
+            .then(|spec| {
+                let (session, graph_failed) = (Arc::clone(&session), Arc::clone(&graph_failed));
+                async move {
+                    let turn = session.turn(spec.0).await;
+                    if graph_failed.load(Ordering::Relaxed) {
+                        turn.finish();
+                        return None;
+                    }
+                    Some((spec, turn))
+                }
+            })
+            .filter_map(std::future::ready)
+            .map(|((index, pom_path, absolute_pom), turn)| {
                 let graph_failed = Arc::clone(&graph_failed);
                 let workspace = Arc::clone(&workspace);
                 let store_state = Arc::clone(&store_state);
@@ -653,8 +1060,10 @@ impl PlatformResolver {
                             &absolute_pom,
                             workspace,
                             Some(store_state),
+                            Some(Arc::clone(&turn)),
                         ))
                         .await;
+                    turn.finish();
                     progress.leave(index);
                     if pending.is_err() {
                         graph_failed.store(true, Ordering::Relaxed);
@@ -674,7 +1083,9 @@ impl PlatformResolver {
                     )
                 })
             })
-            .buffer_unordered(module_concurrency);
+            // The turns bound the graphs in flight; a module waiting for
+            // another's reads gives its slot up.
+            .buffer_unordered(workspace.len().max(1));
         let (done, mut resolved) = futures::channel::mpsc::unbounded();
         let failed = Arc::clone(&graph_failed);
         let resolving = async move {
@@ -805,6 +1216,36 @@ impl PlatformResolver {
             futures::join!(checking, resolving, finishing);
         store_state.models.clear();
         crate::util::drop_in_background(retired);
+        // Maven sorts the reactor before it builds a module. The sort's
+        // plugin links are read first, so the checks below cover their POMs.
+        let invalid_plugins = session.invalid_plugins().await;
+        let cycle = session.cycle().await;
+        // Before the lock and the store's rows are written, or anything is
+        // reported: a POM read on its `.sha1` fails here when its `.sha256`
+        // holds another digest, and what the graphs logged is dropped, as it
+        // may come from those bytes. The jars the pass downloaded may be in
+        // the store's blobs already, each checked against its own checksum
+        // file or pin; a build extension's row waits for the checks of the
+        // POMs read before it.
+        if let Some(client) = &self.ctx.client {
+            (client.settle_checksums())
+                .await
+                .map_err(|source| ResolveError::Repo {
+                    coord: None,
+                    source: Box::new(source),
+                    searched: Vec::new(),
+                })?;
+        }
+        if let Some((index, message)) = invalid_plugins {
+            let path = workspace.root().join(&workspace.modules()[index].pom_path);
+            return Err(ResolveError::LocalPom {
+                path: path.display().to_string(),
+                source: rv_maven_model::PomError::InvalidProject(message),
+            });
+        }
+        if let Some(cycle) = cycle {
+            return Err(ResolveError::WorkspaceDependencyCycle { cycle });
+        }
         // Modules resolve in any order; a failed graph is reported first, the
         // first in reactor order.
         if let Some((error, failed)) = graph_failure {
@@ -903,85 +1344,207 @@ impl PlatformResolver {
     /// The project Maven 3.9's `ProjectSorter` puts first, the session's
     /// current project. Its `TopologicalSorter` starts from the first
     /// project the reactor builds, the one reached through each first
-    /// `<module>`, and follows the first edge to another reactor project
-    /// until a project has none. A project's edges lead to the projects its
-    /// dependencies name, in order, then to its parent. The build plugin
-    /// and extension edges Maven adds after those are not followed. A model
-    /// that fails to build ends the search, and the resolution of that
-    /// module reports it.
+    /// `<module>`, and follows the first of its
+    /// [`Workspace::sorter_edges`] until a project has none, but for a link
+    /// to a project sorted later whose parent it is, which that parent link
+    /// drops. A model that fails to build ends the search, and the
+    /// resolution of that module reports it.
     async fn first_sorted_project(
         &self,
         workspace: &Arc<Workspace>,
         support_poms: &WorkspaceSupportPomBuffer,
     ) -> Option<Project> {
-        let modules = workspace.modules();
-        let mut by_id: HashMap<(&str, &str), Vec<(&str, usize)>> = HashMap::new();
-        for (index, module) in modules.iter().enumerate() {
-            let gav = module.gav();
-            by_id
-                .entry((&gav.group_id, &gav.artifact_id))
-                .or_default()
-                .push((&gav.version, index));
-        }
-        // Maven links a version that is empty or a range to every version
-        // of the id in the reactor.
-        let projects = |group: &str, artifact: &str, version: Option<&str>| -> Vec<usize> {
-            let specific = version.filter(|v| !v.is_empty() && !v.starts_with(['[', '(']));
-            by_id
-                .get(&(group, artifact))
-                .into_iter()
-                .flatten()
-                .filter(|(known, _)| specific.is_none_or(|version| version == *known))
-                .map(|(_, index)| *index)
-                .collect()
-        };
-        let mut vertex = modules
-            .iter()
-            .position(|module| module.descriptor.modules.is_empty())?;
+        let mode = self.ctx.config.lock.maven.mode;
+        let order = workspace.project_order();
+        let place = |index: usize| order.iter().position(|&listed| listed == index);
+        let mut vertex = *order.first()?;
         let mut visited = std::collections::HashSet::new();
+        let mut built = HashMap::new();
         // The projects on the way build the same imported BOMs, each logging
         // what its own builds log.
         let imports = Arc::<KeptImports>::default();
+        let build = |index: usize| {
+            let path = workspace.root().join(&workspace.modules()[index].pom_path);
+            let imports = &imports;
+            async move {
+                let built = self
+                    .load_root_project(
+                        &path,
+                        &self.ctx.repos,
+                        Arc::clone(workspace),
+                        Some(support_poms),
+                        Some(imports),
+                        None,
+                    )
+                    .await;
+                let project = match built {
+                    Ok(root) => Some(root.project),
+                    Err(_) => (self.project_after_lineages(workspace, support_poms, &path)).await,
+                };
+                imports.forget_logged();
+                project
+            }
+        };
         loop {
             // Maven refuses a reactor whose edges form a cycle.
             if !visited.insert(vertex) {
                 return None;
             }
-            let path = workspace.root().join(&modules[vertex].pom_path);
-            let (_, project, _, _) = self
-                .load_root_project(
-                    &path,
-                    &self.ctx.repos,
-                    Arc::clone(workspace),
-                    Some(support_poms),
-                    Some(&imports),
-                )
-                .await
-                .ok()?;
-            imports.forget_logged();
-            let dependencies = project.dependencies.iter().map(|dependency| {
-                (
-                    dependency.group_id.as_str(),
-                    dependency.artifact_id.as_str(),
-                    dependency.version.as_deref(),
-                )
-            });
-            let parent = project.parent.iter().map(|parent| {
-                (
-                    parent.group_id.as_str(),
-                    parent.artifact_id.as_str(),
-                    Some(parent.version.as_str()),
-                )
-            });
-            let next = dependencies
-                .chain(parent)
-                .flat_map(|(group, artifact, version)| projects(group, artifact, version))
-                .find(|target| *target != vertex);
+            let project = match built.remove(&vertex) {
+                Some(project) => project,
+                None => build(vertex).await?,
+            };
+            let edges = workspace.sorter_edges(vertex, &project, mode);
+            let mut next = edges.parents.first().copied();
+            for target in edges.links {
+                if let std::collections::hash_map::Entry::Vacant(entry) = built.entry(target) {
+                    entry.insert(build(target).await?);
+                }
+                let parents = workspace
+                    .sorter_edges(target, &built[&target], mode)
+                    .parents;
+                if !parents.contains(&vertex) {
+                    next = Some(target);
+                    break;
+                }
+                if place(target) < place(vertex) {
+                    return None;
+                }
+            }
             match next {
                 Some(target) => vertex = target,
                 None => return Some(project),
             }
         }
+    }
+
+    /// The modules [`Workspace::plugin_edges`] links module `index` to, its
+    /// plugin model built from what its project build read, `read`. The
+    /// support POMs it reads go to the reactor's `support_poms`, written
+    /// once their checksums are settled.
+    async fn plugin_edges(
+        &self,
+        workspace: &Arc<Workspace>,
+        index: usize,
+        read: Arc<backend::ModelCache>,
+    ) -> std::result::Result<Vec<usize>, String> {
+        let path = workspace.root().join(&workspace.modules()[index].pom_path);
+        // The parents it reads are the project build's, kept by that build.
+        let discarded = WorkspaceSupportPomBuffer::default();
+        let inputs = self.root_model_inputs(
+            &path,
+            &self.ctx.repos,
+            Arc::clone(workspace),
+            Some(&discarded),
+            None,
+            None,
+        );
+        let Ok((pom, activation, mut backend, local_parents)) = inputs.await else {
+            return Ok(Vec::new());
+        };
+        backend.read_models = Arc::new(Mutex::new(Arc::unwrap_or_clone(read)));
+        let scope = ModelScope::root(&backend, local_parents);
+        let policy = rv_maven_model::ModelPolicy::PROJECT_PLUGINS;
+        match Project::build(pom, &scope, policy, &activation)
+            .await
+            .map(|project| project.plugins())
+        {
+            Ok(Ok(Some(plugins))) => Ok(workspace.plugin_edges(index, &plugins)),
+            // Maven validates the build plugins whether raeva locks them or not.
+            Ok(Err(rv_maven_model::PomError::InvalidProject(message))) => Err(message),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Read the lineages of the first `count` modules of `workspace` in
+    /// turn into one model cache, as Maven's project builder does, and give
+    /// it with the effective GAV of each module `take` names. Another
+    /// module's own build records what its lineage reads, and reports its
+    /// failure.
+    async fn read_lineages(
+        &self,
+        workspace: &Arc<Workspace>,
+        support_poms: Option<&WorkspaceSupportPomBuffer>,
+        progress: Option<&Arc<WorkspaceProgress>>,
+        count: usize,
+        take: impl Fn(usize) -> bool,
+    ) -> Result<(backend::ReadModels, Vec<(usize, rv_maven_model::Gav)>)> {
+        let models = backend::ReadModels::default();
+        let mut gavs = Vec::new();
+        for (index, module) in workspace.modules().iter().enumerate().take(count) {
+            let path = workspace.root().join(&module.pom_path);
+            // The module's own state: its repositories decide what is missing.
+            let ctx = self.ctx.for_module(self.ctx.config.clone());
+            let resolver = Self::new(match take(index) {
+                true => ctx,
+                false => ctx.recording_only_into(Default::default()),
+            });
+            let in_module = |err: ResolveError| err.in_module(&module.pom_path);
+            let inputs = resolver
+                .root_model_inputs(
+                    &path,
+                    &self.ctx.repos,
+                    Arc::clone(workspace),
+                    support_poms,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(in_module);
+            let (pom, activation, mut backend, local_parents) = match inputs {
+                Ok(inputs) => inputs,
+                Err(error) if take(index) => return Err(error),
+                Err(_) => continue,
+            };
+            if let Some(progress) = progress {
+                progress.enter(index, &module.pom_path, WorkPhase::Graph);
+                backend = backend.with_workspace_progress(Arc::clone(progress));
+            }
+            backend.read_models = Arc::clone(&models);
+            let descriptor = rv_maven_model::EffectiveDescriptor::build(
+                pom,
+                &ModelScope::root(&backend, local_parents),
+                rv_maven_model::ModelPolicy::PROJECT,
+                &activation,
+            )
+            .await
+            .map_err(|err| in_module(project_model_error(err, &path)));
+            if let Some(progress) = progress {
+                progress.leave(index);
+            }
+            if take(index) {
+                gavs.push((index, descriptor?.gav));
+            }
+        }
+        Ok((models, gavs))
+    }
+
+    /// The project at `path` built with what every lineage of `workspace`
+    /// read, as Maven builds it.
+    async fn project_after_lineages(
+        &self,
+        workspace: &Arc<Workspace>,
+        support_poms: &WorkspaceSupportPomBuffer,
+        path: &Path,
+    ) -> Option<Project> {
+        let lineages =
+            self.read_lineages(workspace, Some(support_poms), None, workspace.len(), |_| {
+                false
+            });
+        let (models, _) = lineages.await.ok()?;
+        let resolver = Self::new(self.ctx.for_module(self.ctx.config.clone()));
+        let inputs = resolver.root_model_inputs(
+            path,
+            &self.ctx.repos,
+            Arc::clone(workspace),
+            Some(support_poms),
+            None,
+            None,
+        );
+        let (pom, activation, mut backend, local_parents) = inputs.await.ok()?;
+        backend.read_models = models;
+        let scope = ModelScope::root(&backend, local_parents);
+        scope.project(pom, &activation).await.ok()
     }
 
     /// `workspace` indexed by its modules' effective GAVs, as Maven indexes
@@ -997,37 +1560,23 @@ impl PlatformResolver {
         support_poms: &WorkspaceSupportPomBuffer,
     ) -> Result<Arc<Workspace>> {
         let shared = Arc::new(workspace);
-        let workspace = &*shared;
-        let mut gavs = Vec::new();
-        for (index, module) in workspace.modules().iter().enumerate() {
-            if !module.descriptor.gav_is_provisional() {
-                continue;
-            }
-            let path = workspace.root().join(&module.pom_path);
-            progress.enter(index, &module.pom_path, WorkPhase::Graph);
-            let in_module = |err: ResolveError| err.in_module(&module.pom_path);
-            let (pom, activation, backend, local_parents) = self
-                .root_model_inputs(
-                    &path,
-                    &self.ctx.repos,
-                    Arc::clone(&shared),
-                    Some(support_poms),
-                    None,
-                )
-                .await
-                .map_err(in_module)?;
-            let backend = backend.with_workspace_progress(Arc::clone(progress));
-            let descriptor = rv_maven_model::EffectiveDescriptor::build(
-                pom,
-                &ModelScope::root(&backend, local_parents),
-                rv_maven_model::ModelPolicy::PROJECT,
-                &activation,
+        let modules = shared.modules();
+        let provisional = |index: usize| modules[index].descriptor.gav_is_provisional();
+        // Maven reads the lineages in turn with one model cache, so those
+        // before a provisional module are read as well.
+        let count = (0..modules.len())
+            .rposition(provisional)
+            .map_or(0, |last| last + 1);
+        let (_, gavs) = self
+            .read_lineages(
+                &shared,
+                Some(support_poms),
+                Some(progress),
+                count,
+                provisional,
             )
-            .await
-            .map_err(|err| in_module(project_model_error(err, &path)))?;
-            progress.leave(index);
-            gavs.push((index, descriptor.gav));
-        }
+            .await?;
+        let workspace = &*shared;
         if gavs.is_empty() {
             return Ok(shared);
         }
@@ -1053,7 +1602,7 @@ impl PlatformResolver {
         workspace_store: Option<Arc<WorkspaceStoreState>>,
     ) -> Result<ModuleResolution> {
         let pending = self
-            .resolve_graph_internal(path, workspace, workspace_store.clone())
+            .resolve_graph_internal(path, workspace, workspace_store.clone(), None)
             .await?;
         if let Some(state) = workspace_store.as_ref() {
             let (rows, served) = self.flush_workspace_support_poms(state).await?;
@@ -1066,11 +1615,54 @@ impl PlatformResolver {
         complete_resolution(self.ctx.platform.clone(), pending)
     }
 
-    async fn resolve_graph_internal(
+    /// Whether Maven collects depth first: Maven 3.9 unless
+    /// `-Daether.dependencyCollector.impl=bf`, a user or a system property
+    /// (`.mvn/jvm.config`), selects its breadth-first collector, and Maven
+    /// 3.10 only when it is `df`. Maven fails on another collector.
+    pub(crate) fn collects_depth_first(&self, workspace: &Workspace) -> Result<bool> {
+        const COLLECTOR: &str = "aether.dependencyCollector.impl";
+        let environment = self.ctx.environment();
+        let activation = rv_maven_model::ActivationContext::new(environment.clone());
+        let collector = (workspace
+            .root_user_properties(&activation)
+            .0
+            .remove(COLLECTOR))
+        .or_else(|| environment.system_properties().get(COLLECTOR).cloned());
+        let Some(collector) = collector else {
+            return Ok(self.ctx.config.lock.maven.mode == rv_maven_types::MavenMode::Maven39);
+        };
+        environment.record_user_property(COLLECTOR);
+        match collector.as_str() {
+            "df" => Ok(true),
+            "bf" => Ok(false),
+            _ => Err(rv_config::ConfigError::Invalid {
+                origin: rv_config::ConfigOrigin::CommandLine,
+                message: format!("{COLLECTOR} is {collector:?}; Maven knows bf and df"),
+            }
+            .into()),
+        }
+    }
+
+    /// [`Self::module_graph`] on the heap. A debug build keeps the future
+    /// of each await on the caller's stack frame, and this one, which holds
+    /// the root project's load and the solver, overflowed a 2 MiB test
+    /// thread on Windows.
+    fn resolve_graph_internal<'a>(
+        &'a self,
+        path: &'a Path,
+        workspace: Arc<Workspace>,
+        workspace_store: Option<Arc<WorkspaceStoreState>>,
+        turn: Option<Arc<ModuleTurn>>,
+    ) -> BoxFuture<'a, Result<PendingModuleResolution>> {
+        Box::pin(self.module_graph(path, workspace, workspace_store, turn))
+    }
+
+    async fn module_graph(
         &self,
         path: &Path,
         workspace: Arc<Workspace>,
         workspace_store: Option<Arc<WorkspaceStoreState>>,
+        turn: Option<Arc<ModuleTurn>>,
     ) -> Result<PendingModuleResolution> {
         let mut repos = self.ctx.repos.clone();
 
@@ -1078,21 +1670,34 @@ impl PlatformResolver {
         // the parent chain. Parent POMs may declare `<repositories>` that host
         // their own deps; without merging them here the solver backend below
         // never sees them and resolution fails for parent-hosted artifacts.
-        let (root_coord, project, observed_repos, root_support_pom_provenance) = self
+        let RootProject {
+            coord: root_coord,
+            project,
+            observed_repos,
+            import_repos,
+            support_pom_provenance: root_support_pom_provenance,
+            models: root_models,
+        } = self
             .load_root_project(
                 path,
                 &repos,
                 Arc::clone(&workspace),
                 workspace_store.as_ref().map(|state| &state.support_poms),
                 workspace_store.as_ref().map(|state| &state.models.imports),
+                turn.as_ref(),
             )
             .await?;
+        let built = Arc::new(lock(&root_models).clone());
+        if let Some(turn) = &turn {
+            let mode = self.ctx.config.lock.maven.mode;
+            turn.built(Arc::clone(&built), &project, &root_models, mode);
+        }
         if !project.repositories.is_empty() {
             let declared = project.repositories.iter().cloned().map(Repository::from);
-            repos = merge_repos(repos, declared.collect());
+            repos = merge_project_repos(&self.ctx.config, repos, declared.collect());
         }
         if !observed_repos.is_empty() {
-            repos = merge_repos(repos, observed_repos);
+            repos = merge_project_repos(&self.ctx.config, repos, observed_repos);
         }
         let module_gav = Gav::new(
             root_coord.group_id.as_str(),
@@ -1104,7 +1709,21 @@ impl PlatformResolver {
             .clone()
             .unwrap_or_else(|| "jar".to_string());
         let root_parent_ranges = backend::model_parent_ranges(&module_gav.to_string(), &project);
-        let management = Management::new(project.dependency_management.dependencies);
+        let pom_path = crate::workspace::normalized_relative_pom(workspace.root(), path);
+        let own_module = pom_path.clone();
+        let types = Arc::new(extension_types::ExtensionTypes::new(
+            self.clone(),
+            path.to_path_buf(),
+            pom_path,
+            Arc::clone(&workspace),
+            workspace_store
+                .as_ref()
+                .map(|state| Arc::clone(&state.support_poms)),
+            built,
+        ));
+        types.meet(&project).await?;
+        let parents = project.parents;
+        let management = Management::new(project.dependency_management.dependencies, types.types());
         let root_spec = SolverRoot {
             coord: root_coord,
             dependencies: project.dependencies,
@@ -1116,21 +1735,55 @@ impl PlatformResolver {
             "starting dependency resolution"
         );
 
-        let mut backend = ModelService::new(&self.ctx, repos).with_workspace(workspace);
+        let depth_first = self.collects_depth_first(&workspace)?;
+        let mut backend = ModelService::new(&self.ctx, repos)
+            .with_workspace(workspace)
+            .with_own_module(own_module)
+            .with_extension_types(types);
+        backend.read_models = root_models;
+        backend.note_import_repositories(&import_repos);
+        if let Some(turn) = turn {
+            backend = backend.with_module_turn(turn);
+        }
         if let Some(state) = workspace_store.as_ref() {
             backend = backend.with_workspace_support_poms(Arc::clone(&state.support_poms));
             backend = backend.with_workspace_progress(Arc::clone(&state.progress));
             backend = backend.with_reactor_models(Arc::clone(&state.models));
         }
 
-        let graph = Solver::new(&backend)
-            .with_management(management)
-            .solve(root_spec)
-            .await?;
+        let solver =
+            (Solver::new(&backend).with_management(management)).breadth_first(!depth_first);
+        let graph = solver.solve(root_spec).await?;
         backend.release_graph_caches();
         // With what the graph logged, which a reactor shows though another
         // module fails.
         let reachable = graph.reachable();
+        let nodes = || {
+            (graph.node_indices())
+                .filter(|index| *index != graph.root() && reachable.contains(index))
+                .filter_map(|index| graph.node(index))
+                .filter(|node| !node.local && node.workspace_module.is_none())
+        };
+        // A replay reports them only for a graph of the lock's rows, which a
+        // passing frozen check solves: another version's POM may declare
+        // repositories the check never reads.
+        let locked = |caps: &Arc<VersionCaps>| {
+            nodes().all(|node| {
+                let coord = &node.coord;
+                let (group, artifact) = (coord.group_id.as_str(), coord.artifact_id.as_str());
+                caps.has_row(group, artifact, coord.version.as_str())
+            })
+        };
+        if let Some(observer) = &self.ctx.root_repositories
+            && self.ctx.version_caps.as_ref().is_none_or(locked)
+        {
+            let imports = backend.import_repositories();
+            observer(
+                &self.ctx.platform,
+                &backend.effective_repos_snapshot(),
+                &imports,
+            );
+        }
         for index in graph
             .node_indices()
             .filter(|index| reachable.contains(index))
@@ -1158,6 +1811,8 @@ impl PlatformResolver {
             module_packaging,
             root_support_pom_provenance,
             root_parent_ranges,
+            parents,
+            losers: true,
         })
     }
 
@@ -1171,6 +1826,7 @@ impl PlatformResolver {
         workspace: Arc<Workspace>,
         support_poms: Option<&WorkspaceSupportPomBuffer>,
         kept_imports: Option<&Arc<KeptImports>>,
+        turn: Option<&Arc<ModuleTurn>>,
     ) -> Result<(
         Pom,
         rv_maven_model::ActivationContext,
@@ -1194,12 +1850,18 @@ impl PlatformResolver {
         // keeps a unique Arc free and clones only when the cache still holds
         // the shared model.
         let mut pom = (self.ctx.parsed_poms())
-            .parse(&BlobId::from_bytes(&contents), &contents)
+            .parse_project(&BlobId::from_bytes(&contents), &contents)
             .map(Arc::unwrap_or_clone)
             .map_err(|source| ResolveError::LocalPom {
-                path: path.display().to_string(),
+                path: rv_fs::plain_path(path).display().to_string(),
                 source,
             })?;
+        rv_maven_model::check_project_pom(&contents, None).map_err(|source| {
+            ResolveError::LocalPom {
+                path: rv_fs::plain_path(path).display().to_string(),
+                source,
+            }
+        })?;
         pom.set_provenance(workspace.module_provenance(path).unwrap_or_else(|| {
             rv_maven_model::Provenance::RootProject {
                 path: path.to_path_buf(),
@@ -1231,6 +1893,9 @@ impl PlatformResolver {
         if let Some(kept_imports) = kept_imports {
             backend = backend.with_kept_imports(Arc::clone(kept_imports));
         }
+        if let Some(turn) = turn {
+            backend = backend.with_module_turn(Arc::clone(turn));
+        }
         let local_parents = match base_dir.clone() {
             Some(base_dir) => {
                 LocalParents::new(base_dir, boundary).cached_in(self.ctx.local_parents())
@@ -1249,17 +1914,21 @@ impl PlatformResolver {
         support_poms: &WorkspaceSupportPomBuffer,
         imports: &Arc<KeptImports>,
     ) -> Result<()> {
-        let (coord, project, ..) = self
+        let RootProject { coord, project, .. } = self
             .load_root_project(
                 path,
                 &self.ctx.repos,
                 Arc::clone(&workspace),
                 Some(support_poms),
                 Some(imports),
+                None,
             )
             .await?;
         let backend = ModelService::new(&self.ctx, Vec::new()).with_workspace(workspace);
-        let management = Management::new(project.dependency_management.dependencies);
+        let management = Management::new(
+            project.dependency_management.dependencies,
+            rv_maven_model::ArtifactTypes::core(self.ctx.config.lock.maven.mode),
+        );
         Solver::new(&backend)
             .with_management(management)
             .check_root(SolverRoot {
@@ -1276,42 +1945,38 @@ impl PlatformResolver {
         workspace: Arc<Workspace>,
         support_poms: Option<&WorkspaceSupportPomBuffer>,
         kept_imports: Option<&Arc<KeptImports>>,
-    ) -> Result<(
-        Coord,
-        Project,
-        Vec<Repository>,
-        Vec<(String, SupportPomProvenance)>,
-    )> {
+        turn: Option<&Arc<ModuleTurn>>,
+    ) -> Result<RootProject> {
         let (pom, activation, backend, local_parents) = self
-            .root_model_inputs(path, repos, workspace, support_poms, kept_imports)
+            .root_model_inputs(path, repos, workspace, support_poms, kept_imports, turn)
             .await?;
         let project = ModelScope::root(&backend, local_parents)
             .project(pom, &activation)
             .await
             .map_err(|err| project_model_error(err, path))?;
-        // Reject unsupported repository schemes before resolution can reach them.
-        // Only a repository the project's own POMs declare is project input;
-        // one a fetched parent declares is that POM's fault.
+        // Maven skips a repository whose URL it has no transport for, with
+        // a warning, and so does raeva: its requests fail and the search
+        // goes on. A mirror that serves the repository is fetched instead,
+        // as in Maven. The URLs Maven reads as a directory were rewritten
+        // to `file:` URLs as the model was read.
         for repo in &project.repositories {
             let scheme = repo
                 .url
                 .split_once(':')
                 .map(|(scheme, _)| scheme.trim().to_ascii_lowercase())
                 .unwrap_or_default();
-            if !matches!(scheme.as_str(), "http" | "https" | "file") {
-                let source = rv_maven_model::PomError::InvalidModel(format!(
-                    "repository '{}' has unsupported URL '{}'; only http, https and file are supported",
-                    rv_maven_types::bounded(repo.id.as_deref().unwrap_or("<no id>")),
-                    rv_config::redact_url(&repo.url)
-                ));
-                return Err(if repo.root_declared {
-                    ResolveError::LocalPom {
-                        path: path.display().to_string(),
-                        source,
-                    }
-                } else {
-                    ResolveError::Pom(source)
-                });
+            let mirrored = || {
+                let declared = Repository::from(repo);
+                rv_repo::mirrored_repository(&self.ctx.config, &declared).url != declared.url
+            };
+            if !matches!(scheme.as_str(), "http" | "https" | "file") && !mirrored() {
+                // The URL is not shown: it may come from a secret's variable.
+                tracing::warn!(
+                    sec_code = "REPOSITORY_IGNORED",
+                    repository = %rv_maven_types::bounded(repo.id.as_deref().unwrap_or("<no id>")),
+                    "a POM repository has no http, https or file URL that raeva can read; as \
+                     in Maven, its requests fail and the search goes on"
+                );
             }
         }
 
@@ -1329,7 +1994,7 @@ impl PlatformResolver {
         let root_support_pom_provenance = backend.support_pom_provenance_snapshot();
 
         project
-            .validate_build_coordinates()
+            .validate_build_coordinates(self.ctx.config.lock.maven.mode)
             .map_err(|source| ResolveError::LocalPom {
                 path: path.display().to_string(),
                 source,
@@ -1342,7 +2007,17 @@ impl PlatformResolver {
             packaging: Some(project.packaging.clone()),
             classifier: None,
         };
-        Ok((coord, project, observed_repos, root_support_pom_provenance))
+        // Maven's model cache serves the module's dependencies what building
+        // the module read.
+        let models = Arc::clone(&backend.read_models);
+        Ok(RootProject {
+            coord,
+            project,
+            observed_repos,
+            import_repos: backend.import_repositories(),
+            support_pom_provenance: root_support_pom_provenance,
+            models,
+        })
     }
 
     /// Write the reactor's buffered support POMs (parents / imported BOMs) into
@@ -1516,8 +2191,11 @@ impl PlatformResolver {
                     .cloned()
                     .collect::<Vec<_>>();
             // As Maven's artifact resolver does, a SNAPSHOT build's files are
-            // asked only of the repository whose metadata named the build.
-            if let Some(build_repo) = node.build_repo.as_ref() {
+            // asked only of the repository whose metadata named the build. A
+            // pinned build the lock records in a repository whose metadata
+            // was not read is asked of it first, then of the others, as
+            // Maven reads every repository's metadata.
+            if let Some(build_repo) = node.build_repo.as_ref().filter(|repo| !repo.pinned) {
                 repo_candidates.retain(|repo| build_repo.is(repo));
             } else if let Some(repo_url) = node.repo_url.as_deref()
                 && let Some(pos) = repo_candidates.iter().position(|repo| repo.url == repo_url)
@@ -1575,11 +2253,14 @@ impl PlatformResolver {
             // Reuse only bytes this repository served, so a coordinate
             // another project fetched from elsewhere is not adopted; and,
             // unless missing checksums are allowed, only bytes its checksum
-            // verified. A hit is verified below before use. `--update`
-            // fetches a non-unique `-SNAPSHOT` again, as a rebuild replaces
-            // it in place.
-            let renew = rv_maven_types::resolves_through_snapshot_metadata(key.version())
-                && self.ctx.client.as_ref().is_some_and(RepoClient::updates);
+            // verified. A hit is verified below before use. A non-unique
+            // `-SNAPSHOT`, which a rebuild replaces in place, is fetched
+            // again under `--update` or with a POM this run fetched.
+            let renew = self
+                .ctx
+                .client
+                .as_ref()
+                .is_some_and(|client| client.renews(&key));
             let indexed = match (selected_repo.filter(|_| !renew), self.ctx.client.as_ref()) {
                 (Some(repo), Some(client)) => {
                     client.stored_artifact(&self.ctx.store, repo, &key).await?
@@ -1850,7 +2531,8 @@ fn merge_support_pom_provenance(
 
 /// The model errors of building the project at `path` that are about the
 /// project's own model rather than a POM fetched for it: an invalid
-/// `<systemPath>` and a property cycle in the effective model, and a
+/// `<systemPath>`, a project model Maven's validation refuses and a
+/// property cycle in the effective model, and a
 /// `<parent>` that keeps a `${...}`. The model layer reports a property
 /// cycle or a `<parent>` expression inside a fetched parent or BOM as
 /// another error naming that POM, so those, like the other model errors,
@@ -1860,6 +2542,7 @@ pub(super) fn project_model_error(error: ResolveError, path: &Path) -> ResolveEr
     match error {
         ResolveError::Pom(
             source @ (PomError::InvalidSystemPath(_)
+            | PomError::InvalidProject(_)
             | PomError::PropertyCycle(_)
             | PomError::ParentExpression(_)),
         ) => ResolveError::LocalPom {

@@ -2,6 +2,7 @@
   "exit_code": 0,
   "stdout": {
     "data": {
+      "causes": [],
       "changed": true,
       "changed_inputs": [
         "config_hash",
@@ -26,12 +27,14 @@
           "via_truncated": false
         }
       ],
+      "checksum_markers": [],
       "edge_changes": [],
       "module_changes": [],
       "new": "<tmp>/project/raeva.lock",
       "old": "<tmp>/project/old.lock",
       "platforms_added": [],
       "platforms_removed": [],
+      "plugin_changes": [],
       "pom_changes": [],
       "profile_changes": [],
       "via_limited": false,

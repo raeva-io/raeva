@@ -68,7 +68,7 @@ impl Assessment {
 
     /// Statements agree when status and justification match; the impact
     /// statement is prose.
-    fn agrees(&self, other: &Self) -> bool {
+    pub(crate) fn agrees(&self, other: &Self) -> bool {
         self.status == other.status && self.justification == other.justification
     }
 }

@@ -6,23 +6,23 @@ use std::path::Path;
 
 use rv_fs::{NewFileAccess, write_file_atomic};
 use rv_maven_types::{
-    ArtifactCoord, CoordinateField, Digest, Gav, HashAlgorithm, Sha256, SnapshotStamp,
+    ArtifactCoord, CoordinateField, Digest, Gav, HashAlgorithm, MavenMode, Sha256, SnapshotStamp,
     is_snapshot_version, is_terminal_safe, validate_coordinate_component, validate_reactor_version,
 };
 
+use crate::Scope;
 use crate::ambient::AmbientInput;
 use crate::codec::{self, is_sha256_hex};
 use crate::error::LockError;
 use crate::lock_origin::{
-    LockOrigins, encode_repo_id_lines, is_project_relative_origin, record_repo_ids, redact_origin,
-    validate_project_relative_origin,
+    LockOrigins, PARENT_ORIGIN_PREFIX, encode_repo_id_lines, is_project_relative_origin,
+    record_repo_ids, redact_origin, validate_project_relative_origin,
 };
 use crate::platform::Platform;
-use crate::scope::Scope;
 
 /// The only schema this build reads and writes. A lock of any other schema
 /// is refused, and a plain `raeva sync` regenerates it.
-pub const LOCKFILE_SCHEMA_VERSION: u32 = 8;
+pub const LOCKFILE_SCHEMA_VERSION: u32 = 9;
 
 /// Model hash given to a platform built in memory without one (see
 /// [`LockPlatform::single_module`]). `raeva sync` always records the real hash.
@@ -75,6 +75,10 @@ pub struct Lockfile {
     /// resolved under. Written as the top-level `config_hash`, omitted when
     /// `None`.
     pub config_hash: Option<String>,
+    /// The Maven line the lock was resolved as, which `config_hash` and
+    /// every graph digest cover. Written as the top-level `maven`, left out
+    /// for Maven 3.9.
+    pub maven: MavenMode,
     /// The host inputs the resolution consulted. Written as the
     /// `[resolution]` table, omitted when empty.
     pub resolution: LockResolution,
@@ -95,8 +99,8 @@ pub struct Lockfile {
 #[non_exhaustive]
 pub struct LockResolution {
     /// The host values the resolution consulted, by name. `config_hash`
-    /// covers their values, so `--frozen` reads the same names again and
-    /// compares the hash without resolving.
+    /// covers their values, so a sync reads the same names again and
+    /// compares the hash to tell whether the lock is current.
     pub ambient_inputs: BTreeSet<AmbientInput>,
     /// The command line's options by name, without values: `-DNAME` for
     /// each `-D` and `-PID` for each id a `-P` lists, as written. Any
@@ -113,57 +117,68 @@ impl Lockfile {
     }
 
     /// The digest this lockfile pins for each file, by the file's path below
-    /// a Maven repository root: every artifact row, its companion POM and
-    /// every support POM. With it, the origins the lockfile records as
-    /// serving the file, spelled as `repo_url` is. A file a row pins only by
-    /// SHA-1 is held to that, unless another row pins it by SHA-256.
+    /// a Maven repository root: every artifact row, its companion POM,
+    /// every support POM and every release build extension jar. With it,
+    /// the origins the lockfile records as serving the file, spelled as
+    /// `repo_url` is. A file a row pins only by SHA-1 is held to that,
+    /// unless another row pins it by SHA-256.
     pub fn pinned_paths(&self) -> HashMap<String, (Digest, BTreeSet<String>)> {
         let mut files: HashMap<String, (Digest, BTreeSet<String>)> = (self.sha256_pins())
             .into_iter()
             .map(|(path, (pin, origins))| (path, (Digest::Sha256(pin), origins)))
             .collect();
-        let mut sha1: HashMap<String, (Digest, BTreeSet<String>)> = HashMap::new();
-        for artifact in self
-            .platforms
-            .iter()
-            .flat_map(|platform| &platform.artifacts)
-        {
-            if let Some(pin @ Digest::Sha1(_)) = artifact.pin() {
-                let file = (sha1.entry(artifact.repository_path()))
-                    .or_insert_with(|| (pin.clone(), BTreeSet::new()));
-                file.1.extend(artifact.file_origins().map(str::to_string));
-            }
-        }
-        for (path, pin) in sha1 {
+        for (path, pin) in self.sha1_pins() {
             files.entry(path).or_insert(pin);
         }
         files
     }
 
+    fn sha1_pins(&self) -> HashMap<String, (Digest, BTreeSet<String>)> {
+        let mut sha1: HashMap<String, (Digest, BTreeSet<String>)> = HashMap::new();
+        for file in self.platforms.iter().flat_map(LockPlatform::pinned_files) {
+            if let Digest::Sha1(_) = file.pin {
+                let entry = (sha1.entry(file.path()))
+                    .or_insert_with(|| (file.pin.clone(), BTreeSet::new()));
+                entry.1.extend(file.origins.into_iter().map(str::to_string));
+            }
+        }
+        sha1
+    }
+
     fn sha256_pins(&self) -> HashMap<String, (Sha256, BTreeSet<String>)> {
         let mut files: HashMap<String, (Sha256, BTreeSet<String>)> = HashMap::new();
-        for (path, pin, served) in self.pinned_files() {
+        for (path, pin, served) in self.sha256_files() {
             let file = files
                 .entry(path)
                 .or_insert_with(|| (pin.clone(), BTreeSet::new()));
-            file.0.clone_from(pin);
+            file.0 = pin;
             file.1.extend(served.into_iter().map(str::to_string));
         }
         files
     }
 
-    /// Each release file or timestamped snapshot build `fresh` pins to other
-    /// bytes than this lockfile, by path, with this lockfile's pin and then
-    /// `fresh`'s. Other bytes under the same path are a replaced file.
-    /// Only non-unique snapshot filenames can be redeployed and are left out.
-    pub fn repinned_releases(&self, fresh: &Lockfile) -> Vec<(String, Sha256, Sha256)> {
-        let pinned = self.sha256_pins();
+    /// Each release file or timestamped snapshot build `fresh` pins that
+    /// this lockfile pins too, by path, with this lockfile's pin and then
+    /// `fresh`'s, when the two may name other bytes: a SHA-256 pin that
+    /// differs, or a pin by another algorithm, which only the bytes can
+    /// settle. Other bytes under the same path are a replaced file. Only
+    /// non-unique snapshot filenames can be redeployed and are left out. A
+    /// SHA-1 pin is listed even when another row pins the file by SHA-256,
+    /// as a conflict side or a platform of a lock may.
+    pub fn repinned_releases(&self, fresh: &Lockfile) -> Vec<(String, Digest, Sha256)> {
+        let pinned = self.pinned_paths();
+        let sha1 = self.sha1_pins();
         let mut repinned: Vec<_> = fresh
-            .pinned_files()
+            .sha256_files()
             .filter(|(path, ..)| !rv_maven_types::layout::is_mutable_snapshot_path(path))
-            .filter_map(|(path, pin, _)| {
-                let (locked, _) = pinned.get(&path)?;
-                (locked != pin).then(|| (path, locked.clone(), pin.clone()))
+            .flat_map(|(path, pin, _)| {
+                let changed = (pinned.get(&path))
+                    .filter(|(locked, _)| locked.as_sha256() != Some(&pin))
+                    .map(|(locked, _)| locked);
+                let sha1 = sha1.get(&path).map(|(locked, _)| locked);
+                (changed.into_iter().chain(sha1))
+                    .map(|locked| (path.clone(), locked.clone(), pin.clone()))
+                    .collect::<Vec<_>>()
             })
             .collect();
         repinned.sort_by(|a, b| a.0.cmp(&b.0));
@@ -171,47 +186,20 @@ impl Lockfile {
         repinned
     }
 
-    fn pinned_files(&self) -> impl Iterator<Item = (String, &Sha256, Vec<&str>)> {
-        let artifacts = (self.platforms.iter())
-            .flat_map(|platform| &platform.artifacts)
-            .flat_map(|artifact| {
-                let file = match artifact.pin() {
-                    Some(Digest::Sha256(pin)) => Some((
-                        artifact.repository_path(),
-                        pin,
-                        artifact.file_origins().collect(),
-                    )),
-                    _ => None,
+    /// Each file the platforms pin by SHA-256, by path, as often as rows
+    /// pin it, and each release build extension jar.
+    fn sha256_files(&self) -> impl Iterator<Item = (String, Sha256, Vec<&str>)> {
+        let rows =
+            (self.platforms.iter().flat_map(LockPlatform::pinned_files)).filter_map(|file| {
+                let Digest::Sha256(pin) = &file.pin else {
+                    return None;
                 };
-                let pom = artifact.pom_sha256.as_ref().map(|pom| {
-                    let (dir, version) = (
-                        artifact.directory_version(),
-                        artifact.pom_gav().version().to_string(),
-                    );
-                    let path = rv_maven_types::layout::artifact_path(
-                        &artifact.coord().pom(),
-                        &dir,
-                        &version,
-                    );
-                    let origins = if artifact.pom_repo_urls.is_empty() {
-                        artifact.file_origins().collect()
-                    } else {
-                        artifact.pom_repo_urls.iter().map(String::as_str).collect()
-                    };
-                    (path, pom, origins)
-                });
-                file.into_iter().chain(pom)
+                Some((file.path(), pin.clone(), file.origins))
             });
-        let support = (self.platforms.iter())
-            .flat_map(|platform| &platform.support_poms)
-            .filter_map(|(coord, pin)| {
-                Some((
-                    pin.repository_path(coord)?,
-                    &pin.sha256,
-                    vec![pin.repo_url.as_str()],
-                ))
-            });
-        artifacts.chain(support)
+        // A build extension's jar records no origin.
+        let extensions = (self.platforms.iter().flat_map(LockPlatform::extension_jars))
+            .map(|(path, jar)| (path, jar.sha256.clone(), Vec::new()));
+        rows.chain(extensions)
     }
 
     /// The path below a Maven repository root of each companion POM the
@@ -313,6 +301,7 @@ impl Lockfile {
             .collect::<Result<_, _>>()?;
         Ok(Cow::Owned(Lockfile {
             config_hash: self.config_hash.clone(),
+            maven: self.maven,
             resolution: self.resolution.clone(),
             platforms: selected,
             repo_ids: self.repo_ids.clone(),
@@ -337,6 +326,7 @@ impl Lockfile {
             .platforms
             .sort_by_key(|entry| entry.platform.to_string());
         let config_hash = canonical.config_hash.clone();
+        let maven = canonical.maven;
         let repo_ids = canonical.repo_ids.clone();
         let ambient = canonical.resolution.ambient_inputs.clone();
         for platform in &mut canonical.platforms {
@@ -354,8 +344,13 @@ impl Lockfile {
             }
             if let Some(inputs) = &platform.model_inputs {
                 let reads = platform.reads(&repo_ids, &ambient);
-                let graphs =
-                    crate::inputs::graph_digests(platform, inputs, config_hash.as_deref(), &reads);
+                let graphs = crate::inputs::graph_digests(
+                    platform,
+                    inputs,
+                    config_hash.as_deref(),
+                    maven,
+                    &reads,
+                );
                 (platform.model_inputs.as_mut())
                     .expect("model inputs")
                     .graphs = graphs;
@@ -370,12 +365,32 @@ impl Lockfile {
     /// `repo_ids` block, so a checkout at another path records the same
     /// lock. `raeva sync` applies this to a freshly resolved lock; an origin
     /// outside the project keeps its spelling.
+    ///
+    /// A file, POM or version list origin no declaration could match, a
+    /// repository URL that does not parse which only a mirror serves,
+    /// becomes the empty origin: the mirror's URL is not recorded, and the
+    /// repository's own names nothing a later run could fetch from.
     pub fn relativize_origins(&mut self, origins: &LockOrigins) -> Result<(), LockError> {
+        let or_none = |origin: &mut String| {
+            if !origins.records_declaration(origin) {
+                origin.clear();
+            }
+        };
         for artifact in self
             .platforms
             .iter_mut()
             .flat_map(|platform| platform.artifacts.iter_mut())
         {
+            or_none(&mut artifact.repo_url);
+            for origin in (artifact.other_repo_urls.iter_mut()).chain(&mut artifact.pom_repo_urls) {
+                or_none(origin);
+            }
+            let own = artifact.repo_url.clone();
+            artifact.other_repo_urls.retain(|origin| *origin != own);
+            artifact.other_repo_urls.sort();
+            artifact.other_repo_urls.dedup();
+            artifact.pom_repo_urls.sort();
+            artifact.pom_repo_urls.dedup();
             artifact.repo_url = origins.recorded(&artifact.repo_url)?;
             for origin in artifact
                 .other_repo_urls
@@ -390,13 +405,59 @@ impl Lockfile {
             .iter_mut()
             .flat_map(|platform| platform.support_poms.values_mut())
         {
+            or_none(&mut pin.repo_url);
             pin.repo_url = origins.recorded(&pin.repo_url)?;
         }
-        let ids = std::mem::take(&mut self.repo_ids);
-        self.repo_ids = record_repo_ids(origins, ids)?;
+        let mode = self.maven;
+        for module in (self.platforms.iter_mut()).flat_map(|platform| &mut platform.modules) {
+            let ranges = (module
+                .evicted_ranges
+                .iter_mut()
+                .map(|range| &mut range.origin))
+            .chain(
+                module
+                    .range_versions
+                    .iter_mut()
+                    .map(|read| &mut read.origin),
+            );
+            ranges.for_each(or_none);
+            // Two spellings of one directory are one origin.
+            let mut merged: BTreeMap<(String, String, String, String), BTreeSet<String>> =
+                BTreeMap::new();
+            for range in std::mem::take(&mut module.evicted_ranges) {
+                let origin = origins.recorded(&range.origin)?;
+                (merged
+                    .entry((range.group, range.artifact, range.range, origin))
+                    .or_default())
+                .extend(range.versions);
+            }
+            module.evicted_ranges = (merged.into_iter())
+                .map(|((group, artifact, range, origin), versions)| {
+                    let mut versions: Vec<String> = versions.into_iter().collect();
+                    EvictedRange::sort_versions(&mut versions, mode);
+                    EvictedRange {
+                        group,
+                        artifact,
+                        range,
+                        versions,
+                        origin,
+                    }
+                })
+                .collect();
+            for read in &mut module.range_versions {
+                read.origin = origins.recorded(&read.origin)?;
+            }
+            module.range_versions.sort();
+            module.range_versions.dedup();
+        }
+        let record_ids = |mut ids: RepoIds| {
+            ids.retain(|origin, _| origins.records_declaration(origin));
+            record_repo_ids(origins, ids)
+        };
+        self.repo_ids = record_ids(std::mem::take(&mut self.repo_ids))?;
         for platform in &mut self.platforms {
             if let Some(ids) = platform.repo_ids.take() {
-                platform.repo_ids = Some(record_repo_ids(origins, ids)?);
+                platform.repo_ids = Some(record_ids(ids)?);
             }
         }
         Ok(())
@@ -404,7 +465,10 @@ impl Lockfile {
 
     /// Check that every origin is spelled as a lock for the project directory
     /// `origins` describes records it: a project-relative origin is valid, and
-    /// no absolute `file:` origin names a directory inside the project.
+    /// no absolute `file:` origin names a directory inside the project. One
+    /// outside it that a lock written here would record with `../` matches no
+    /// declaration, which `--frozen` reports as drift: whether it has such a
+    /// spelling depends on where the checkout is.
     pub(crate) fn check_origins(&self, origins: &LockOrigins) -> Result<(), LockError> {
         let artifact_origins = self
             .platforms
@@ -418,9 +482,18 @@ impl Lockfile {
             .flat_map(|platform| platform.support_poms.values())
             .map(|pin| pin.repo_url.clone());
         let id_origins = self.repo_ids.keys().cloned();
-        for origin in artifact_origins.chain(support_origins).chain(id_origins) {
+        let plugin_origins = (self.platforms.iter())
+            .flat_map(|platform| &platform.plugins)
+            .flat_map(|tables| tables.origins().map(|(origin, _)| origin.to_string()));
+        let range_origins = (self.platforms.iter())
+            .flat_map(LockPlatform::range_origins)
+            .map(str::to_string);
+        for origin in (artifact_origins.chain(support_origins).chain(id_origins))
+            .chain(plugin_origins)
+            .chain(range_origins)
+        {
             let recorded = origins.recorded(&origin)?;
-            if recorded != origin {
+            if recorded != origin && !recorded.starts_with(PARENT_ORIGIN_PREFIX) {
                 return Err(LockError::Invalid(format!(
                     "repository origin {:?} names a directory inside the project, \
                      which raeva.lock records as {recorded:?}",
@@ -467,7 +540,8 @@ impl Lockfile {
             .iter()
             .flat_map(|platform| platform.artifacts.iter())
             .flat_map(LockArtifact::origins);
-        for origin in artifact_origins.chain(support_origins) {
+        let range_origins = self.platforms.iter().flat_map(LockPlatform::range_origins);
+        for origin in (artifact_origins.chain(support_origins)).chain(range_origins) {
             if is_project_relative_origin(origin) {
                 validate_project_relative_origin(origin)?;
             }
@@ -494,9 +568,16 @@ impl Lockfile {
     /// Set what each of [`Self::platforms`] read, `reads` in the same order:
     /// [`Self::repo_ids`] and the names of `[resolution] ambient_inputs`
     /// other than property and variable names become their union, and a
-    /// platform that did not read all of it lists what it read.
+    /// platform that did not read all of it lists what it read. Fails when
+    /// `reads` does not hold one entry per platform.
     pub fn set_target_reads(&mut self, reads: &[TargetReads]) -> Result<(), LockError> {
-        assert_eq!(reads.len(), self.platforms.len(), "one entry per platform");
+        if reads.len() != self.platforms.len() {
+            return Err(LockError::Invalid(format!(
+                "{} target reads for {} platforms",
+                reads.len(),
+                self.platforms.len()
+            )));
+        }
         let mut ids = RepoIds::new();
         for (origin, id) in reads.iter().flat_map(|read| repo_id_lines(&read.repo_ids)) {
             ids.entry(origin.clone()).or_default().insert(id.clone());
@@ -515,6 +596,19 @@ impl Lockfile {
                 (read.host_inputs != host_inputs).then(|| read.host_inputs.clone());
         }
         self.set_repo_ids(ids)
+    }
+
+    /// A property or variable name `[resolution] ambient_inputs` lists that
+    /// no platform's records list as read, which a sync never writes: it
+    /// lists a name only while a graph read it. `None` also when a platform
+    /// has no records to tell.
+    pub fn unread_property_name(&self) -> Option<&AmbientInput> {
+        let mut read = HashSet::new();
+        for platform in &self.platforms {
+            read.extend(platform.model_inputs.as_ref()?.read_names());
+        }
+        (self.resolution.ambient_inputs.iter())
+            .find(|input| input.is_property_name() && !read.contains(input))
     }
 
     /// The names of `[resolution] ambient_inputs` other than property and
@@ -640,21 +734,39 @@ impl Lockfile {
             .map_err(|err| LockError::Invalid(format!("failed to encode lockfile: {err}")))
     }
 
+    /// Whether the file at `path` holds the text [`Lockfile::write_atomic`]
+    /// writes for this lock, or it with CRLF line endings.
+    pub fn is_written_at(&self, path: &Path) -> Result<bool, LockError> {
+        Ok(rewrite_unneeded(path, self.to_toml()?.as_bytes()))
+    }
+
     /// Write the canonical form to `path`, replacing the file so a reader
     /// sees the old contents or the new ones. Writes nothing if the lockfile
     /// breaks a rule of the schema or an origin is not spelled as the
     /// project directory holding `path` records it
     /// ([`Lockfile::relativize_origins`]). A file that already holds exactly
-    /// these bytes is kept, with its modification time set to now.
+    /// these bytes is left as it is, also through a symbolic link.
+    ///
+    /// Other bytes for a symbolic link at `path` are refused: the rename
+    /// would replace the link and leave the file it names stale, and writing
+    /// through it would let a link a checkout holds point the write at any
+    /// file.
     pub fn write_atomic(&self, path: &Path) -> Result<(), LockError> {
         let contents = self.to_toml()?;
         self.check_origins(&LockOrigins::for_lock_path(path))?;
         if rewrite_unneeded(path, contents.as_bytes()) {
             return Ok(());
         }
-        write_file_atomic(path, contents.as_bytes(), NewFileAccess::Shared).map_err(|err| {
-            LockError::io(format!("failed to write lockfile {}", path.display()), err)
-        })
+        let failed =
+            |err| LockError::io(format!("failed to write lockfile {}", path.display()), err);
+        if fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(failed(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "it is a symbolic link, which raeva does not write through; replace it with a \
+                 copy of the file it names",
+            )));
+        }
+        write_file_atomic(path, contents.as_bytes(), NewFileAccess::Shared).map_err(failed)
     }
 
     /// Refuse an origin with userinfo, a query or a fragment, which may hold
@@ -691,7 +803,15 @@ impl Lockfile {
             .repo_ids
             .keys()
             .map(|origin| (origin.as_str(), "an origin in repo_ids".to_string()));
-        for (origin, what) in rows.chain(support).chain(ids) {
+        let evicted = self.platforms.iter().flat_map(|platform| {
+            platform.range_origins().map(move |origin| {
+                (
+                    origin,
+                    format!("a range origin on platform '{}'", platform.platform),
+                )
+            })
+        });
+        for (origin, what) in rows.chain(support).chain(ids).chain(evicted) {
             if is_project_relative_origin(origin) {
                 continue;
             }
@@ -705,11 +825,9 @@ impl Lockfile {
     }
 }
 
-/// Whether `path` is a regular file holding exactly `contents`, or them with
-/// CRLF line endings as a Git checkout on Windows may have, now with its
-/// modification time set to the present. `raeva sync` reads that time as
-/// when SNAPSHOTs were last refreshed, so a refresh that changed nothing
-/// still has to move it.
+/// Whether `path` is, or links to, a regular file holding exactly
+/// `contents`, or them with CRLF line endings as a Git checkout on Windows
+/// may have.
 fn rewrite_unneeded(path: &Path, contents: &[u8]) -> bool {
     // CRLF line endings at most double the size, so a longer file differs
     // without being read whole.
@@ -721,18 +839,13 @@ fn rewrite_unneeded(path: &Path, contents: &[u8]) -> bool {
             .read_to_end(&mut existing)?;
         Ok(existing)
     };
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() <= limit)
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() <= limit)
         && read().is_ok_and(|existing| {
             existing == contents
                 || (existing.len() > contents.len()
                     && String::from_utf8(existing)
                         .is_ok_and(|text| text.replace("\r\n", "\n").as_bytes() == contents))
         })
-        && fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .and_then(|file| file.set_modified(std::time::SystemTime::now()))
-            .is_ok()
 }
 
 fn check_repo_ids(ids: &RepoIds) -> Result<(), LockError> {
@@ -769,6 +882,12 @@ fn check_cross_platform_pins(platforms: &[LockPlatform]) -> Result<(), LockError
             }
             seen_rows.push((artifact, &platform.platform));
         }
+    }
+    if let Some(coordinate) = conflicting_extension_jar(platforms) {
+        return Err(LockError::Invalid(format!(
+            "conflicting pins for build extension '{coordinate}': two rows record different \
+             checksums for its jar; one Maven local repository holds one file per path"
+        )));
     }
     // A parent or BOM several platforms read is one file in a local
     // repository, so it has one build and one digest. A `-SNAPSHOT` row and
@@ -823,9 +942,33 @@ fn check_cross_platform_pins(platforms: &[LockPlatform]) -> Result<(), LockError
     Ok(())
 }
 
+/// The first build extension of `platforms` whose jar a module or an
+/// artifact row pins to other bytes, by SHA-256, than one of theirs.
+fn conflicting_extension_jar<P: std::borrow::Borrow<LockPlatform>>(
+    platforms: &[P],
+) -> Option<String> {
+    let platforms = || platforms.iter().map(std::borrow::Borrow::borrow);
+    let mut jars: HashMap<String, &ExtensionJar> = HashMap::new();
+    for (path, jar) in platforms().flat_map(LockPlatform::extension_jars) {
+        if jars.entry(path).or_insert(jar).sha256 != jar.sha256 {
+            return Some(jar.to_string());
+        }
+    }
+    let rows = platforms().flat_map(|platform| &platform.artifacts);
+    rows.filter_map(|row| match row.pin() {
+        Some(Digest::Sha256(pin)) => jars
+            .get(&row.repository_path())
+            .filter(|jar| jar.sha256 != *pin),
+        _ => None,
+    })
+    .map(ToString::to_string)
+    .next()
+}
+
 /// Every artifact row naming one `group:artifact:version` must pin the same
 /// companion POM, or none, across classifiers and across platforms, and a
-/// support POM naming that file must pin it too.
+/// support POM naming that file must pin it too, unless the rows pin none:
+/// a plugin may read the POM from a repository the rows' lacks.
 ///
 /// Maven has exactly one local-repository path per GAV, so `raeva export-m2`
 /// writes one `.pom` there, or none for a dependency no repository has a POM
@@ -869,8 +1012,11 @@ fn check_pom_pins(platforms: &[LockPlatform]) -> Result<(), LockError> {
                     platform.platform
                 )));
             }
+            // A row read without a POM, from a repository that lacks it,
+            // beside a support POM another repository served: Maven's local
+            // repository holds that one.
             if let Some((coord, support)) = support.get(&gav)
-                && Some(&support.sha256) != digest
+                && digest.is_some_and(|digest| *digest != support.sha256)
             {
                 return Err(LockError::Invalid(format!(
                     "conflicting POM digests for '{gav}': support POM '{coord}' pins {} \
@@ -897,13 +1043,13 @@ fn check_pom_pins(platforms: &[LockPlatform]) -> Result<(), LockError> {
     Ok(())
 }
 
-/// Refuse every schema but the current one. An older lock was written by an
-/// earlier raeva and a newer one by a later raeva; neither is migrated in place.
 /// The first lines of every raeva.lock. License checks such as Apache RAT
 /// accept a file that says it is `@generated`, as Cargo.lock does.
 const HEADER: &str =
     "# This file is automatically @generated by raeva.\n# It is not intended for manual editing.\n";
 
+/// Refuse every schema but the current one. An older lock was written by an
+/// earlier raeva and a newer one by a later raeva; neither is migrated in place.
 pub(crate) fn check_schema_version(found: u32) -> Result<(), LockError> {
     if found == LOCKFILE_SCHEMA_VERSION {
         Ok(())
@@ -1029,17 +1175,33 @@ fn validate_platform(platform: &LockPlatform) -> Result<(), LockError> {
         }
     }
 
-    // Modules check apart; the first failure in module order is reported.
     let mut used_artifacts = vec![false; platform.artifacts.len()];
-    let checked = rv_maven_types::par_map(&platform.modules, |module| {
-        validate_module(platform, module, &module_paths, &artifact_by_coordinate)
-    });
-    for used in checked {
-        for index in used? {
+    if let Some(tables) = &platform.plugins {
+        for index in crate::plugins::check(tables, platform)? {
             used_artifacts[index] = true;
         }
     }
-
+    // Modules check apart; the first failure in module order is reported.
+    let checked = rv_maven_types::par_map(&platform.modules, |module| {
+        validate_module(platform, module, &module_paths, &artifact_by_coordinate)
+    });
+    let mut shared = Vec::new();
+    for checked in checked {
+        let (used, rows) = checked?;
+        for index in used {
+            used_artifacts[index] = true;
+        }
+        shared.extend(rows);
+    }
+    // A workspace or system package shares its coordinates with a row only
+    // when another use holds it: an extension takes the repository's file,
+    // and so does a module that names its own coordinates.
+    if let Some(shared) = shared.iter().find(|shared| !used_artifacts[shared.row]) {
+        return Err(LockError::Invalid(format!(
+            "{} package '{}' must not have an artifact-table row",
+            shared.kind, shared.package
+        )));
+    }
     for (artifact, used) in platform.artifacts.iter().zip(used_artifacts) {
         if !used {
             return Err(LockError::Invalid(format!(
@@ -1051,15 +1213,24 @@ fn validate_platform(platform: &LockPlatform) -> Result<(), LockError> {
     Ok(())
 }
 
+/// A row that shares the coordinates of a workspace or system package.
+struct SharedRow {
+    package: ArtifactCoord,
+    row: usize,
+    kind: &'static str,
+}
+
 /// [`validate_platform`] for the rows of `module`: the indices of the
-/// artifact rows its packages use.
+/// artifact rows its packages use, and the rows its workspace and system
+/// packages share coordinates with.
 fn validate_module(
     platform: &LockPlatform,
     module: &LockModule,
     module_paths: &HashMap<&str, &LockModule>,
     artifact_by_coordinate: &foldhash::HashMap<&ArtifactCoord, usize>,
-) -> Result<Vec<usize>, LockError> {
+) -> Result<(Vec<usize>, Vec<SharedRow>), LockError> {
     let mut used = Vec::with_capacity(module.packages.len());
+    let mut shared = Vec::new();
     let mut package_coordinates =
         foldhash::HashSet::with_capacity_and_hasher(module.packages.len(), Default::default());
     for package in &module.packages {
@@ -1108,18 +1279,20 @@ fn validate_module(
                     workspace_path, target.gav, package.coordinate
                 )));
             }
-            if artifact_by_coordinate.contains_key(&package.coordinate) {
-                return Err(LockError::Invalid(format!(
-                    "workspace package '{}' must not have an artifact-table row",
-                    package.coordinate
-                )));
+            if let Some(&row) = artifact_by_coordinate.get(&package.coordinate) {
+                shared.push(SharedRow {
+                    package: package.coordinate.clone(),
+                    row,
+                    kind: "workspace",
+                });
             }
         } else if package.system_path.is_some() {
-            if artifact_by_coordinate.contains_key(&package.coordinate) {
-                return Err(LockError::Invalid(format!(
-                    "system-scoped package '{}' must not have an artifact-table row",
-                    package.coordinate
-                )));
+            if let Some(&row) = artifact_by_coordinate.get(&package.coordinate) {
+                shared.push(SharedRow {
+                    package: package.coordinate.clone(),
+                    row,
+                    kind: "system-scoped",
+                });
             }
         } else {
             let Some(&index) = artifact_by_coordinate.get(&package.coordinate) else {
@@ -1140,7 +1313,16 @@ fn validate_module(
             )));
         }
     }
-    Ok(used)
+    for (at, coord) in module.parents.iter().enumerate() {
+        if !module.support_poms.contains(coord) || module.parents[..at].contains(coord) {
+            return Err(LockError::Invalid(format!(
+                "parent '{coord}' of module '{}' on platform '{}' is not one of its \
+                 support POMs, or is named twice",
+                module.path, platform.platform
+            )));
+        }
+    }
+    Ok((used, shared))
 }
 
 /// Check every string in `lock` that a later check, a path, a URL or a
@@ -1177,32 +1359,86 @@ fn check_lock_fields(lock: &Lockfile) -> Result<(), LockError> {
             for origin in artifact.origins() {
                 check_origin_text(origin, &row)?;
             }
-        }
-        for (coord, pin) in &platform.support_poms {
-            validate_support_pom_coord(coord)?;
-            let row = || format!("support POM '{coord}' {on}");
-            check_origin_text(&pin.repo_url, &row)?;
-            if pin.snapshot.is_some() && pin.file_gav(coord).is_none() {
+            if artifact.snapshot.is_some()
+                && !rv_maven_types::resolves_through_snapshot_metadata(
+                    artifact.coordinate.version(),
+                )
+            {
                 return Err(LockError::Invalid(format!(
                     "{} records a snapshot build, but its version is not a SNAPSHOT",
                     row()
                 )));
             }
         }
-        for checked in
-            rv_maven_types::par_map(&platform.modules, |module| check_module_fields(module, &on))
-        {
+        for (coord, pin) in &platform.support_poms {
+            check_support_pom(coord, pin, &on)?;
+        }
+        for checked in rv_maven_types::par_map(&platform.modules, |module| {
+            check_module_fields(module, lock.maven, &on)
+        }) {
             checked?;
         }
     }
     Ok(())
 }
 
+/// [`check_lock_fields`] for the support POM row `coord` on the platform
+/// `on` names. A lock that does not read passes it too before its pins are
+/// kept, as one that fails it pins no file.
+pub(crate) fn check_support_pom(coord: &str, pin: &SupportPom, on: &str) -> Result<(), LockError> {
+    validate_support_pom_coord(coord)?;
+    let row = || format!("support POM '{coord}' {on}");
+    check_origin_text(&pin.repo_url, &row)?;
+    if pin.snapshot.is_some() && pin.file_gav(coord).is_none() {
+        return Err(LockError::Invalid(format!(
+            "{} records a snapshot build, but its version is not a SNAPSHOT",
+            row()
+        )));
+    }
+    Ok(())
+}
+
 /// [`check_lock_fields`] for the strings of `module`, on the platform `on`
 /// names.
-fn check_module_fields(module: &LockModule, on: &str) -> Result<(), LockError> {
+fn check_module_fields(module: &LockModule, mode: MavenMode, on: &str) -> Result<(), LockError> {
     validate_module_path(&module.path, "module")?;
     let row = format!("module '{}' {on}", module.path);
+    let key = |jar: &ExtensionJar| (jar.gav.clone(), jar.classifier.clone());
+    for (index, jar) in module.extensions.iter().enumerate() {
+        let earlier = index
+            .checked_sub(1)
+            .map(|index| key(&module.extensions[index]));
+        if jar.coord().validate().is_err()
+            || jar.classifier.as_deref() == Some("")
+            || earlier.is_some_and(|earlier| earlier >= key(jar))
+        {
+            return Err(LockError::Invalid(format!(
+                "{row} lists build extension {} out of order, twice or invalid",
+                crate::error::printable(&jar.to_string())
+            )));
+        }
+    }
+    let mut ranges = HashSet::new();
+    for range in &module.evicted_ranges {
+        check_evicted_range(range, mode, &row)?;
+        if !ranges.insert((&range.group, &range.artifact, &range.range, &range.origin)) {
+            return Err(LockError::Invalid(format!(
+                "{row} records the evicted range {}:{} {} of one origin twice",
+                range.group, range.artifact, range.range
+            )));
+        }
+    }
+    if !module
+        .range_versions
+        .is_sorted_by(|left, right| left < right)
+    {
+        return Err(LockError::Invalid(format!(
+            "{row} lists its range versions out of order or twice"
+        )));
+    }
+    for read in &module.range_versions {
+        check_range_version(read, &row)?;
+    }
     let mut selections = HashSet::new();
     for selection in &module.parent_ranges {
         let invalid = || LockError::Invalid(format!("invalid parent range selection in {row}"));
@@ -1220,13 +1456,14 @@ fn check_module_fields(module: &LockModule, on: &str) -> Result<(), LockError> {
         if !range.trim_start().starts_with(['[', '(']) {
             return Err(invalid());
         }
-        let range = rv_maven_types::VersionReq::parse(range).map_err(|_| invalid())?;
+        let range = rv_maven_types::VersionReq::parse_in(range, mode).map_err(|_| invalid())?;
         validate_support_pom_coord(&selection.selected)?;
         let (selected_group, selected_artifact, version) =
             split_support_pom_coord(&selection.selected).ok_or_else(invalid)?;
         if group != selected_group
             || artifact != selected_artifact
-            || !rv_maven_types::Version::parse(version).is_ok_and(|version| range.matches(&version))
+            || !rv_maven_types::Version::parse(version)
+                .is_ok_and(|version| range.matches_in(&version, mode))
             || !selections.insert((&selection.model, &selection.parent))
         {
             return Err(invalid());
@@ -1309,7 +1546,7 @@ fn invalid_lock_field(row: &str, err: impl std::fmt::Display) -> LockError {
 
 /// `reactor` for a reactor module's coordinate, as a workspace package names
 /// it: its version gets [`validate_reactor_version`] instead of the full rule.
-fn validate_coordinate(
+pub(crate) fn validate_coordinate(
     coordinate: &ArtifactCoord,
     row: &dyn Fn() -> String,
     reactor: bool,
@@ -1346,7 +1583,7 @@ fn check_text(value: &str, what: &str) -> Result<(), LockError> {
     }
 }
 
-fn check_origin_text(origin: &str, row: &dyn Fn() -> String) -> Result<(), LockError> {
+pub(crate) fn check_origin_text(origin: &str, row: &dyn Fn() -> String) -> Result<(), LockError> {
     if is_terminal_safe(origin) && !origin.contains(char::is_whitespace) {
         Ok(())
     } else {
@@ -1373,7 +1610,7 @@ fn check_model_inputs(inputs: &ModelInputs, platform: &Platform) -> Result<(), L
     })
 }
 
-fn validate_module_path(path: &str, field: &str) -> Result<(), LockError> {
+pub(crate) fn validate_module_path(path: &str, field: &str) -> Result<(), LockError> {
     let invalid = path.is_empty()
         || !is_terminal_safe(path)
         || path.starts_with('/')
@@ -1384,22 +1621,23 @@ fn validate_module_path(path: &str, field: &str) -> Result<(), LockError> {
         || path
             .split('/')
             .any(|component| component.is_empty() || component == "." || component == "..");
-    // The published `pomPath` pattern ends in an exact `pom.xml` component; a
-    // plain suffix test would also accept `app/mypom.xml`.
-    if invalid || path.rsplit('/').next() != Some("pom.xml") {
+    // A `<module>` entry may name its POM file under any name, as in Maven.
+    if invalid {
         return Err(LockError::Invalid(format!(
-            "{field} path {path:?} must be a normalized root-relative pom.xml path"
+            "{field} path {path:?} must be a normalized root-relative POM path"
         )));
     }
     Ok(())
 }
 
 impl Lockfile {
-    /// Warn, without failing, for each coordinate-bearing field that holds
-    /// one of `values`, the values of the `${env.*}` variables POMs were
-    /// allowed to read. Such a field means a variable's value, possibly a
-    /// secret, ended up in a tracked file. Values shorter than 4 bytes are
-    /// skipped, since they match version numbers.
+    /// Warn, without failing, for each coordinate, path or repository URL
+    /// field that holds one of `values`, the values of the `${env.*}`
+    /// variables POMs were allowed to read. Such a field means a variable's
+    /// value, possibly a secret, ended up in a tracked file. Values shorter
+    /// than 4 bytes are skipped, since they match version numbers. The
+    /// warning names the field and its row, with the value masked, never
+    /// the URL.
     pub fn warn_on_env_values(&self, values: &BTreeMap<String, String>) {
         for hit in self.env_value_hits(values) {
             tracing::warn!(
@@ -1407,8 +1645,8 @@ impl Lockfile {
                 sec_code = "ENV_VALUE_IN_LOCKFILE",
                 env_var = %hit.env_var,
                 field = hit.field,
-                coord = %hit.coord,
-                platform = %hit.platform,
+                row = %hit.row,
+                platform = hit.platform.map(tracing::field::display),
                 "lockfile field contains the resolved value of an allowlisted ${{env.X}} \
                  substitution; the secret may have leaked into a tracked artifact"
             );
@@ -1417,28 +1655,142 @@ impl Lockfile {
 
     fn env_value_hits<'a>(&'a self, values: &'a BTreeMap<String, String>) -> Vec<EnvValueHit<'a>> {
         let mut hits = Vec::new();
+        // Shorter values match version numbers.
+        let values: Vec<_> = (values.iter())
+            .filter(|(_, value)| value.len() >= 4)
+            .collect();
+        if values.is_empty() {
+            return hits;
+        }
+        let mut scan = |platform, row: &dyn Fn() -> String, fields: &[(&'static str, &str)]| {
+            scan_fields(&values, platform, row, fields, &mut hits);
+        };
+        let origins = (self.repo_ids.keys()).map(|origin| ("origin", origin.as_str()));
+        scan(
+            None,
+            &|| "metadata.repo_ids".to_string(),
+            &origins.collect::<Vec<_>>(),
+        );
         for platform in &self.platforms {
-            let on = &platform.platform;
+            let on = Some(&platform.platform);
             for artifact in &platform.artifacts {
-                let extra: Vec<_> = artifact
-                    .origins()
-                    .map(|origin| ("repo_url", origin))
-                    .collect();
-                scan_fields(&artifact.coord(), &extra, values, on, &mut hits);
+                let coord = artifact.coord();
+                let mut fields = coord_fields(&coord).to_vec();
+                fields.push(("repo_url", &artifact.repo_url));
+                fields.extend(
+                    (artifact.other_repo_urls.iter()).map(|url| ("other_repo_urls", &**url)),
+                );
+                fields.extend((artifact.pom_repo_urls.iter()).map(|url| ("pom_repo_urls", &**url)));
+                scan(on, &|| coord.to_string(), &fields);
             }
-            for package in platform.modules.iter().flat_map(|module| &module.packages) {
-                let (workspace, system) = (&package.workspace_module, &package.system_path);
-                if workspace.is_none() && system.is_none() {
-                    continue;
+            for (key, pin) in &platform.support_poms {
+                let mut fields: Vec<_> = ["group_id", "artifact_id", "version"]
+                    .into_iter()
+                    .zip(key.splitn(3, ':'))
+                    .collect();
+                fields.push(("repo_url", &pin.repo_url));
+                scan(on, &|| format!("support POM {key}"), &fields);
+            }
+            for module in &platform.modules {
+                for package in &module.packages {
+                    let (workspace, system) = (&package.workspace_module, &package.system_path);
+                    if workspace.is_none() && system.is_none() {
+                        continue;
+                    }
+                    let mut fields = coord_fields(&package.coordinate).to_vec();
+                    fields.push(("workspace_module", workspace.as_deref().unwrap_or_default()));
+                    fields.push(("system_path", system.as_deref().unwrap_or_default()));
+                    scan(on, &|| package.coordinate.to_string(), &fields);
                 }
-                let extra = [
-                    ("workspace_module", workspace.as_deref().unwrap_or_default()),
-                    ("system_path", system.as_deref().unwrap_or_default()),
-                ];
-                scan_fields(&package.coordinate, &extra, values, on, &mut hits);
+                for range in &module.evicted_ranges {
+                    let fields = [
+                        ("group_id", range.group.as_str()),
+                        ("artifact_id", &range.artifact),
+                        ("range", &range.range),
+                        ("origin", &range.origin),
+                    ];
+                    let row = || {
+                        let (group, artifact) = (&range.group, &range.artifact);
+                        format!(
+                            "evicted range {group}:{artifact} {} of {}",
+                            range.range, module.path
+                        )
+                    };
+                    scan(on, &row, &fields);
+                }
+                let row = || format!("metadata_versions of {}", module.path);
+                scan_metadata_versions(&mut scan, on, &row, &module.metadata_versions);
+                let row = || format!("range_versions of {}", module.path);
+                scan_range_versions(&mut scan, on, &row, &module.range_versions);
+            }
+            if let Some(tables) = &platform.plugins {
+                let row = || "the metadata_versions of the plugin tables".to_string();
+                scan_metadata_versions(&mut scan, on, &row, &tables.metadata_versions);
+                let row = || "the range_versions of the plugin tables".to_string();
+                scan_range_versions(&mut scan, on, &row, &tables.range_versions);
+                for set in &tables.sets {
+                    let fields: Vec<_> = (set.repo_urls.iter())
+                        .map(|url| ("repo_urls", &**url))
+                        .collect();
+                    scan(on, &|| format!("plugin set {}", set.key), &fields);
+                }
+                for prefix in &tables.prefixes {
+                    let fields = [("repo_url", prefix.repo_url.as_str())];
+                    scan(
+                        on,
+                        &|| format!("the prefix list of plugin group {}", prefix.group),
+                        &fields,
+                    );
+                }
+                let origins = (tables.repo_ids.keys()).map(|origin| ("origin", origin.as_str()));
+                scan(
+                    on,
+                    &|| "plugins.repo_ids".to_string(),
+                    &origins.collect::<Vec<_>>(),
+                );
+                let shared = (tables.shared_origins.values().flatten())
+                    .map(|origin| ("origin", origin.as_str()));
+                scan(
+                    on,
+                    &|| "plugins.shared_origins".to_string(),
+                    &shared.collect::<Vec<_>>(),
+                );
             }
         }
         hits
+    }
+}
+
+fn scan_metadata_versions<'a>(
+    scan: &mut impl FnMut(Option<&'a Platform>, &dyn Fn() -> String, &[(&'static str, &'a str)]),
+    platform: Option<&'a Platform>,
+    row: &dyn Fn() -> String,
+    markers: &'a [MetadataVersion],
+) {
+    for marker in markers {
+        let fields = [
+            ("group_id", marker.group.as_str()),
+            ("artifact_id", marker.artifact.as_str()),
+            ("version", marker.version.as_str()),
+        ];
+        scan(platform, row, &fields);
+    }
+}
+
+fn scan_range_versions<'a>(
+    scan: &mut impl FnMut(Option<&'a Platform>, &dyn Fn() -> String, &[(&'static str, &'a str)]),
+    platform: Option<&'a Platform>,
+    row: &dyn Fn() -> String,
+    reads: &'a [RangeVersion],
+) {
+    for read in reads {
+        let fields = [
+            ("group_id", read.group.as_str()),
+            ("artifact_id", read.artifact.as_str()),
+            ("version", read.version.as_str()),
+            ("origin", read.origin.as_str()),
+        ];
+        scan(platform, row, &fields);
     }
 }
 
@@ -1447,32 +1799,36 @@ impl Lockfile {
 struct EnvValueHit<'a> {
     env_var: &'a str,
     field: &'static str,
-    coord: ArtifactCoord,
-    platform: &'a Platform,
+    /// What names the row, with the value masked.
+    row: String,
+    /// `None` for the lock's metadata.
+    platform: Option<&'a Platform>,
 }
 
-fn scan_fields<'a>(
-    coord: &ArtifactCoord,
-    extra: &[(&'static str, &str)],
-    values: &'a BTreeMap<String, String>,
-    platform: &'a Platform,
-    hits: &mut Vec<EnvValueHit<'a>>,
-) {
-    let fields = [
+fn coord_fields(coord: &ArtifactCoord) -> [(&'static str, &str); 5] {
+    [
         ("group_id", coord.group_id()),
         ("artifact_id", coord.artifact_id()),
         ("version", coord.version()),
         ("packaging", coord.extension()),
         ("classifier", coord.classifier().unwrap_or_default()),
-    ];
-    // Shorter values match version numbers.
-    for (name, value) in values.iter().filter(|(_, value)| value.len() >= 4) {
-        for &(field, content) in fields.iter().chain(extra) {
+    ]
+}
+
+fn scan_fields<'a>(
+    values: &[(&'a String, &'a String)],
+    platform: Option<&'a Platform>,
+    row: &dyn Fn() -> String,
+    fields: &[(&'static str, &str)],
+    hits: &mut Vec<EnvValueHit<'a>>,
+) {
+    for &(name, value) in values {
+        for &(field, content) in fields {
             if content.contains(value.as_str()) {
                 hits.push(EnvValueHit {
                     env_var: name,
                     field,
-                    coord: coord.clone(),
+                    row: row().replace(value.as_str(), "***"),
                     platform,
                 });
             }
@@ -1556,9 +1912,39 @@ pub struct LockPlatform {
     /// them. Written as `host_inputs` in the target's `[[inputs]]`, which
     /// every graph digest of the target covers.
     pub host_inputs: Option<BTreeSet<AmbientInput>>,
+    /// The plugin tables, written as `[platforms.plugins]`. Their files
+    /// are rows of [`Self::artifacts`] and [`Self::support_poms`].
+    pub plugins: Option<crate::PluginTables>,
 }
 
 impl LockPlatform {
+    /// Each release or timestamped snapshot build extension jar the modules
+    /// record, with its path; a plain `-SNAPSHOT` one is left out, as its
+    /// file can be redeployed.
+    pub fn extension_jars(&self) -> impl Iterator<Item = (String, &ExtensionJar)> {
+        (self.modules.iter())
+            .flat_map(|module| &module.extensions)
+            .filter(|jar| !rv_maven_types::resolves_through_snapshot_metadata(jar.gav.version()))
+            .map(|jar| {
+                let coord = jar.coord();
+                let version = jar.gav.version();
+                let directory = rv_maven_types::snapshot_base_version(version);
+                let directory = directory.as_deref().unwrap_or(version);
+                let path = rv_maven_types::layout::artifact_path(&coord, directory, version);
+                (path, jar)
+            })
+    }
+
+    /// The coordinates of the artifact rows the modules read from a
+    /// repository: not those of a reactor module or a system file, though
+    /// a row of the same coordinates may serve a plugin.
+    pub fn module_rows(&self) -> BTreeSet<&ArtifactCoord> {
+        (self.modules.iter())
+            .flat_map(|module| &module.packages)
+            .filter_map(LockModulePackage::repository_file)
+            .collect()
+    }
+
     /// A platform with this model hash and no artifacts or modules yet.
     pub fn new(platform: Platform, model_hash: impl Into<String>) -> Self {
         Self {
@@ -1570,6 +1956,7 @@ impl LockPlatform {
             model_inputs: None,
             repo_ids: None,
             host_inputs: None,
+            plugins: None,
         }
     }
 
@@ -1601,14 +1988,36 @@ impl LockPlatform {
                 edges: Vec::new(),
                 parent_ranges: Vec::new(),
                 support_poms: Vec::new(),
+                parents: Vec::new(),
+                evicted_ranges: Vec::new(),
+                extensions: Vec::new(),
+                metadata_versions: Vec::new(),
+                range_versions: Vec::new(),
             }],
             support_poms: BTreeMap::new(),
             model_inputs: None,
             repo_ids: None,
             host_inputs: None,
+            plugins: None,
         };
         value.canonicalize();
         value
+    }
+
+    /// The origins of every module's evicted ranges and range versions.
+    pub fn range_origins(&self) -> impl Iterator<Item = &str> {
+        (self.modules.iter()).flat_map(|module| {
+            (module
+                .evicted_ranges
+                .iter()
+                .map(|range| range.origin.as_str()))
+            .chain(
+                module
+                    .range_versions
+                    .iter()
+                    .map(|read| read.origin.as_str()),
+            )
+        })
     }
 
     /// Record profile ids and per-POM digests, then recompute `model_hash`.
@@ -1632,11 +2041,11 @@ impl LockPlatform {
         }
     }
 
-    /// Whether the graph digests read from a lock whose `config_hash` is
-    /// `config_hash` and whose `[metadata] repo_ids` are `repo_ids` match the
-    /// rows and records this platform holds, and `ambient`, the lock's
-    /// `[resolution] ambient_inputs`, lists every name a graph read, and a
-    /// module read each support POM: false when they
+    /// Whether the graph digests read from a lock whose `config_hash`,
+    /// Maven mode and `[metadata] repo_ids` are `config_hash`, `maven` and
+    /// `repo_ids` match the rows and records this platform holds, and
+    /// `ambient`, the lock's `[resolution] ambient_inputs`, lists every name
+    /// a graph read, and a module read each support POM: false when they
     /// come from different resolutions, as after a merge of two branches
     /// that each changed a module's graph, its POM or the configuration. A
     /// platform with only a `model_hash` has no graph digests, so it never
@@ -1644,25 +2053,33 @@ impl LockPlatform {
     pub fn graphs_match(
         &self,
         config_hash: Option<&str>,
+        maven: MavenMode,
         ambient: &BTreeSet<AmbientInput>,
         repo_ids: &RepoIds,
     ) -> bool {
         let reads = self.reads(repo_ids, ambient);
         let read: HashSet<&String> = (self.modules.iter())
             .flat_map(|module| &module.support_poms)
+            .chain(
+                self.plugins
+                    .iter()
+                    .flat_map(|tables| &tables.sets)
+                    .flat_map(|set| &set.poms),
+            )
             .collect();
         (self.model_inputs.as_ref()).is_some_and(|inputs| {
             inputs.read_names().all(|name| ambient.contains(name))
                 && self.support_poms.keys().all(|coord| read.contains(coord))
-                && inputs.graphs == crate::inputs::graph_digests(self, inputs, config_hash, &reads)
+                && inputs.graphs
+                    == crate::inputs::graph_digests(self, inputs, config_hash, maven, &reads)
         })
     }
 
     /// The first coordinate whose row here pins a different file than
     /// `other`'s row for it does ([`LockArtifact::conflicts_with`]), or other
-    /// bytes than `other`'s row for the same local-repository file under
-    /// another coordinate.
-    pub(crate) fn conflicting_artifact_pin(&self, other: &LockPlatform) -> Option<&ArtifactCoord> {
+    /// bytes than `other`'s row or build extension jar for the same
+    /// local-repository file.
+    pub(crate) fn conflicting_artifact_pin(&self, other: &LockPlatform) -> Option<String> {
         let theirs: HashMap<&ArtifactCoord, &LockArtifact> = other
             .artifacts
             .iter()
@@ -1685,7 +2102,8 @@ impl LockPlatform {
                         .get(&artifact.repository_path())
                         .is_some_and(|rows| rows.iter().any(|other| artifact.bytes_differ(other)))
             })
-            .map(|artifact| &artifact.coordinate)
+            .map(|artifact| artifact.coordinate.to_string())
+            .or_else(|| conflicting_extension_jar(&[self, other]))
     }
 
     fn canonicalize(&mut self) {
@@ -1768,6 +2186,13 @@ pub struct LockArtifact {
     /// only from these. Written as `pom_repo_urls` when not
     /// empty.
     pub pom_repo_urls: Vec<String>,
+    /// Whether the file was accepted without a checksum file from its
+    /// repository, under `--allow-missing-checksums`, and no download since
+    /// verified it against one. Written as `missing_checksum` when true.
+    pub missing_checksum: bool,
+    /// [`Self::missing_checksum`] for the companion POM. Written as
+    /// `pom_missing_checksum` when true.
+    pub pom_missing_checksum: bool,
 }
 
 impl LockArtifact {
@@ -1784,6 +2209,8 @@ impl LockArtifact {
             pom_base: false,
             pom_sha256: None,
             pom_repo_urls: Vec::new(),
+            missing_checksum: false,
+            pom_missing_checksum: false,
         }
     }
 
@@ -1835,6 +2262,12 @@ impl LockArtifact {
                     .iter()
                     .any(|theirs| theirs.algorithm() == mine.algorithm() && theirs != mine)
             })
+    }
+
+    /// Whether the row records the one SHA-256 a resolution writes, which
+    /// a frozen check compares the checksums with.
+    pub fn checksums_as_resolved(&self) -> bool {
+        matches!(self.checksums.as_slice(), [Digest::Sha256(_)])
     }
 
     /// The checksum a download of this file is checked against: the
@@ -1922,6 +2355,16 @@ impl LockArtifact {
             &self.file_version(),
         )
     }
+
+    /// The path below a Maven repository root of the companion POM.
+    pub(crate) fn pom_path(&self) -> String {
+        let version = self.pom_gav().version().to_string();
+        rv_maven_types::layout::artifact_path(
+            &self.coord().pom(),
+            &self.directory_version(),
+            &version,
+        )
+    }
 }
 
 /// One reactor module's graph on one platform.
@@ -1949,6 +2392,226 @@ pub struct LockModule {
     /// graph digest covers their pins ([`crate::inputs::graph_digests`]).
     /// Written as `support_poms`, one per line, omitted when empty.
     pub support_poms: Vec<String>,
+    /// The parents of the module's lineage that came from a repository,
+    /// nearest first, each one of [`Self::support_poms`]. Written as
+    /// `parents`, one per line, omitted when empty.
+    pub parents: Vec<String>,
+    /// The version ranges this module's resolution listed whose highest
+    /// listed version its graph does not hold, sorted. Written as
+    /// `evicted_ranges`, one per line, omitted when empty.
+    pub evicted_ranges: Vec<EvictedRange>,
+    /// The build extensions whose artifact handlers this module's
+    /// resolution read to type a dependency, sorted. Written as `extensions`, one
+    /// per line, omitted when empty.
+    pub extensions: Vec<ExtensionJar>,
+    /// The versions this module's resolution took from repository metadata
+    /// that the pins alone do not give `mvn -o`, sorted. Written as
+    /// `metadata_versions`, one per line, omitted when empty.
+    pub metadata_versions: Vec<MetadataVersion>,
+    /// The version each range this module's graph holds took, by the
+    /// repository whose list named it, sorted: what an export lists for
+    /// `mvn -o`, where `evicted_ranges` gives the ranges that lost. Written
+    /// as `range_versions`, one per line, omitted when empty.
+    pub range_versions: Vec<RangeVersion>,
+}
+
+/// A version a range took from the version list of one repository. Written
+/// as `group:artifact`, the version and the repository's origin, separated
+/// by tabs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RangeVersion {
+    /// The ranged dependency's groupId.
+    pub group: String,
+    /// The ranged dependency's artifactId.
+    pub artifact: String,
+    /// The version as the list spells it.
+    pub version: String,
+    /// The repository whose list named the version, spelled as `repo_url`
+    /// is.
+    pub origin: String,
+}
+
+/// The rules for a range version of `row`: a valid coordinate and an origin,
+/// the empty one for a repository whose URL the lock cannot record.
+pub(crate) fn check_range_version(read: &RangeVersion, row: &str) -> Result<(), LockError> {
+    let invalid = || {
+        LockError::Invalid(format!(
+            "invalid range version {}:{}:{} of {row}",
+            crate::error::printable(&read.group),
+            crate::error::printable(&read.artifact),
+            crate::error::printable(&read.version),
+        ))
+    };
+    for (field, value) in [
+        (CoordinateField::Group, read.group.as_str()),
+        (CoordinateField::Artifact, read.artifact.as_str()),
+        (CoordinateField::Version, read.version.as_str()),
+    ] {
+        validate_coordinate_component(field, value).map_err(|_| invalid())?;
+    }
+    rv_maven_types::Version::parse(&read.version).map_err(|_| invalid())?;
+    check_origin_text(&read.origin, &|| format!("a range version of {row}"))
+}
+
+/// A version Maven took from repository metadata that the lock's pins
+/// alone do not give `mvn -o`. Written as `group:artifact`, the kind and
+/// the version, separated by tabs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MetadataVersion {
+    /// The artifact's groupId.
+    pub group: String,
+    /// The artifact's artifactId.
+    pub artifact: String,
+    /// What read it.
+    pub kind: MetadataVersionKind,
+    /// The version as the metadata spells it.
+    pub version: String,
+}
+
+/// How a [`MetadataVersion`] was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MetadataVersionKind {
+    /// The version a `RELEASE`, or a plugin without a version, took. An
+    /// export writes it as `<release>`.
+    Release,
+    /// The version a `LATEST` took, from `<latest>` or else `<release>`. An
+    /// export writes it as `<latest>`.
+    Latest,
+    /// The spelling a range took among listed versions that compare equal,
+    /// which the order of the whole listing decides.
+    Range,
+}
+
+impl MetadataVersionKind {
+    /// The name raeva.lock writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Latest => "latest",
+            Self::Range => "range",
+        }
+    }
+}
+
+impl std::str::FromStr for MetadataVersionKind {
+    type Err = ();
+
+    fn from_str(text: &str) -> Result<Self, ()> {
+        [Self::Release, Self::Latest, Self::Range]
+            .into_iter()
+            .find(|kind| kind.as_str() == text)
+            .ok_or(())
+    }
+}
+
+/// The jar of a build extension whose artifact handlers raeva read, which
+/// the module's graph digest covers. Written as `group:artifact:version`,
+/// then `:classifier` for a classified jar, and the jar's SHA-256,
+/// separated by a tab.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExtensionJar {
+    /// The extension's coordinates.
+    pub gav: Gav,
+    /// The jar's classifier, which a jar of the extension's dependencies
+    /// may have.
+    pub classifier: Option<String>,
+    /// The SHA-256 of its jar.
+    pub sha256: Sha256,
+}
+
+impl ExtensionJar {
+    /// The jar's coordinates.
+    pub fn coord(&self) -> ArtifactCoord {
+        ArtifactCoord::of(self.gav.clone(), "jar", self.classifier.as_deref())
+    }
+}
+
+/// `group:artifact:version[:classifier]`.
+impl std::fmt::Display for ExtensionJar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.gav)?;
+        if let Some(classifier) = &self.classifier {
+            write!(f, ":{classifier}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A version range a module's resolution listed whose highest version the
+/// module's graph does not hold: a range that lost to a nearer declaration,
+/// or one below a version that lost. Maven still reads the versions of such
+/// a range, so a frozen check offers it the versions it listed when
+/// raeva.lock was written, and an export lists one under the ids of the
+/// repository that listed them. One line per range and repository, of
+/// tab-separated columns: `group:artifact`, the range, the repository's
+/// origin, and the versions its list offered, separated by spaces.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EvictedRange {
+    /// The ranged dependency's groupId.
+    pub group: String,
+    /// The ranged dependency's artifactId.
+    pub artifact: String,
+    /// The range as raeva writes a parsed range.
+    pub range: String,
+    /// The repository whose list named the versions, spelled as `repo_url`
+    /// is.
+    pub origin: String,
+    /// The listed versions the range matched, lowest first in the lock's
+    /// Maven order, two that compare equal by their text.
+    pub versions: Vec<String>,
+}
+
+impl EvictedRange {
+    /// `versions` sorted as raeva.lock writes them, in `mode`'s order.
+    pub fn sort_versions(versions: &mut [String], mode: MavenMode) {
+        versions.sort_by(|left, right| version_order(left, right, mode));
+    }
+}
+
+fn version_order(left: &str, right: &str, mode: MavenMode) -> std::cmp::Ordering {
+    let parse = |text| rv_maven_types::Version::parse(text).ok();
+    match (parse(left), parse(right)) {
+        (Some(a), Some(b)) => a.cmp_in(&b, mode).then_with(|| left.cmp(right)),
+        _ => left.cmp(right),
+    }
+}
+
+/// The rules for an evicted range of `row`: valid coordinates, a range as
+/// raeva writes one, and versions it matches, sorted, each once.
+fn check_evicted_range(range: &EvictedRange, mode: MavenMode, row: &str) -> Result<(), LockError> {
+    let invalid = |what: &str| {
+        LockError::Invalid(format!(
+            "invalid evicted range {}:{} {:?} of {row}: {what}",
+            crate::error::printable(&range.group),
+            crate::error::printable(&range.artifact),
+            crate::error::printable(&range.range),
+        ))
+    };
+    for (field, value) in [
+        (CoordinateField::Group, range.group.as_str()),
+        (CoordinateField::Artifact, range.artifact.as_str()),
+    ] {
+        validate_coordinate_component(field, value).map_err(|_| invalid("not a coordinate"))?;
+    }
+    let req = rv_maven_types::VersionReq::parse_in(&range.range, mode)
+        .ok()
+        .filter(|req| matches!(req, rv_maven_types::VersionReq::Ranges(_)))
+        .filter(|req| req.to_string() == range.range)
+        .ok_or_else(|| invalid("not a range as raeva writes it"))?;
+    if range.versions.is_empty() {
+        return Err(invalid("it lists no version"));
+    }
+    for version in &range.versions {
+        validate_coordinate_component(CoordinateField::Version, version)
+            .ok()
+            .and_then(|()| rv_maven_types::Version::parse(version).ok())
+            .filter(|parsed| req.matches_in(parsed, mode))
+            .ok_or_else(|| invalid("a version is not one the range matches"))?;
+    }
+    if !(range.versions.windows(2)).all(|pair| version_order(&pair[0], &pair[1], mode).is_lt()) {
+        return Err(invalid("the versions must be sorted, each once"));
+    }
+    check_origin_text(&range.origin, &|| format!("an evicted range of {row}"))
 }
 
 /// One remote parent range selected while building a model's parent lineage.
@@ -1988,9 +2651,25 @@ pub struct LockModulePackage {
     /// Written as the fourth column, left empty when it is the direct scope
     /// or, for a node reached only through another package, compile.
     pub scope: Scope,
+    /// Where the module's dependency management declares the version it
+    /// supplied, when it did: a POM of the module's lineage or a BOM it
+    /// imports, and the property the version is written as. Written in the
+    /// module's `managed` lines, which name the package by its index.
+    pub managed: Option<std::sync::Arc<rv_maven_types::ManagedSource>>,
 }
 
 impl LockModule {
+    /// Whether `gav` names the module's own artifacts, which its graph
+    /// takes from a repository: its coordinates, or a build of its
+    /// `SNAPSHOT` Maven reads as a release, `1.020240101.010101-1` of
+    /// `1.0SNAPSHOT`.
+    pub fn owns(&self, gav: &Gav) -> bool {
+        gav.group == self.gav.group
+            && gav.artifact == self.gav.artifact
+            && (gav.version() == self.gav.version()
+                || SnapshotStamp::of_file_version(self.gav.version(), gav.version()).is_some())
+    }
+
     /// The module at `path` (its `pom.xml`, relative to the lockfile's
     /// directory) with no packages or edges yet.
     pub fn new(path: impl Into<String>, gav: Gav, packaging: impl Into<String>) -> Self {
@@ -2002,6 +2681,11 @@ impl LockModule {
             edges: Vec::new(),
             parent_ranges: Vec::new(),
             support_poms: Vec::new(),
+            parents: Vec::new(),
+            evicted_ranges: Vec::new(),
+            extensions: Vec::new(),
+            metadata_versions: Vec::new(),
+            range_versions: Vec::new(),
         }
     }
 }
@@ -2018,8 +2702,39 @@ impl LockModulePackage {
             workspace_module: None,
             system_path: None,
             system_sha256: None,
+            managed: None,
         }
     }
+
+    /// Where the package comes from.
+    pub fn source(&self) -> PackageSource<'_> {
+        match (&self.workspace_module, &self.system_path) {
+            (Some(path), _) => PackageSource::Module(path),
+            (None, Some(path)) => PackageSource::System(path),
+            (None, None) => PackageSource::Repository,
+        }
+    }
+
+    /// The coordinate of the artifact row the package reads, when it comes
+    /// from a repository.
+    pub fn repository_file(&self) -> Option<&ArtifactCoord> {
+        matches!(self.source(), PackageSource::Repository).then_some(&self.coordinate)
+    }
+}
+
+/// Where a module's package comes from. One coordinate may name a package
+/// of each source in one lock: a module that takes its own jar from a
+/// repository reads a file of the coordinates other modules build it as,
+/// and a build extension may read that file too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageSource<'a> {
+    /// A file from a repository, which the artifact row of its coordinate
+    /// pins.
+    Repository,
+    /// Another reactor module, by its POM path.
+    Module(&'a str),
+    /// A system-scoped file, by its path.
+    System(&'a str),
 }
 
 fn sorted<'a>(items: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
@@ -2035,6 +2750,13 @@ pub(crate) fn is_canonical_module(module: &LockModule) -> bool {
         && module.edges.is_sorted()
         && module.parent_ranges.is_sorted()
         && (module.support_poms).is_sorted_by(|left, right| left < right)
+        && (module.evicted_ranges).is_sorted_by(|left, right| {
+            (&left.group, &left.artifact, &left.range, &left.origin)
+                < (&right.group, &right.artifact, &right.range, &right.origin)
+        })
+        && (module.extensions).is_sorted_by(|left, right| left < right)
+        && (module.metadata_versions).is_sorted_by(|left, right| left < right)
+        && (module.range_versions).is_sorted_by(|left, right| left < right)
 }
 
 pub(crate) fn canonicalize_module(module: &mut LockModule) {
@@ -2056,6 +2778,13 @@ pub(crate) fn canonicalize_module(module: &mut LockModule) {
     module.parent_ranges.sort();
     module.support_poms.sort();
     module.support_poms.dedup();
+    module.evicted_ranges.sort();
+    module.extensions.sort();
+    module.extensions.dedup();
+    module.metadata_versions.sort();
+    module.metadata_versions.dedup();
+    module.range_versions.sort();
+    module.range_versions.dedup();
 }
 
 /// A dependency edge between two packages of one module, by index. Edges
@@ -2068,12 +2797,11 @@ pub struct LockEdge {
     pub from: usize,
     /// Index of the package depended on, the second field.
     pub to: usize,
-    /// The scope the dependency has below `from`, `None` when none is
-    /// recorded: the scope management gives it, else the one Maven's
-    /// JavaScopeDeriver derives from its declared scope and the scope `from`
-    /// resolves to ([`LockModulePackage::scope`]). Written next, omitted
-    /// when `None`.
-    pub scope: Option<Scope>,
+    /// The scope the dependency has below `from`: the scope management
+    /// gives it, else the one Maven's JavaScopeDeriver derives from its
+    /// declared scope and the scope `from` resolves to
+    /// ([`LockModulePackage::scope`]). Written next.
+    pub scope: Scope,
     /// Whether the dependency is optional. Written last as `optional`, and
     /// read as `false` when absent.
     pub optional: bool,
@@ -2083,7 +2811,7 @@ impl LockEdge {
     /// An edge from package `from` to package `to`, both indexes into the
     /// module's packages, with the scope and optional flag the dependency
     /// has below `from`.
-    pub fn new(from: usize, to: usize, scope: Option<Scope>, optional: bool) -> Self {
+    pub fn new(from: usize, to: usize, scope: Scope, optional: bool) -> Self {
         Self {
             from,
             to,
@@ -2122,6 +2850,10 @@ pub struct SupportPom {
     /// The deployed build a `SNAPSHOT` version resolved to. Written as
     /// `snapshot`, omitted when `None`.
     pub snapshot: Option<SnapshotStamp>,
+    /// Whether the POM was accepted without a checksum file, as
+    /// [`LockArtifact::missing_checksum`] says of a file. Written as
+    /// `missing_checksum` when true.
+    pub missing_checksum: bool,
 }
 
 impl SupportPom {
@@ -2131,6 +2863,7 @@ impl SupportPom {
             repo_url: repo_url.into(),
             sha256,
             snapshot: None,
+            missing_checksum: false,
         }
     }
 
@@ -2206,46 +2939,222 @@ pub(crate) fn validate_support_pom_coord(coord: &str) -> Result<(), LockError> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use rv_maven_types::ArtifactCoord;
 
-    use super::{EnvValueHit, LockArtifact, LockModulePackage, Lockfile, Scope};
+    use super::{
+        EnvValueHit, EvictedRange, LockArtifact, LockModulePackage, Lockfile, MetadataVersion,
+        MetadataVersionKind, Scope, SupportPom,
+    };
     use crate::error::LockError;
+    use crate::platform::Platform;
+    use crate::plugins::{PluginFiles, PluginPrefix, PluginRole, PluginSet, PluginTables};
     use crate::test_lock::{lock, locked_platform, package, platform};
 
-    /// A coordinate or path field that holds an allowlisted variable's value
-    /// is reported by field; a short value would match version numbers and
-    /// is skipped.
+    /// Each coordinate, path and repository URL field raeva.lock records is
+    /// scanned: a field that holds an allowlisted variable's value is
+    /// reported by field and row, with the value masked, and the warning
+    /// never shows it. A value shorter than 4 bytes would match version
+    /// numbers and is skipped.
     #[test]
-    fn env_values_are_found_in_coordinates_and_paths() {
+    fn env_values_are_found_in_every_field_that_records_them() {
+        const LEAK: &str = "leaked-v4lue";
+        let url = format!("https://repo.example/{LEAK}/");
         let values = BTreeMap::from([
-            ("RAEVA_GROUP".to_string(), "com.example".to_string()),
-            ("RAEVA_SYSTEM_DIR".to_string(), "leaked-system".to_string()),
-            ("RAEVA_SHORT".to_string(), "app".to_string()),
+            ("RAEVA_TOKEN".to_string(), LEAK.to_string()),
+            ("RAEVA_SHORT".to_string(), "com".to_string()),
         ]);
-        let mut entry = locked_platform("linux-x86_64", vec![package("demo", "1.0", 'a')], 'b');
-        let tool = ArtifactCoord::new("org.example", "tool", "1.0.0", "jar", None);
-        let mut system = LockModulePackage::new(tool.clone(), Some(Scope::System));
-        system.system_path = Some("leaked-system/tool.jar".to_string());
-        entry.modules[0].packages.push(system);
-        let lock = lock(vec![entry]);
         let linux = platform("linux-x86_64");
-        let hit = |env_var, field, coord| EnvValueHit {
-            env_var,
-            field,
-            coord,
-            platform: &linux,
+        let base = || {
+            lock(vec![locked_platform(
+                "linux-x86_64",
+                vec![package("demo", "1.0", 'a')],
+                'b',
+            )])
         };
-        let demo = ArtifactCoord::new("com.example", "demo", "1.0", "jar", None);
-        assert_eq!(
-            lock.env_value_hits(&values),
-            [
-                hit("RAEVA_GROUP", "group_id", demo),
-                hit("RAEVA_SYSTEM_DIR", "system_path", tool),
-            ]
-        );
-        lock.warn_on_env_values(&values);
+        let demo = "com.example:demo:1.0:jar";
+        let sha = || "d".repeat(64).parse().expect("digest");
+        let tables = |edit: &dyn Fn(&mut PluginTables)| {
+            let mut tables = PluginFiles::new(sha()).tables;
+            edit(&mut tables);
+            tables
+        };
+        type Edit<'e> = Box<dyn Fn(&mut Lockfile) + 'e>;
+        let cases: Vec<(&str, &str, Option<&Platform>, Edit<'_>)> = vec![
+            (
+                "artifact_id",
+                "com.example:***:1.0:jar",
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].artifacts[0] = package(LEAK, "1.0", 'a');
+                }),
+            ),
+            (
+                "system_path",
+                "org.example:tool:1.0.0:jar",
+                Some(&linux),
+                Box::new(|lock| {
+                    let tool = ArtifactCoord::new("org.example", "tool", "1.0.0", "jar", None);
+                    let mut system = LockModulePackage::new(tool, Some(Scope::System));
+                    system.system_path = Some(format!("{LEAK}/tool.jar"));
+                    lock.platforms[0].modules[0].packages.push(system);
+                }),
+            ),
+            (
+                "repo_url",
+                demo,
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].artifacts[0].repo_url = url.clone();
+                }),
+            ),
+            (
+                "other_repo_urls",
+                demo,
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].artifacts[0].other_repo_urls = vec![url.clone()];
+                }),
+            ),
+            (
+                "pom_repo_urls",
+                demo,
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].artifacts[0].pom_repo_urls = vec![url.clone()];
+                }),
+            ),
+            (
+                "repo_url",
+                "support POM com.example:parent:1",
+                Some(&linux),
+                Box::new(|lock| {
+                    let pin = SupportPom::new(url.clone(), sha());
+                    lock.platforms[0]
+                        .support_poms
+                        .insert("com.example:parent:1".to_string(), pin);
+                }),
+            ),
+            (
+                "artifact_id",
+                "support POM com.example:***-bom:1",
+                Some(&linux),
+                Box::new(|lock| {
+                    let pin = SupportPom::new("https://repo.example/", sha());
+                    let key = format!("com.example:{LEAK}-bom:1");
+                    lock.platforms[0].support_poms.insert(key, pin);
+                }),
+            ),
+            (
+                "origin",
+                "evicted range com.example:lib [2,3) of pom.xml",
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].modules[0]
+                        .evicted_ranges
+                        .push(EvictedRange {
+                            group: "com.example".to_string(),
+                            artifact: "lib".to_string(),
+                            range: "[2,3)".to_string(),
+                            origin: url.clone(),
+                            versions: vec!["2.0".to_string()],
+                        });
+                }),
+            ),
+            (
+                "origin",
+                "metadata.repo_ids",
+                None,
+                Box::new(|lock| {
+                    lock.repo_ids
+                        .insert(url.clone(), BTreeSet::from(["corp".to_string()]));
+                }),
+            ),
+            (
+                "repo_urls",
+                "plugin set sha256:p",
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].plugins = Some(tables(&|tables| {
+                        let mut set = PluginSet::new("sha256:p", PluginRole::Plugin);
+                        set.repo_urls = vec![url.clone()];
+                        tables.sets.push(set);
+                    }));
+                }),
+            ),
+            (
+                "repo_url",
+                "the prefix list of plugin group org.example",
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].plugins = Some(tables(&|tables| {
+                        let prefix =
+                            PluginPrefix::new("org.example", &url, "demo", "demo-maven-plugin");
+                        tables.prefixes.push(prefix);
+                    }));
+                }),
+            ),
+            (
+                "artifact_id",
+                "metadata_versions of pom.xml",
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].modules[0]
+                        .metadata_versions
+                        .push(MetadataVersion {
+                            group: "com.example".to_string(),
+                            artifact: LEAK.to_string(),
+                            kind: MetadataVersionKind::Release,
+                            version: "1.0".to_string(),
+                        });
+                }),
+            ),
+            (
+                "group_id",
+                "the metadata_versions of the plugin tables",
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].plugins = Some(tables(&|tables| {
+                        tables.metadata_versions.push(MetadataVersion {
+                            group: LEAK.to_string(),
+                            artifact: "demo-maven-plugin".to_string(),
+                            kind: MetadataVersionKind::Release,
+                            version: "1.0".to_string(),
+                        });
+                    }));
+                }),
+            ),
+            (
+                "origin",
+                "plugins.repo_ids",
+                Some(&linux),
+                Box::new(|lock| {
+                    lock.platforms[0].plugins = Some(tables(&|tables| {
+                        tables
+                            .repo_ids
+                            .insert(url.clone(), BTreeSet::from(["corp".to_string()]));
+                    }));
+                }),
+            ),
+        ];
+        assert_eq!(base().env_value_hits(&values), []);
+        for (field, row, platform, edit) in cases {
+            let mut lock = base();
+            edit(&mut lock);
+            let hit = EnvValueHit {
+                env_var: "RAEVA_TOKEN",
+                field,
+                row: row.to_string(),
+                platform,
+            };
+            assert_eq!(lock.env_value_hits(&values), [hit], "{field} of {row}");
+            let log = rv_test_support::capture_warnings(|| lock.warn_on_env_values(&values));
+            assert!(
+                log.contains("ENV_VALUE_IN_LOCKFILE") && !log.contains(LEAK),
+                "{log}"
+            );
+        }
     }
 
     /// One map holds every pin: SHA-256 where any row has one, else the
@@ -2276,6 +3185,146 @@ mod tests {
         );
         assert_eq!(pin("com/example/only/1.0/only-1.0.jar"), Some(sha1('e')));
         assert_eq!(pin("com/example/only/1.0/only-1.0.pom"), Some(sha256('b')));
+    }
+
+    /// A release build extension's jar is pinned; a lock lists each
+    /// extension of a module once.
+    #[test]
+    fn build_extension_jars_are_pinned_once() {
+        let jar = |artifact: &str, version: &str, digest: char| super::ExtensionJar {
+            gav: rv_maven_types::Gav::new("t", artifact, version),
+            classifier: None,
+            sha256: digest.to_string().repeat(64).parse().unwrap(),
+        };
+        let mut entry = locked_platform("linux-x86_64", vec![package("demo", "1.0", 'a')], 'b');
+        entry.modules[0].extensions = vec![jar("ext", "1", 'c'), jar("snap", "1-SNAPSHOT", 'd')];
+        let pins = lock(vec![entry.clone()]).pinned_paths();
+        assert!(pins.contains_key("t/ext/1/ext-1.jar"));
+        assert!(!pins.keys().any(|path| path.contains("snap")));
+        lock(vec![entry.clone()]).check().unwrap();
+        let mut other = entry.clone();
+        other.platform = "macos-aarch64".parse().unwrap();
+        other.modules[0].extensions = vec![jar("ext", "1", 'e')];
+        assert!(
+            lock(vec![entry.clone(), other]).check().is_err(),
+            "another platform's jar"
+        );
+        let mut row = package("ext", "1", 'e');
+        row.coordinate = rv_maven_types::ArtifactCoord::new("t", "ext", "1", "jar", None);
+        row.pom_sha256 = entry.artifacts[0].pom_sha256.clone();
+        let mut rows = entry.clone();
+        rows.artifacts.push(row);
+        assert!(lock(vec![rows]).check().is_err(), "a row of the jar");
+        entry.modules[0].extensions = vec![jar("ext", "1", 'c'), jar("ext", "1", 'e')];
+        assert!(lock(vec![entry]).check().is_err());
+    }
+
+    /// A classified jar of an extension's realm is pinned at its own path
+    /// and written with its classifier after the jar of the same version
+    /// without one; a line with an empty or invalid classifier, or a jar
+    /// listed twice, is refused.
+    #[test]
+    fn classified_extension_jars_round_trip() {
+        let jar = |classifier: Option<&str>, digest: char| super::ExtensionJar {
+            gav: rv_maven_types::Gav::new("t", "guice", "4"),
+            classifier: classifier.map(str::to_string),
+            sha256: digest.to_string().repeat(64).parse().unwrap(),
+        };
+        let mut entry = locked_platform("linux-x86_64", vec![package("demo", "1.0", 'a')], 'b');
+        entry.modules[0].extensions = vec![jar(None, 'c'), jar(Some("no_aop"), 'd')];
+        let pins = lock(vec![entry.clone()]).pinned_paths();
+        assert!(pins.contains_key("t/guice/4/guice-4.jar"));
+        assert!(pins.contains_key("t/guice/4/guice-4-no_aop.jar"));
+        let toml = lock(vec![entry.clone()]).to_toml().unwrap();
+        let (c, d) = ("c".repeat(64), "d".repeat(64));
+        let written = format!("t:guice:4\\t{c}\nt:guice:4:no_aop\\t{d}");
+        assert!(toml.contains(&written), "{toml}");
+        let decoded = Lockfile::from_toml(&toml).unwrap();
+        assert_eq!(
+            decoded.platforms[0].modules[0].extensions,
+            entry.modules[0].extensions
+        );
+        for edited in [
+            format!("t:guice:4:no_aop\\t{d}\nt:guice:4\\t{c}"),
+            format!("t:guice:4\\t{c}\nt:guice:4:\\t{d}"),
+            format!("t:guice:4\\t{c}\nt:guice:4:no/aop\\t{d}"),
+            format!("t:guice:4\\t{c}\nt:guice:4:no_aop:x\\t{d}"),
+            format!("t:guice:4:no_aop\\t{c}\nt:guice:4:no_aop\\t{d}"),
+        ] {
+            let toml = toml.replace(&written, &edited);
+            assert!(Lockfile::from_toml(&toml).is_err(), "{edited}");
+        }
+    }
+
+    /// A module's metadata versions round-trip, and a line raeva would not
+    /// write, out of order or of another kind, is refused.
+    #[test]
+    fn metadata_versions_round_trip_sorted() {
+        let read = |artifact: &str, kind, version: &str| super::MetadataVersion {
+            group: "t".to_string(),
+            artifact: artifact.to_string(),
+            kind,
+            version: version.to_string(),
+        };
+        let mut entry = locked_platform("linux-x86_64", vec![package("demo", "1.0", 'a')], 'b');
+        entry.modules[0].metadata_versions = vec![
+            read("lib", super::MetadataVersionKind::Release, "1.0"),
+            read("lib", super::MetadataVersionKind::Latest, "2-SNAPSHOT"),
+        ];
+        let toml = lock(vec![entry.clone()]).to_toml().unwrap();
+        let written = "t:lib\\trelease\\t1.0\nt:lib\\tlatest\\t2-SNAPSHOT";
+        assert!(toml.contains(written), "{toml}");
+        let decoded = Lockfile::from_toml(&toml).unwrap();
+        assert_eq!(decoded.platforms[0].modules[0].metadata_versions.len(), 2);
+        for edited in [
+            "t:lib\\tlatest\\t2-SNAPSHOT\nt:lib\\trelease\\t1.0",
+            "t:lib\\tRELEASE\\t1.0",
+            "t:lib\\trelease\\t1.0\nt:lib\\trelease\\t1.0",
+            "t:lib\\trelease\\t../1",
+        ] {
+            let toml = toml.replace(written, edited);
+            assert!(Lockfile::from_toml(&toml).is_err(), "{edited}");
+        }
+    }
+
+    /// A module's range versions round-trip, also with the empty origin, and
+    /// a line raeva would not write, out of order, twice, or with an origin
+    /// that may hold a credential, is refused.
+    #[test]
+    fn range_versions_round_trip_sorted() {
+        let read = |version: &str, origin: &str| super::RangeVersion {
+            group: "t".to_string(),
+            artifact: "lib".to_string(),
+            version: version.to_string(),
+            origin: origin.to_string(),
+        };
+        let mut entry = locked_platform("linux-x86_64", vec![package("demo", "1.0", 'a')], 'b');
+        entry.modules[0].range_versions = vec![
+            read("2", "https://b.example/"),
+            read("1-SNAPSHOT", "https://a.example/"),
+        ];
+        let toml = lock(vec![entry.clone()]).to_toml().unwrap();
+        let written = "t:lib\\t1-SNAPSHOT\\thttps://a.example/\nt:lib\\t2\\thttps://b.example/";
+        assert!(toml.contains(written), "{toml}");
+        let decoded = Lockfile::from_toml(&toml).unwrap();
+        assert_eq!(decoded.platforms[0].modules[0].range_versions.len(), 2);
+        for edited in [
+            "t:lib\\t2\\thttps://b.example/\nt:lib\\t1-SNAPSHOT\\thttps://a.example/",
+            "t:lib\\t2\\thttps://b.example/\nt:lib\\t2\\thttps://b.example/",
+            "t:lib\\t2",
+            "t:lib\\t../2\\thttps://b.example/",
+            "t:lib\\t2\\thttps://user:secret@b.example/",
+        ] {
+            let toml = toml.replace(written, edited);
+            assert!(Lockfile::from_toml(&toml).is_err(), "{edited}");
+        }
+        // The empty origin names a mirrored repository the lock cannot record.
+        let toml = toml.replace(written, "t:lib\\t2\\t");
+        let decoded = Lockfile::from_toml(&toml).unwrap();
+        assert_eq!(
+            decoded.platforms[0].modules[0].range_versions,
+            [read("2", "")]
+        );
     }
 
     #[test]
@@ -2319,6 +3368,23 @@ mod tests {
         assert!(toml.contains("linux-x86_64@21"), "{toml}");
         let decoded = Lockfile::from_toml(&toml).unwrap();
         assert_eq!(decoded, lockfile.canonical().unwrap());
+
+        // The Maven mode is written once, and only when it is not 3.9.
+        assert!(!toml.contains("maven ="), "{toml}");
+        let mut maven310 = lockfile.clone();
+        maven310.maven = rv_maven_types::MavenMode::Maven310;
+        let toml310 = maven310.to_toml().unwrap();
+        assert_eq!(
+            toml310.matches("\nmaven = \"3.10\"\n").count(),
+            1,
+            "{toml310}"
+        );
+        let decoded = Lockfile::from_toml(&toml310).unwrap();
+        assert_eq!(decoded, maven310.canonical().unwrap());
+        assert_ne!(
+            decoded.platforms[0].model_inputs,
+            lockfile.canonical().unwrap().platforms[0].model_inputs
+        );
 
         // Duplicate (platform, jdk) is rejected.
         let dup_err = lock(vec![jdk17.clone(), jdk17.clone()])

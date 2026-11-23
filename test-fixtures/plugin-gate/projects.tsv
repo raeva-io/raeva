@@ -1,0 +1,9 @@
+# name	repository	commit	jdk	raeva arguments	mvn arguments	prep script
+# gate.sh gives each checkout a raeva.toml with `[plugins] lock = true`, and
+# with GATE_TRACE=1 `trace` set to the mvn arguments.
+commons-io	https://github.com/apache/commons-io.git	59b09cf2327fd789372181b189a04ae16c7b5203	21	-	-DtrimStackTrace=false -Dtest=!URIOriginTest#testGetInputStrea*,!XmlStreamReaderTest#testConstructorURL* -Dsurefire.failIfNoSpecifiedTests=false	-
+petclinic	https://github.com/spring-projects/spring-petclinic.git	500158f732419217507c7656904b8e6aa1bcc0d6	21	-	verify -Dtest=!MySqlIntegrationTests,!PostgresIntegrationTests -Dsurefire.failIfNoSpecifiedTests=false	-
+maven-resolver	https://github.com/apache/maven-resolver.git	1801bd588915c8f5f23db27ecd568a4a83e83472	21	-Prun-its	-Prun-its verify -Dit.test=!MinioTransporterIT,!Redisson*IT -Dfailsafe.failIfNoSpecifiedTests=false -Dtest=!*TransporterTest#testGet_ParseRfc9457,!RepositorySystemSupplierTest#smoke*,!AllResolverDemosTest -Dsurefire.failIfNoSpecifiedTests=false	-
+netty	https://github.com/netty/netty.git	014ef8d7031f9f1015020095421a659ced36cc8a	21	-Dtcnative.classifier=linux-x86_64	verify -DskipTests=true -DskipH3Spec=true -Dtcnative.classifier=linux-x86_64	prep-netty.sh
+log4j2	https://github.com/apache/logging-log4j2.git	cdd9cab6cf76a40a71b228a10aa7cf9fad9a65f8	17	-	verify -DskipTests -Dxml.skip=true	-
+mybatis-3	https://github.com/mybatis/mybatis-3.git	34147d0bd2f5ed0016ef367c92b25e174149326b	21	-	verify -DskipTests -Dlicense.skip=true -Denforcer.skip=true	-

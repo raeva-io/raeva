@@ -22,6 +22,11 @@ fn an_unreadable_lockfile_exits_1_with_io() {
     let mut perms = fs::metadata(&lock).expect("meta").permissions();
     perms.set_mode(0o000);
     fs::set_permissions(&lock, perms).expect("chmod");
+    // Root, also inside `unshare -r`, reads the file whatever its mode.
+    if fs::File::open(&lock).is_ok() {
+        eprintln!("skipped: this user reads a file with mode 000");
+        return;
+    }
 
     let output = raeva_command(project.path(), home.path())
         .args(["--json", "tree"])
@@ -69,7 +74,20 @@ fn an_unusable_lockfile_says_where_and_what_fixes_it() {
     );
     assert_eq!(
         envelope["hints"],
-        serde_json::json!(["Run 'raeva sync' without --frozen to regenerate it"])
+        serde_json::json!([
+            "Run 'raeva sync --update' to regenerate it without its pins, which a plain sync \
+             cannot keep, or delete raeva.lock"
+        ])
+    );
+    assert_eq!(
+        raeva_command(project.path(), home.path())
+            .args(["sync", "--offline"])
+            .output()
+            .expect("sync")
+            .status
+            .code(),
+        Some(3),
+        "a plain sync refuses it"
     );
 
     fs::write(&lock, b"\x00\x01\xff").expect("write lock");
@@ -77,6 +95,52 @@ fn an_unusable_lockfile_says_where_and_what_fixes_it() {
     assert!(
         hints.contains("Delete raeva.lock and run 'raeva sync'"),
         "{hints}"
+    );
+}
+
+/// A plain sync refuses a raeva.lock it can neither keep the pins of nor
+/// read whole as an invalid lock, with what fixes it as a hint, as
+/// `sync --frozen` does.
+#[test]
+fn a_plain_sync_refuses_an_unusable_lockfile_with_a_hint() {
+    let (project, home) = temp_project();
+    write_empty_pom(&project.path().join("pom.xml"));
+    let lock = project.path().join("raeva.lock");
+    let sync = |contents: &[u8]| {
+        fs::write(&lock, contents).expect("write lock");
+        let output = raeva_command(project.path(), home.path())
+            .args(["--json", "sync", "--offline"])
+            .output()
+            .expect("sync");
+        assert_status(&output, 3, "sync with an unusable lock");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("JSON envelope");
+        assert_eq!(envelope["code"], "LOCKFILE_INVALID", "{envelope}");
+        assert_eq!(fs::read(&lock).expect("lock"), contents);
+        envelope
+    };
+    for contents in [&b""[..], b"not = [valid toml\n"] {
+        let envelope = sync(contents);
+        let error = envelope["error"].as_str().expect("error");
+        assert!(
+            error.starts_with("raeva.lock cannot be used: ")
+                && error.contains("a sync cannot keep its pins")
+                && !error.contains("Run "),
+            "{error}"
+        );
+        assert_eq!(
+            envelope["hints"],
+            serde_json::json!([
+                "Run 'raeva sync --update' to lock the bytes the repositories serve now, or \
+                 delete raeva.lock to start again without its pins"
+            ])
+        );
+    }
+    let envelope = sync(b"\x00\x01\xff");
+    assert_eq!(
+        envelope["hints"],
+        serde_json::json!(["Delete raeva.lock and run 'raeva sync'"]),
+        "{envelope}"
     );
 }
 
@@ -117,6 +181,42 @@ fn a_missing_lockfile_is_named_from_the_working_directory() {
             serde_json::from_slice(&output.stdout).expect("JSON envelope");
         assert_eq!(envelope["error"], "lockfile not found: raeva.lock");
     }
+}
+
+/// Where `raeva sync` cannot create raeva.lock, the error does not say to
+/// run it: a directory without a pom.xml is the wrong one, and `lock diff`
+/// under a project root that does not exist names that root, as every
+/// other command does.
+#[test]
+fn a_missing_lockfile_sync_cannot_create_does_not_ask_for_a_sync() {
+    let (project, home) = temp_project();
+    let raeva = |root: &std::path::Path, args: &[&str]| {
+        let output = raeva_command(root, home.path())
+            .args(args)
+            .output()
+            .expect("raeva");
+        assert_status(&output, 3, &args.join(" "));
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("JSON envelope");
+        envelope
+    };
+    for command in [&["tree"][..], &["sbom"], &["lock", "verify"]] {
+        let envelope = raeva(project.path(), &[&["--json"][..], command].concat());
+        assert_eq!(envelope["code"], "LOCKFILE_MISSING", "{envelope}");
+        assert_eq!(envelope["hints"], serde_json::json!([]), "{envelope}");
+    }
+    let old = project.path().join("old.lock");
+    fs::write(&old, "schema_version = 9\n").expect("write old lock");
+    let missing = project.path().join("nowhere");
+    let envelope = raeva(&missing, &["--json", "lock", "diff", old.to_str().unwrap()]);
+    assert_eq!(envelope["code"], "CONFIG", "{envelope}");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("project root not found: {}", missing.display())),
+        "{envelope}"
+    );
 }
 
 /// `--frozen` beside a raeva.lock but no pom.xml is the wrong directory, as

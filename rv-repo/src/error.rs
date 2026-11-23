@@ -96,6 +96,12 @@ pub enum RepoError {
     /// A repository URL, or a URL joined from it, did not parse.
     #[error("url error: {0}")]
     Url(#[from] url::ParseError),
+    /// A repository URL whose scheme is neither `http`, `https` nor
+    /// `file`, which no request is sent to, as Maven has no transport for
+    /// it either. The scheme is not shown: it may come from a secret's
+    /// variable.
+    #[error("url error: no http, https or file URL")]
+    NoTransport,
     /// A local read or write failed, such as reading a `file:` repository
     /// file (a missing one is [`RepoError::NotFound`]) or a stored blob that
     /// has gone missing.
@@ -133,7 +139,7 @@ pub enum RepoError {
     ///
     /// [`ensure_artifacts`]: crate::ensure_artifacts
     #[error("not found: {0}")]
-    NotFound(String),
+    NotFound(Missing),
     /// Bytes that do not match a checksum. `check` says which promise
     /// failed; `expected` and `actual` use that checksum's algorithm.
     #[error("checksum mismatch for {subject}: expected {expected}, got {actual} ({})", check.describe())]
@@ -178,6 +184,15 @@ pub enum RepoError {
     /// [`ensure_artifacts`]: crate::ensure_artifacts
     #[error("raeva.lock records no checksum for {0}, so a download of it cannot be verified")]
     UnpinnedLockRow(String),
+    /// Offline, raeva.lock records the POM at this repository path as
+    /// missing, and no repository answer kept in the metadata cache says
+    /// so. Only an online sync's 404 proves a POM missing; the lock alone
+    /// does not.
+    #[error(
+        "raeva.lock records the POM {0} as missing, and no repository answer kept offline \
+         confirms it"
+    )]
+    UnprovenMissingPom(String),
     /// A `maven-metadata.xml` that is not UTF-8, does not parse, or names a
     /// snapshot version that is missing or not a valid version; or a
     /// checksum sidecar that is not UTF-8. The message gives sizes, never the
@@ -191,6 +206,10 @@ pub enum RepoError {
     /// [`RepoClient::resolve_snapshot_version`](crate::RepoClient::resolve_snapshot_version).
     #[error("invalid coordinate: {0}")]
     InvalidCoord(String),
+    /// A `file:` repository URL that names no local path, such as one
+    /// without a drive letter on Windows.
+    #[error("invalid file URL: {0}")]
+    InvalidFileUrl(String),
     /// The server refused the request: 401 or 403 from a repository, or 407
     /// from a proxy.
     #[error(
@@ -243,6 +262,18 @@ pub enum RepoError {
         /// The non-global address the URL names.
         addr: std::net::IpAddr,
     },
+    /// A request a proxy would carry to a host name of a repository nothing
+    /// trusts, as [`RepoError::NonGlobalAddress`] says. The proxy resolves
+    /// the name, out of reach of the address screen. Not retried; a
+    /// repository search moves on to the next repository.
+    #[error(
+        "refusing to send {0} through the proxy: the proxy would resolve its host where raeva \
+         cannot check that it is a public address, and only a repository that raeva.toml, \
+         settings.xml, the project's own POM or the transitive repository allowlist names may \
+         be reached that way; if this machine reaches the host without the proxy, add it to \
+         NO_PROXY or the proxy's non_proxy_hosts"
+    )]
+    ProxiedUntrustedHost(String),
     /// A failure inside raeva itself: a poisoned lock or a background task that
     /// panicked. Not retried and not a property of the repository.
     #[error("internal error: {0}")]
@@ -312,6 +343,11 @@ pub enum RepoError {
         #[source]
         error: Box<RepoError>,
     },
+    /// The failure of a `.sha256` check that several reads share, for a
+    /// read that cannot have a copy of it, such as a transport failure.
+    /// [`RepoError::cause`] unwraps it, as it does [`RepoError::Retried`].
+    #[error(transparent)]
+    Shared(std::sync::Arc<RepoError>),
     /// The redirect policy or the address-screening resolver refused a hop
     /// or a connection. Not retried.
     #[error("{kind}: {details}")]
@@ -394,6 +430,8 @@ pub enum ErrorClass {
     /// raeva.lock cannot be used as written: a row to download records no
     /// checksum.
     Lockfile,
+    /// A failure inside raeva itself, [`RepoError::Internal`].
+    Internal,
     /// Anything else: invalid metadata, a refused redirect, a missing or
     /// unsupported sidecar, a coordinate that would leave the repository.
     Other,
@@ -417,11 +455,57 @@ impl IntegritySource {
     }
 }
 
+/// What a [`RepoError::NotFound`] names, and whether a remote repository
+/// filter, not the repository, answered that it is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missing {
+    what: String,
+    filtered: bool,
+}
+
+impl Missing {
+    /// A request for `what` that a remote repository filter refused.
+    pub(crate) fn filtered(what: String) -> Self {
+        Self {
+            what,
+            filtered: true,
+        }
+    }
+}
+
+impl From<String> for Missing {
+    fn from(what: String) -> Self {
+        Self {
+            what,
+            filtered: false,
+        }
+    }
+}
+
+impl From<&str> for Missing {
+    fn from(what: &str) -> Self {
+        what.to_string().into()
+    }
+}
+
+impl std::fmt::Display for Missing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.what)
+    }
+}
+
 impl RepoError {
+    /// Whether a remote repository filter kept the request from the
+    /// repository, which then counts as not having the file.
+    pub fn is_filtered(&self) -> bool {
+        matches!(self.cause(), RepoError::NotFound(missing) if missing.filtered)
+    }
+
     /// The failure without the [`RepoError::Retried`] count around it.
     pub fn cause(&self) -> &RepoError {
         match self {
             RepoError::Retried { error, .. } => error.cause(),
+            RepoError::Shared(error) => error.cause(),
             other => other,
         }
     }
@@ -430,6 +514,7 @@ impl RepoError {
     pub fn class(&self) -> ErrorClass {
         match self {
             RepoError::Retried { error, .. } => error.class(),
+            RepoError::Shared(error) => error.class(),
             RepoError::Unauthorized { status, .. }
                 if *status == StatusCode::PROXY_AUTHENTICATION_REQUIRED =>
             {
@@ -454,6 +539,7 @@ impl RepoError {
             RepoError::NotFound(_) => ErrorClass::NotFound,
             RepoError::ChecksumMismatch { check, .. } => ErrorClass::Integrity(*check),
             RepoError::Url(_)
+            | RepoError::NoTransport
             | RepoError::SnapshotsDisabled { .. }
             | RepoError::ReleasesDisabled { .. }
             | RepoError::UntrustedRepoUrl(_)
@@ -463,16 +549,19 @@ impl RepoError {
             RepoError::Store(_) | RepoError::Cache(_) | RepoError::Io(_) => ErrorClass::Store,
             RepoError::OfflineNotCached(_) => ErrorClass::Offline,
             RepoError::UnpinnedLockRow(_) => ErrorClass::Lockfile,
+            RepoError::UnprovenMissingPom(_) => ErrorClass::Integrity(IntegritySource::LockPin),
             // An invalid coordinate comes from POM content, such as a path
             // that would leave the repository, not from the configuration.
             RepoError::InvalidCoord(_)
+            | RepoError::InvalidFileUrl(_)
             | RepoError::TooLarge { .. }
             | RepoError::InvalidMetadata(_)
             | RepoError::MissingChecksum(_)
             | RepoError::MissingMetadataChecksum(_)
             | RepoError::RedirectRejected { .. }
             | RepoError::NonGlobalAddress { .. }
-            | RepoError::Internal(_) => ErrorClass::Other,
+            | RepoError::ProxiedUntrustedHost(_) => ErrorClass::Other,
+            RepoError::Internal(_) => ErrorClass::Internal,
         }
     }
 
@@ -482,6 +571,7 @@ impl RepoError {
     pub fn is_transient(&self) -> bool {
         match self {
             RepoError::Retried { error, .. } => error.is_transient(),
+            RepoError::Shared(error) => error.is_transient(),
             RepoError::Http(err) => transport_is_retryable(err),
             RepoError::Transfer(_) => true,
             RepoError::HttpStatus { status, .. } => status_is_transient(*status),
@@ -514,13 +604,16 @@ impl RepoError {
                 *kind != RedirectRejectionKind::HttpsDowngrade
             }
             RepoError::Http(_)
+            | RepoError::Url(_)
+            | RepoError::NoTransport
             | RepoError::Io(_)
             | RepoError::Transfer(_)
             | RepoError::TooLarge { .. }
             | RepoError::Unauthorized { .. }
             | RepoError::HttpStatus { .. }
             | RepoError::BlockedMirror(_)
-            | RepoError::NonGlobalAddress { .. } => true,
+            | RepoError::NonGlobalAddress { .. }
+            | RepoError::ProxiedUntrustedHost(_) => true,
             _ => false,
         }
     }
@@ -626,9 +719,11 @@ mod tests {
             (status(504), code(504, true), true, false, ""),
             (RepoError::Retried { attempts: 4, error: Box::new(status(503)) }, code(503, true), true, false,
                 "unexpected response: 503 Service Unavailable for https://repo.example/ (after 4 attempts)"),
+            (RepoError::Shared(std::sync::Arc::new(RepoError::Retried { attempts: 4, error: Box::new(status(503)) })),
+                code(503, true), true, false, "(after 4 attempts)"),
             (status(500), code(500, false), false, true, ""),
             (status(418), code(418, false), false, true, ""),
-            (RepoError::NotFound("p".to_string()), C::NotFound, false, false, ""),
+            (RepoError::NotFound("p".into()), C::NotFound, false, false, ""),
             (unauthorized(401), C::Auth, false, true, ""),
             (unauthorized(403), C::Auth, false, true, ""),
             (RepoError::AuthSetup("no token".to_string()), C::Auth, false, false, ""),
@@ -644,12 +739,18 @@ mod tests {
             (RepoError::Store(rv_store::StoreError::IoError(disk())), C::Store, false, false, ""),
             (RepoError::Cache(rv_store::metadata_cache::CacheError::Pool("busy".to_string())), C::Store, false, false, ""),
             (RepoError::OfflineNotCached(path.to_string()), C::Offline, false, false, "offline mode"),
+            (RepoError::UnprovenMissingPom(path.to_string()), C::Integrity(IntegritySource::LockPin), false, false, "as missing"),
             (RepoError::UntrustedRepoUrl(url()), C::Config, false, false, ""),
+            (RepoError::Url(url::ParseError::InvalidIpv6Address), C::Config, false, true, "url error"),
+            (RepoError::NoTransport, C::Config, false, true, "no http, https or file URL"),
             (RepoError::BlockedMirror("corp".to_string()), C::Config, false, true, "mirror 'corp' is blocked"),
             (RepoError::InvalidCoord("../x".to_string()), C::Other, false, false, ""),
+            (RepoError::InvalidFileUrl("'file:/x'".to_string()), C::Other, false, false, "invalid file URL"),
             (RepoError::MissingChecksum(path.to_string()), C::Other, false, false, "raeva sync --allow-missing-checksums"),
             (RepoError::MissingMetadataChecksum(path.to_string()), C::Other, false, false, "checksum policy is fail"),
             (RepoError::NonGlobalAddress { url: url(), addr: std::net::IpAddr::from([10, 0, 0, 5]) }, C::Other, false, true, ""),
+            (RepoError::ProxiedUntrustedHost(url()), C::Other, false, true, "NO_PROXY"),
+            (RepoError::Internal("task panicked".to_string()), C::Internal, false, false, "internal"),
             (RepoError::RedirectRejected { kind: RedirectRejectionKind::NonGlobalTarget, details: "nexus.internal".to_string() },
                 C::Other, false, true, ""),
             (RepoError::RedirectRejected { kind: RedirectRejectionKind::ChainLimit, details: url() }, C::Other, false, true, ""),

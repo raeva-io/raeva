@@ -133,7 +133,9 @@ pub(crate) fn uuid_v8(digest: &[u8]) -> String {
     )
 }
 
-pub(crate) fn count_dependencies(lock: &rv_lock::Lockfile) -> usize {
+pub(crate) fn count_dependencies<'a>(
+    platforms: impl IntoIterator<Item = &'a rv_lock::LockPlatform>,
+) -> usize {
     // Count unique coordinates across platforms rather than summing
     // per-platform package lists. A 2-platform lockfile that resolved
     // the same dep set would otherwise report 2× the real number,
@@ -143,15 +145,8 @@ pub(crate) fn count_dependencies(lock: &rv_lock::Lockfile) -> usize {
     // Reactor modules are built and system files are on disk; neither is
     // resolved from a repository, so they do not count.
     let mut seen = std::collections::HashSet::new();
-    for platform in &lock.platforms {
-        for package in platform
-            .modules
-            .iter()
-            .flat_map(|module| module.packages.iter())
-            .filter(|package| package.workspace_module.is_none() && package.system_path.is_none())
-        {
-            seen.insert(&package.coordinate);
-        }
+    for platform in platforms {
+        seen.extend(platform.module_rows());
     }
     seen.len()
 }
@@ -212,14 +207,11 @@ pub(crate) fn modules_phrase(modules: &std::collections::BTreeSet<String>) -> St
     join_and(modules.iter().map(|path| module_name(path)))
 }
 
+/// A module's directory, or its POM path where the file is not a pom.xml.
 pub(crate) fn module_name(path: &str) -> String {
-    match path
-        .strip_suffix("pom.xml")
-        .map(|dir| dir.trim_end_matches('/'))
-    {
-        Some("") => "the root module".to_string(),
-        Some(dir) => dir.to_string(),
-        None => path.to_string(),
+    match path {
+        "pom.xml" => "the root module".to_string(),
+        _ => path.strip_suffix("/pom.xml").unwrap_or(path).to_string(),
     }
 }
 
@@ -249,8 +241,8 @@ pub(crate) fn read_lockfile_at(path: &std::path::Path) -> crate::error::Result<r
     match path.metadata() {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(CliError::LockfileMissing {
+                sync_creates: path.with_file_name("pom.xml").is_file(),
                 path: path_buf,
-                sync_creates: true,
                 reactor: None,
             });
         }
@@ -272,23 +264,30 @@ pub(crate) fn read_lockfile_at(path: &std::path::Path) -> crate::error::Result<r
                 expected: rv_lock::LOCKFILE_SCHEMA_VERSION,
             }
         } else if err.is_incompatible_lockfile() {
-            // What a plain sync reads it as: within the cap and UTF-8.
-            let regenerable = !matches!(err, rv_lock::LockError::TooLarge { .. }) && {
-                use std::io::Read;
-                let mut bytes = Vec::new();
-                std::fs::File::open(path)
-                    .and_then(|file| {
-                        file.take(rv_lock::MAX_LOCKFILE_BYTES + 1)
-                            .read_to_end(&mut bytes)
-                    })
-                    .is_ok_and(|read| {
-                        read as u64 <= rv_lock::MAX_LOCKFILE_BYTES
-                            && std::str::from_utf8(&bytes).is_ok()
-                    })
-            };
+            // What a plain sync reads it as: within the cap and UTF-8, and
+            // with pins it keeps, which agree.
+            let text = (!matches!(err, rv_lock::LockError::TooLarge { .. }))
+                .then(|| {
+                    use std::io::Read;
+                    let mut bytes = Vec::new();
+                    let file = std::fs::File::open(path).ok()?;
+                    let read = file
+                        .take(rv_lock::MAX_LOCKFILE_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                        .ok()?;
+                    (read as u64 <= rv_lock::MAX_LOCKFILE_BYTES).then_some(())?;
+                    String::from_utf8(bytes).ok()
+                })
+                .flatten();
+            let regenerate = text.map(|text| {
+                rv_lock::conflict::recover_pins(&text).is_ok_and(|versions| {
+                    let locks: Vec<_> = versions.iter().map(|(_, lock)| lock).collect();
+                    rv_lock::conflict::disagreements(&locks).is_empty()
+                })
+            });
             CliError::LockfileIncompatible {
                 reason: err.to_string(),
-                regenerable,
+                regenerate,
             }
         } else {
             // The only non-incompatible LockError is Io. Surface it as IO so
@@ -299,6 +298,31 @@ pub(crate) fn read_lockfile_at(path: &std::path::Path) -> crate::error::Result<r
             }
         }
     })
+}
+
+/// Whether raeva.lock at `path` holds the text raeva writes for `lock`,
+/// checked on a thread of its own while the caller goes on.
+pub(crate) fn check_written(
+    lock: &rv_lock::Lockfile,
+    path: &std::path::Path,
+) -> std::thread::JoinHandle<bool> {
+    let (lock, path) = (lock.clone(), path.to_path_buf());
+    std::thread::spawn(move || lock.is_written_at(&path).unwrap_or(false))
+}
+
+/// What `--frozen` and `raeva lock verify` say of a raeva.lock
+/// [`check_written`] finds other text in. Text raeva would not write, such
+/// as comments, another order or other spellings, reads as the same lock
+/// but shows a reviewer something else.
+pub(crate) fn not_written(written: std::thread::JoinHandle<bool>) -> crate::error::Result<()> {
+    if written.join().unwrap_or(false) {
+        return Ok(());
+    }
+    Err(crate::error::CliError::lockfile_mismatch_with(
+        "raeva.lock is not the text raeva writes for what it holds: a hand edit or another \
+         tool changed it",
+        "Run 'raeva sync' to rewrite it, review the diff, and commit the result",
+    ))
 }
 
 /// The highest top-level `schema_version` above this raeva's that the lock
@@ -313,42 +337,17 @@ fn newer_schema(path: &std::path::Path) -> Option<u32> {
     if bytes.len() as u64 > rv_lock::MAX_LOCKFILE_BYTES {
         return None;
     }
-    // Each side of each conflict, with the lines outside them, parsed whole.
-    let (mut ours, mut theirs) = (String::new(), String::new());
-    let (mut to_ours, mut to_theirs) = (true, true);
-    for line in String::from_utf8_lossy(&bytes).lines() {
-        match line {
-            _ if line.starts_with("<<<<<<<") => (to_ours, to_theirs) = (true, false),
-            _ if line.starts_with("|||||||") => (to_ours, to_theirs) = (false, false),
-            "=======" => (to_ours, to_theirs) = (false, true),
-            _ if line.starts_with(">>>>>>>") => (to_ours, to_theirs) = (true, true),
-            _ => {
-                for (side, keep) in [(&mut ours, to_ours), (&mut theirs, to_theirs)] {
-                    if keep {
-                        side.push_str(line);
-                        side.push('\n');
-                    }
-                }
-            }
-        }
-    }
-    [ours, theirs]
-        .iter()
-        .filter_map(|side| {
-            let table = side.parse::<toml::Table>().ok()?;
-            u32::try_from(table.get("schema_version")?.as_integer()?).ok()
-        })
-        .filter(|&found| found > rv_lock::LOCKFILE_SCHEMA_VERSION)
-        .max()
+    rv_lock::conflict::newer_schema(&String::from_utf8_lossy(&bytes))
 }
 
-/// Each module's POM path with the repositories it declares.
-type DeclaredRepositories = Vec<(String, Vec<rv_repo::Repository>)>;
+/// Each module's POM path with the repositories and the plugin
+/// repositories it declares.
+type DeclaredRepositories = Vec<(String, Vec<rv_repo::Repository>, Vec<rv_repo::Repository>)>;
 
 /// The repositories the project's own POMs declare, the root `pom.xml` and
 /// its reactor modules, for each target `[lock] jdks` gives this platform:
-/// every module's POM path with the repositories it declares, in reactor
-/// order. Repositories declared only by dependency POMs are not among them.
+/// every module's POM path with the repositories and plugin repositories it
+/// declares, in reactor order. Repositories declared only by dependency POMs are not among them.
 /// Discovery reads local files only.
 pub(crate) fn project_declared_repositories(
     config: &rv_config::Config,
@@ -371,11 +370,18 @@ pub(crate) fn project_declared_repositories(
                 .modules()
                 .iter()
                 .map(|module| {
-                    let declared = (module.descriptor.repositories.iter())
-                        .filter(|declared| declared.root_declared)
-                        .map(rv_repo::Repository::from)
-                        .collect();
-                    (module.pom_path.clone(), declared)
+                    let declared = |repositories: &[rv_maven_model::Repository]| {
+                        (repositories.iter())
+                            .filter(|declared| declared.root_declared)
+                            .map(rv_repo::Repository::from)
+                            .collect()
+                    };
+                    let descriptor = &module.descriptor;
+                    (
+                        module.pom_path.clone(),
+                        declared(&descriptor.repositories),
+                        declared(&descriptor.plugin_repositories),
+                    )
                 })
                 .collect())
         })
@@ -383,14 +389,9 @@ pub(crate) fn project_declared_repositories(
 }
 
 pub(crate) fn parse_scope(value: &str) -> Result<rv_lock::Scope, String> {
-    let scope: rv_maven_model::Scope =
-        value.trim().to_ascii_lowercase().parse().map_err(|_| {
-            "expected compile, runtime, test, provided, system or import".to_string()
-        })?;
-    scope
-        .as_ref()
-        .parse()
-        .map_err(|err: rv_lock::InvalidScope| err.to_string())
+    value.trim().to_ascii_lowercase().parse().map_err(|_| {
+        "expected compile, runtime, test, provided, system, import or compile-only".to_string()
+    })
 }
 
 /// The platforms `--platforms` accepts, besides the one raeva runs on. Each is
@@ -456,16 +457,15 @@ fn platform_suggestion(value: &str) -> Option<String> {
 
 pub(crate) fn select_platform<'a>(
     lock: &'a rv_lock::Lockfile,
-    host_jdk: &str,
+    host_jdk: Option<&str>,
 ) -> Result<&'a rv_lock::LockPlatform, crate::error::CliError> {
     let current = rv_lock::Platform::current()?;
     if let Some(entry) = lock.platforms.iter().find(|entry| {
         entry.platform == current
             || (entry.platform.without_jdk() == current
-                && entry
-                    .platform
-                    .jdk()
-                    .is_some_and(|jdk| rv_config::jdk_matches_target(jdk, host_jdk)))
+                && entry.platform.jdk().is_some_and(|jdk| {
+                    host_jdk.is_some_and(|host| rv_config::jdk_matches_target(jdk, host))
+                }))
     }) {
         return Ok(entry);
     }
@@ -478,12 +478,11 @@ pub(crate) fn select_platform<'a>(
         // A `sec_code` warning reaches the JSON envelope and, in human mode,
         // the warning summary printed at exit. Swapping platforms silently
         // would mask "wrong arch jar" outcomes.
-        let current_target = if fallback.platform.jdk().is_some() {
-            current.with_jdk(host_jdk)
-        } else {
-            current
+        let current_str = match host_jdk {
+            Some(host) if fallback.platform.jdk().is_some() => current.with_jdk(host).to_string(),
+            None if fallback.platform.jdk().is_some() => format!("{current} (JDK unknown)"),
+            _ => current.to_string(),
         };
-        let current_str = current_target.to_string();
         let fallback_str = fallback.platform.to_string();
         tracing::warn!(
             sec_code = "PLATFORM_FALLBACK",
@@ -515,7 +514,13 @@ mod tests {
         let conflict = format!(
             "<<<<<<< ours\nschema_version = {current}\n[resolution]\nx = 1\n=======\nschema_version = {newer}\n# '''\n[resolution]\nx = 2\n>>>>>>> theirs\n"
         );
-        assert_eq!(scan(conflict), Some(newer));
+        assert_eq!(scan(conflict.clone()), Some(newer));
+        let long = (conflict.replace("<<<<<<<", "<<<<<<<<<"))
+            .replace("=======", "=========")
+            .replace(">>>>>>>", ">>>>>>>>>");
+        assert_eq!(scan(long), Some(newer));
+        let stray = format!("schema_version = {newer}\n[resolution]\n=======\nx = 1\n");
+        assert_eq!(scan(stray), Some(newer));
         let quoted = format!(
             "schema_version = {current}\nnote = '''\n\"\"\"\nschema_version = {newer}\n'''\n"
         );
@@ -548,7 +553,7 @@ mod tests {
         platform.modules[0].packages.push(system);
         let mut lock = Lockfile::new();
         lock.platforms.push(platform);
-        assert_eq!(super::count_dependencies(&lock), 1);
+        assert_eq!(super::count_dependencies(&lock.platforms), 1);
     }
     use crate::error::CliError;
     use rv_config::{Config, ResolvedPaths};
@@ -631,7 +636,14 @@ mod parse_tests {
         );
         assert_eq!(
             super::parse_scope("optional"),
-            Err("expected compile, runtime, test, provided, system or import".to_string())
+            Err(
+                "expected compile, runtime, test, provided, system, import or compile-only"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            super::parse_scope("compile-only").expect("compile-only"),
+            rv_lock::Scope::CompileOnly
         );
         assert!(super::parse_scope("").is_err());
     }

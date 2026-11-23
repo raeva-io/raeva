@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 use rv_test_support::fixtures;
 use rv_test_support::http::{Response, StubServer};
@@ -23,6 +24,20 @@ pub(crate) const HOST_ENV: &[&str] = &[
     "SSL_CERT_DIR",
     "JAVA_HOME",
     "JAVA_VERSION",
+    "MAVEN_SKIP_RC",
+    "MAVEN_DEBUG_OPTS",
+    "MAVEN_ARGS",
+    "MAVEN_CONFIG",
+    "CFFIXED_USER_HOME",
+    "_JAVA_OPTIONS",
+    "JAVA_TOOL_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "OPENJ9_JAVA_OPTIONS",
+    "IBM_JAVA_OPTIONS",
+    "MAVEN_REPO_CENTRAL",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LANG",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
@@ -53,20 +68,51 @@ pub(crate) fn temp_project() -> (TempDir, TempDir) {
 /// user-level input: the Raeva home, the user `config.toml`, Maven settings
 /// (also on Windows, where the home directory ignores `HOME` and
 /// `USERPROFILE`), and none of [`HOST_ENV`], [`CLAP_COLOR_ENV`] or the
-/// os-release a test sets.
+/// os-release a test sets. No `java` is found without `JAVA_HOME`, as the
+/// lookup hook names a directory without one, and the CPU reads as one
+/// without AVX-512 VBMI. Requests for Maven Central go to
+/// [`central_stand_in`].
 pub(crate) fn raeva_command(project_root: &Path, home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_raeva"));
     cmd.env("RAEVA_HOME", home)
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env(rv_config::MAVEN_USER_HOME_TEST_ENV, home)
+        .env(rv_maven_model::JAVA_PATH_TEST_ENV, home.join("no-jdk"))
+        .env(rv_maven_model::AVX512_VBMI_TEST_ENV, "0")
+        .env(
+            rv_repo::CENTRAL_TEST_ENV,
+            central_stand_in().addr().to_string(),
+        )
         .env_remove(rv_maven_model::OS_RELEASE_TEST_ENV)
         .arg("-C")
         .arg(project_root);
     for name in HOST_ENV.iter().chain(CLAP_COLOR_ENV) {
         cmd.env_remove(name);
     }
+    isolate_maven_user_home(&mut cmd, home, "");
     cmd
+}
+
+/// Point Maven's user home, which the JVM takes from the passwd entry and
+/// not `HOME`, at `home` through `MAVEN_OPTS`, after `opts`, as Maven's
+/// own launcher would; a run that reads the real one fails. A test that
+/// sets `MAVEN_OPTS` itself calls this instead.
+pub(crate) fn isolate_maven_user_home(cmd: &mut Command, home: &Path, opts: &str) {
+    let define = format!("-Duser.home={}", home.display());
+    let opts = match opts {
+        "" => define,
+        opts => format!("{opts} {define}"),
+    };
+    cmd.env("MAVEN_OPTS", opts)
+        .env(rv_config::REAL_HOME_GUARD_TEST_ENV, "1");
+}
+
+/// This test process's Maven Central: a stub that answers
+/// 404, as the real Central does for the coordinates tests publish, so a
+/// resolution that goes on to Central never leaves the machine.
+pub(crate) fn central_stand_in() -> &'static StubServer {
+    static CENTRAL: OnceLock<StubServer> = OnceLock::new();
+    CENTRAL.get_or_init(|| StubServer::start(|_| Response::new(404, "")))
 }
 
 pub(crate) fn run_raeva(project_root: &Path, home: &Path, args: &[&str]) -> Output {
@@ -98,9 +144,25 @@ pub(crate) fn write_repo_toml(project: &Path, id: &str, url: &str) {
     std::fs::write(project.join("raeva.toml"), toml).expect("write raeva.toml");
 }
 
+/// A project with one dependency, `org.example:lib:1.0`, from the repository
+/// at `url`.
+pub(crate) fn lib_project(url: &str) -> TempDir {
+    let dir = tempfile::tempdir().expect("project dir");
+    std::fs::write(
+        dir.path().join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+<artifactId>app</artifactId><version>1.0</version><dependencies><dependency>\
+<groupId>org.example</groupId><artifactId>lib</artifactId><version>1.0</version>\
+</dependency></dependencies></project>",
+    )
+    .expect("write pom.xml");
+    write_repo_toml(dir.path(), "fixture", url);
+    dir
+}
+
 /// A Central stand-in that answers 404 to every request, and the
-/// raeva.toml entry that points Central at it, for a test whose resolution
-/// would otherwise go on to the real Central.
+/// raeva.toml entry that points Central at it, for a test that configures
+/// Central itself rather than leave it to [`central_stand_in`].
 pub(crate) fn local_central() -> (StubServer, String) {
     let server = StubServer::start(|_| Response::new(404, ""));
     let entry = format!(
@@ -122,6 +184,19 @@ pub(crate) fn pom(artifact: &str, body: &str) -> String {
 pub(crate) fn envelope(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|err| panic!("{err}: {}", String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The origin raeva.lock in `project` records for a repository at `url`:
+/// a `file:` one beside the project is relative to it.
+pub(crate) fn recorded_origin(project: &Path, url: &str) -> String {
+    rv_lock::LockOrigins::for_root(project)
+        .declared(url)
+        .expect("a URL raeva.lock records")
+}
+
+/// The text `output` wrote to stderr.
+pub(crate) fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 pub(crate) fn assert_success(output: &Output, action: &str) {
@@ -290,6 +365,71 @@ where
     Response::new(404, "")
 }
 
+/// `path` from `lookup`, or its SHA-256 file, or 404.
+pub(crate) fn serve_sha256<B: AsRef<[u8]>>(
+    path: &str,
+    lookup: impl FnOnce(&str) -> Option<B>,
+) -> Response {
+    let (path, sidecar) = match path.strip_suffix(".sha256") {
+        Some(path) => (path, true),
+        None => (path, false),
+    };
+    match lookup(path) {
+        Some(body) if sidecar => Response::new(200, sha256_hex(body.as_ref())),
+        Some(body) => Response::new(200, body.as_ref()),
+        None => Response::new(404, ""),
+    }
+}
+
+/// A repository that serves `files` by request path, each with its SHA-256
+/// file.
+pub(crate) fn sha256_repository<K, B>(files: impl IntoIterator<Item = (K, B)>) -> StubServer
+where
+    K: Into<String>,
+    B: Into<Vec<u8>>,
+{
+    let files: std::collections::HashMap<String, Vec<u8>> = (files.into_iter())
+        .map(|(path, body)| (path.into(), body.into()))
+        .collect();
+    StubServer::start(move |request| serve_sha256(&request.path, |path| files.get(path)))
+}
+
+/// Writes `bytes` at `path`, and its SHA-256 file beside it.
+pub(crate) fn write_with_sha256(path: &Path, bytes: &[u8]) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("create repository directory");
+    std::fs::write(path, bytes).expect("write repository file");
+    let mut sidecar = path.as_os_str().to_owned();
+    sidecar.push(".sha256");
+    std::fs::write(sidecar, sha256_hex(bytes)).expect("write sidecar");
+}
+
+/// Publishes `group:artifact:version` in the file repository `repository`:
+/// a POM with `body` in its `<project>`, and a jar unless `body` sets the
+/// packaging to `pom`, each with its SHA-256 file.
+pub(crate) fn publish(repository: &Path, coordinate: &str, body: &str) {
+    let [group, artifact, version] = coordinate.split(':').collect::<Vec<_>>()[..] else {
+        panic!("{coordinate}");
+    };
+    let dir = (repository.join(group.replace('.', "/")))
+        .join(artifact)
+        .join(version);
+    let pom = format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>{group}</groupId>\
+         <artifactId>{artifact}</artifactId><version>{version}</version>{body}</project>"
+    );
+    write_with_sha256(
+        &dir.join(format!("{artifact}-{version}.pom")),
+        pom.as_bytes(),
+    );
+    if !body.contains("<packaging>pom</packaging>") {
+        let jar = format!("{coordinate} jar");
+        write_with_sha256(
+            &dir.join(format!("{artifact}-{version}.jar")),
+            jar.as_bytes(),
+        );
+    }
+}
+
 /// String values of a TOML array, in file order.
 pub(crate) fn toml_strings(value: &toml::Value) -> Vec<String> {
     value
@@ -389,14 +529,15 @@ pub(crate) fn cli_global_flags() -> Vec<(String, Option<char>)> {
     flags
 }
 
-/// Top-level commands and `lock` subcommands as `lock-<sub>`, matching
-/// `json-payloads/` directory names and the README command list.
+/// Top-level commands, and `lock` and `seed` subcommands as `lock-<sub>`
+/// and `seed-<sub>`, matching `json-payloads/` directory names and the
+/// README command list.
 pub(crate) fn cli_command_dirs() -> Vec<String> {
     let mut names = Vec::new();
     for command in cli_commands(&["--help"]) {
-        if command == "lock" {
-            for sub in cli_commands(&["lock", "--help"]) {
-                names.push(format!("lock-{sub}"));
+        if command == "lock" || command == "seed" {
+            for sub in cli_commands(&[&command, "--help"]) {
+                names.push(format!("{command}-{sub}"));
             }
         } else {
             names.push(command);
@@ -423,6 +564,8 @@ fn host_env_covers_the_documented_variables() {
         .iter()
         .map(String::as_str)
         .filter(|name| !overwritten.iter().any(|set| set == name))
+        // Tests run git from PATH; their `java` lookup reads RAEVA_TEST_JAVA_PATH.
+        .filter(|name| *name != "PATH")
         .collect();
     expected.sort();
     let mut stripped: Vec<&str> = HOST_ENV.to_vec();
@@ -450,4 +593,35 @@ pub(crate) fn closing_server() -> String {
         }
     });
     format!("http://{addr}")
+}
+
+/// Every file under `root` but `skip`, with the marker `zq...zq` it holds.
+pub(crate) fn markers_under(root: &std::path::Path, skip: &[&std::path::Path]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if !skip.contains(&path.as_path()) {
+                let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+                found.extend(
+                    markers_in(&text).map(|marker| format!("{}: {marker}", path.display())),
+                );
+            }
+        }
+    }
+    found
+}
+
+/// The markers `zq...zq`, an upper-case word between `zq`s, `text` holds.
+pub(crate) fn markers_in(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.match_indices("zq").filter_map(|(at, _)| {
+        let rest = &text[at + 2..];
+        let end = rest.find("zq")?;
+        let inner = &rest[..end];
+        (!inner.is_empty() && inner.bytes().all(|b| b.is_ascii_uppercase()))
+            .then(|| format!("zq{inner}zq"))
+    })
 }

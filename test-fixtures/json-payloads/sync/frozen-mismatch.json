@@ -14,7 +14,7 @@
         }
       ]
     },
-    "error": "raeva.lock is out of date: resolving again changes these entries:\n  runtime-only  1.0, scope runtime -> compile",
+    "error": "raeva.lock is out of date: resolving again gives other results: the graph of module pom.xml changed on platform <host-platform>; these entries change:\n  runtime-only  1.0, scope runtime -> compile",
     "exit_code": 7,
     "hints": [
       "Run 'raeva sync' to update raeva.lock"

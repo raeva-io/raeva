@@ -5,9 +5,11 @@ use std::path::Path;
 use clap::Args;
 use rv_lock::LockModule;
 use rv_lock::Scope;
+use rv_maven_model::ArtifactTypes;
 use serde::Serialize;
 
 use crate::commands::module_selector::{LockModuleExt, ModuleSelector};
+use crate::commands::report_selector::TargetSelector;
 use crate::error::{CliError, Result};
 use crate::output::{CommandOutput, Human, Report};
 use crate::session::Session;
@@ -20,17 +22,20 @@ use crate::session::Session;
         ("tree --module com.acme:app", "Show one module by unique GA"),
         ("tree --scope compile", "Show only compile-scoped dependencies"),
         ("tree --depth 1", "Show only the direct dependencies"),
+        ("tree --platform linux-x86_64 --jdk 21", "Show one recorded target"),
         ("--json tree", "Output as JSON"),
     ])
 )]
 pub(crate) struct TreeArgs {
     #[command(flatten)]
     module: ModuleSelector,
+    #[command(flatten)]
+    target: TargetSelector,
     #[arg(
         long,
         value_name = "SCOPE",
         value_parser = crate::commands::parse_scope,
-        help = "Filter tree by scope (compile, runtime, test, provided, system, import)"
+        help = "Filter tree by scope (compile, runtime, test, provided, system, import, compile-only)"
     )]
     pub scope: Option<Scope>,
     #[arg(
@@ -99,19 +104,37 @@ const JSON_DEPTH_LIMIT: usize = 256;
 pub(crate) fn run(args: &TreeArgs, session: &Session) -> Result<Report> {
     let config = session.lock_config()?;
     let lock = crate::commands::read_lockfile(&config)?;
-    let platform = crate::commands::select_platform(&lock, config.host().java_version())?;
+    let platform = args
+        .target
+        .select(&lock, config.host().named_java_version())?;
     let selection = args.module.select(platform)?;
     let lock_dir = config
         .lock_path
         .parent()
         .map_or_else(|| config.project_root.clone(), Path::to_path_buf);
     let show_headers = selection.is_aggregate();
+    let mode = lock.maven;
+    // The store holds the extension jars whose handlers type a dependency.
+    let store = (selection.modules().iter())
+        .any(|module| !module.extensions.is_empty())
+        .then(|| rv_store::Store::open(&config.paths.store_dir).ok())
+        .flatten();
+    // A reactor's modules mostly pin the same jars, which are read once.
+    let mut read = std::collections::BTreeMap::new();
     let modules = selection
         .modules()
         .iter()
         .map(|module| {
             let mut tree = ModuleTree::new(module, args.scope)?;
-            tree.mark_declared_optional(&lock_dir, module);
+            let types = match &store {
+                Some(store) => (read.entry(&module.extensions))
+                    .or_insert_with(|| {
+                        rv_resolver::locked_artifact_types(store, mode, &module.extensions)
+                    })
+                    .clone(),
+                None => ArtifactTypes::core(mode),
+            };
+            tree.mark_declared_optional(&lock_dir, module, &types);
             if show_headers {
                 tree.header = Some(format!("Module: {}", module.display_label()));
             }
@@ -164,15 +187,23 @@ impl ModuleTree {
     }
 
     /// Mark the direct dependencies the module's own POM declares
-    /// `<optional>true</optional>`. raeva.lock records the flag on edges only,
-    /// so a direct dependency has no edge to carry it. A dependency the POM
-    /// inherits from a parent, takes from a profile, or names through a
-    /// property is not matched, and a POM that cannot be read marks nothing.
-    fn mark_declared_optional(&mut self, lock_dir: &Path, module: &LockModule) {
+    /// `<optional>true</optional>`, their types read with `types`. raeva.lock
+    /// records the flag on edges only, so a direct dependency has no edge to
+    /// carry it. A dependency the POM inherits from a parent, takes from a
+    /// profile, or names through a property is not matched, and a POM that
+    /// cannot be read marks nothing.
+    fn mark_declared_optional(
+        &mut self,
+        lock_dir: &Path,
+        module: &LockModule,
+        types: &ArtifactTypes,
+    ) {
         let Ok(bytes) = rv_config::read_project_input(&lock_dir.join(&module.path)) else {
             return;
         };
-        let Ok(pom) = rv_maven_model::Pom::parse(&String::from_utf8_lossy(&bytes)) else {
+        let Ok(pom) =
+            rv_maven_model::decode_pom(&bytes).and_then(|text| rv_maven_model::Pom::parse(&text))
+        else {
             return;
         };
         let declared: HashSet<(&str, &str, &str, Option<&str>)> = pom
@@ -188,8 +219,8 @@ impl ModuleTree {
                 (
                     dependency.group_id.trim(),
                     dependency.artifact_id.trim(),
-                    dependency.effective_type(),
-                    dependency.effective_classifier(),
+                    dependency.effective_type_in(types),
+                    dependency.effective_classifier_in(types),
                 )
             })
             .collect();
@@ -409,15 +440,15 @@ impl<'a> Walk<'a> {
         let levels = self
             .max_depth
             .map_or(usize::MAX, |max| max.saturating_sub(depth));
-        if levels == 0 {
-            return Visit::Cut;
-        }
         if self
             .expanded
             .get(&node)
             .is_some_and(|&shown| shown >= levels)
         {
             return Visit::Repeated;
+        }
+        if levels == 0 {
+            return Visit::Cut;
         }
         self.expanded.insert(node, levels);
         Visit::Expand
@@ -545,7 +576,7 @@ impl<'a> Walk<'a> {
             edges: children.iter(),
             node: TreeNode {
                 coordinate: info.coordinate.clone(),
-                scope: scope.to_string(),
+                scope: scope.as_str().to_string(),
                 optional,
                 workspace: info.workspace_module.is_some(),
                 workspace_module: info.workspace_module.clone(),
@@ -577,16 +608,22 @@ struct JsonFrame<'a> {
 }
 
 fn scope_includes(target: Scope, dependency: Scope) -> bool {
+    // Maven 3's scope filters keep a scope they do not know, so it is on
+    // every classpath.
+    let unknown = matches!(
+        dependency,
+        Scope::CompileOnly | Scope::Import | Scope::Other(_) | Scope::Empty
+    );
     match target {
-        Scope::Compile => matches!(dependency, Scope::Compile | Scope::Provided | Scope::System),
-        Scope::Runtime => matches!(dependency, Scope::Compile | Scope::Runtime),
-        Scope::Test => matches!(
-            dependency,
-            Scope::Compile | Scope::Runtime | Scope::Test | Scope::Provided | Scope::System
-        ),
+        Scope::Compile => {
+            unknown || matches!(dependency, Scope::Compile | Scope::Provided | Scope::System)
+        }
+        Scope::Runtime => unknown || matches!(dependency, Scope::Compile | Scope::Runtime),
+        Scope::Test => true,
         Scope::Provided => matches!(dependency, Scope::Provided | Scope::System),
-        Scope::System => dependency == Scope::System,
-        Scope::Import => dependency == Scope::Import,
+        Scope::System | Scope::Import | Scope::CompileOnly | Scope::Other(_) | Scope::Empty => {
+            dependency == target
+        }
     }
 }
 
@@ -635,7 +672,7 @@ mod tests {
             package("lib", true, Some("lib/pom.xml")),
             package("external", false, None),
         ];
-        module.edges = vec![LockEdge::new(0, 1, Some(rv_lock::Scope::Runtime), true)];
+        module.edges = vec![LockEdge::new(0, 1, rv_lock::Scope::Runtime, true)];
         module
     }
 
@@ -680,7 +717,7 @@ mod tests {
             .map(|index| package(&format!("a{index}"), index == 0, None))
             .collect();
         module.edges = (1..n)
-            .map(|index| LockEdge::new(index - 1, index, None, false))
+            .map(|index| LockEdge::new(index - 1, index, rv_lock::Scope::Compile, false))
             .collect();
         module
     }
@@ -748,21 +785,26 @@ mod tests {
     }
 
     /// Only the declaration with the same type and classifier marks a direct
-    /// dependency optional.
+    /// dependency optional, in a POM of any encoding Maven reads.
     #[test]
     fn optional_is_matched_by_type_and_classifier() {
-        let dir = tempfile::tempdir().expect("dir");
-        std::fs::write(
-            dir.path().join("pom.xml"),
-            "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\
+             <project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
              <artifactId>app</artifactId><version>1</version><dependencies>\
              <dependency><groupId>com.example</groupId><artifactId>lib</artifactId>\
              <version>1</version></dependency>\
              <dependency><groupId>com.example</groupId><artifactId>lib</artifactId>\
              <version>1</version><type>test-jar</type><optional>true</optional></dependency>\
-             </dependencies></project>",
-        )
-        .expect("pom");
+             </dependencies></project>";
+        let utf16: Vec<u8> = (text.encode_utf16()).flat_map(u16::to_le_bytes).collect();
+        for bytes in [text.replace("UTF-16", "UTF-8").into_bytes(), utf16] {
+            optional_in_pom(&bytes);
+        }
+    }
+
+    fn optional_in_pom(bytes: &[u8]) {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("pom.xml"), bytes).expect("pom");
         let mut module = LockModule::new(
             "pom.xml".to_string(),
             Gav::new("com.example", "app", "1"),
@@ -776,7 +818,11 @@ mod tests {
             ),
         ];
         let mut tree = ModuleTree::new(&module, None).expect("tree");
-        tree.mark_declared_optional(dir.path(), &module);
+        tree.mark_declared_optional(
+            dir.path(),
+            &module,
+            &rv_maven_model::ArtifactTypes::default(),
+        );
         assert_eq!(
             lines(&tree, None),
             [
@@ -805,9 +851,9 @@ mod tests {
             package("leaf", false, None),
         ];
         module.edges = vec![
-            LockEdge::new(0, 2, None, false),
-            LockEdge::new(1, 2, None, false),
-            LockEdge::new(2, 3, None, false),
+            LockEdge::new(0, 2, rv_lock::Scope::Compile, false),
+            LockEdge::new(1, 2, rv_lock::Scope::Compile, false),
+            LockEdge::new(2, 3, rv_lock::Scope::Compile, false),
         ];
         module
     }
@@ -815,7 +861,9 @@ mod tests {
     #[test]
     fn an_edge_back_up_the_path_is_listed_as_a_cycle() {
         let mut module = diamond();
-        module.edges.push(LockEdge::new(3, 2, None, false));
+        module
+            .edges
+            .push(LockEdge::new(3, 2, rv_lock::Scope::Compile, false));
         let tree = ModuleTree::new(&module, None).expect("tree");
         assert_eq!(
             lines(&tree, None),
@@ -835,6 +883,46 @@ mod tests {
         let value = serde_json::to_value(&json.dependencies[1]).expect("json");
         assert!(value.to_string().contains("\"repeated\":true"), "{value}");
         assert!(!value.to_string().contains("cycle"), "{value}");
+    }
+
+    /// A package already expanded is listed above also where it shows up
+    /// again at `--depth`, not cut there.
+    #[test]
+    fn a_repeat_at_the_depth_limit_is_listed_above() {
+        let mut module = LockModule::new(
+            "pom.xml".to_string(),
+            Gav::new("com.example", "app", "1"),
+            "jar".to_string(),
+        );
+        module.packages = vec![
+            package("p", true, None),
+            package("q", true, None),
+            package("b", false, None),
+            package("c", false, None),
+            package("e", false, None),
+        ];
+        module.edges = vec![
+            LockEdge::new(0, 2, rv_lock::Scope::Compile, false),
+            LockEdge::new(2, 3, rv_lock::Scope::Compile, false),
+            LockEdge::new(1, 4, rv_lock::Scope::Compile, false),
+            LockEdge::new(4, 2, rv_lock::Scope::Compile, false),
+        ];
+        let tree = ModuleTree::new(&module, None).expect("tree");
+        assert_eq!(
+            lines(&tree, Some(3)),
+            [
+                "com.example:app:1",
+                "├── com.example:p:1 (compile)",
+                "│   └── com.example:b:1 (compile)",
+                "│       └── com.example:c:1 (compile)",
+                "└── com.example:q:1 (compile)",
+                "    └── com.example:e:1 (compile)",
+                "        └── com.example:b:1 (compile, listed above)",
+            ]
+        );
+        let json = json_module(&tree, Some(3)).expect("json");
+        let again = &json.dependencies[1].children[0].children[0];
+        assert!(again.repeated && again.children.is_empty());
     }
 
     /// A system-scoped package already names its scope once. The human tree
@@ -886,11 +974,11 @@ mod tests {
             package("managed", false, None),
         ];
         module.edges = vec![
-            LockEdge::new(0, 2, Some(rv_lock::Scope::Compile), false),
-            LockEdge::new(1, 2, Some(rv_lock::Scope::Runtime), true),
-            LockEdge::new(0, 3, Some(rv_lock::Scope::Compile), false),
-            LockEdge::new(3, 4, Some(rv_lock::Scope::Test), false),
-            LockEdge::new(3, 5, Some(rv_lock::Scope::Compile), false),
+            LockEdge::new(0, 2, rv_lock::Scope::Compile, false),
+            LockEdge::new(1, 2, rv_lock::Scope::Runtime, true),
+            LockEdge::new(0, 3, rv_lock::Scope::Compile, false),
+            LockEdge::new(3, 4, rv_lock::Scope::Test, false),
+            LockEdge::new(3, 5, rv_lock::Scope::Compile, false),
         ];
         let tree = ModuleTree::new(&module, None).expect("tree");
         // shared is a leaf, so its second appearance is not "listed above".

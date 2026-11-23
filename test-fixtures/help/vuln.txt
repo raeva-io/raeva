@@ -1,7 +1,6 @@
 Scan locked dependencies for known vulnerabilities
 
-Usage: raeva vuln [OPTIONS]
-       raeva vuln <COMMAND>
+Usage: raeva vuln [OPTIONS] [COMMAND]
 
 Commands:
   triage  Record in an OpenVEX file that a finding does not affect a module
@@ -9,7 +8,7 @@ Commands:
 
 Options:
       --module <MODULE>
-          Select a module by root-relative pom.xml path or unique groupId:artifactId
+          Select a module by root-relative POM path or unique groupId:artifactId
 
       --platform <OS-ARCH>
           Report only this recorded platform (default: all platforms)
@@ -94,9 +93,9 @@ suppressed and does not count toward --fail-on. The Fixed column is the
 nearest version above the locked one that the advisory names as fixed.
 
 With --baseline, only new findings count toward --fail-on. A finding is
-existing when the same exact dependency purl and OSV id occur anywhere in
-the baseline, in any of its targets and modules. Only the current inventory
-is queried. Every current finding is shown as New or Existing. A record
+existing when its exact dependency purl occurs anywhere in the baseline, in
+any of its targets and modules. Only the current inventory is queried, so a
+new advisory on an unchanged dependency is existing. Every current finding is shown as New or Existing. A record
 fetch failure fails the scan. The baseline does not need to match the
 current project POMs or targets.
 

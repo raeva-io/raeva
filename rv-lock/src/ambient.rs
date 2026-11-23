@@ -17,7 +17,7 @@ use rv_maven_types::is_terminal_safe;
 /// raeva.lock lists the inputs a resolution consulted in
 /// `[resolution] ambient_inputs`, and `config_hash` covers the current
 /// value of each plain input and the current outcome of each condition
-/// ([`crate::inputs::ResolutionInputs::ambient`]), so `--frozen` can check
+/// ([`crate::inputs::ResolutionInputs::ambient`]), so a sync can check
 /// them again without resolving. A condition records the POM's text and
 /// the outcome, never the host value it tested, so a host whose JDK or
 /// variables differ but give every condition the same outcome still
@@ -36,8 +36,12 @@ pub enum AmbientInput {
     OsRelease,
     /// `settings-property:NAME`: the settings.xml profile property `NAME`.
     SettingsProperty(String),
-    /// `user-property:NAME`: a consulted user-property override.
+    /// `user-property:NAME`: a consulted user-property override, which a
+    /// JVM system property answers where no user property does.
     UserProperty(String),
+    /// `user-override:NAME`: a consulted user-property override of a name
+    /// the model defines, whose own value ranks above a system property.
+    UserOverride(String),
     /// `user-property-lookup:JSON`: public text for private interpolation or activation reads.
     UserPropertyLookup(String),
     /// A profile activation condition on the host and whether it held.
@@ -88,7 +92,7 @@ impl fmt::Display for InvalidAmbientInput {
             f,
             "ambient input {} is not java.version, java.home, os-release, env.NAME with \
              NAME made of ASCII letters, digits and '_', not starting with a digit, \
-             user-property:NAME with a printable option name, \
+             user-property:NAME or user-override:NAME with a printable option name, \
              settings-property:NAME with NAME made of ASCII letters, digits, '.', '-' and '_', \
              or a jdk:, property:, file: or settings: condition followed by \" is true\" or \
              \" is false\"",
@@ -163,7 +167,10 @@ impl AmbientInput {
     pub fn is_property_name(&self) -> bool {
         matches!(
             self,
-            Self::UserProperty(_) | Self::SettingsProperty(_) | Self::Env(_)
+            Self::UserProperty(_)
+                | Self::UserOverride(_)
+                | Self::SettingsProperty(_)
+                | Self::Env(_)
         )
     }
 
@@ -193,6 +200,25 @@ impl AmbientInput {
             Ok(Self::UserProperty(name.to_string()))
         } else {
             Err(InvalidAmbientInput(format!("user-property:{name}")))
+        }
+    }
+
+    /// A consulted user-property name the model defines, without its value.
+    pub fn user_override(name: &str) -> Result<Self, InvalidAmbientInput> {
+        if crate::codec::is_option_name(name) {
+            Ok(Self::UserOverride(name.to_string()))
+        } else {
+            Err(InvalidAmbientInput(format!("user-override:{name}")))
+        }
+    }
+
+    /// The user-property name this input reads and whether a system
+    /// property answers it where no user property does.
+    pub fn user_property_name(&self) -> Option<(&str, bool)> {
+        match self {
+            Self::UserProperty(name) => Some((name, true)),
+            Self::UserOverride(name) => Some((name, false)),
+            _ => None,
         }
     }
 
@@ -370,6 +396,7 @@ impl AmbientInput {
             Self::OsRelease => ["os-release", "", "", "", "", ""],
             Self::SettingsProperty(name) => ["settings-property:", name, "", "", "", ""],
             Self::UserProperty(name) => ["user-property:", name, "", "", "", ""],
+            Self::UserOverride(name) => ["user-override:", name, "", "", "", ""],
             Self::UserPropertyLookup(template) => {
                 ["user-property-lookup:", template, "", "", "", ""]
             }
@@ -442,6 +469,9 @@ impl FromStr for AmbientInput {
         }
         if let Some(name) = value.strip_prefix("user-property:") {
             return Self::user_property(name).map_err(|_| invalid());
+        }
+        if let Some(name) = value.strip_prefix("user-override:") {
+            return Self::user_override(name).map_err(|_| invalid());
         }
         if let Some(template) = value.strip_prefix("user-property-lookup:") {
             return rv_config::maven_config::PropertyLookup::parse(template)

@@ -33,7 +33,8 @@ impl EffectiveMetadata {
                         .interpolate_opt(license.url.as_deref(), &model.project)?,
                 })
             })
-            .collect::<Result<Vec<_>, crate::PomError>>()?;
+            .collect::<Result<Vec<_>, crate::PomError>>()
+            .map_err(|error| model.fetched.blame(error))?;
         Ok(Self {
             gav: Gav {
                 group_id: model.project.group_id,
@@ -88,6 +89,30 @@ mod tests {
         let metadata = build("<licenses><license><name>Own ${kind}</name></license></licenses>");
         assert_eq!(metadata.licenses.len(), 1);
         assert_eq!(metadata.licenses[0].name.as_deref(), Some("Own Child"));
+    }
+
+    /// A cycle in a fetched parent's licenses is the parent's.
+    #[test]
+    fn a_license_cycle_is_blamed_on_the_parent_that_holds_it() {
+        let parent = Pom::parse(
+            "<project><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+             <properties><loop>${loop}</loop></properties><licenses><license>\
+             <name>${loop}</name></license></licenses></project>",
+        )
+        .unwrap();
+        let child = Pom::parse(
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+             <version>1</version></parent><artifactId>child</artifactId></project>",
+        )
+        .unwrap();
+        let error = ready(EffectiveMetadata::build(
+            child,
+            &MemorySource::new().with_parent("g", "parent", "1", parent),
+            ModelPolicy::DEPENDENCY,
+            &ActivationContext::default(),
+        ))
+        .unwrap_err();
+        assert!(error.to_string().contains(": g:parent:1: "), "{error}");
     }
 
     #[test]

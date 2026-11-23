@@ -18,12 +18,18 @@ pub enum ProxyAuthType {
 }
 
 /// How long a cached snapshot or metadata answer stays fresh, as Maven's
-/// `<updatePolicy>` names it. The default is `interval:60`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `<updatePolicy>` names it. The default is `daily`, as in Maven Resolver's
+/// `RepositoryPolicy()`, for releases and snapshots alike.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum UpdatePolicy {
     /// Check again on every use.
     Always,
-    /// Check again after 24 hours, not at the next calendar day.
+    /// Check again once a local midnight has passed since the check, as
+    /// Maven's update check decides it when it reads, in the zone of the run
+    /// that reads, also where midnight repeats or is skipped
+    /// (`rv_store::daily`); its 24 hours of [`UpdatePolicy::ttl_secs`] only
+    /// key and order the policies.
+    #[default]
     Daily,
     /// Check again after this many minutes; [`UpdatePolicy::parse`]
     /// refuses zero.
@@ -62,12 +68,6 @@ impl UpdatePolicy {
             UpdatePolicy::Interval(minutes) => i64::from(minutes) * 60,
             UpdatePolicy::Never => i64::MAX,
         }
-    }
-}
-
-impl Default for UpdatePolicy {
-    fn default() -> Self {
-        UpdatePolicy::Interval(60)
     }
 }
 
@@ -194,6 +194,16 @@ pub struct RepoConfig {
         rename = "snapshots-checksum-policy"
     )]
     pub snapshots_checksum_policy: Option<ChecksumPolicy>,
+    /// The settings.xml URL as written, when `url` is the `file:` URL of
+    /// the directory Maven 3.10 reads for it, such as for
+    /// `symlink+file:///srv/repo`. Mirror patterns and repository filters
+    /// read this one.
+    #[serde(
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        rename = "declared-url"
+    )]
+    pub declared_url: Option<String>,
 }
 
 /// A mirror that serves requests for the repositories `mirror_of` matches:
@@ -219,6 +229,11 @@ pub struct MirrorConfig {
     /// requests, through it or around it.
     #[serde(default)]
     pub blocked: bool,
+    /// The settings.xml URL as written, when `url` is the `file:` URL of
+    /// the directory Maven 3.10 reads for it; repository filters read this
+    /// one, as for [`RepoConfig::declared_url`].
+    #[serde(skip)]
+    pub declared_url: Option<String>,
 }
 
 /// Credentials for a repository or mirror id: an `[[auth]]` entry in
@@ -243,6 +258,12 @@ pub struct AuthConfig {
     /// `<configuration><httpHeaders>`.
     #[serde(default)]
     pub token: Option<SecretString>,
+    /// A settings.xml `<server>` with a username and no bearer token whose
+    /// Maven-encrypted password raeva could not decrypt. It sends nothing
+    /// for its id, and lower sources do not answer for it, so a repository
+    /// that allows anonymous reads serves raeva as it serves Maven.
+    #[serde(skip)]
+    pub password_dropped: bool,
 }
 
 impl MirrorConfig {
@@ -255,7 +276,15 @@ impl MirrorConfig {
             mirror_of: Vec::new(),
             mirror_of_layouts: None,
             blocked: false,
+            declared_url: None,
         }
+    }
+
+    /// Whether `mirror_of` names no repository: it is empty or blank, as an
+    /// empty settings.xml `<mirrorOf/>` is.
+    pub fn mirrors_nothing(&self) -> bool {
+        (self.mirror_of.iter().flat_map(|pattern| pattern.split(',')))
+            .all(|entry| entry.trim().is_empty())
     }
 }
 
@@ -268,6 +297,7 @@ impl AuthConfig {
             username: None,
             password: None,
             token: None,
+            password_dropped: false,
         }
     }
 }
@@ -354,6 +384,7 @@ impl RepoConfig {
             releases_update_policy: None,
             releases_checksum_policy: None,
             snapshots_checksum_policy: None,
+            declared_url: None,
         }
     }
 
@@ -390,7 +421,7 @@ mod tests {
             }
         }
         assert!("hourly".parse::<UpdatePolicy>().is_err());
-        assert_eq!(UpdatePolicy::default(), UpdatePolicy::Interval(60));
+        assert_eq!(UpdatePolicy::default(), UpdatePolicy::Daily);
     }
 
     #[test]

@@ -354,7 +354,7 @@ impl OsvClient {
         Fut: std::future::Future<Output = std::result::Result<T, Outcome<VulnError>>>,
     {
         let mut retries = 0;
-        rv_http::retry::run(&self.retry, &self.cooldown, attempt, |error, wait| {
+        let on_retry = |error: &VulnError, wait: Duration| {
             retries += 1;
             debug!(
                 request,
@@ -371,8 +371,17 @@ impl OsvClient {
                     safe_error_message(error)
                 ));
             }
-        })
-        .await
+        };
+        let refused = |status, retry_after| match status {
+            StatusCode::TOO_MANY_REQUESTS => VulnError::RateLimited {
+                retry_after: Some(retry_after),
+            },
+            status => VulnError::HttpStatus {
+                status,
+                body_size: None,
+            },
+        };
+        rv_http::retry::run(&self.retry, &self.cooldown, attempt, on_retry, refused).await
     }
 }
 
@@ -380,13 +389,18 @@ fn outcome(error: VulnError) -> Outcome<VulnError> {
     let transient = match &error {
         VulnError::RateLimited { retry_after } => {
             let retry_after = *retry_after;
-            return Outcome::Busy { error, retry_after };
+            return Outcome::Busy {
+                error,
+                status: StatusCode::TOO_MANY_REQUESTS,
+                retry_after,
+            };
         }
         VulnError::Http(source) if transport_is_lookup_failure(source) => {
             return Outcome::Unresolved(error);
         }
         VulnError::Http(source) => transport_is_retryable(source),
         VulnError::HttpStatus { status, .. } => status_is_transient(*status),
+        VulnError::Truncated { .. } => true,
         _ => false,
     };
     if transient {
@@ -513,6 +527,7 @@ async fn handle_response(
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(Outcome::Busy {
             error: VulnError::RateLimited { retry_after },
+            status,
             retry_after,
         });
     }
@@ -521,12 +536,16 @@ async fn handle_response(
     // its size reaches the error.
     let body_size = match read_response_bytes(response, MAX_ERROR_BODY_BYTES).await {
         Ok(body) => Some(body.len()),
-        Err(VulnError::Http(_)) => None,
+        Err(VulnError::Http(_) | VulnError::Truncated { .. }) => None,
         Err(err) => return Err(Outcome::permanent(err)),
     };
     let error = VulnError::HttpStatus { status, body_size };
     if status_is_transient(status) {
-        Err(Outcome::Busy { error, retry_after })
+        Err(Outcome::Busy {
+            error,
+            status,
+            retry_after,
+        })
     } else {
         Err(Outcome::permanent(error))
     }
@@ -560,6 +579,9 @@ async fn read_response_bytes(response: reqwest::Response, limit: usize) -> Resul
         Err(BodyError::TooLarge { .. }) => Err(VulnError::InvalidResponse(format!(
             "OSV response exceeds the {limit}-byte limit"
         ))),
+        Err(BodyError::Truncated { declared, read }) => {
+            Err(VulnError::Truncated { declared, read })
+        }
     }
 }
 
@@ -765,6 +787,17 @@ mod tests {
         );
     }
 
+    /// A body cut short of its Content-Length is retried as a broken
+    /// connection is, and leaves an error status the answer.
+    #[test]
+    fn a_truncated_body_is_retried() {
+        let truncated = VulnError::Truncated {
+            declared: 100,
+            read: 1,
+        };
+        assert!(super::outcome(truncated).is_transient());
+    }
+
     /// 502, 503 and 504 are retried; other failures are the answer.
     #[test]
     fn only_transient_statuses_are_retried() {
@@ -877,16 +910,15 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_past_the_budget_fails_without_waiting() {
-        let (mut client, server) = osv(|_, _| Response::new(429, "").header("Retry-After", "30"));
-        client.retry.budget = Duration::from_secs(5);
+    fn retry_after_past_the_cap_fails_without_waiting() {
+        let (client, server) = osv(|_, _| Response::new(429, "").header("Retry-After", "301"));
         let start = Instant::now();
         let error = block_on(client.query_batch(&[PURL.to_string()])).expect_err("rate limited");
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(server.answered(), 1);
         assert!(matches!(
             error,
-            VulnError::RateLimited { retry_after: Some(after) } if after == Duration::from_secs(30)
+            VulnError::RateLimited { retry_after: Some(after) } if after == Duration::from_secs(301)
         ));
     }
 
@@ -894,16 +926,15 @@ mod tests {
     /// names every purl the batch listed it for, whatever the cause.
     #[test]
     fn a_failed_record_keeps_the_fetched_ones() {
-        let (mut client, _server) = osv(|path, _| match path {
+        let (client, _server) = osv(|path, _| match path {
             "/v1/querybatch" => json(
                 r#"{"results":[{"vulns":[{"id":"OSV-A"},{"id":"OSV-B"},{"id":"OSV-C"},{"id":"OSV-D"}]},{"vulns":[{"id":"OSV-B"}]}]}"#,
             ),
             "/v1/vulns/OSV-A" => json(r#"{"id":"OSV-A","summary":"a","affected":[]}"#),
-            "/v1/vulns/OSV-C" => Response::new(429, "").header("Retry-After", "30"),
+            "/v1/vulns/OSV-C" => Response::new(429, "").header("Retry-After", "301"),
             "/v1/vulns/OSV-D" => json(r#"{"id":"OSV-E"}"#),
             _ => Response::new(404, ""),
         });
-        client.retry.budget = Duration::from_secs(5);
         let start = Instant::now();
         let (results, failed) =
             block_on(client.query_batch(&[PURL.to_string(), OTHER.to_string()])).expect("batch");

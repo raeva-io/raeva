@@ -51,6 +51,16 @@ impl WorkspaceModule {
     }
 }
 
+/// What `ProjectSorter` links one reactor project to: see
+/// [`Workspace::sorter_edges`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SorterEdges {
+    /// Its dependencies, then in the 3.10 mode its imports.
+    pub(crate) links: Vec<usize>,
+    /// Its parent, a link that wins over one back.
+    pub(crate) parents: Vec<usize>,
+}
+
 /// A recursively discovered Maven reactor and its effective-GAV index.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -136,7 +146,14 @@ impl Workspace {
         config.apply(&mut activation);
 
         // Every module reads the same parents, so their parses are shared.
-        let parents = Arc::new(LocalParentCache::new(Arc::default()));
+        // Maven 3.10 validates the plugin sections of these POMs.
+        let parsed = match activation.environment.maven_mode() {
+            rv_maven_types::MavenMode::Maven310 => {
+                Arc::new(crate::parsed_pom_cache::ParsedPomCache::with_plugin_sections())
+            }
+            _ => Arc::default(),
+        };
+        let parents = Arc::new(LocalParentCache::new(parsed));
         let strict = Self::scan(
             &canonical_root,
             &root_pom,
@@ -276,10 +293,151 @@ impl Workspace {
         &self.local_parent_poms
     }
 
+    /// The canonical paths of the project's POM files a build may read, each
+    /// once: the modules, those a profile discovery did not activate lists,
+    /// with theirs in any profile, and the local `<relativePath>` parents of
+    /// each, wherever they are, as Maven reads them. `options` says the build
+    /// takes options discovery did not read, which may set the properties a
+    /// `<module>` entry reads or select other profiles.
+    ///
+    /// # Errors
+    ///
+    /// Such a module whose entry keeps a `${...}`, which discovery did not
+    /// interpolate, does not resolve or whose POM cannot be read, or more
+    /// than 100,000 of them; with `options`, any module entry that keeps a
+    /// `${...}`.
+    pub fn project_poms(&self, options: bool) -> Result<Vec<PathBuf>, WorkspaceError> {
+        let anywhere = self.root.ancestors().last().unwrap_or(&self.root);
+        let parsed = self.parents.parsed();
+        let mut poms = BTreeSet::new();
+        let mut queue: Vec<(PathBuf, Pom, Option<&[String]>)> = (self.modules.iter())
+            .map(|module| {
+                let active = module.descriptor.selected_profiles().first();
+                let path = self.root.join(&module.pom_path);
+                (
+                    path,
+                    module.pom.clone(),
+                    Some(active.map_or(&[][..], Vec::as_slice)),
+                )
+            })
+            .collect();
+        let mut seen: HashSet<PathBuf> = queue.iter().map(|(path, ..)| path.clone()).collect();
+        while let Some((path, pom, active)) = queue.pop() {
+            poms.extend(
+                accepted_local_parents(&path, &pom, anywhere, Some(parsed))
+                    .into_iter()
+                    .map(|parent| fs::canonicalize(&parent).unwrap_or(parent)),
+            );
+            let listed = (pom.modules.iter()).map(|entry| (entry, active.is_none()));
+            let profiles = (pom.profiles.iter()).flat_map(|profile| {
+                let inactive = active.is_none_or(|active| !active.contains(&profile.id));
+                profile.modules.iter().map(move |entry| (entry, inactive))
+            });
+            for (entry, unread) in listed.chain(profiles) {
+                let declaring_pom = normalized_relative_pom(&self.root, &path);
+                if (unread || options) && entry.contains("${") {
+                    return Err(WorkspaceError::InvalidModule {
+                        module: entry.trim().to_string(),
+                        declaring_pom,
+                    });
+                }
+                if !unread {
+                    continue;
+                }
+                let module = resolve_module(&self.root, &path, entry)?;
+                if !seen.insert(module.clone()) {
+                    continue;
+                }
+                if seen.len() > MAX_PROJECT_POMS {
+                    return Err(WorkspaceError::InvalidModule {
+                        module: entry.trim().to_string(),
+                        declaring_pom,
+                    });
+                }
+                let bytes = read_project_input(&module)?;
+                let module_pom = (parsed
+                    .parse_project(&rv_maven_types::BlobId::from_bytes(&bytes), &bytes))
+                .map_err(|source| WorkspaceError::InvalidPom {
+                    path: normalized_relative_pom(&self.root, &module),
+                    source,
+                })?;
+                queue.push((module, Arc::unwrap_or_clone(module_pom), None));
+            }
+            poms.insert(path);
+        }
+        Ok(poms.into_iter().collect())
+    }
+
     /// Modules in deterministic depth-first discovery order, starting at the
     /// aggregator itself.
     pub fn modules(&self) -> &[WorkspaceModule] {
         &self.modules
+    }
+
+    /// A repository id that names one repository among the dependency
+    /// repositories of the settings.xml profiles of `config` and the
+    /// reactor's POMs and another, by URL after mirrors, among their plugin
+    /// repositories: the id, then the two URLs. Maven 3.9 and 3.10 take a
+    /// POM from the local repository for a request that lists the id it was
+    /// downloaded under, so a module reads the POM an extension or plugin
+    /// read there, which its own repository may lack. `central` is left
+    /// out: a repository that takes Central's id serves what Central does.
+    pub fn split_repository_id(
+        &self,
+        config: &rv_config::Config,
+    ) -> Option<(String, String, String)> {
+        let by_id = |declared: Vec<rv_repo::Repository>| {
+            let mut ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            for repo in declared {
+                if repo.id.as_deref() == Some("central") {
+                    continue;
+                }
+                let repo = rv_repo::mirrored_repository(config, &repo);
+                if let Some(id) = repo.id {
+                    ids.entry(id).or_default().insert(repo.url);
+                }
+            }
+            ids
+        };
+        // raeva.toml and config.toml are no input of Maven's.
+        let descriptors = self.modules.iter().map(|module| &module.descriptor);
+        let repositories = by_id(
+            (descriptors
+                .clone()
+                .flat_map(|descriptor| &descriptor.repositories))
+            .map(rv_repo::Repository::from)
+            .chain(
+                config
+                    .settings_repositories()
+                    .iter()
+                    .map(rv_repo::Repository::from),
+            )
+            .collect(),
+        );
+        let plugin_repositories = by_id(
+            (descriptors.flat_map(|descriptor| &descriptor.plugin_repositories))
+                .map(rv_repo::Repository::from)
+                .chain(
+                    config
+                        .profile_plugin_repositories()
+                        .iter()
+                        .map(rv_repo::Repository::from),
+                )
+                .chain(
+                    config
+                        .named_plugin_repositories()
+                        .iter()
+                        .map(rv_repo::Repository::from),
+                )
+                .collect(),
+        );
+        repositories.iter().find_map(|(id, urls)| {
+            let others = plugin_repositories.get(id)?;
+            urls.iter().find_map(|url| {
+                let other = others.iter().find(|other| *other != url)?;
+                Some((id.clone(), url.clone(), other.clone()))
+            })
+        })
     }
 
     /// Number of modules, the aggregator included.
@@ -469,6 +627,223 @@ impl Workspace {
             .filter_map(|index| self.modules.get(*index))
     }
 
+    /// The modules Maven's `ProjectSorter` links the reactor project
+    /// `project`, module `index`, to: those its dependencies name, in order,
+    /// in the 3.10 mode then those its POM's own `import` entries name, and
+    /// its parent. A version that is empty or a range names every version of
+    /// the id in the reactor.
+    pub(crate) fn sorter_edges(
+        &self,
+        index: usize,
+        project: &rv_maven_model::Project,
+        mode: rv_maven_types::MavenMode,
+    ) -> SorterEdges {
+        let dependencies = project.dependencies.iter().map(|dependency| {
+            (
+                &dependency.group_id,
+                &dependency.artifact_id,
+                dependency.version.clone(),
+            )
+        });
+        // Maven 3.10 reads them from the original model, as written but for
+        // a version that is `${project.version}` or one property.
+        let imports = (self.modules[index].pom.dependency_management.iter())
+            .flat_map(|management| &management.dependencies)
+            .filter(|_| mode == rv_maven_types::MavenMode::Maven310)
+            .filter(|dependency| {
+                dependency.scope.as_deref() == Some("import")
+                    && dependency.type_.as_deref() == Some("pom")
+            })
+            .map(|dependency| {
+                let version = dependency.version.as_deref().map(|version| {
+                    let name = (version.strip_prefix("${"))
+                        .and_then(|v| v.strip_suffix('}'))
+                        .map(rv_maven_types::expression_key);
+                    match name {
+                        Some("project.version" | "pom.version") => project.version.clone(),
+                        Some(name) => (project.properties.get(name))
+                            .and_then(|value| {
+                                project.properties.interpolate_str_no_project(value).ok()
+                            })
+                            .unwrap_or_else(|| version.to_string()),
+                        None => version.to_string(),
+                    }
+                });
+                (&dependency.group_id, &dependency.artifact_id, version)
+            });
+        let parent = (project.parent.iter()).map(|parent| {
+            (
+                &parent.group_id,
+                &parent.artifact_id,
+                Some(parent.version.clone()),
+            )
+        });
+        SorterEdges {
+            links: self.edges_to(index, dependencies.chain(imports)),
+            parents: self.edges_to(index, parent),
+        }
+    }
+
+    /// The modules `ProjectSorter` links module `index` to through the
+    /// build plugins of `plugins`, their dependencies, then its build
+    /// extensions.
+    pub(crate) fn plugin_edges(
+        &self,
+        index: usize,
+        model: &rv_maven_model::EffectivePlugins,
+    ) -> Vec<usize> {
+        let plugins = model.plugins.iter().flat_map(|plugin| {
+            let dependencies = plugin.dependencies.iter().map(|dependency| {
+                (
+                    &dependency.group_id,
+                    &dependency.artifact_id,
+                    dependency.version.as_deref(),
+                )
+            });
+            std::iter::once((
+                &plugin.group_id,
+                &plugin.artifact_id,
+                plugin.version.as_deref(),
+            ))
+            .chain(dependencies)
+        });
+        let extensions = (model.extensions.iter()).map(|extension| {
+            (
+                &extension.group_id,
+                &extension.artifact_id,
+                extension.version.as_deref(),
+            )
+        });
+        self.edges_to(index, plugins.chain(extensions))
+    }
+
+    fn edges_to<'a, V: AsRef<str>>(
+        &self,
+        index: usize,
+        ids: impl Iterator<Item = (&'a String, &'a String, Option<V>)>,
+    ) -> Vec<usize> {
+        let mut edges = Vec::new();
+        for (group, artifact, version) in ids {
+            let version = version.as_ref().map(AsRef::as_ref);
+            let specific = version.filter(|v| !v.is_empty() && !v.starts_with(['[', '(']));
+            let ids = (self.ga_index.get(group))
+                .and_then(|by_artifact| by_artifact.get(artifact))
+                .into_iter()
+                .flatten();
+            edges.extend(ids.copied().filter(|&target| {
+                target != index
+                    && specific.is_none_or(|version| version == self.modules[target].gav().version)
+            }));
+        }
+        edges
+    }
+
+    /// The projects as Maven's project builder lists them, which
+    /// `ProjectSorter` takes in turn: each aggregator after its modules.
+    pub(crate) fn project_order(&self) -> Vec<usize> {
+        fn listed(modules: &[WorkspaceModule], index: usize, out: &mut Vec<usize>) -> usize {
+            let mut next = index + 1;
+            for _ in &modules[index].descriptor.modules {
+                if next < modules.len() {
+                    next = listed(modules, next, out);
+                }
+            }
+            out.push(index);
+            next
+        }
+        let mut projects = Vec::with_capacity(self.modules.len());
+        let mut next = 0;
+        while next < self.modules.len() {
+            next = listed(&self.modules, next, &mut projects);
+        }
+        projects
+    }
+
+    /// The modules in Maven's `ProjectSorter` order, which the reactor
+    /// builds them in, given each module's [`Self::sorter_edges`]: a
+    /// depth-first walk that puts a project after those it links to, over
+    /// the [`Self::project_order`]. Maven adds each project's edges in that
+    /// order: a parent link drops one back from the parent, and each
+    /// module's [`Self::plugin_edges`] follow its others but for one that
+    /// would close a cycle, which Maven leaves out. Any other link that
+    /// closes one fails the reactor: the error holds the `group:artifact`
+    /// of each module on the cycle, joined by ` -> `.
+    pub(crate) fn sorted(
+        &self,
+        edges: &[SorterEdges],
+        plugin_edges: &[Vec<usize>],
+    ) -> Result<Vec<usize>, String> {
+        /// The path from `from` to `to`, both included.
+        fn path(edges: &[Vec<usize>], from: usize, to: usize) -> Option<Vec<usize>> {
+            let mut came = vec![None; edges.len()];
+            let mut next = vec![from];
+            came[from] = Some(from);
+            while let Some(index) = next.pop() {
+                if index == to {
+                    let mut path = vec![to];
+                    while let Some(&last) = path.last().filter(|&&last| last != from) {
+                        path.push(came[last].expect("a visited vertex"));
+                    }
+                    path.reverse();
+                    return Some(path);
+                }
+                for &target in &edges[index] {
+                    if came[target].is_none() {
+                        came[target] = Some(index);
+                        next.push(target);
+                    }
+                }
+            }
+            None
+        }
+        fn visit(index: usize, edges: &[Vec<usize>], seen: &mut [bool], out: &mut Vec<usize>) {
+            seen[index] = true;
+            for &target in edges.get(index).into_iter().flatten() {
+                if !seen[target] {
+                    visit(target, edges, seen, out);
+                }
+            }
+            out.push(index);
+        }
+        let projects = self.project_order();
+        let mut dag = vec![Vec::new(); self.modules.len()];
+        let none = SorterEdges::default();
+        for &index in &projects {
+            let edges = edges.get(index).unwrap_or(&none);
+            let parents = edges.parents.iter().map(|&parent| (parent, true));
+            for (target, parent) in (edges.links.iter())
+                .map(|&link| (link, false))
+                .chain(parents)
+            {
+                let back = dag[target].iter().position(|&linked| linked == index);
+                if let Some(back) = back.filter(|_| parent) {
+                    dag[target].remove(back);
+                }
+                if let Some(path) = path(&dag, target, index) {
+                    let ids = (path.iter().chain([&target])).map(|&module| {
+                        let gav = self.modules[module].gav();
+                        format!("{}:{}", gav.group_id, gav.artifact_id)
+                    });
+                    return Err(ids.collect::<Vec<_>>().join(" -> "));
+                }
+                dag[index].push(target);
+            }
+            for &target in plugin_edges.get(index).into_iter().flatten() {
+                if path(&dag, target, index).is_none() {
+                    dag[index].push(target);
+                }
+            }
+        }
+        let mut seen = vec![false; self.modules.len()];
+        let mut sorted = Vec::with_capacity(self.modules.len());
+        for index in projects {
+            if !seen[index] {
+                visit(index, &dag, &mut seen, &mut sorted);
+            }
+        }
+        Ok(sorted)
+    }
+
     /// Return the effective version for a unique reactor member with this group and artifact.
     /// Return `None` if no member matches or several do.
     pub(crate) fn unique_version(&self, group_id: &str, artifact_id: &str) -> Option<String> {
@@ -599,10 +974,10 @@ pub enum WorkspaceError {
         /// The canonical reactor root, without a Windows `\\?\` prefix.
         workspace_root: String,
     },
-    /// A `<module>` entry is empty or does not name a `pom.xml` file or a
-    /// directory holding one.
+    /// A `<module>` entry is empty or does not name a POM file or a
+    /// directory holding a `pom.xml`.
     #[error(
-        "module `{}` declared by {declaring_pom} does not resolve to a pom.xml",
+        "module `{}` declared by {declaring_pom} does not resolve to a POM file",
         bounded(module)
     )]
     InvalidModule {
@@ -659,8 +1034,13 @@ pub enum WorkspaceError {
     },
 }
 
+/// The most module POMs [`Workspace::project_poms`] reads, so a hostile
+/// tree cannot keep it going.
+const MAX_PROJECT_POMS: usize = 100_000;
+
 const DISCOVERY_POLICY: ModelPolicy = ModelPolicy {
     root: true,
+    plugins: rv_maven_model::PluginModel::Repositories,
     missing_parent: MissingParent::InheritDeclaredCoordinates,
 };
 
@@ -798,12 +1178,18 @@ impl Scanner {
         let pom_path = normalized_relative_pom(&self.root, canonical_pom);
         let bytes = read_project_input(canonical_pom)?;
         let mut pom = (self.parents.parsed())
-            .parse(&rv_maven_types::BlobId::from_bytes(&bytes), &bytes)
+            .parse_project(&rv_maven_types::BlobId::from_bytes(&bytes), &bytes)
             .map(Arc::unwrap_or_clone)
             .map_err(|source| WorkspaceError::InvalidPom {
                 path: pom_path.clone(),
                 source,
             })?;
+        rv_maven_model::check_project_pom(&bytes, None).map_err(|source| {
+            WorkspaceError::InvalidPom {
+                path: pom_path.clone(),
+                source,
+            }
+        })?;
         let path = canonical_pom.to_path_buf();
         pom.set_provenance(if root {
             Provenance::RootProject { path }
@@ -838,7 +1224,7 @@ impl Scanner {
         let modules = descriptor
             .modules
             .iter()
-            .map(|entry| self.resolve_module(canonical_pom, entry))
+            .map(|entry| resolve_module(&self.root, canonical_pom, entry))
             .collect();
         Ok(Prepared {
             pom_path,
@@ -847,70 +1233,71 @@ impl Scanner {
             modules,
         })
     }
+}
 
-    fn resolve_module(
-        &self,
-        declaring_pom: &Path,
-        module_entry: &str,
-    ) -> Result<PathBuf, WorkspaceError> {
-        let declaring_pom_relative = normalized_relative_pom(&self.root, declaring_pom);
-        let module_entry = module_entry.trim();
-        if module_entry.is_empty() {
-            return Err(WorkspaceError::InvalidModule {
-                module: module_entry.to_string(),
-                declaring_pom: declaring_pom_relative,
-            });
-        }
-
-        // Accept either platform separator on every host, then canonicalize
-        // so aliases and symlinks share one identity.
-        let portable_entry = module_entry.replace('\\', "/");
-        let declaring_dir = declaring_pom.parent().unwrap_or(&self.root);
-        let candidate = rv_fs::join_pom_entry(declaring_dir, &portable_entry);
-        let (candidate, pom_entry) = match fs::metadata(&candidate) {
-            Ok(metadata) if metadata.is_dir() => (
-                rv_fs::join_pom_entry_pom_xml(declaring_dir, &portable_entry),
-                format!("{portable_entry}/pom.xml"),
-            ),
-            Ok(_) => (candidate, portable_entry),
-            Err(source) => {
-                let pom_candidate = if candidate.extension().is_some() {
-                    candidate
-                } else {
-                    candidate.join("pom.xml")
-                };
-                return Err(WorkspaceError::Io {
-                    path: display_path(&pom_candidate),
-                    source,
-                });
-            }
-        };
-        let mut canonical = canonicalize(&candidate, display_path(&candidate))?;
-        // Maven checks that this file exists but reads the module through its
-        // canonical path, which on Windows can be a sibling.
-        let read = rv_fs::join_module_pom(declaring_dir, &pom_entry);
-        if read != candidate {
-            canonical = canonicalize(&read, display_path(&read))?;
-        }
-
-        if !canonical.starts_with(&self.root) {
-            return Err(WorkspaceError::ModuleEscapes {
-                module: module_entry.to_string(),
-                declaring_pom: declaring_pom_relative,
-                workspace_root: display_path(&self.root),
-            });
-        }
-        if canonical.file_name().and_then(|name| name.to_str()) != Some("pom.xml")
-            || !canonical.is_file()
-        {
-            return Err(WorkspaceError::InvalidModule {
-                module: module_entry.to_string(),
-                declaring_pom: declaring_pom_relative,
-            });
-        }
-
-        Ok(canonical)
+/// The canonical POM file the `<module>` entry `module_entry` of
+/// `declaring_pom` names, which must stay inside `root`.
+fn resolve_module(
+    root: &Path,
+    declaring_pom: &Path,
+    module_entry: &str,
+) -> Result<PathBuf, WorkspaceError> {
+    let declaring_pom_relative = normalized_relative_pom(root, declaring_pom);
+    let module_entry = module_entry.trim();
+    if module_entry.is_empty() {
+        return Err(WorkspaceError::InvalidModule {
+            module: module_entry.to_string(),
+            declaring_pom: declaring_pom_relative,
+        });
     }
+
+    // Accept either platform separator on every host, then canonicalize
+    // so aliases and symlinks share one identity.
+    let portable_entry = module_entry.replace('\\', "/");
+    let declaring_dir = declaring_pom.parent().unwrap_or(root);
+    let candidate = rv_fs::join_pom_entry(declaring_dir, &portable_entry);
+    let (candidate, pom_entry) = match fs::metadata(&candidate) {
+        Ok(metadata) if metadata.is_dir() => (
+            rv_fs::join_pom_entry_pom_xml(declaring_dir, &portable_entry),
+            format!("{portable_entry}/pom.xml"),
+        ),
+        Ok(_) => (candidate, portable_entry),
+        Err(source) => {
+            let pom_candidate = if candidate.extension().is_some() {
+                candidate
+            } else {
+                candidate.join("pom.xml")
+            };
+            return Err(WorkspaceError::Io {
+                path: display_path(&pom_candidate),
+                source,
+            });
+        }
+    };
+    let mut canonical = canonicalize(&candidate, display_path(&candidate))?;
+    // Maven checks that this file exists but reads the module through its
+    // canonical path, which on Windows can be a sibling.
+    let read = rv_fs::join_module_pom(declaring_dir, &pom_entry);
+    if read != candidate {
+        canonical = canonicalize(&read, display_path(&read))?;
+    }
+
+    if !canonical.starts_with(root) {
+        return Err(WorkspaceError::ModuleEscapes {
+            module: module_entry.to_string(),
+            declaring_pom: declaring_pom_relative,
+            workspace_root: display_path(root),
+        });
+    }
+    // As in Maven, an entry may name the module's POM file under any name.
+    if !canonical.is_file() {
+        return Err(WorkspaceError::InvalidModule {
+            module: module_entry.to_string(),
+            declaring_pom: declaring_pom_relative,
+        });
+    }
+
+    Ok(canonical)
 }
 
 fn canonical_reactor_root(root: &Path) -> Result<(PathBuf, PathBuf), WorkspaceError> {
@@ -987,7 +1374,10 @@ fn display_path(path: &Path) -> String {
     rv_fs::plain_path(path).display().to_string()
 }
 
-fn normalized_relative_pom(root: &Path, pom: &Path) -> String {
+/// `pom` relative to `root` with `/` between its parts, as raeva.lock names
+/// a module. A Windows root is verbatim (`\\?\`), which a joined `/` path
+/// takes `\` from.
+pub(crate) fn normalized_relative_pom(root: &Path, pom: &Path) -> String {
     pom.strip_prefix(root)
         .unwrap_or(pom)
         .components()
@@ -1013,7 +1403,9 @@ impl MavenConfig {
         command_line: &CommandLine,
         activation: &ActivationContext,
     ) -> Result<Self, WorkspaceError> {
-        let path = root.join(".mvn").join("maven.config");
+        // `mvn` reads the file in its project directory, the launcher's.
+        let launcher = activation.environment.launcher_root().map(Path::new);
+        let path = launcher.unwrap_or(root).join(".mvn").join("maven.config");
         let content = rv_config::read_optional_project_input_string(&path)
             .map_err(|error| workspace_input_error(&path, error))?;
         let root = rv_fs::plain_path(root);
@@ -1292,6 +1684,62 @@ mod tests {
         let root = rv_fs::plain_path(workspace.root());
         let root = root.to_string_lossy();
         assert!(!root.starts_with(r"\\?\"), "verbatim workspace root {root}");
+    }
+
+    /// `ProjectSorter` adds each project's edges in turn and leaves out a
+    /// build plugin edge that would close a cycle: `x` and `q` depend on
+    /// `p`, whose build plugin `q` is, and Maven 3.9.12 sorts `p`, `x`, `q`.
+    #[test]
+    fn a_plugin_edge_that_closes_a_cycle_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pom(dir.path(), "root", &["x", "q", "p"]);
+        for name in ["x", "q", "p"] {
+            write_pom(&dir.path().join(name), name, &[]);
+        }
+        let workspace = Workspace::discover(dir.path()).unwrap();
+        let links = |links: Vec<usize>| SorterEdges {
+            links,
+            parents: Vec::new(),
+        };
+        let edges = [links(vec![]), links(vec![3]), links(vec![3]), links(vec![])];
+        let plugins = [vec![], vec![], vec![], vec![2]];
+        assert_eq!(workspace.sorted(&edges, &plugins), Ok(vec![3, 1, 2, 0]));
+    }
+
+    /// A parent link drops the parent's link back to the project, as
+    /// `ProjectSorter` forces it, when the parent was taken first: `p`
+    /// depends on `c`, whose parent it is, and Maven sorts `p`, `c`. Taken
+    /// after its child, the parent's link closes a cycle.
+    #[test]
+    fn a_parent_link_wins_over_the_link_back() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pom(dir.path(), "root", &["p", "c"]);
+        for name in ["p", "c"] {
+            write_pom(&dir.path().join(name), name, &[]);
+        }
+        let workspace = Workspace::discover(dir.path()).unwrap();
+        let edges = |links: Vec<usize>, parents: Vec<usize>| SorterEdges { links, parents };
+        let sorted = workspace.sorted(
+            &[
+                edges(vec![], vec![]),
+                edges(vec![2], vec![]),
+                edges(vec![], vec![1]),
+            ],
+            &[],
+        );
+        assert_eq!(sorted, Ok(vec![1, 2, 0]));
+        let sorted = workspace.sorted(
+            &[
+                edges(vec![], vec![]),
+                edges(vec![], vec![2]),
+                edges(vec![1], vec![]),
+            ],
+            &[],
+        );
+        assert_eq!(
+            sorted,
+            Err("com.example:p -> com.example:c -> com.example:p".to_string())
+        );
     }
 
     fn write_pom(dir: &Path, artifact_id: &str, modules: &[&str]) {
@@ -1724,6 +2172,67 @@ mod tests {
             workspace.module_provenance(&path("leaf/pom.xml")),
             provenance[2]
         );
+    }
+
+    /// The project's POMs are the modules discovery interpolates, those an
+    /// inactive profile lists and the local parents of each, also one
+    /// outside the reactor root; a POM at a parent's path with other
+    /// coordinates is not one. An inactive profile's module that keeps a
+    /// `${...}` or does not resolve fails, as does any module that keeps one
+    /// when the build takes options discovery did not read.
+    #[test]
+    fn project_poms_follow_interpolated_and_inactive_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path();
+        let root = outer.join("project");
+        let write = |path: &Path, xml: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!("<project><modelVersion>4.0.0</modelVersion>{xml}</project>"),
+            )
+            .unwrap();
+        };
+        write(
+            &outer.join("pom.xml"),
+            "<groupId>g</groupId><artifactId>outer</artifactId><version>1</version>",
+        );
+        let root_pom = |profile_module: &str| {
+            format!(
+                "<parent><groupId>g</groupId><artifactId>outer</artifactId><version>1</version>\
+                 </parent><artifactId>root</artifactId><packaging>pom</packaging>\
+                 <properties><module.path>child</module.path></properties>\
+                 <modules><module>${{module.path}}</module></modules>\
+                 <profiles><profile><id>off</id><modules><module>{profile_module}</module>\
+                 </modules></profile></profiles>"
+            )
+        };
+        write(&root.join("pom.xml"), &root_pom("extra"));
+        let child = "<parent><groupId>g</groupId><artifactId>root</artifactId><version>1</version>\
+                     </parent><artifactId>child</artifactId>";
+        write(&root.join("child/pom.xml"), child);
+        write(
+            &root.join("extra/pom.xml"),
+            "<parent><groupId>g</groupId><artifactId>other</artifactId><version>1</version>\
+             </parent><artifactId>extra</artifactId>",
+        );
+        let workspace = Workspace::discover(&root).unwrap();
+        let canonical = |path: PathBuf| fs::canonicalize(path).unwrap();
+        let mut expected = vec![
+            canonical(outer.join("pom.xml")),
+            canonical(root.join("pom.xml")),
+            canonical(root.join("child/pom.xml")),
+            canonical(root.join("extra/pom.xml")),
+        ];
+        expected.sort();
+        assert_eq!(workspace.project_poms(false).unwrap(), expected);
+        assert!(workspace.project_poms(true).is_err());
+
+        for profile_module in ["${module.path}", "missing"] {
+            write(&root.join("pom.xml"), &root_pom(profile_module));
+            let workspace = Workspace::discover(&root).unwrap();
+            assert!(workspace.project_poms(false).is_err(), "{profile_module}");
+        }
     }
 
     /// Module coordinates interpolate properties inherited from local

@@ -136,7 +136,7 @@ fn api_built_lock() -> Lockfile {
             Some(Scope::Test),
         ),
     ];
-    app.edges = vec![LockEdge::new(1, 3, Some(rv_lock::Scope::Runtime), false)];
+    app.edges = vec![LockEdge::new(1, 3, rv_lock::Scope::Runtime, false)];
     let api = LockModule::new(
         "api/pom.xml".to_string(),
         Gav::new("org.golden.app", "api", "1.0"),
@@ -187,4 +187,45 @@ fn api_built_lock_writes_the_golden_bytes() {
         &fixtures::path("lock-golden/api-built/raeva.lock"),
         &written,
     );
+}
+
+/// A scope Maven does not know reads back as written, `optional` too, which
+/// an edge line would otherwise read as its optional flag, and so does the
+/// empty scope Maven gives a node it reaches only in such scopes.
+#[test]
+fn an_unknown_scope_reads_back_as_written() {
+    let mut lock = api_built_lock();
+    let optional = Scope::read("optional").unwrap();
+    let edges = vec![
+        LockEdge::new(1, 3, optional, false),
+        LockEdge::new(2, 3, optional, true),
+        LockEdge::new(2, 4, Scope::read("${scope}").unwrap(), false),
+    ];
+    lock.platforms[0].modules[0].edges.clone_from(&edges);
+    let reached = &mut lock.platforms[0].modules[0].packages[4];
+    reached.direct_scope = None;
+    reached.scope = Scope::Empty;
+    let reached = reached.coordinate.clone();
+    let dir = TempDir::new().expect("temp dir");
+    let path = dir.path().join("raeva.lock");
+    lock.write_atomic(&path).expect("write lock");
+    let text = fs::read_to_string(&path).expect("read lock");
+    let read = Lockfile::read(&path).expect("read back");
+    let platform = &lock.platforms[0];
+    let module = (read.platforms.iter())
+        .filter(|read| read.platform == platform.platform)
+        .flat_map(|read| &read.modules)
+        .find(|read| read.path == platform.modules[0].path)
+        .expect("the module");
+    let package = (module.packages.iter())
+        .find(|package| package.coordinate == reached)
+        .expect("the package");
+    assert_eq!((package.direct_scope, package.scope), (None, Scope::Empty));
+    assert!(text.contains("\\t\\t?"), "{text}");
+    let mut scopes: Vec<_> = (module.edges.iter())
+        .map(|edge| (edge.scope.as_str(), edge.optional))
+        .collect();
+    scopes.sort();
+    let expected = [("${scope}", false), ("optional", false), ("optional", true)];
+    assert_eq!(scopes, expected, "{text}");
 }

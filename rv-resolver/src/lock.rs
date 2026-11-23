@@ -4,16 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use foldhash::{HashMap, HashMapExt};
-use rv_config::Config;
+use rv_config::{Config, redact_url};
 use rv_lock::{
     AmbientInput, LockArtifact, LockError, LockModule, LockModulePackage, LockOrigins,
     LockPlatform, Lockfile, Platform, SupportPom, is_recordable_repo_id,
 };
 use rv_maven_model::HostInput;
-use rv_maven_types::{ArtifactCoord, BlobId, Digest, Gav, Sha256};
+use rv_maven_types::{ArtifactCoord, BlobId, Digest, Gav, MavenMode, Sha256, SnapshotStamp};
 use rv_repo::{Repository, normalize_repo_url};
 
 use crate::error::{ConflictingPom, ResolveError};
+use crate::graph::{DescriptorKey, PomReading};
 use crate::output::{ResolvedArtifact, ResolvedPackage};
 use crate::resolver::{SupportPomProvenance, WorkspaceResolution, pom_digest_text};
 
@@ -80,6 +81,7 @@ fn read_names(reads: &BTreeSet<HostInput>) -> BTreeSet<AmbientInput> {
     (reads.iter())
         .filter_map(|input| match input {
             HostInput::UserProperty(name) => AmbientInput::user_property(name).ok(),
+            HostInput::UserOverride(name) => AmbientInput::user_override(name).ok(),
             HostInput::SettingsProperty(name) => AmbientInput::settings_property(name).ok(),
             HostInput::Env(name) => AmbientInput::env(name).ok(),
             // A condition the lock cannot list, or one past its limit, is
@@ -105,6 +107,7 @@ pub fn assemble(
     resolutions: Vec<(PlatformModel<'_>, WorkspaceResolution)>,
 ) -> Result<AssembledLock, AssembleError> {
     let mut lock = Lockfile::new();
+    lock.maven = config.lock.maven.mode;
     let mut trusted_repositories: BTreeMap<(String, Option<String>), Repository> = BTreeMap::new();
     let mut support_poms: BTreeMap<String, AggregateSupportPom> = BTreeMap::new();
     let mut companion_poms: BTreeMap<Gav, AggregateCompanionPom> = BTreeMap::new();
@@ -121,6 +124,8 @@ pub fn assemble(
         let mut module_reads = BTreeMap::new();
         let mut artifacts: BTreeMap<ArtifactCoord, AggregateArtifact> = BTreeMap::new();
         let mut platform_support: BTreeMap<String, AggregateSupportPom> = BTreeMap::new();
+        let mut descriptors: BTreeMap<DescriptorKey, Vec<(usize, PomReading)>> = BTreeMap::new();
+        let mut module_paths = Vec::new();
         let platform = result.platform;
         let pom_hashes = if result.reactor_through_dependencies {
             model.whole_reactor_pom_hashes
@@ -129,7 +134,11 @@ pub fn assemble(
         };
 
         for module in result.modules {
-            let resolution = module.resolution;
+            let mut resolution = module.resolution;
+            for (key, read) in std::mem::take(&mut resolution.graph.descriptors) {
+                (descriptors.entry(key).or_default()).push((module_paths.len(), read));
+            }
+            module_paths.push(format!("module {}", module.pom_path));
             for repo in &resolution.trusted_repositories {
                 trusted_repositories
                     .entry((normalize_repo_url(&repo.url), repo.id.clone()))
@@ -137,8 +146,12 @@ pub fn assemble(
             }
             for (url, id) in &resolution.repositories {
                 // The URL is checked too: an unparsable POM URL is kept
-                // verbatim and may hold a line break.
-                if !is_recordable_repo_id(id) || !is_recordable_repo_id(url) {
+                // verbatim and may hold a line break, or read as a
+                // project-relative origin.
+                if !is_recordable_repo_id(id)
+                    || !is_recordable_repo_id(url)
+                    || !order.origins.records_declaration(url)
+                {
                     continue;
                 }
                 repo_ids.entry(url.clone()).or_default().insert(id.clone());
@@ -155,6 +168,7 @@ pub fn assemble(
                     &config.project_root,
                     &module.pom_path,
                     &package,
+                    &platform,
                 )?);
                 let Some(resolved) = package.artifact else {
                     continue;
@@ -167,8 +181,10 @@ pub fn assemble(
                     &module.pom_path,
                 )?;
                 let rank = order.rank(&resolved.repo_url);
-                // The POM may come from another repository than the jar.
-                let pom_origin = (resolved.pom_repo_url.as_ref()).unwrap_or(&resolved.repo_url);
+                // The POM may come from another repository than the jar, and
+                // a read from repositories that lack it served none.
+                let pom_origin = (resolved.companion_pom.is_some())
+                    .then(|| (resolved.pom_repo_url.as_ref()).unwrap_or(&resolved.repo_url));
                 if let Some(existing) = artifacts.get_mut(&package.coordinate) {
                     if existing.blob != resolved.blob {
                         return Err(ResolveError::ConflictingArtifactBytes {
@@ -181,21 +197,31 @@ pub fn assemble(
                         .into());
                     }
                     insert_new(&mut existing.origins, &resolved.repo_url);
-                    insert_new(&mut existing.pom_origins, pom_origin);
+                    if let Some(pom_origin) = pom_origin {
+                        insert_new(&mut existing.pom_origins, pom_origin);
+                    }
                     if order.precedes(
                         (rank, &resolved.repo_url),
                         (existing.repo_rank, &existing.artifact.repo_url),
                     ) {
-                        existing.artifact = lock_artifact(package.coordinate, resolved);
+                        let read = lock_artifact(package.coordinate, resolved);
+                        let other = std::mem::replace(&mut existing.artifact, read);
+                        carry_pom(&mut existing.artifact, &other);
                         existing.repo_rank = rank;
                     } else {
+                        carry_pom(
+                            &mut existing.artifact,
+                            &lock_artifact(package.coordinate.clone(), resolved.clone()),
+                        );
                         duplicates.push((package.coordinate, resolved));
                     }
                     continue;
                 }
                 let (mut origins, mut pom_origins) = (BTreeSet::new(), BTreeSet::new());
                 insert_new(&mut origins, &resolved.repo_url);
-                insert_new(&mut pom_origins, pom_origin);
+                if let Some(pom_origin) = pom_origin {
+                    insert_new(&mut pom_origins, pom_origin);
+                }
                 let blob = resolved.blob.clone();
                 artifacts.insert(
                     package.coordinate.clone(),
@@ -224,10 +250,16 @@ pub fn assemble(
                 module.packages = packages;
                 module.edges = resolution.edges;
                 module.parent_ranges = resolution.parent_ranges;
+                module.parents = resolution.parents;
+                module.evicted_ranges = resolution.evicted_ranges;
+                module.metadata_versions = resolution.metadata_versions;
+                module.range_versions = resolution.range_versions;
                 module.support_poms = (resolution.support_pom_provenance.iter())
                     .map(|(coord, _)| coord.clone())
                     .collect();
                 module.support_poms.sort();
+                module.extensions = resolution.extensions;
+                module.extensions.sort();
                 module
             });
             graphs.push(resolution.graph);
@@ -237,6 +269,9 @@ pub fn assemble(
                 resolution.trusted_repositories,
                 host_reads,
             ));
+        }
+        if config.lock.maven.mode == MavenMode::Maven39 {
+            refuse_shared_descriptors(&descriptors, &module_paths)?;
         }
 
         let mut entry = LockPlatform::new(platform, String::new());
@@ -262,6 +297,7 @@ pub fn assemble(
             if !provenance.repo_id.is_empty()
                 && is_recordable_repo_id(&provenance.repo_id)
                 && is_recordable_repo_id(&provenance.repo_url)
+                && order.origins.records_declaration(&provenance.repo_url)
             {
                 repo_ids
                     .entry(provenance.repo_url.clone())
@@ -287,6 +323,8 @@ pub fn assemble(
     crate::util::drop_in_background((graphs, leftovers));
     lock.platforms
         .sort_by(|a, b| a.platform.os_arch().cmp(&b.platform.os_arch()));
+    rv_lock::merge::adopt_served_poms(&mut lock.platforms);
+    refuse_support_companion_conflict(&lock, &companion_poms)?;
 
     // Each platform holds every id it used until the lock splits them.
     let reads: Vec<_> = (lock.platforms.iter())
@@ -309,6 +347,7 @@ fn module_package(
     project_root: &Path,
     pom_path: &str,
     package: &ResolvedPackage,
+    platform: &Platform,
 ) -> Result<LockModulePackage, AssembleError> {
     let system_file = package
         .system_path
@@ -318,13 +357,10 @@ fn module_package(
                 AssembleError::SystemFile {
                     path: project_root.join(pom_path),
                     reason: format!(
-                        "system-scoped dependency {}: {err}{}",
+                        "system-scoped dependency {} for the locked platform {}: {err}{}",
                         rv_maven_types::bounded(&package.coordinate.to_string()),
-                        if path.contains("${") {
-                            " (it names a property that has no value)"
-                        } else {
-                            ""
-                        }
+                        platform.os_arch(),
+                        unexpanded(path),
                     ),
                 }
             })
@@ -337,8 +373,26 @@ fn module_package(
         lock_package.workspace_module = package.workspace_module.clone();
         lock_package.system_path = system_file.as_ref().map(|file| file.path.clone());
         lock_package.system_sha256 = system_file.map(|file| file.sha256);
+        lock_package.managed = package.managed.clone();
         lock_package
     })
+}
+
+/// Why a system path still holds `${...}`: a model takes no host path,
+/// which would put this host's layout into raeva.lock, and has no value
+/// for other names.
+fn unexpanded(path: &str) -> String {
+    let Some(start) = path.find("${") else {
+        return String::new();
+    };
+    let name = path[start + 2..].split('}').next().unwrap_or_default();
+    match name {
+        "java.home" | "user.home" | "user.dir" => format!(
+            " (raeva does not expand ${{{name}}} in a POM as Maven does: it is a path of this \
+             host)"
+        ),
+        _ => " (it names a property that has no value)".to_string(),
+    }
 }
 
 /// Inserts `url` unless it is empty or already there.
@@ -358,12 +412,12 @@ struct RepoOrder {
 
 impl RepoOrder {
     fn new(config: &Config) -> Self {
-        let precedence = config
-            .repositories()
-            .iter()
-            .enumerate()
-            .map(|(index, repo)| (normalize_repo_url(&repo.url), index))
-            .collect();
+        let mut precedence = HashMap::new();
+        for (index, repo) in config.repositories().iter().enumerate() {
+            precedence
+                .entry(normalize_repo_url(&repo.url))
+                .or_insert(index);
+        }
         Self {
             origins: LockOrigins::for_root(&config.project_root),
             precedence,
@@ -418,6 +472,8 @@ struct AggregateSupportPom {
 struct AggregateCompanionPom {
     blob: Option<BlobId>,
     origin: String,
+    /// The platform and module path of the read that gave `blob`.
+    module: (Platform, String),
 }
 
 /// Fold one resolved artifact's companion-POM pin into the reactor-wide map.
@@ -428,6 +484,33 @@ struct AggregateCompanionPom {
 /// pin one and the other's build would compile against a POM it never resolved
 /// against. Caught here, before the lockfile is written, so the run fails with
 /// both origins named rather than producing a lockfile export has to reject.
+/// Maven 3.9 keeps one descriptor per artifact, its type included, for a
+/// whole build, whatever repositories a module reads it from, losing
+/// versions' too: a module resolves with the POM of whichever module reads
+/// it first, which the build's order, `-T` and `-pl` decide. So every
+/// reading of an artifact must be alike: the same bytes, or none and an
+/// empty POM. The first artifact in order is named.
+fn refuse_shared_descriptors(
+    reads: &BTreeMap<DescriptorKey, Vec<(usize, PomReading)>>,
+    modules: &[String],
+) -> Result<(), ResolveError> {
+    for (key, reads) in reads {
+        let [(first, reading), rest @ ..] = reads.as_slice() else {
+            continue;
+        };
+        if let Some((second, _)) = rest.iter().find(|(_, other)| other != reading) {
+            return Err(ResolveError::SharedDescriptorDiffers {
+                coord: key.to_string(),
+                first: modules[*first].clone(),
+                second: modules[*second].clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// One read without a POM, from repositories that lack it, beside one with
+/// it is no conflict: the row takes that POM (`adopt_served_poms`).
 fn merge_companion_pom(
     aggregate: &mut BTreeMap<Gav, AggregateCompanionPom>,
     coordinate: &ArtifactCoord,
@@ -437,17 +520,29 @@ fn merge_companion_pom(
 ) -> Result<(), ResolveError> {
     let gav = &coordinate.gav;
     let repo = artifact.pom_repo_url.as_ref().unwrap_or(&artifact.repo_url);
-    let origin = || format!("{platform}/{module_path} from {repo}");
-    match aggregate.get(gav) {
-        Some(existing) if existing.blob != artifact.companion_pom => Err(
-            ResolveError::ConflictingCompanionPomBytes(Box::new(ConflictingPom {
-                coord: gav.to_string(),
-                first_origin: existing.origin.clone(),
-                second_origin: origin(),
-                first_sha256: pom_digest_text(existing.blob.as_ref()),
-                second_sha256: pom_digest_text(artifact.companion_pom.as_ref()),
-            })),
-        ),
+    let origin = || format!("{platform}/{module_path} from {}", redact_url(repo));
+    match aggregate.get_mut(gav) {
+        Some(existing) if existing.blob.is_none() => {
+            if artifact.companion_pom.is_some() {
+                existing.blob = artifact.companion_pom.clone();
+                existing.origin = origin();
+                existing.module = (platform.clone(), module_path.to_string());
+            }
+            Ok(())
+        }
+        Some(existing)
+            if artifact.companion_pom.is_some() && existing.blob != artifact.companion_pom =>
+        {
+            Err(ResolveError::ConflictingCompanionPomBytes(Box::new(
+                ConflictingPom {
+                    coord: gav.to_string(),
+                    first_origin: existing.origin.clone(),
+                    second_origin: origin(),
+                    first_sha256: pom_digest_text(existing.blob.as_ref()),
+                    second_sha256: pom_digest_text(artifact.companion_pom.as_ref()),
+                },
+            )))
+        }
         Some(_) => Ok(()),
         None => {
             aggregate.insert(
@@ -455,6 +550,7 @@ fn merge_companion_pom(
                 AggregateCompanionPom {
                     blob: artifact.companion_pom.clone(),
                     origin: origin(),
+                    module: (platform.clone(), module_path.to_string()),
                 },
             );
             Ok(())
@@ -489,9 +585,10 @@ fn merge_support_pom(
                 coord: coord.to_string(),
                 first_origin: format!(
                     "{} from {}",
-                    existing.module_path, existing.provenance.repo_url
+                    existing.module_path,
+                    redact_url(&existing.provenance.repo_url)
                 ),
-                second_origin: format!("{module_path} from {}", provenance.repo_url),
+                second_origin: format!("{module_path} from {}", redact_url(&provenance.repo_url)),
                 first_sha256: existing.provenance.sha256.clone(),
                 second_sha256: provenance.sha256.clone(),
             })),
@@ -519,7 +616,61 @@ fn merge_support_pom(
     }
 }
 
-fn lock_artifact(coordinate: ArtifactCoord, artifact: ResolvedArtifact) -> LockArtifact {
+/// A support POM and an artifact row that pin other bytes for one `.pom`,
+/// named by the module that read each, and the platform where the lock has
+/// several. A row without a POM agrees, as the lockfile accepts.
+fn refuse_support_companion_conflict(
+    lock: &Lockfile,
+    companions: &BTreeMap<Gav, AggregateCompanionPom>,
+) -> Result<(), ResolveError> {
+    let Some(coord) = lock.support_companion_conflict() else {
+        return Ok(());
+    };
+    let name = |platform: &Platform, path: &str| match lock.platforms.len() {
+        1 => format!("module {path}"),
+        _ => format!("module {path} on {platform}"),
+    };
+    let support_module = (lock.platforms.iter())
+        .flat_map(|entry| (entry.modules.iter()).map(move |module| (&entry.platform, module)))
+        .find(|(_, module)| module.support_poms.contains(&coord))
+        .map_or_else(
+            || "a module".to_string(),
+            |(platform, module)| name(platform, &module.path),
+        );
+    let row_module = (rv_lock::split_support_pom_coord(&coord))
+        .and_then(|(group, artifact, version)| companions.get(&Gav::new(group, artifact, version)))
+        .filter(|companion| companion.blob.is_some())
+        .map_or_else(
+            || "a module".to_string(),
+            |companion| name(&companion.module.0, &companion.module.1),
+        );
+    Err(ResolveError::ConflictingSupportCompanionPom {
+        coord,
+        support_module,
+        row_module,
+    })
+}
+
+/// Give `row`, read without its POM, the POM `other` read for the same file.
+fn carry_pom(row: &mut LockArtifact, other: &LockArtifact) {
+    if row.pom_sha256.is_none()
+        && let Some(sha256) = &other.pom_sha256
+    {
+        take_pom(row, sha256, other.pom_base, other.pom_build());
+    }
+}
+
+/// Pin on `row` the POM `sha256` of build `build`, or the base file when
+/// `base`, spelled against the row's own build.
+fn take_pom(row: &mut LockArtifact, sha256: &Sha256, base: bool, build: Option<&SnapshotStamp>) {
+    row.pom_sha256 = Some(sha256.clone());
+    row.pom_base = base;
+    row.pom_snapshot = build
+        .filter(|build| !base && Some(*build) != row.snapshot.as_ref())
+        .cloned();
+}
+
+pub(crate) fn lock_artifact(coordinate: ArtifactCoord, artifact: ResolvedArtifact) -> LockArtifact {
     let mut row = LockArtifact::new(coordinate, artifact.repo_url);
     row.checksums = vec![Digest::Sha256(artifact.blob)];
     row.snapshot = artifact.snapshot;

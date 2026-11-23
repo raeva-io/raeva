@@ -1,5 +1,6 @@
 //! The Maven repository path layout, shared by remote requests, the
-//! local-repository export and the trusted-checksums file.
+//! local-repository export, the trusted-checksums file and the plugin trace,
+//! which reads coordinates back from paths.
 //!
 //! The formatting functions do not check the parts, so callers that take
 //! them from untrusted input validate first (see
@@ -37,6 +38,38 @@ pub fn artifact_path(coord: &ArtifactCoord, dir_version: &str, file_version: &st
         coord.extension(),
         coord.classifier(),
     )
+}
+
+/// The coordinate of the release file at `path`, a `/`-separated
+/// [`artifact_path`] of it, or `None` for any other path.
+///
+/// A file name alone is ambiguous when a classifier or an extension holds a
+/// dot. A classifier such as `jdk1.8` is more common than such an extension,
+/// so the extension is the part after the last dot, or the last two after
+/// `tar`, as in `bin.tar.gz`. The result names the file `path` names, so a
+/// fetch, a pin and an export address that file.
+pub fn parse_artifact_path(path: &str) -> Option<ArtifactCoord> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let [group @ .., artifact, version, name] = &parts[..] else {
+        return None;
+    };
+    if group.is_empty() || crate::resolves_through_snapshot_metadata(version) {
+        return None;
+    }
+    let rest = name.strip_prefix(&format!("{artifact}-{version}"))?;
+    let (classifier, extension) = match rest.strip_prefix('-') {
+        Some(tail) => {
+            let (stem, last) = tail.rsplit_once('.')?;
+            match stem.rsplit_once('.') {
+                Some((classifier, "tar")) => (Some(classifier), &tail[classifier.len() + 1..]),
+                _ => (Some(stem), last),
+            }
+        }
+        None => (None, rest.strip_prefix('.')?),
+    };
+    let coordinate = ArtifactCoord::new(&group.join("."), artifact, version, extension, classifier);
+    coordinate.validate().ok()?;
+    (artifact_path(&coordinate, version, version) == path).then_some(coordinate)
 }
 
 /// `group/as/dirs/artifact[/version]/maven-metadata.xml`.
@@ -90,6 +123,33 @@ mod tests {
             artifact_path(&coord, "1.0-SNAPSHOT", coord.version()),
             "com/example/demo/1.0-SNAPSHOT/demo-1.0-20240101.010101-1-tests.jar"
         );
+    }
+
+    #[test]
+    fn release_paths_parse_back() {
+        for (path, shown) in [
+            ("g/a/1/a-1.jar", Some("g:a:1:jar")),
+            ("g/h/a/1.0/a-1.0-tests.jar", Some("g.h:a:1.0:jar:tests")),
+            ("g/a/1/a-1-jdk1.8.jar", Some("g:a:1:jar:jdk1.8")),
+            ("g/a/1/a-1-bin.tar.gz", Some("g:a:1:tar.gz:bin")),
+            ("g/a/1/a-1-jdk1.8.tar.xz", Some("g:a:1:tar.xz:jdk1.8")),
+            ("g/a/1/a-1.tar.gz", Some("g:a:1:tar.gz")),
+            ("g/a/1/a-1-linux-x64.tar.gz", Some("g:a:1:tar.gz:linux-x64")),
+            (
+                "io/netty/netty-tcnative/2.0.1/netty-tcnative-2.0.1-linux-x86_64.jar",
+                Some("io.netty:netty-tcnative:2.0.1:jar:linux-x86_64"),
+            ),
+            ("g/a/1/a-1-.jar", None),
+            ("g/a/1/a-1-x", None),
+            ("g/a/1/a-1", None),
+            ("g.h/a/1/a-1.jar", None),
+            ("a/1/a-1.jar", None),
+            ("g/a/1/b-1.jar", None),
+            ("g/a/1-SNAPSHOT/a-1-SNAPSHOT.jar", None),
+        ] {
+            let parsed = parse_artifact_path(path).map(|coord| coord.to_string());
+            assert_eq!(parsed.as_deref(), shown, "{path}");
+        }
     }
 
     #[test]

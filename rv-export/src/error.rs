@@ -202,6 +202,49 @@ pub enum ExportError {
         /// The refused segment.
         name: String,
     },
+    /// A build plugin or extension without a version names an artifact
+    /// the export writes metadata for, and raeva.lock records no version it
+    /// took: `mvn -o` would take the greatest locked version.
+    #[error(
+        "{coordinate} is a build plugin or extension without a version, which mvn -o takes from the metadata the export writes for the locked {coordinate}, not from the repositories Maven reads online; raeva.lock records no version it took"
+    )]
+    UnversionedPlugin {
+        /// The artifact's `group:artifact`.
+        coordinate: String,
+    },
+    /// raeva.lock records two values of one `<release>` or `<latest>`,
+    /// read by resolutions over other repositories. Every metadata file of
+    /// the artifact gets the one value, so `mvn -o` would take it for both.
+    #[error(
+        "raeva.lock records two {marker} versions of {coordinate} that resolutions read from repository metadata, {first} and {second}; the export writes one {marker} for the artifact, so mvn -o would take it for both"
+    )]
+    ConflictingMarkers {
+        /// The artifact's `group:artifact`.
+        coordinate: String,
+        /// `release` or `latest`.
+        marker: &'static str,
+        /// The version seen first.
+        first: String,
+        /// The version that disagreed.
+        second: String,
+    },
+    /// A range took one of versions that compare equal, and the export
+    /// lists more than one of them. Maven takes among equal versions in the
+    /// order of every version its repositories list, which raeva.lock does
+    /// not record, so `mvn -o` may take another spelling than the build
+    /// did online.
+    #[error(
+        "a version range over {coordinate} took {version} among versions that compare equal, and the export lists {}; mvn -o takes among them in the order of every version the repositories list, which raeva.lock does not record, so it may build with another one",
+        spellings.join(", ")
+    )]
+    EqualSpellings {
+        /// The artifact's `group:artifact`.
+        coordinate: String,
+        /// The version the range took.
+        version: String,
+        /// The spellings the export lists that compare equal to it.
+        spellings: Vec<String>,
+    },
     /// A destination path resolves, after canonicalizing its existing
     /// prefix, outside [`ExportOptions::m2_path`](crate::ExportOptions::m2_path),
     /// as through a symbolic link inside the local repository. Holds the
@@ -234,6 +277,36 @@ pub enum ExportError {
         /// The destination's SHA-256, or `<unreadable>` when it could not be
         /// hashed.
         actual: String,
+    },
+    /// [`Exporter::layout`](crate::Exporter::layout) found a file missing
+    /// from the store, or damaged, or only a SHA-1 pin for one the store
+    /// does not hold: the plan takes every file's digests from the store.
+    #[error(
+        "a repository plan takes the digests of every file from raeva's store, which must hold them all intact: {0}"
+    )]
+    NotStored(Box<ExportError>),
+    /// [`Exporter::layout`](crate::Exporter::layout) found two names that
+    /// differ only in letter case or Unicode normalization, which a plan
+    /// refuses on every volume.
+    #[error(
+        "{first} and {second} differ only in letter case or Unicode normalization, which a repository plan refuses on every volume, since the one it is rebuilt on may treat such names as one"
+    )]
+    PlanCaseCollision {
+        /// The coordinate queued first.
+        first: String,
+        /// The coordinate that collides with it.
+        second: String,
+        /// The second coordinate's colliding path in the plan.
+        path: PathBuf,
+    },
+    /// The origin raeva.lock records for a file has userinfo, a query or a
+    /// fragment, which may hold a credential.
+    #[error("the origin of {coordinate} has {part}, which may hold a credential")]
+    SecretOrigin {
+        /// The file's coordinate.
+        coordinate: String,
+        /// What [`rv_config::secret_url_part`] names.
+        part: &'static str,
     },
 }
 

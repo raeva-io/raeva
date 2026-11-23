@@ -1,0 +1,15 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "data": {
+      "blobs": 14,
+      "bytes": 2175,
+      "files": 14,
+      "key": "<string>",
+      "metadata": 0,
+      "path": "<tmp>/seed",
+      "warnings": []
+    },
+    "success": true
+  }
+}

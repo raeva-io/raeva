@@ -42,6 +42,7 @@ fn external(artifact: &str, repo_url: &str, blob: &[u8], pom: &[u8]) -> Resolved
         scope: rv_lock::Scope::Compile,
         workspace_module: None,
         system_path: None,
+        managed: None,
         artifact: Some(ResolvedArtifact {
             version: "1.0".to_string(),
             snapshot: None,
@@ -67,6 +68,7 @@ fn module(pom_path: &str, packages: Vec<ResolvedPackage>) -> WorkspaceModuleReso
         system_path: None,
         repos: Default::default(),
         winner_parent: None,
+        version_origin: Default::default(),
     };
     WorkspaceModuleResolution {
         pom_path: pom_path.to_string(),
@@ -79,9 +81,16 @@ fn module(pom_path: &str, packages: Vec<ResolvedPackage>) -> WorkspaceModuleReso
             module_packaging: "jar".to_string(),
             repositories: Vec::new(),
             trusted_repositories: Vec::new(),
+            import_repositories: Vec::new(),
             parent_ranges: Vec::new(),
+            parents: Vec::new(),
             support_pom_provenance: Vec::new(),
+            evicted_ranges: Vec::new(),
+            metadata_versions: Vec::new(),
+            range_versions: Vec::new(),
+            extensions: Vec::new(),
             host_reads: Default::default(),
+            pom_reads: Default::default(),
         },
     }
 }
@@ -133,6 +142,17 @@ fn modules_share_one_row_per_artifact() {
     let platform = &assembled.lock.platforms[0];
     assert_eq!(platform.artifacts.len(), 1);
     assert_eq!(platform.artifacts[0].repo_url, first);
+    // A URL configured again later keeps its first place.
+    let again = self::config(root.path(), &[first, second, first]);
+    let assembled = assemble_modules(
+        &again,
+        vec![
+            module("app", vec![external("lib", second, b"jar", b"pom")]),
+            module("web", vec![external("lib", first, b"jar", b"pom")]),
+        ],
+    )
+    .expect("assembled");
+    assert_eq!(assembled.lock.platforms[0].artifacts[0].repo_url, first);
     assert_eq!(
         platform.artifacts[0].pom_sha256,
         Some(BlobId::from_bytes(b"pom"))
@@ -166,6 +186,7 @@ fn a_system_file_is_recorded_relative_to_the_project() {
         scope: rv_lock::Scope::System,
         workspace_module: None,
         system_path: Some(path),
+        managed: None,
         artifact: None,
     };
 
@@ -236,17 +257,16 @@ fn aggregated_support_poms_keep_one_pin_per_coordinate() {
         "a/pom.xml",
     )
     .expect("first module");
-    let message = merge_support_pom(
-        &mut aggregate,
-        "g:a:1.0",
-        &provenance("corp", 'b'),
-        "b/pom.xml",
-    )
-    .expect_err("different bytes must not be collapsed")
-    .to_string();
+    let mut other = provenance("corp", 'b');
+    other.repo_url = "https://[hostsentinel/".to_string();
+    let message = merge_support_pom(&mut aggregate, "g:a:1.0", &other, "b/pom.xml")
+        .expect_err("different bytes must not be collapsed")
+        .to_string();
     for part in ["g:a:1.0", "a/pom.xml", "b/pom.xml"] {
         assert!(message.contains(part), "{message}");
     }
+    // A URL that does not parse, which a mirror served, is not shown.
+    assert!(!message.contains("hostsentinel"), "{message}");
 }
 
 /// Two freshly resolved modules (or platforms) that parsed different bytes
@@ -301,6 +321,64 @@ fn fresh_companion_pom_conflict_names_both_origins() {
     for artifact in [first_artifact, second_artifact] {
         let digest = pom_digest_text(artifact.companion_pom.as_ref());
         assert!(message.contains(&digest), "{digest}: {message}");
+    }
+    // A URL that does not parse, which a mirror served, is not shown.
+    let hidden = external(
+        "lib",
+        "https://[hostsentinel/",
+        b"jar",
+        b"<project>third</project>",
+    );
+    let message = merge_companion_pom(
+        &mut aggregate,
+        &hidden.coordinate,
+        hidden.artifact.as_ref().expect("artifact"),
+        &darwin,
+        "lib/pom.xml",
+    )
+    .expect_err("differing bytes must fail the sync")
+    .to_string();
+    assert!(!message.contains("hostsentinel"), "{message}");
+}
+
+/// A module that read no POM, from a repository that lacks it, beside one
+/// that read it: Maven's local repository holds that one, so the
+/// coordinate has it, and other bytes still conflict with it.
+#[test]
+fn no_companion_pom_beside_one_is_that_one() {
+    let linux = linux();
+    let url = "https://repo.example/maven2/";
+    let mut none = external("lib", url, b"jar", b"");
+    none.artifact.as_mut().expect("artifact").companion_pom = None;
+    let some = external(
+        "lib",
+        "https://other.example/",
+        b"jar",
+        b"<project>one</project>",
+    );
+    let other = external("lib", url, b"jar", b"<project>two</project>");
+    for order in [[&none, &some], [&some, &none]] {
+        let mut aggregate = BTreeMap::new();
+        for (package, module) in order.into_iter().zip(["a/pom.xml", "b/pom.xml"]) {
+            let artifact = package.artifact.as_ref().expect("artifact");
+            merge_companion_pom(
+                &mut aggregate,
+                &package.coordinate,
+                artifact,
+                &linux,
+                module,
+            )
+            .expect("no POM beside one");
+        }
+        let artifact = other.artifact.as_ref().expect("artifact");
+        merge_companion_pom(
+            &mut aggregate,
+            &other.coordinate,
+            artifact,
+            &linux,
+            "c/pom.xml",
+        )
+        .expect_err("other bytes conflict");
     }
 }
 
@@ -367,4 +445,23 @@ fn timestamped_snapshot_row_records_its_build() {
     );
     assert_eq!(artifact.file_version(), timestamped);
     assert_eq!(artifact.pom_sha256.as_ref(), Some(&pom));
+}
+
+#[test]
+fn a_carried_pom_keeps_the_build_it_was_read_at() {
+    let coordinate = ArtifactCoord::new("t", "s", "1.0-SNAPSHOT", "jar", None);
+    let stamp = |build| rv_maven_types::SnapshotStamp::new("20240101.010101", build);
+    let mut row = LockArtifact::new(coordinate.clone(), "https://a.example/");
+    row.snapshot = stamp(1);
+    let mut other = LockArtifact::new(coordinate, "https://b.example/");
+    other.snapshot = stamp(2);
+    other.pom_sha256 = Some(Sha256::from_bytes(b"pom"));
+    carry_pom(&mut row, &other);
+    assert_eq!(row.pom_build(), stamp(2).as_ref());
+    assert_eq!(row.pom_sha256, other.pom_sha256);
+    other.pom_base = true;
+    let mut base = LockArtifact::new(row.coordinate.clone(), "https://a.example/");
+    base.snapshot = stamp(1);
+    carry_pom(&mut base, &other);
+    assert!(base.pom_base && base.pom_build().is_none());
 }

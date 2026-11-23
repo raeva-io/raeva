@@ -23,7 +23,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 use crate::common::{
-    assert_success, cli_command_dirs, raeva_command, sha256_hex, write_empty_pom, write_repo_toml,
+    assert_success, cli_command_dirs, raeva_command, write_empty_pom, write_repo_toml,
 };
 
 /// Snapshot names a case below writes, from each `Env::check` call in this file.
@@ -161,8 +161,9 @@ fn host_platform() -> String {
 }
 
 /// Keys whose values change from run to run, replaced by a placeholder that
-/// still records the value's JSON type.
-const VOLATILE_KEYS: &[&str] = &["duration_ms", "last_modified", "query_timestamp"];
+/// still records the value's JSON type. A seed key names the raeva version
+/// and the host platform, and its digest covers them.
+const VOLATILE_KEYS: &[&str] = &["duration_ms", "key", "last_modified", "query_timestamp"];
 
 /// The SBOM serial number: a UUID derived from the raeva version and the
 /// platform as well as the content, so it changes with every release and
@@ -258,7 +259,9 @@ fn normalize_string(text: String, replacements: &[(String, String)]) -> String {
     if text == env!("CARGO_PKG_VERSION") {
         return "<raeva-version>".to_string();
     }
-    let mut out = text;
+    // The CI snippet `raeva doctor` prints names the version to install.
+    let version = format!("raeva {} ", env!("CARGO_PKG_VERSION"));
+    let mut out = text.replace(&version, "raeva <raeva-version> ");
     for (from, to) in replacements {
         out = out.replace(from.as_str(), to);
     }
@@ -556,6 +559,49 @@ fn lock_info_success() {
 }
 
 #[test]
+fn seed_save_and_restore() {
+    let env = Env::new();
+    env.synced_project();
+    let seed = env.base.path().join("seed");
+    let seed = seed.to_str().expect("UTF-8 path");
+    env.check("seed-key/success", &env.run(&["seed", "key"]));
+    env.check("seed-save/success", &env.run(&["seed", "save", seed]));
+    env.check("seed-restore/success", &env.run(&["seed", "restore", seed]));
+}
+
+#[test]
+fn seed_key_no_lock() {
+    let env = Env::new();
+    write_empty_pom(&env.project().join("pom.xml"));
+    env.check("seed-key/no-lock", &env.run(&["seed", "key"]));
+}
+
+#[test]
+fn seed_save_without_the_files() {
+    let env = Env::new();
+    env.synced_project();
+    fs::remove_dir_all(env.home()).expect("remove the store");
+    fs::create_dir_all(env.home()).expect("recreate home");
+    let seed = env.base.path().join("seed");
+    env.check(
+        "seed-save/missing-blobs",
+        &env.run(&["seed", "save", seed.to_str().expect("UTF-8 path")]),
+    );
+}
+
+#[test]
+fn seed_restore_without_a_seed() {
+    let env = Env::new();
+    env.synced_project();
+    let empty = env.base.path().join("empty");
+    fs::create_dir_all(&empty).expect("create empty dir");
+    env.check(
+        "seed-restore/no-seed",
+        &env.run(&["seed", "restore", empty.to_str().expect("UTF-8 path")]),
+    );
+}
+
+#[test]
 fn lock_info_no_lock() {
     let env = Env::new();
     write_empty_pom(&env.project().join("pom.xml"));
@@ -575,6 +621,24 @@ fn lock_diff_success() {
     }
     env.check(
         "lock-diff/success",
+        &env.run(&["lock", "diff", old.to_str().unwrap()]),
+    );
+}
+
+/// A BOM bump leads with the BOM, both versions and the packages it moved.
+#[test]
+fn lock_diff_causes() {
+    let env = Env::new();
+    let old = env.project().join("old.lock");
+    for (fixture, destination) in [
+        ("lock-diff/bom-before.lock", old.clone()),
+        ("lock-diff/bom-after.lock", env.project().join("raeva.lock")),
+    ] {
+        let text = fs::read_to_string(fixtures::path(fixture)).unwrap();
+        fs::write(destination, text.replace("linux-x86_64", &host_platform())).unwrap();
+    }
+    env.check(
+        "lock-diff/causes",
         &env.run(&["lock", "diff", old.to_str().unwrap()]),
     );
 }
@@ -606,6 +670,22 @@ fn export_m2_dry_run() {
     ]);
     env.check("export-m2/dry-run", &output);
     assert!(!m2.exists(), "a dry run must not create the repository");
+}
+
+#[test]
+fn export_m2_unfinished() {
+    let env = Env::new();
+    env.synced_project();
+    let m2 = env.base.path().join("m2");
+    fs::create_dir_all(&m2).unwrap();
+    fs::write(m2.join(".raeva-export-unfinished"), "").unwrap();
+    let output = env.run(&[
+        "export-m2",
+        "--dry-run",
+        "--m2-path",
+        m2.to_str().expect("utf-8"),
+    ]);
+    env.check("export-m2/unfinished", &output);
 }
 
 #[test]
@@ -797,15 +877,15 @@ fn vuln_osv_error() {
 #[test]
 fn doctor_reachable() {
     let mut env = Env::new();
+    // A repository of its own, so the project checks do not depend on
+    // where the temporary directory is.
+    fs::create_dir(env.base.path().join(".git")).unwrap();
     write_empty_pom(&env.project().join("pom.xml"));
     let metadata = "<metadata><groupId>org.apache</groupId><artifactId>maven</artifactId>\
                     <versioning><versions><version>1.0</version></versions></versioning></metadata>";
-    let server = env.stub(move |request| match request.path.as_str() {
-        "/maven2/org/apache/maven/maven-metadata.xml" => Response::new(200, metadata),
-        "/maven2/org/apache/maven/maven-metadata.xml.sha256" => {
-            Response::new(200, sha256_hex(metadata.as_bytes()))
-        }
-        _ => Response::new(404, ""),
+    let server = env.stub(move |request| {
+        let listing = "/maven2/org/apache/maven/maven-metadata.xml";
+        crate::common::with_sha256(&request.path, [(listing, metadata)])
     });
     write_repo_toml(
         &env.project(),
@@ -814,6 +894,19 @@ fn doctor_reachable() {
     );
     env.check("doctor/reachable", &env.run(&["doctor"]));
     server.stop();
+}
+
+#[test]
+fn doctor_offline() {
+    let env = Env::new();
+    fs::create_dir(env.base.path().join(".git")).unwrap();
+    env.single_module_project();
+    fs::write(
+        env.base.path().join(".gitattributes"),
+        "raeva.lock linguist-generated=true\n",
+    )
+    .unwrap();
+    env.check("doctor/offline", &env.run(&["--offline", "doctor"]));
 }
 
 #[test]

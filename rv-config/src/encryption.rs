@@ -34,13 +34,6 @@ struct SecurityXml {
 impl SecuritySettings {
     const MAX_RELOCATION_DEPTH: usize = 10;
 
-    pub(crate) fn load_default() -> Result<Option<Self>, ConfigError> {
-        let Some(path) = default_security_path() else {
-            return Ok(None);
-        };
-        Self::load(&path)
-    }
-
     pub(crate) fn load(path: &Path) -> Result<Option<Self>, ConfigError> {
         Self::load_with_depth(path, 0).map_err(|err| match err {
             ConfigError::Invalid { .. } => err,
@@ -52,10 +45,20 @@ impl SecuritySettings {
         if depth > Self::MAX_RELOCATION_DEPTH {
             return Err(ConfigError::RelocationDepthExceeded);
         }
-        let Some(content) = crate::maven_settings::read_settings_text(path)
-            .map_err(|message| invalid(path, message))?
-        else {
-            return Ok(None);
+        // Maven's sec-dispatcher reads the file only to decrypt, and a file
+        // it cannot read decrypts nothing, so raeva reads one as none.
+        let content = match crate::maven_settings::read_settings_text(path) {
+            Ok(Some(content)) => content,
+            Ok(None) => return Ok(None),
+            Err(message) if message.starts_with(crate::maven_settings::UNREADABLE) => {
+                tracing::warn!(
+                    sec_code = "SETTING_IGNORED",
+                    "cannot read {}; encrypted passwords will not be decrypted",
+                    path.display()
+                );
+                return Ok(None);
+            }
+            Err(message) => return Err(invalid(path, message)),
         };
         Self::parse_with_depth(&content, depth, path.parent()).map_err(|err| match err {
             ConfigError::InvalidSettings(message) => invalid(path, message),
@@ -73,6 +76,7 @@ impl SecuritySettings {
         depth: usize,
         base_dir: Option<&Path>,
     ) -> Result<Option<Self>, ConfigError> {
+        crate::prime::register_credential_text(xml, &[], &|_| None);
         let (xml, _) = harden_xml(xml)?;
         // A malformed file counts as none. Its parse error stays out of the
         // warning: the file holds the master password.
@@ -92,6 +96,16 @@ impl SecuritySettings {
                 .filter(|value| !value.is_empty())
         };
         let mut master = non_empty(parsed.master);
+        // The master password, as written and decrypted.
+        if let Some(master) = &master {
+            crate::redact::register_secret(master);
+            if let Some(plain) = (is_encrypted(master))
+                .then(|| decrypt_maven_password(master, "settings.security"))
+                .flatten()
+            {
+                crate::redact::register_secret(&plain);
+            }
+        }
         let Some(relocation) = non_empty(parsed.relocation).map(PathBuf::from) else {
             return Ok(master.map(|master| Self {
                 master: Some(master),
@@ -115,10 +129,6 @@ fn invalid(path: &Path, message: String) -> ConfigError {
         origin: ConfigOrigin::MavenSettingsSecurity(path.to_path_buf()),
         message,
     }
-}
-
-pub(crate) fn default_security_path() -> Option<PathBuf> {
-    crate::paths::maven_user_home().map(|home| home.join(".m2").join("settings-security.xml"))
 }
 
 /// Extracts the brace-delimited cipher payload from a possibly decorated value.
@@ -210,7 +220,7 @@ pub(crate) fn decrypt_password(
         return Ok(password.to_string());
     }
     let Some(settings) = security else {
-        return Err("no settings-security.xml was found");
+        return Err("no settings-security.xml with a master password was read");
     };
     let Some(master) = settings.master.as_deref() else {
         return Err("settings-security.xml has no master password");
@@ -409,12 +419,45 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         assert!(SecuritySettings::load(&path).unwrap().is_none());
+    }
+
+    /// Maven's sec-dispatcher reads the file only to decrypt a password, and
+    /// decrypts nothing when it cannot read it, so the build goes on.
+    #[test]
+    fn a_security_file_raeva_cannot_read_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings-security.xml");
         fs::create_dir(&path).unwrap();
-        let message = SecuritySettings::load(&path).unwrap_err().to_string();
-        let prefix = format!(
-            "invalid Maven settings security file {}: cannot read it: ",
-            path.display()
-        );
-        assert!(message.starts_with(&prefix), "{message}");
+        assert!(SecuritySettings::load(&path).unwrap().is_none());
+        fs::remove_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(
+                &path,
+                "<settingsSecurity><master>m</master></settingsSecurity>",
+            )
+            .unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            // A process that may override file modes, such as root in a user
+            // namespace, reads it anyway.
+            if fs::read(&path).is_err() {
+                assert!(SecuritySettings::load(&path).unwrap().is_none());
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let hidden = dir.path().join("hidden");
+            fs::create_dir(&hidden).unwrap();
+            let inside = hidden.join("settings-security.xml");
+            fs::write(
+                &inside,
+                "<settingsSecurity><master>m</master></settingsSecurity>",
+            )
+            .unwrap();
+            fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+            if fs::metadata(&inside).is_err() {
+                assert!(SecuritySettings::load(&inside).unwrap().is_none());
+            }
+            fs::set_permissions(&hidden, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 }

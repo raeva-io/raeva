@@ -1,22 +1,27 @@
 //! The model source one effective-model build reads its parents and
 //! imported BOMs from.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rv_maven_model::{
     ImportCoord, ImportedBom, ModelPolicy, ModelSource, Parent, ParentLookup, Pom, PomError,
     Project, Provenance, parent_has_expression,
 };
-use rv_maven_types::{Coord, Version, VersionReq};
+use rv_maven_types::{Coord, MavenMode, Version, VersionReq};
 
 use crate::context::{MissingParentKey, RepoContext};
 use crate::error::ResolveError;
 use crate::parent_resolver::LocalParents;
+use crate::solver::Backend;
 use crate::util::lock;
 
 use super::ModelService;
-use super::backend::SupportPom;
+use super::backend::{
+    ModelCache, ModelKey, ModelTag, PomGav, RangeListing, SupportPom, pom_gav, repo_key,
+};
+use super::model_list::{self, Added, Entry, ModelBuild, Reach};
+use super::reactor_models::{Flight, KeptImports};
 
 /// Whether the POM's `<repositories>` bypass the security gate. Root POMs
 /// are user-authored and always trusted; transitive POMs go through
@@ -50,6 +55,9 @@ pub(super) struct ModelScope<'a> {
     /// repositories its lineage declares. They serve that BOM's parents and
     /// nested imports only, as Maven's copy of the model resolver does.
     import_repos: Mutex<Vec<BuildRepos>>,
+    /// The mirror routes of the build's repositories as written, then of
+    /// each imported BOM's build, innermost last.
+    routes: Mutex<Vec<Routes>>,
     /// One entry per imported BOM being built, innermost last: the context
     /// it started in and the local parent lookups its build made.
     import_builds: Mutex<Vec<ImportBuild>>,
@@ -60,9 +68,49 @@ pub(super) struct ModelScope<'a> {
     /// Where the BOM [`ModelSource::import`] last read starts in the reads
     /// of the innermost build.
     import_start: Mutex<usize>,
-    /// The support POMs of the BOM [`ModelSource::reuse_import`] last
-    /// returned.
-    offered_reads: Mutex<Vec<Arc<SupportPom>>>,
+    /// The BOM [`ModelSource::cached_import`] or
+    /// [`ModelSource::reuse_import`] last returned, and its coordinates.
+    offered: Mutex<Option<(PomGav, Arc<KeptImport>)>>,
+    /// Whether the BOM [`ModelSource::import`] last read came from Maven's
+    /// model cache, for the build [`ModelSource::enter_import`] starts.
+    import_borrowed: Mutex<bool>,
+    /// The import builds this scope claimed; see `ModelScope::reuse_import`.
+    claims: Claims,
+}
+
+/// The import builds a scope claimed in [`KeptImports`], by key, with the
+/// depth of the build that imports each, outermost first. All land when
+/// the scope is dropped, as when a failed or cancelled build drops it.
+struct Claims {
+    imports: Arc<KeptImports>,
+    owner: usize,
+    held: Mutex<Vec<(String, usize)>>,
+}
+
+impl Claims {
+    fn new(imports: &Arc<KeptImports>) -> Self {
+        static OWNERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        Self {
+            imports: Arc::clone(imports),
+            owner: OWNERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            held: Mutex::default(),
+        }
+    }
+
+    /// Land the claims of the builds at `depth` or deeper, which have
+    /// ended once the scope asks about another import at `depth`.
+    fn land_from(&self, depth: usize) {
+        let mut held = lock(&self.held);
+        while let Some((key, _)) = held.pop_if(|(_, at)| *at >= depth) {
+            self.imports.land(&key, self.owner);
+        }
+    }
+}
+
+impl Drop for Claims {
+    fn drop(&mut self) {
+        self.land_from(0);
+    }
 }
 
 /// The local parent lookups a build made, each once however many nested
@@ -78,6 +126,8 @@ type LocalLookups = HashMap<Parent, Option<Pom>>;
 struct Reads {
     poms: Vec<Arc<SupportPom>>,
     held: HashSet<usize>,
+    /// See [`ModelScope::borrowed`].
+    borrowed: bool,
 }
 
 impl Reads {
@@ -102,6 +152,12 @@ struct ImportBuild {
     logged_from: Option<usize>,
     /// Whether a nested BOM the build reused had logged anything.
     logged: bool,
+    /// Where the build's own reads start in `reads`, after the BOM's POM.
+    own_from: usize,
+    /// Each support POM the build and its nested imports read, by
+    /// `g:a:v`, with each repository an imported BOM declared that the
+    /// read searched.
+    searched: Vec<(String, rv_repo::Repository)>,
 }
 
 /// What a resolution keeps of an imported BOM: its contribution, the
@@ -113,6 +169,8 @@ pub(super) struct KeptImport {
     support_poms: Vec<Arc<SupportPom>>,
     /// Whether the build, or a nested build it reused, logged anything.
     pub(super) logged: bool,
+    /// See [`ImportBuild::searched`].
+    searched: Vec<(String, rv_repo::Repository)>,
 }
 
 impl<'a> ModelScope<'a> {
@@ -141,11 +199,14 @@ impl<'a> ModelScope<'a> {
             repo_ctx: RepoContext::default(),
             build_repos: Mutex::default(),
             import_repos: Mutex::default(),
+            routes: Mutex::new(vec![Routes::default()]),
             import_builds: Mutex::default(),
             left_import: Mutex::default(),
             reads: Mutex::default(),
             import_start: Mutex::default(),
-            offered_reads: Mutex::default(),
+            offered: Mutex::default(),
+            import_borrowed: Mutex::default(),
+            claims: Claims::new(&backend.kept_imports),
         }
     }
 
@@ -187,6 +248,7 @@ impl<'a> ModelScope<'a> {
         &self,
         coord: Coord,
         inherited: bool,
+        model: Option<ModelKey>,
     ) -> Result<Option<Pom>, ResolveError> {
         let reactor_side = self.trust == RepoTrust::Root;
         if let Some(pom) = self.backend.workspace_pom_for_coord(&coord, reactor_side) {
@@ -195,44 +257,139 @@ impl<'a> ModelScope<'a> {
             }
             return Ok(Some(pom));
         }
-        self.fetch_remote(coord).await
+        self.fetch_remote(coord, false, model).await
     }
 
-    async fn fetch_remote(&self, coord: Coord) -> Result<Option<Pom>, ResolveError> {
+    /// `coord`'s POM from the repositories, else from Maven's model cache
+    /// under `model`. A parent of the project keeps its plugin sections,
+    /// which a project build checks.
+    async fn fetch_remote(
+        &self,
+        coord: Coord,
+        project_parent: bool,
+        model: Option<ModelKey>,
+    ) -> Result<Option<Pom>, ResolveError> {
+        let build = self.model_build();
+        let entries = self.backend.model_entries(&self.repo_ctx, &build);
+        let search = model_list::search(&entries, coord.version.as_str());
+        let searched = search.before;
+        if let Some(unread) = search.unread {
+            let fetched =
+                (self.before_unread(&coord, model, searched, unread, search.central)).await?;
+            if let Some(refusal) = self.mirrored_import_refusal(&fetched) {
+                return Err(refusal);
+            }
+            self.backend.learn_models(std::slice::from_ref(&fetched));
+            return self
+                .parse_fetched(&coord, fetched, project_parent)
+                .map(Some);
+        }
         let ctx = &self.backend.ctx;
-        let build_repos = self.build_repos();
-        let search_ctx = self
-            .backend
-            .parent_search_context(&self.repo_ctx, &build_repos);
+        let search_ctx = self.backend.parent_search_context(&self.repo_ctx, &build);
         let missing_key = missing_key(&coord, &search_ctx);
-        if ctx.is_parent_missing(&missing_key) {
+        let mut failed = None;
+        let fetched = if ctx.is_parent_missing(&missing_key) {
             tracing::debug!(
                 group_id = %coord.group_id,
                 artifact_id = %coord.artifact_id,
                 version = %coord.version,
                 "Parent POM known to be missing (cached)"
             );
-            return Ok(None);
-        }
-
-        let fetched = match self
-            .backend
-            .fetch_pom_bytes(&coord, &self.repo_ctx, &build_repos)
-            .await
-        {
-            Ok(fetched) => fetched,
-            Err(ResolveError::ArtifactNotFound { .. }) => {
-                ctx.mark_parent_missing(missing_key);
-                tracing::debug!(
-                    group_id = %coord.group_id,
-                    artifact_id = %coord.artifact_id,
-                    version = %coord.version,
-                    "Parent POM not found, caching as missing"
-                );
-                return Ok(None);
+            None
+        } else {
+            match self
+                .backend
+                .fetch_pom_bytes_from(&coord, searched, model.clone())
+                .await
+            {
+                Ok(fetched) => Some(fetched),
+                Err(ResolveError::ArtifactNotFound { searched, .. }) => {
+                    ctx.mark_parent_missing(missing_key, searched);
+                    tracing::debug!(
+                        group_id = %coord.group_id,
+                        artifact_id = %coord.artifact_id,
+                        version = %coord.version,
+                        "Parent POM not found, caching as missing"
+                    );
+                    None
+                }
+                // Maven looks in its model cache before it fetches.
+                Err(error) => {
+                    failed = Some(error);
+                    None
+                }
             }
-            Err(error) => return Err(error),
         };
+        let fetched = match fetched {
+            Some(fetched) => {
+                if let Some(refusal) = self.mirrored_import_refusal(&fetched) {
+                    return Err(refusal);
+                }
+                self.backend.learn_models(std::slice::from_ref(&fetched));
+                fetched
+            }
+            None => {
+                let cached = match &model {
+                    Some(key) => self.cached(key).await,
+                    None => None,
+                };
+                let Some(fetched) = cached else {
+                    return failed.map_or(Ok(None), Err);
+                };
+                self.note_borrowed();
+                self.backend
+                    .record_support_poms(std::slice::from_ref(&fetched))
+                    .await?;
+                fetched
+            }
+        };
+        self.parse_fetched(&coord, fetched, project_parent)
+            .map(Some)
+    }
+
+    /// Whether the build took a POM from Maven's model cache that its own
+    /// repositories lack: what it built then depends on what this module
+    /// read before.
+    pub(super) fn borrowed(&self) -> bool {
+        lock(&self.reads).borrowed
+    }
+
+    async fn cached(&self, key: &ModelKey) -> Option<Arc<SupportPom>> {
+        let own = lock(&self.backend.read_models).poms.get(key).cloned();
+        match own {
+            Some(pom) => Some(pom),
+            None => {
+                self.session_model(|models| models.poms.get(key).cloned())
+                    .await
+            }
+        }
+    }
+
+    /// What the reactor's model cache gives `find`. Another module may wait
+    /// for an import build this scope claimed while this one waits for it.
+    async fn session_model<T>(&self, find: impl Fn(&ModelCache) -> Option<T>) -> Option<T> {
+        self.claims.land_from(0);
+        self.backend.session_model(find).await
+    }
+
+    /// Keeps what this build makes, which depends on what the module read
+    /// before, with the module.
+    fn note_borrowed(&self) {
+        for build in lock(&self.import_builds).iter_mut() {
+            build.reads.borrowed = true;
+        }
+        lock(&self.reads).borrowed = true;
+        *lock(&self.import_borrowed) = true;
+    }
+}
+
+impl ModelScope<'_> {
+    fn parse_fetched(
+        &self,
+        coord: &Coord,
+        fetched: Arc<SupportPom>,
+        project_parent: bool,
+    ) -> Result<Pom, ResolveError> {
         let unparseable = |source: PomError| match source {
             _ if source.is_malformed_xml() => PomError::UnparseablePom {
                 coord: coord.to_string(),
@@ -241,18 +398,17 @@ impl<'a> ModelScope<'a> {
             PomError::UnsupportedEncoding(_) | PomError::Ebcdic(_) => source,
             _ => PomError::InvalidModel(format!("{coord}: {source}")),
         };
-        let mut pom = ctx
-            .parsed_poms()
-            .parse(&fetched.blob, &fetched.bytes)
-            .map(Arc::unwrap_or_clone)
-            .map_err(unparseable)?;
+        let parsed_poms = self.backend.ctx.parsed_poms();
+        let parsed = match project_parent {
+            true => parsed_poms.parse_project(&fetched.blob, &fetched.bytes),
+            false => parsed_poms.parse(&fetched.blob, &fetched.bytes),
+        };
+        let mut pom = parsed.map(Arc::unwrap_or_clone).map_err(unparseable)?;
         without_local_parent(&mut pom);
         self.add_reads([fetched]);
-        Ok(Some(pom))
+        Ok(pom)
     }
-}
 
-impl ModelScope<'_> {
     /// Everything this scope's answers for an import's lookups depend on
     /// besides the import and the local parents: the trust its
     /// repositories get and the repositories it searches.
@@ -263,7 +419,7 @@ impl ModelScope<'_> {
             self.backend.root_repos_snapshot(),
             self.backend.root_repo_ids_snapshot(),
             self.repo_ctx.as_slice(),
-            self.build_repos()
+            self.model_build()
         )
     }
 
@@ -289,11 +445,13 @@ impl ModelScope<'_> {
     /// Maven requires to have an upper bound. As in Maven, a project model's
     /// range sees the repositories only, since the reactor is not known yet,
     /// and a range of one version names it without a version list.
+    /// The parent `range` takes, and what the repositories listed for it,
+    /// unless the range names a single version, which reads no list.
     async fn range_coord(
         &self,
         parent: &Parent,
         range: &VersionReq,
-    ) -> Result<Coord, ResolveError> {
+    ) -> Result<(Coord, Option<RangeListing>), ResolveError> {
         let coord = |version| Coord {
             group_id: parent.group_id.clone().into(),
             artifact_id: parent.artifact_id.clone().into(),
@@ -301,10 +459,15 @@ impl ModelScope<'_> {
             packaging: Some("pom".to_string()),
             classifier: None,
         };
-        if let Some(version) = range.exact_version() {
-            return Ok(coord(version.clone()));
+        if let Some(version) = range.exact_version_in(self.backend.mode()) {
+            return Ok((coord(version.clone()), None));
         }
         let not_found = || {
+            let ctx = &self.backend.ctx;
+            let (group, artifact) = (&parent.group_id, &parent.artifact_id);
+            if let Some(searched) = ctx.listing_miss(group, artifact) {
+                ctx.note_model_miss((group, artifact, &parent.version), searched);
+            }
             PomError::ParentNotFound(
                 parent.group_id.clone(),
                 parent.artifact_id.clone(),
@@ -325,31 +488,51 @@ impl ModelScope<'_> {
             )
             .into());
         }
-        let version = self
+        // Maven lists the versions in every repository it searches, so one
+        // raeva does not read ahead of one it reads may list another.
+        let entries = (self.backend).model_entries(&self.repo_ctx, &self.model_build());
+        if let Some(unread) = (["1", "1-SNAPSHOT"].into_iter())
+            .find_map(|version| model_list::search(&entries, version).unread)
+        {
+            let (group, artifact) = (&parent.group_id, &parent.artifact_id);
+            let pom = format!("{group}:{artifact}:{}", parent.version);
+            return Err(self.unread_refusal(pom, unread));
+        }
+        let (version, listing) = self
             .backend
             .parent_range_version(
                 &parent.group_id,
                 &parent.artifact_id,
                 range,
                 &self.repo_ctx,
-                &self.build_repos(),
+                &self.model_build(),
                 self.trust == RepoTrust::Transitive,
             )
-            .await?
-            .ok_or_else(not_found)?;
-        Ok(coord(version))
+            .await?;
+        let version = version.ok_or_else(not_found)?;
+        Ok((coord(version), Some(listing)))
     }
 
-    /// The repositories this build has declared, searched after the shared
-    /// ones: the build's own, then each imported BOM's being built.
-    fn build_repos(&self) -> Vec<rv_repo::Repository> {
-        let mut build_repos = lock(&self.build_repos).repos.clone();
-        build_repos.extend(
-            lock(&self.import_repos)
-                .iter()
-                .flat_map(|list| list.repos.iter().cloned()),
-        );
-        build_repos
+    /// The declarations this build's model resolvers were handed: the
+    /// build's own, then each imported BOM's being built.
+    fn model_build(&self) -> ModelBuild {
+        let mut added = lock(&self.build_repos).added.clone();
+        added.extend((lock(&self.import_repos).iter()).flat_map(|list| list.added.iter().cloned()));
+        ModelBuild {
+            project: self.trust == RepoTrust::Root,
+            added,
+        }
+    }
+
+    /// Mark the innermost build's lineage read: Maven reads its imports
+    /// through its effective model's repositories, which end with the super
+    /// POM's `central`. A project's own are the root list's.
+    fn end_lineage(&self) {
+        match lock(&self.import_repos).last_mut() {
+            Some(list) => list.effective(),
+            None if self.trust == RepoTrust::Transitive => lock(&self.build_repos).effective(),
+            None => {}
+        }
     }
 }
 
@@ -389,11 +572,31 @@ pub(crate) fn parent_coord(parent: &Parent) -> Result<Coord, PomError> {
     )
 }
 
+/// The key of a build of the import `key` under way: `key` and the
+/// importer's properties, as a build for an importer with others would not
+/// fit; see [`ModelSource::reuse_import`].
+fn flight_key(key: &str, importer: &rv_maven_model::ActivationContext) -> String {
+    let mut properties: Vec<_> = importer.properties.iter().collect();
+    properties.sort_unstable();
+    let mut system_properties: Vec<_> = importer.system_properties.iter().collect();
+    system_properties.sort_unstable();
+    format!("{key}\n{properties:?}\n{system_properties:?}")
+}
+
 /// Make `kept` the last of `builds`. A build that logged is dropped once
 /// another is last, as only the last is reused whatever it logged.
 fn keep_last(builds: &mut Vec<Arc<KeptImport>>, kept: Arc<KeptImport>) {
     builds.retain(|other| !other.logged);
     builds.push(kept);
+}
+
+/// The coordinates Maven's model cache keys `bom` by.
+fn bom_gav(bom: ImportCoord<'_>) -> PomGav {
+    (
+        bom.group_id.to_string(),
+        bom.artifact_id.to_string(),
+        bom.version.to_string(),
+    )
 }
 
 fn import_coord(bom: ImportCoord<'_>) -> Result<Coord, PomError> {
@@ -418,6 +621,12 @@ impl ModelSource for ModelScope<'_> {
         parent: &mut Parent,
         lookup: ParentLookup,
     ) -> Result<Option<Pom>, ResolveError> {
+        // Maven reads a POM from a repository, and so its parents' paths,
+        // leniently.
+        if (self.trust, lookup) == (RepoTrust::Root, ParentLookup::Project) {
+            (self.local.check_strictly(parent, false))
+                .map_err(|(path, source)| ResolveError::LocalPom { path, source })?;
+        }
         if let Some(mut pom) = self.load_local(parent) {
             if self.trust == RepoTrust::Root {
                 pom.mark_root_repositories();
@@ -429,39 +638,149 @@ impl ModelSource for ModelScope<'_> {
             // the model layer reports why.
             return Ok(None);
         }
-        let coord = match rv_maven_model::parent_version_range(parent) {
+        let named = (
+            parent.group_id.clone(),
+            parent.artifact_id.clone(),
+            parent.version.clone(),
+        );
+        let declared = parent.version.clone();
+        let range = rv_maven_model::parent_version_range(parent, self.backend.mode());
+        let ranged = range.is_some();
+        let (coord, model) = match range {
+            // Maven caches a ranged parent by the range text and looks there
+            // before it resolves the range: the version this module read
+            // first under it stays.
             Some(range) => {
-                let coord = self.range_coord(parent, &range).await?;
-                parent.version = coord.version.to_string();
-                coord
+                let key = (named, ModelTag::Parent);
+                self.note_borrowed();
+                let own = lock(&self.backend.read_models).range_version(&key);
+                let cached = match own {
+                    Some(version) => Some(version),
+                    None => {
+                        let version =
+                            (self.session_model(|models| models.range_version(&key))).await;
+                        // The list the session's read saw, which the lock
+                        // records for this module too.
+                        let listing = (self
+                            .session_model(|models| models.range_listings.get(&key.0).cloned()))
+                        .await;
+                        if let Some(listing) = listing.filter(|_| version.is_some()) {
+                            (lock(&self.backend.read_models).range_listings)
+                                .entry(key.0.clone())
+                                .or_insert(listing);
+                        }
+                        version
+                    }
+                };
+                let coord = match cached {
+                    Some(version) => {
+                        parent.version = version;
+                        parent_coord(parent)?
+                    }
+                    None => {
+                        let (coord, listing) = self.range_coord(parent, &range).await?;
+                        if let Some(listing) = listing {
+                            (lock(&self.backend.read_models).range_listings)
+                                .entry(key.0.clone())
+                                .or_insert_with(|| Arc::new(listing));
+                        }
+                        parent.version = coord.version.to_string();
+                        let workspace =
+                            lookup == ParentLookup::Import || self.trust == RepoTrust::Transitive;
+                        if workspace && self.backend.workspace_module_for_coord(&coord).is_some() {
+                            (lock(&self.backend.read_models).reactor_ranges)
+                                .entry(key.0.clone())
+                                .or_insert_with(|| parent.version.clone());
+                        }
+                        coord
+                    }
+                };
+                (coord, Some(key))
             }
-            None => parent_coord(parent)?,
+            None => (parent_coord(parent)?, Some((named, ModelTag::Parent))),
         };
+        let mirrored = lock(&self.routes).last().is_some_and(Routes::mirrored);
+        let from_workspace = (self.trust, lookup) != (RepoTrust::Root, ParentLookup::Project)
+            && self.backend.workspace_module_for_coord(&coord).is_some();
+        if mirrored && !from_workspace {
+            let ahead = match ranged {
+                true => None,
+                false => (self.ahead_of_kept_mirrors(&coord, model.clone(), false)).await?,
+            };
+            let provenance = match lookup {
+                ParentLookup::Project => Provenance::Dependency,
+                ParentLookup::Import => Provenance::BomImport,
+            };
+            if let Some(pom) = ahead {
+                return Ok(fetched_from_repository(Some(pom), provenance));
+            }
+            if let Some(routes) = lock(&self.routes).last_mut() {
+                routes.consult();
+            }
+        }
+        let looked_up = coord.version.to_string();
         let (pom, provenance) = match (self.trust, lookup) {
             (RepoTrust::Root, ParentLookup::Project) => (
-                self.fetch_remote(coord).await?,
+                self.fetch_remote(coord, true, model).await?,
                 Provenance::RemoteParentOfRoot,
             ),
-            (RepoTrust::Transitive, ParentLookup::Project) => (
-                self.fetch_with_workspace(coord, false).await?,
-                Provenance::Dependency,
-            ),
+            (RepoTrust::Transitive, ParentLookup::Project) => {
+                let pom = self.fetch_with_workspace(coord, false, model).await?;
+                if pom.is_none()
+                    && !from_workspace
+                    && let Some(error) = (lock(&self.routes).last()).and_then(|routes| {
+                        routes.parent_behind_mirror(
+                            &self.backend.ctx.config,
+                            format!("{}:{}:{declared}", parent.group_id, parent.artifact_id),
+                        )
+                    })
+                {
+                    return Err(error);
+                }
+                (pom, Provenance::Dependency)
+            }
             (_, ParentLookup::Import) => (
-                self.fetch_with_workspace(coord, true).await?,
+                self.fetch_with_workspace(coord, true, model).await?,
                 Provenance::BomImport,
             ),
         };
+        // The error names the parent by the range it declares.
+        if pom.is_none() && looked_up != declared {
+            let ctx = &self.backend.ctx;
+            let (group, artifact) = (&parent.group_id, &parent.artifact_id);
+            if let Some(searched) = ctx.model_miss((group, artifact, &looked_up)) {
+                ctx.note_model_miss((group, artifact, &declared), searched);
+            }
+        }
         Ok(fetched_from_repository(pom, provenance))
     }
 
     async fn import(&self, bom: ImportCoord<'_>) -> Result<Option<Pom>, ResolveError> {
+        self.backend.lineage_read();
+        self.end_lineage();
         let coord = import_coord(bom)?;
+        *lock(&self.import_borrowed) = false;
         *lock(&self.import_start) = match lock(&self.import_builds).last() {
             Some(build) => build.reads.poms.len(),
             None => lock(&self.reads).poms.len(),
         };
+        // Maven's workspace reader answers before any repository.
+        if let Some(refusal) = self.split_route_refusal()
+            && self.backend.workspace_module_for_coord(&coord).is_none()
+        {
+            let model = Some((pom_gav(&coord), ModelTag::Import));
+            return match self.ahead_of_kept_mirrors(&coord, model, true).await? {
+                Some(pom) => Ok(fetched_from_repository(Some(pom), Provenance::BomImport)),
+                None => Err(refusal),
+            };
+        }
         Ok(fetched_from_repository(
-            self.fetch_with_workspace(coord, false).await?,
+            self.fetch_with_workspace(
+                coord.clone(),
+                false,
+                Some((pom_gav(&coord), ModelTag::Import)),
+            )
+            .await?,
             Provenance::BomImport,
         ))
     }
@@ -488,18 +807,21 @@ impl ModelSource for ModelScope<'_> {
     }
 
     fn observe_repositories(&self, repositories: &[rv_maven_model::Repository]) {
-        self.observe(repositories, false);
+        // Only an interpolated declaration is refused.
+        let _ = self.observe(repositories, false);
     }
 
-    fn observe_effective_repositories(&self, repositories: &[rv_maven_model::Repository]) {
-        self.observe(repositories, true);
+    fn observe_effective_repositories(
+        &self,
+        repositories: &[rv_maven_model::Repository],
+    ) -> Result<(), ResolveError> {
+        self.observe(repositories, true)
     }
 
     fn prefetch_imports(&self, imports: &[ImportCoord<'_>]) {
-        let build_repos = self.build_repos();
-        let search_ctx = self
-            .backend
-            .parent_search_context(&self.repo_ctx, &build_repos);
+        self.end_lineage();
+        let build = self.model_build();
+        let search_ctx = self.backend.parent_search_context(&self.repo_ctx, &build);
         for bom in imports {
             let Ok(coord) = import_coord(*bom) else {
                 continue;
@@ -510,7 +832,7 @@ impl ModelSource for ModelScope<'_> {
                 .is_parent_missing(&missing_key(&coord, &search_ctx))
             {
                 self.backend
-                    .prefetch_pom(&coord, &self.repo_ctx, Some(&build_repos), false);
+                    .prefetch_pom(&coord, &self.repo_ctx, Some(&build), false);
             }
         }
     }
@@ -519,26 +841,59 @@ impl ModelSource for ModelScope<'_> {
         let context = self.import_context();
         let start = *lock(&self.import_start);
         let mut builds = lock(&self.import_builds);
-        let mut reads = Reads::default();
+        let mut reads = Reads {
+            borrowed: std::mem::take(&mut *lock(&self.import_borrowed)),
+            ..Reads::default()
+        };
         match builds.last() {
             Some(outer) => reads.add(outer.reads.poms[start..].iter().cloned()),
             None => reads.add(lock(&self.reads).poms[start..].iter().cloned()),
         }
+        let own_from = reads.poms.len();
         builds.push(ImportBuild {
             context,
             local_lookups: LocalLookups::new(),
             reads,
             logged_from: rv_maven_model::held::mark(),
             logged: false,
+            own_from,
+            searched: Vec::new(),
         });
         lock(&self.import_repos).push(BuildRepos::default());
+        // The build's model resolver is a copy of the importer's, which has
+        // reserved the importer's ids.
+        let mut routes = lock(&self.routes);
+        let written = (routes.last().into_iter())
+            .flat_map(|outer| outer.written.keys().map(|id| (id.clone(), None)))
+            .collect();
+        routes.push(Routes {
+            written,
+            ..Routes::default()
+        });
     }
 
     fn leave_import(&self) {
-        lock(&self.import_repos).pop();
+        // The build read its parents and imports through its own list and
+        // those of the builds it is nested in.
+        let searched: Vec<_> = {
+            lock(&self.routes).pop();
+            let mut lists = lock(&self.import_repos);
+            let own = lists.pop().unwrap_or_default().admitted;
+            (own.into_iter())
+                .chain(lists.iter().flat_map(|list| list.admitted.iter().cloned()))
+                .collect()
+        };
         let mut builds = lock(&self.import_builds);
-        let left = builds.pop();
-        if let Some(left) = &left {
+        let mut left = builds.pop();
+        if let Some(left) = &mut left {
+            let own = (left.reads.poms.iter().skip(left.own_from)).map(|pom| pom.name.clone());
+            let pairs = own.flat_map(|name| {
+                searched
+                    .iter()
+                    .map(move |repo| (name.clone(), repo.clone()))
+            });
+            add_searched(&mut left.searched, pairs.collect());
+            self.backend.note_import_repositories(&left.searched);
             let poms = left.reads.poms.iter().cloned();
             match builds.last_mut() {
                 Some(outer) => {
@@ -548,6 +903,7 @@ impl ModelSource for ModelScope<'_> {
                     );
                     outer.logged |= left.logged;
                     outer.reads.add(poms);
+                    add_searched(&mut outer.searched, left.searched.clone());
                 }
                 None => lock(&self.reads).add(poms),
             }
@@ -569,48 +925,102 @@ impl ModelSource for ModelScope<'_> {
     /// replacing the one before. Another is used only when its build logged
     /// nothing, as building it again would log nothing either; it is then
     /// the last. A build that logged is kept only while it is the last.
-    fn reuse_import(
+    ///
+    /// A scope that finds none claims the build of the BOM for importers
+    /// with the same properties, so the other modules wait for it instead
+    /// of building the BOM at once beside it, then look again. A waiter
+    /// that still finds a build to reuse only in one that logged, or none,
+    /// as after a failed build, builds the BOM itself, logging as its own.
+    /// The claim lands once the build is kept, and otherwise once the scope
+    /// asks for another import at that depth or is dropped.
+    async fn reuse_import(
         &self,
         bom: ImportCoord<'_>,
         policy: ModelPolicy,
-        usable: &dyn Fn(&ImportedBom) -> bool,
+        importer: &rv_maven_model::ActivationContext,
+        usable: &(dyn Fn(&ImportedBom) -> bool + Sync),
     ) -> Option<Arc<ImportedBom>> {
+        // Maven searches the repositories for each build, so one that may
+        // reach a split route, or a repository raeva does not read, is not
+        // shared.
+        self.end_lineage();
+        if self.split_route_refusal().is_some() || self.reads_ahead_of_unread() {
+            return None;
+        }
+        self.backend.lineage_read();
+        let depth = lock(&self.import_builds).len();
+        self.claims.land_from(depth);
         let key = Self::import_key(bom, policy, &self.import_context());
-        let builds = lock(&self.backend.kept_imports.builds).get(&key)?.clone();
-        let fits = |kept: &&Arc<KeptImport>| {
-            usable(&kept.imported)
-                && (kept.local_lookups.iter())
-                    .all(|(parent, found)| self.local.load(parent) == *found)
-        };
-        let kept = match builds.last().filter(fits) {
-            Some(last) => Arc::clone(last),
-            None => {
-                let kept = builds.iter().find(|kept| !kept.logged && fits(kept))?;
-                let mut kept_imports = lock(&self.backend.kept_imports.builds);
-                if let Some(builds) = kept_imports.get_mut(&key)
-                    && let Some(at) = builds.iter().position(|other| Arc::ptr_eq(other, kept))
-                {
-                    let kept = builds.remove(at);
-                    keep_last(builds, kept);
+        let imports = &self.backend.kept_imports;
+        let mut flight = None;
+        let mut waited = false;
+        let kept = loop {
+            if let Some(kept) = self.kept_import(&key, usable, !waited) {
+                break kept;
+            }
+            let flight = flight.get_or_insert_with(|| flight_key(&key, importer));
+            match imports.board(flight, self.claims.owner, !waited) {
+                Flight::Lead => {
+                    // The build it would wait for may have landed since.
+                    if let Some(kept) = self.kept_import(&key, usable, !waited) {
+                        imports.land(flight, self.claims.owner);
+                        break kept;
+                    }
+                    lock(&self.claims.held).push((std::mem::take(flight), depth));
+                    return None;
                 }
-                Arc::clone(kept)
+                Flight::Wait(waiting) => {
+                    waiting.landed().await;
+                    waited = true;
+                }
+                Flight::Build => return None,
             }
         };
-        let mut builds = lock(&self.import_builds);
-        if let Some(build) = builds.last_mut() {
-            build.local_lookups.extend(
-                (kept.local_lookups.iter()).map(|(parent, found)| (parent.clone(), found.clone())),
-            );
-            build.logged |= kept.logged;
+        Some(self.offer(bom_gav(bom), kept))
+    }
+
+    /// Maven 3.9 keeps the first build of a BOM in its session cache for
+    /// every later import of the coordinates, whatever the importer, so a
+    /// dependency's import takes what a project build with the user
+    /// properties made. Maven 3.10 builds each import again.
+    async fn cached_import(
+        &self,
+        bom: ImportCoord<'_>,
+        fits: &(dyn Fn(&ImportedBom) -> bool + Sync),
+    ) -> Option<Arc<ImportedBom>> {
+        if self.backend.mode() != MavenMode::Maven39 {
+            return None;
         }
-        *lock(&self.offered_reads) = kept.support_poms.clone();
-        Some(Arc::clone(&kept.imported))
+        self.backend.lineage_read();
+        let gav = bom_gav(bom);
+        let own = lock(&self.backend.read_models).imports.get(&gav).cloned();
+        let kept = match own {
+            Some(kept) => kept,
+            None => {
+                self.claims.land_from(0);
+                self.backend.session_import(&gav).await?
+            }
+        };
+        fits(&kept.imported).then(|| self.offer(gav, kept))
     }
 
     fn reused_import(&self) -> Result<(), ResolveError> {
-        let offered = std::mem::take(&mut *lock(&self.offered_reads));
-        self.backend.record_kept_support_poms(&offered)?;
-        self.add_reads(offered);
+        let Some((gav, kept)) = lock(&self.offered).take() else {
+            return Ok(());
+        };
+        self.backend.record_kept_support_poms(&kept.support_poms)?;
+        self.backend.note_import_repositories(&kept.searched);
+        self.add_reads(kept.support_poms.iter().cloned());
+        // A project build may have built a reactor BOM this external POM
+        // imports.
+        if self.trust == RepoTrust::Transitive
+            && (kept.imported.boms()).any(|(group, artifact, version)| {
+                self.backend.is_reactor_module(group, artifact, version)
+            })
+        {
+            self.backend.ctx.note_reactor_through_dependencies();
+        }
+        self.cache_import(gav, kept);
         Ok(())
     }
 
@@ -618,20 +1028,25 @@ impl ModelSource for ModelScope<'_> {
         let Some(build) = lock(&self.left_import).take() else {
             return;
         };
-        let key = Self::import_key(bom, policy, &build.context);
-        let support_poms = build.reads.poms;
+        let depth = lock(&self.import_builds).len();
         let kept = Arc::new(KeptImport {
             imported,
             local_lookups: build.local_lookups,
-            support_poms,
+            support_poms: build.reads.poms,
             logged: build.logged || rv_maven_model::held::logged_since(build.logged_from),
+            searched: build.searched,
         });
-        keep_last(
-            lock(&self.backend.kept_imports.builds)
-                .entry(key)
-                .or_default(),
-            kept,
-        );
+        self.cache_import(bom_gav(bom), Arc::clone(&kept));
+        if !build.reads.borrowed {
+            let key = Self::import_key(bom, policy, &build.context);
+            keep_last(
+                lock(&self.backend.kept_imports.builds)
+                    .entry(key)
+                    .or_default(),
+                kept,
+            );
+        }
+        self.claims.land_from(depth);
     }
 
     fn import_holds(&self) -> Option<&rv_maven_model::held::Holds> {
@@ -641,6 +1056,62 @@ impl ModelSource for ModelScope<'_> {
 }
 
 impl ModelScope<'_> {
+    /// Give the build `kept` for the import `bom`, which the build it is
+    /// nested in then depends on as on its own lookups.
+    fn offer(&self, bom: PomGav, kept: Arc<KeptImport>) -> Arc<ImportedBom> {
+        if let Some(build) = lock(&self.import_builds).last_mut() {
+            build.local_lookups.extend(
+                (kept.local_lookups.iter()).map(|(parent, found)| (parent.clone(), found.clone())),
+            );
+            build.logged |= kept.logged;
+            add_searched(&mut build.searched, kept.searched.clone());
+        }
+        let imported = Arc::clone(&kept.imported);
+        *lock(&self.offered) = Some((bom, kept));
+        imported
+    }
+
+    /// Keep what a project build imported as `bom` in the module's model
+    /// cache, in the Maven 3.9 mode; see [`ModelSource::cached_import`].
+    fn cache_import(&self, bom: PomGav, kept: Arc<KeptImport>) {
+        if self.trust == RepoTrust::Root && self.backend.mode() == MavenMode::Maven39 {
+            (lock(&self.backend.read_models).imports)
+                .entry(bom)
+                .or_insert(kept);
+        }
+    }
+
+    /// The kept build of `key` to reuse, if one fits, one that logged only
+    /// if `logged`; see [`ModelSource::reuse_import`].
+    fn kept_import(
+        &self,
+        key: &str,
+        usable: &(dyn Fn(&ImportedBom) -> bool + Sync),
+        logged: bool,
+    ) -> Option<Arc<KeptImport>> {
+        let builds = lock(&self.backend.kept_imports.builds).get(key)?.clone();
+        let fits = |kept: &&Arc<KeptImport>| {
+            usable(&kept.imported)
+                && (kept.local_lookups.iter())
+                    .all(|(parent, found)| self.local.load(parent) == *found)
+        };
+        if let Some(last) = (builds.last())
+            .filter(|last| logged || !last.logged)
+            .filter(fits)
+        {
+            return Some(Arc::clone(last));
+        }
+        let kept = builds.iter().find(|kept| !kept.logged && fits(kept))?;
+        let mut kept_imports = lock(&self.backend.kept_imports.builds);
+        if let Some(builds) = kept_imports.get_mut(key)
+            && let Some(at) = builds.iter().position(|other| Arc::ptr_eq(other, kept))
+        {
+            let kept = builds.remove(at);
+            keep_last(builds, kept);
+        }
+        Some(Arc::clone(kept))
+    }
+
     /// Merge declared `<repositories>` before the parent fetch runs. A POM
     /// that hosts its own parent on a custom repo needs the repo visible
     /// during inheritance, and post-resolution merging is too late.
@@ -651,88 +1122,536 @@ impl ModelScope<'_> {
     /// the shared list, where a lineage declaration still holding an
     /// expression stands until its effective model's declaration replaces
     /// it, and a transitive build adds them to its own.
-    fn observe(&self, repositories: &[rv_maven_model::Repository], replace: bool) {
-        let repos = repositories.iter().cloned().map(rv_repo::Repository::from);
-        let mut imports = lock(&self.import_repos);
-        if let Some(list) = imports.last_mut() {
-            let (admitted, refused) = match self.trust {
-                RepoTrust::Root => self.backend.admit_root_lineage(repos),
-                RepoTrust::Transitive => self.backend.admit_transitive(repos, None),
-            };
-            list.add(admitted, replace);
-            list.hold(&refused, replace);
-            return;
-        }
-        drop(imports);
-        match self.trust {
-            RepoTrust::Root if replace => self.backend.extend_root_effective_repos(repos),
-            RepoTrust::Root => self
-                .backend
-                .extend_root_lineage_repos(repositories.iter().map(|repo| {
-                    (
-                        rv_repo::Repository::from(repo.clone()),
-                        repo.has_expression(),
+    fn observe(
+        &self,
+        repositories: &[rv_maven_model::Repository],
+        replace: bool,
+    ) -> Result<(), ResolveError> {
+        // A lineage URL as written that holds an expression has no scheme
+        // for the parent lookup, so it serves nothing without a mirror, but
+        // holds its id as Maven's model resolver does.
+        let config = &self.backend.ctx.config;
+        // The project's own are refused before resolution starts, and an
+        // imported BOM's are ignored as a dependency's are.
+        if replace && self.trust == RepoTrust::Root && lock(&self.import_repos).is_empty() {
+            let (secrets, names) = (config.secret_named_inputs(), config.secret_input_names());
+            // One that takes a secret is ignored, as secrets are kept out of
+            // messages and raeva.lock.
+            let secret = |repo: &&rv_maven_model::Repository| {
+                rv_repo::secret_url_refusal(&repo.url, &repo.url_reads, &secrets, &names).is_some()
+                    || rv_repo::secret_id_refusal(
+                        repo.id.as_deref(),
+                        &repo.id_reads,
+                        &secrets,
+                        &names,
                     )
-                })),
-            RepoTrust::Transitive => {
-                let (admitted, refused) = self.backend.admit_transitive(repos, None);
-                let mut build_repos = lock(&self.build_repos);
-                build_repos.add(admitted, replace);
-                build_repos.hold(&refused, replace);
+                    .is_some()
+            };
+            let fetched = repositories.iter().filter(|repo| !repo.root_declared);
+            for repo in fetched.filter(|repo| !secret(repo)) {
+                let id = rv_maven_types::bounded(repo.id.as_deref().unwrap_or_default());
+                let read = rv_repo::Repository::from((*repo).clone());
+                if let Some(refusal) = rv_repo::expression_id_refusal(config, &read) {
+                    return Err(ResolveError::RepositoryIdUnfollowed {
+                        id: id.to_string(),
+                        declared_by: "a fetched parent of the project".to_string(),
+                        refusal: refusal.to_string(),
+                    });
+                }
+            }
+        }
+        // Maven's mirror selector routes a declaration whether or not
+        // raeva admits it.
+        if let Some(routes) = lock(&self.routes).last_mut().filter(|_| !replace) {
+            routes.write(
+                config,
+                repositories.iter().cloned().map(rv_repo::Repository::from),
+            );
+        }
+        let declared = repositories;
+        // Nor does a layout as written that holds one name a layout.
+        let (repositories, unserved): (Vec<_>, Vec<_>) = (repositories.iter()).partition(|repo| {
+            let layout = (repo.layout.as_deref()).is_some_and(|layout| layout.contains("${"));
+            replace
+                || !repo.url.contains("${") && !layout
+                || rv_repo::mirror_serves(config, &rv_repo::Repository::from((*repo).clone()))
+        });
+        let unserved: Vec<_> = (unserved.into_iter())
+            .map(|repo| rv_repo::Repository::from(repo.clone()))
+            .collect();
+        let repos: Vec<_> = (repositories.iter())
+            .map(|repo| rv_repo::Repository::from((*repo).clone()))
+            .collect();
+        // A project's model resolver searches a kept mirror ahead of the
+        // configured repositories, so a split refuses its build even where
+        // raeva drops the interpolated declaration. A dependency's searches
+        // it after the repositories it was found through, where raeva only
+        // misses what Maven reads, and so checks only what raeva reads.
+        if replace && self.trust == RepoTrust::Root {
+            self.split_route(&repos)?;
+        }
+        let importing = !lock(&self.import_repos).is_empty();
+        let admitted = match self.trust {
+            RepoTrust::Root if !importing => {
+                if replace {
+                    self.backend.extend_root_effective_repos(repos);
+                } else {
+                    self.backend
+                        .extend_root_lineage_repos(repositories.iter().map(|repo| {
+                            (
+                                rv_repo::Repository::from((*repo).clone()),
+                                repo.has_expression(),
+                            )
+                        }));
+                    self.backend.hold_lineage_ids(&unserved);
+                }
+                return Ok(());
+            }
+            RepoTrust::Root => self.backend.admit_root_lineage(repos).0,
+            RepoTrust::Transitive => self.backend.admit_transitive_model(repos).0,
+        };
+        if replace && self.trust == RepoTrust::Transitive {
+            self.split_route(&admitted)?;
+        }
+        // Each declaration takes its place in Maven's list, raeva reading it
+        // or not.
+        let added = (declared.iter()).map(|declared| {
+            let repo = rv_repo::Repository::from(declared.clone());
+            if let Some(known) = admitted
+                .iter()
+                .find(|known| repo_key(known) == repo_key(&repo))
+            {
+                return (known.clone(), Reach::Read);
+            }
+            let unserved = unserved
+                .iter()
+                .any(|known| repo_key(known) == repo_key(&repo));
+            let neither = unserved
+                || model_list::blocked(config, &repo)
+                || rv_repo::layout_refusal(config, &repo).is_some();
+            match neither {
+                true => (repo, Reach::Neither),
+                false => (repo, Reach::Maven),
+            }
+        });
+        let mut imports = lock(&self.import_repos);
+        let mut own = lock(&self.build_repos);
+        let list = match imports.last_mut() {
+            Some(list) => list,
+            None => &mut own,
+        };
+        list.add(added, replace);
+        if replace {
+            list.effective();
+        }
+        Ok(())
+    }
+}
+
+impl ModelScope<'_> {
+    /// The refusal of `fetched`, which a mirror served for a repository only
+    /// the imported BOMs being built declare: the lock records that
+    /// repository, which the project does not, and a sync cannot fetch the
+    /// POM from it again.
+    fn mirrored_import_refusal(&self, fetched: &SupportPom) -> Option<ResolveError> {
+        let url = fetched.mirrored_from()?;
+        let lists = lock(&self.import_repos);
+        let (depth, repo) = (lists.iter().enumerate())
+            .flat_map(|(depth, list)| list.admitted.iter().map(move |repo| (depth, repo)))
+            .find(|(_, repo)| repo.url == url)?;
+        if (self.backend.effective_repos_snapshot().iter()).any(|known| known.url == url) {
+            return None;
+        }
+        // Each import build's reads start with its BOM's POM.
+        let bom = (lock(&self.import_builds).get(depth))
+            .and_then(|build| build.reads.poms.first())
+            .map(|pom| pom.name.clone())
+            .unwrap_or_default();
+        let config = &self.backend.ctx.config;
+        let secrets = config.secret_named_inputs();
+        let names = config.secret_input_names();
+        let id = repo.id.as_deref().unwrap_or_default();
+        let mirror = rv_repo::matched_mirror(config, repo)?;
+        Some(ResolveError::MirroredImportRepository {
+            pom: fetched.name.clone(),
+            bom,
+            id: rv_maven_types::bounded(&rv_repo::shown_id(id, repo.id_reads(), &secrets, &names))
+                .to_string(),
+            mirror: rv_maven_types::bounded(mirror.id.as_deref().unwrap_or("default")).to_string(),
+        })
+    }
+
+    /// `coord`'s POM from `searched`, the repositories Maven searches before
+    /// `unread`, which raeva does not read, or the refusal where none holds
+    /// it. Maven looks in its model cache before any repository.
+    async fn before_unread(
+        &self,
+        coord: &Coord,
+        model: Option<ModelKey>,
+        searched: Vec<rv_repo::Repository>,
+        unread: &Entry,
+        central: Option<(Vec<rv_repo::Repository>, rv_repo::Repository)>,
+    ) -> Result<Arc<SupportPom>, ResolveError> {
+        if let Some(key) = &model
+            && let Some(cached) = self.cached(key).await
+        {
+            self.note_borrowed();
+            (self.backend)
+                .record_support_poms(std::slice::from_ref(&cached))
+                .await?;
+            return Ok(cached);
+        }
+        let refusal = || self.unread_refusal(coord.to_string(), unread);
+        match (self.backend)
+            .fetch_pom_bytes_from(coord, searched, model.clone())
+            .await
+        {
+            Err(ResolveError::ArtifactNotFound { .. }) => {}
+            fetched => return fetched,
+        }
+        let Some((others, central)) = central else {
+            return Err(refusal());
+        };
+        if !others.is_empty() {
+            match (self.backend)
+                .fetch_pom_bytes_from(coord, others, model.clone())
+                .await
+            {
+                Err(ResolveError::ArtifactNotFound { .. }) => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(refusal()),
+            }
+        }
+        match (self.backend)
+            .fetch_pom_bytes_from(coord, vec![central], model)
+            .await
+        {
+            Err(ResolveError::ArtifactNotFound { .. }) => Err(refusal()),
+            fetched => fetched,
+        }
+    }
+
+    /// Whether a release POM the build reads now may be Maven's from a
+    /// repository raeva does not read.
+    fn reads_ahead_of_unread(&self) -> bool {
+        let entries = (self.backend).model_entries(&self.repo_ctx, &self.model_build());
+        model_list::search(&entries, "1").unread.is_some()
+    }
+
+    fn unread_refusal(&self, pom: String, unread: &Entry) -> ResolveError {
+        let config = &self.backend.ctx.config;
+        let id = unread.repo.id.as_deref().unwrap_or_default();
+        let shown = rv_repo::shown_id(
+            id,
+            unread.repo.id_reads(),
+            &config.secret_named_inputs(),
+            &config.secret_input_names(),
+        );
+        let id = rv_maven_types::bounded(&shown).to_string();
+        let maven = match self.backend.mode() {
+            MavenMode::Maven39 => "Maven 3.9.12",
+            MavenMode::Maven310 => "Maven 3.10.0",
+        };
+        match unread.displaced {
+            true => ResolveError::RedeclaredRepository { id, maven },
+            false => ResolveError::UnreadRepositoryAhead {
+                pom: rv_maven_types::bounded(&pom).to_string(),
+                id,
+                maven,
+            },
+        }
+    }
+
+    /// Note the routes of the interpolated declarations the build reads,
+    /// refusing it when a parent lookup may have read through a split one;
+    /// see [`Routes`].
+    fn split_route(&self, read: &[rv_repo::Repository]) -> Result<(), ResolveError> {
+        let config = &self.backend.ctx.config;
+        let mut routes = lock(&self.routes);
+        let Some(routes) = routes.last_mut() else {
+            return Ok(());
+        };
+        routes.interpolate(config, read);
+        match (routes.splits.iter()).find(|split| routes.consulted.contains(&split.id)) {
+            Some(split) => Err(split.refusal(config)),
+            None => Ok(()),
+        }
+    }
+
+    /// The refusal of a BOM read through a repository whose route split.
+    fn split_route_refusal(&self) -> Option<ResolveError> {
+        let routes = lock(&self.routes);
+        let split = (routes.last().into_iter())
+            .flat_map(|routes| routes.splits.iter())
+            .find(|split| !split.replaced)?;
+        Some(split.refusal(&self.backend.ctx.config))
+    }
+
+    /// `coord`'s POM when a repository Maven searches before every kept
+    /// mirror entry serves it, so the build never reaches one. A
+    /// dependency's model resolver starts from the repositories the
+    /// dependency was resolved through and appends what its POMs declare,
+    /// so those come first. A project's re-adds each declaration once
+    /// interpolated, behind the mirror entries the declarations as written
+    /// left and ahead of the configured repositories, so it has none; nor,
+    /// here, does an imported BOM's build, or a range or snapshot, which
+    /// reads every repository's metadata.
+    async fn ahead_of_kept_mirrors(
+        &self,
+        coord: &Coord,
+        model: Option<ModelKey>,
+        interpolated: bool,
+    ) -> Result<Option<Pom>, ResolveError> {
+        let version = coord.version.to_string();
+        if self.trust != RepoTrust::Transitive
+            || !lock(&self.import_repos).is_empty()
+            || rv_maven_types::resolves_through_snapshot_metadata(&version)
+        {
+            return Ok(None);
+        }
+        // In Maven 3.9.12 the interpolated declaration that takes a request
+        // repository's id, which an imported BOM is read after, replaces
+        // that entry; Maven 3.10.0 keeps the request's.
+        let mut repos = (self.backend).parent_search_list(&self.repo_ctx, &ModelBuild::default());
+        if interpolated
+            && self.backend.mode() == MavenMode::Maven39
+            && let Some(routes) = lock(&self.routes).last()
+        {
+            repos.retain(|repo| {
+                !(repo.id.as_ref()).is_some_and(|id| routes.written.contains_key(id))
+            });
+        }
+        match (self.backend)
+            .fetch_pom_bytes_from(coord, repos, model)
+            .await
+        {
+            Ok(fetched) => {
+                self.backend.learn_models(std::slice::from_ref(&fetched));
+                self.parse_fetched(coord, fetched, false).map(Some)
+            }
+            Err(ResolveError::ArtifactNotFound { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// A mirror's normalized URL and its id.
+type Route = (String, String);
+
+fn route(mirror: &rv_config::MirrorConfig) -> Route {
+    let id = mirror.id.clone().unwrap_or_else(|| "default".to_string());
+    (rv_repo::normalize_repo_url(&mirror.url), id)
+}
+
+/// A repository whose URL as written goes to mirror `written` and
+/// interpolated to `interpolated`.
+struct Split {
+    id: String,
+    /// The id as messages show it.
+    shown: String,
+    written: String,
+    interpolated: Option<String>,
+    /// Whether the mirror has the repository's id, so the interpolated
+    /// declaration replaces it before the build imports a BOM, though not
+    /// before the parent lookups that came first.
+    replaced: bool,
+}
+
+impl Split {
+    fn refusal(&self, config: &rv_config::Config) -> ResolveError {
+        let secrets = config.secret_named_inputs();
+        let shown = |text: &str| {
+            rv_maven_types::bounded(rv_config::without_secret_values(text, &secrets)).to_string()
+        };
+        ResolveError::MirrorRouteSplit {
+            id: rv_maven_types::bounded(&self.shown).to_string(),
+            written: shown(&self.written),
+            interpolated: self.interpolated.as_deref().map(shown),
+        }
+    }
+}
+
+/// The mirror routes of one build's repositories. Maven's model resolver
+/// adds a declaration as written with the mirror it matches, under the
+/// mirror's id, and the interpolated declaration replaces only entries
+/// under the repository's own id. A mirror the URL as written reaches thus
+/// stays in the list the build's parents and imported BOMs are read
+/// through, ahead of the interpolated URL's route, which the dependencies
+/// take. A build that reads a parent or a BOM through such a repository is
+/// refused.
+#[derive(Default)]
+struct Routes {
+    /// The mirror each id's first declaration as written reaches, `None`
+    /// for one no mirror serves.
+    written: HashMap<String, Option<Route>>,
+    /// The ids a parent lookup may have read through: those with a mirror
+    /// when the build looked a parent up.
+    consulted: HashSet<String>,
+    /// The ids whose first declaration as written holds an expression in
+    /// its URL and reaches a mirror, which a dependency's parent lookup in
+    /// raeva does not search.
+    unsearched: BTreeMap<String, Route>,
+    /// The repositories whose interpolated declaration, which the build
+    /// reads, takes another route.
+    splits: Vec<Split>,
+}
+
+impl Routes {
+    fn write(
+        &mut self,
+        config: &rv_config::Config,
+        repos: impl Iterator<Item = rv_repo::Repository>,
+    ) {
+        for repo in repos {
+            let Some(id) = &repo.id else {
+                continue;
+            };
+            if self.written.contains_key(id) {
+                continue;
+            }
+            let written = rv_repo::matched_mirror(config, &repo)
+                .filter(|mirror| !mirror.blocked)
+                .map(route);
+            if let Some(written) = (written.clone()).filter(|_| repo.declared_url().contains("${"))
+            {
+                self.unsearched.insert(id.clone(), written);
+            }
+            self.written.insert(id.clone(), written);
+        }
+    }
+
+    /// A dependency's `parent` that none of the repositories raeva
+    /// searches holds, which Maven also looks up through the mirror a
+    /// declaration as written reaches that raeva does not search. `None`
+    /// when none does.
+    fn parent_behind_mirror(
+        &self,
+        config: &rv_config::Config,
+        parent: String,
+    ) -> Option<ResolveError> {
+        let secrets = config.secret_named_inputs();
+        let shown = |text: &str| {
+            rv_maven_types::bounded(rv_config::without_secret_values(text, &secrets)).to_string()
+        };
+        let (id, (_, mirror)) = self.unsearched.iter().next()?;
+        Some(ResolveError::ParentBehindWrittenMirror {
+            parent: shown(&parent),
+            id: shown(id),
+            mirror: shown(mirror),
+        })
+    }
+
+    /// Whether a declaration as written goes to a mirror.
+    fn mirrored(&self) -> bool {
+        self.written.values().any(Option::is_some)
+    }
+
+    fn consult(&mut self) {
+        let served = (self.written.iter()).filter(|(_, mirror)| mirror.is_some());
+        self.consulted.extend(served.map(|(id, _)| id.clone()));
+    }
+
+    fn interpolate(&mut self, config: &rv_config::Config, repos: &[rv_repo::Repository]) {
+        for repo in repos {
+            let Some(id) = &repo.id else {
+                continue;
+            };
+            let Some(Some(written)) = self.written.get(id) else {
+                continue;
+            };
+            let interpolated = rv_repo::matched_mirror(config, repo).map(route);
+            // A mirror's id selects its `<server>`, so two at one URL are
+            // one route only when neither is blocked and each sends the same
+            // first request: at most a username and password, which Maven
+            // sends only once challenged.
+            let uncredentialed = |id: &str| {
+                config.sends_only_challenged_credentials(id)
+                    && !(config.mirrors().iter())
+                        .any(|mirror| mirror.id.as_deref() == Some(id) && mirror.blocked)
+            };
+            let same = interpolated.as_ref().is_some_and(|(url, mirror)| {
+                *url == written.0
+                    && (*mirror == written.1
+                        || uncredentialed(mirror) && uncredentialed(&written.1))
+            });
+            if !same && !self.splits.iter().any(|split| split.id == *id) {
+                let shown = rv_repo::shown_id(
+                    id,
+                    repo.id_reads(),
+                    &config.secret_named_inputs(),
+                    &config.secret_input_names(),
+                );
+                self.splits.push(Split {
+                    id: id.clone(),
+                    shown,
+                    written: written.1.clone(),
+                    interpolated: interpolated.map(|(_, mirror)| mirror),
+                    replaced: written.1 == *id,
+                });
             }
         }
     }
 }
 
-/// One build's repositories, as Maven's model resolver keeps them.
+/// The declarations one build's model resolver was handed.
 #[derive(Default)]
 struct BuildRepos {
-    repos: Vec<rv_repo::Repository>,
-    /// Every id added so far, an absent id apart from an empty one.
-    ids: HashSet<Option<String>>,
+    added: Vec<Added>,
+    /// Every repository admitted.
+    admitted: Vec<rv_repo::Repository>,
+    /// Whether the build's lineage is read: its effective model's
+    /// repositories, the super POM's `central` last, are added.
+    effective: bool,
+}
+
+/// Add to `known` each of `pairs` it lacks.
+fn add_searched(
+    known: &mut Vec<(String, rv_repo::Repository)>,
+    pairs: Vec<(String, rv_repo::Repository)>,
+) {
+    for pair in pairs {
+        if !known.contains(&pair) {
+            known.push(pair);
+        }
+    }
 }
 
 impl BuildRepos {
-    /// Add `repos` as Maven's `addRepository` does. The list holds one
-    /// repository per id, an absent id counting as the empty id, and keeps
-    /// the one listed first. With `replace`, an id added before drops the
-    /// repositories listed under it and the new one goes last; an absent id
-    /// matches nothing there, so its first repository stays.
-    fn add(&mut self, repos: Vec<rv_repo::Repository>, replace: bool) {
-        for repo in repos {
-            if !self.ids.insert(repo.id.clone()) {
-                if !replace {
-                    continue;
-                }
-                if let Some(id) = &repo.id {
-                    self.repos
-                        .retain(|known| known.id.as_deref().unwrap_or_default() != id);
-                }
+    /// Add `repos`, each with who reads it, as Maven's `addRepository`
+    /// gets them.
+    fn add(
+        &mut self,
+        repos: impl IntoIterator<Item = (rv_repo::Repository, Reach)>,
+        replace: bool,
+    ) {
+        for (repo, reach) in repos {
+            if reach == Reach::Read && !self.admitted.contains(&repo) {
+                self.admitted.push(repo.clone());
             }
-            let key = repo.id.as_deref().unwrap_or_default();
-            if !self
-                .repos
-                .iter()
-                .any(|known| known.id.as_deref().unwrap_or_default() == key)
-            {
-                self.repos.push(repo);
-            }
+            self.added.push(Added {
+                repo,
+                replace,
+                reach,
+                implied: false,
+            });
         }
     }
 
-    /// Reserve the ids of `refused` declarations as [`Self::add`] would
-    /// place them, without searching them: Maven's blocked mirror keeps the
-    /// repository it replaces, so a declaration under that id elsewhere in
-    /// the lineage is not searched instead. One model's declarations have
-    /// distinct ids, so their order against the admitted ones is moot.
-    fn hold(&mut self, refused: &[rv_repo::Repository], replace: bool) {
-        for repo in refused {
-            let Some(id) = repo.id.as_deref().filter(|id| !id.is_empty()) else {
-                continue;
-            };
-            if !self.ids.insert(Some(id.to_string())) && replace {
-                self.repos.retain(|known| known.id.as_deref() != Some(id));
-            }
+    /// End the lineage with the super POM's `central`, unless the effective
+    /// model declares `central` itself.
+    fn effective(&mut self) {
+        if std::mem::replace(&mut self.effective, true) {
+            return;
+        }
+        let declared = (self.added.iter())
+            .any(|added| added.replace && added.repo.id.as_deref() == Some("central"));
+        if !declared {
+            self.added.push(Added {
+                repo: model_list::super_central(),
+                replace: true,
+                reach: Reach::Read,
+                implied: true,
+            });
         }
     }
 }
@@ -1095,19 +2014,19 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let bom = |scope: &str| {
+        let bom = |url: &str| {
             format!(
                 "<project><groupId>g</groupId><artifactId>bom</artifactId><version>1</version>\
-                 <packaging>pom</packaging><dependencies><dependency><groupId>g</groupId>\
-                 <artifactId>x</artifactId><version>1</version><scope>{scope}</scope>\
-                 </dependency></dependencies><profiles><profile><id>p</id><activation>\
+                 <packaging>pom</packaging><repositories><repository><id>r</id><url>{url}</url>\
+                 </repository></repositories><profiles><profile><id>p</id><activation>\
                  <property><name>packaging</name><value>pom</value></property></activation>\
                  </profile></profiles></project>"
             )
             .into_bytes()
         };
-        for (scope, warnings, builds) in [("weird", 4, 1), ("test", 0, 2)] {
-            let files = HashMap::from([("g/bom/1/bom-1.pom".to_string(), bom(scope))]);
+        // Refusing a repository the BOM declares logs.
+        for (url, reads, builds) in [("ftp://r.example/", 4, 1), ("https://r.example/", 2, 2)] {
+            let files = HashMap::from([("g/bom/1/bom-1.pom".to_string(), bom(url))]);
             let source = Arc::new(
                 MemoryPomSource::new(rv_config::SecurityConfig::default())
                     .with_files("https://repo.example/", &files),
@@ -1126,13 +2045,16 @@ mod tests {
             )
             .with_pom_source(source.clone());
             let repo = rv_repo::Repository::new(None, "https://repo.example/", true, false);
-            let backend = ModelService::new(&ctx, vec![repo])
-                .with_reactor_models(Arc::new(Default::default()));
-            let log = rv_test_support::capture_warnings(|| {
+            let models = Arc::new(super::super::reactor_models::ReactorModels::default());
+            // Each importer is a module of its own, with its own model cache.
+            let module = || {
+                ModelService::new(&ctx, vec![repo.clone()]).with_reactor_models(Arc::clone(&models))
+            };
+            rv_test_support::capture_warnings(|| {
                 runtime.block_on(async {
                     for packaging in ["jar", "pom", "jar", "end", "jar"] {
                         if packaging == "end" {
-                            backend.release_graph_caches();
+                            module().release_graph_caches();
                             continue;
                         }
                         let importer = rv_maven_model::Pom::parse(&format!(
@@ -1144,20 +2066,250 @@ mod tests {
                          </dependencyManagement></project>"
                         ))
                         .unwrap();
-                        ModelScope::root(&backend, LocalParents::none())
+                        ModelScope::root(&module(), LocalParents::none())
                             .project(importer, &rv_maven_model::ActivationContext::default())
                             .await
                             .unwrap();
                     }
                 })
             });
-            let warned = log.matches("unknown dependency scope").count();
-            assert_eq!(warned, warnings, "scope {scope}");
-            let kept = crate::util::lock(&backend.kept_imports.builds)
+            let read = (source.requests().iter())
+                .filter(|request| request.ends_with("bom-1.pom"))
+                .count();
+            assert_eq!(read, reads, "{url}");
+            let kept = crate::util::lock(&models.imports.builds)
                 .values()
                 .map(Vec::len)
                 .sum::<usize>();
-            assert_eq!(kept, builds, "scope {scope}");
+            assert_eq!(kept, builds, "{url}");
+        }
+    }
+
+    /// The POMs at `files` served from one repository, each path in
+    /// `delays` answered 50 ms late, in a context over a store in the
+    /// returned directory.
+    fn delayed_context(
+        files: &[(&str, &str)],
+        delays: &[&str],
+    ) -> (
+        ResolveContext,
+        Arc<crate::resolver::pom_source::MemoryPomSource>,
+        tempfile::TempDir,
+    ) {
+        let files: std::collections::HashMap<String, Vec<u8>> = (files.iter())
+            .map(|(path, pom)| (path.to_string(), pom.as_bytes().to_vec()))
+            .collect();
+        let mut source =
+            crate::resolver::pom_source::MemoryPomSource::new(rv_config::SecurityConfig::default())
+                .with_files("https://repo.example/", &files);
+        for path in delays {
+            source = source.with_delay(path, std::time::Duration::from_millis(50));
+        }
+        let source = Arc::new(source);
+        let store_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(store_tmp.path()).expect("store"));
+        let paths = ResolvedPaths::for_testing().expect("paths");
+        let config =
+            Config::for_testing_with_repos(std::path::PathBuf::from("."), paths, Vec::new());
+        let ctx = ResolveContext::new(
+            config,
+            Vec::new(),
+            store,
+            Platform::new("linux", "x86_64").unwrap(),
+            None,
+        )
+        .with_pom_source(source.clone());
+        (ctx, source, store_tmp)
+    }
+
+    /// A project that imports the BOM `g:<bom>:1`.
+    fn bom_importer(bom: &str) -> rv_maven_model::Pom {
+        rv_maven_model::Pom::parse(&format!(
+            "<project><groupId>g</groupId><artifactId>app</artifactId><version>1</version>\
+             <dependencyManagement><dependencies>\
+             <dependency><groupId>g</groupId><artifactId>{bom}</artifactId><version>1</version>\
+             <type>pom</type><scope>import</scope></dependency></dependencies>\
+             </dependencyManagement></project>"
+        ))
+        .unwrap()
+    }
+
+    /// The model of `importer` as a reactor module builds it, sharing `kept`.
+    async fn module_model(
+        ctx: &ResolveContext,
+        kept: &Arc<super::KeptImports>,
+        importer: &rv_maven_model::Pom,
+    ) -> Result<rv_maven_model::Project, crate::ResolveError> {
+        let repo = rv_repo::Repository::new(None, "https://repo.example/", true, false);
+        let backend = ModelService::new(ctx, vec![repo]).with_kept_imports(Arc::clone(kept));
+        ModelScope::root(&backend, LocalParents::none())
+            .project(
+                importer.clone(),
+                &rv_maven_model::ActivationContext::default(),
+            )
+            .await
+    }
+
+    fn kept_builds(kept: &super::KeptImports) -> usize {
+        (crate::util::lock(&kept.builds).values())
+            .map(Vec::len)
+            .sum()
+    }
+
+    const SLOW_BOM: [(&str, &str); 2] = [
+        (
+            "g/bom/1/bom-1.pom",
+            "<project><parent><groupId>g</groupId><artifactId>base</artifactId>\
+             <version>1</version></parent><artifactId>bom</artifactId>\
+             <packaging>pom</packaging><dependencyManagement><dependencies><dependency>\
+             <groupId>g</groupId><artifactId>x</artifactId><version>1</version></dependency>\
+             </dependencies></dependencyManagement></project>",
+        ),
+        (
+            "g/base/1/base-1.pom",
+            "<project><groupId>g</groupId><artifactId>base</artifactId>\
+             <version>1</version><packaging>pom</packaging></project>",
+        ),
+    ];
+
+    /// Modules that import a BOM another module is building wait for that
+    /// build and reuse it instead of building the BOM beside it.
+    #[tokio::test(start_paused = true)]
+    async fn modules_wait_for_the_build_of_a_bom_under_way() {
+        let (ctx, _, _store) = delayed_context(&SLOW_BOM, &["g/base/1/base-1.pom"]);
+        let kept = Arc::<super::KeptImports>::default();
+        let importer = bom_importer("bom");
+        let modules = (0..4).map(|_| module_model(&ctx, &kept, &importer));
+        let projects = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join_all(modules),
+        )
+        .await
+        .expect("no module waits forever");
+        for project in projects {
+            let managed = project.unwrap().dependency_management.dependencies;
+            assert_eq!(managed.len(), 1);
+            assert_eq!(managed[0].artifact_id, "x");
+        }
+        assert_eq!(kept_builds(&kept), 1, "one build for four modules");
+    }
+
+    /// A module that waited for a BOM build that logged builds the BOM
+    /// itself and logs as its own, as it would have without waiting.
+    #[test]
+    fn a_waiter_builds_again_a_bom_whose_build_logged() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let files = [(
+            "g/bom/1/bom-1.pom",
+            "<project><groupId>g</groupId><artifactId>bom</artifactId><version>1</version>\
+             <packaging>pom</packaging><repositories><repository><id>r</id>\
+             <url>ftp://r.example/</url></repository></repositories></project>",
+        )];
+        let (ctx, source, _store) = delayed_context(&files, &["g/bom/1/bom-1.pom"]);
+        let kept = Arc::<super::KeptImports>::default();
+        let importer = bom_importer("bom");
+        let log = rv_test_support::capture_warnings(|| {
+            runtime.block_on(async {
+                let (first, second) = futures::future::join(
+                    module_model(&ctx, &kept, &importer),
+                    module_model(&ctx, &kept, &importer),
+                )
+                .await;
+                first.unwrap();
+                second.unwrap();
+            })
+        });
+        let reads = (source.requests().iter())
+            .filter(|request| request.ends_with("bom-1.pom"))
+            .count();
+        assert_eq!(reads, 2, "{log}");
+    }
+
+    /// A module whose build of a BOM is cancelled lands its claim, and the
+    /// module waiting for it builds the BOM itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_bom_build_wakes_the_modules_waiting_for_it() {
+        let (ctx, _, _store) = delayed_context(&SLOW_BOM, &["g/base/1/base-1.pom"]);
+        let kept = Arc::<super::KeptImports>::default();
+        let importer = bom_importer("bom");
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            module_model(&ctx, &kept, &importer),
+        );
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            module_model(&ctx, &kept, &importer),
+        );
+        let (cancelled, waited) = tokio::join!(cancelled, waiting);
+        assert!(cancelled.is_err(), "the first build is cancelled");
+        let project = waited.expect("the waiter does not wait forever").unwrap();
+        assert_eq!(project.dependency_management.dependencies.len(), 1);
+        assert_eq!(kept_builds(&kept), 1);
+    }
+
+    /// A module waiting for a BOM build that fails builds the BOM again
+    /// itself and fails as the first module did.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_bom_build_leaves_its_waiters_the_same_error() {
+        let files = [(
+            "g/bom/1/bom-1.pom",
+            "<project><parent><groupId>g</groupId><artifactId>gone</artifactId>\
+             <version>1</version></parent><artifactId>bom</artifactId>\
+             <packaging>pom</packaging></project>",
+        )];
+        let (ctx, source, _store) = delayed_context(&files, &["g/gone/1/gone-1.pom"]);
+        let kept = Arc::<super::KeptImports>::default();
+        let importer = bom_importer("bom");
+        let (first, second) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join(
+                module_model(&ctx, &kept, &importer),
+                module_model(&ctx, &kept, &importer),
+            ),
+        )
+        .await
+        .expect("no module waits forever");
+        let first = first.unwrap_err().to_string();
+        assert_eq!(first, second.unwrap_err().to_string());
+        assert!(first.contains("g:gone:1"), "{first}");
+        let parent_reads = (source.requests().iter())
+            .filter(|path| path.ends_with("gone-1.pom"))
+            .count();
+        assert_eq!(parent_reads, 1, "the second module waited for the first");
+        assert_eq!(kept_builds(&kept), 0);
+    }
+
+    /// Two modules each building a BOM the other's build imports do not
+    /// wait for each other: the wait that would close the cycle is not made,
+    /// and both fail on the import cycle as a lone module would.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_would_close_a_cycle_is_not_made() {
+        let bom = |name: &str, imports: &str| {
+            format!(
+                "<project><groupId>g</groupId><artifactId>{name}</artifactId>\
+                 <version>1</version><packaging>pom</packaging><dependencyManagement>\
+                 <dependencies><dependency><groupId>g</groupId><artifactId>{imports}</artifactId>\
+                 <version>1</version><type>pom</type><scope>import</scope></dependency>\
+                 </dependencies></dependencyManagement></project>"
+            )
+        };
+        let (x, y) = (bom("x", "y"), bom("y", "x"));
+        let files = [("g/x/1/x-1.pom", x.as_str()), ("g/y/1/y-1.pom", y.as_str())];
+        let (ctx, _, _store) = delayed_context(&files, &["g/x/1/x-1.pom", "g/y/1/y-1.pom"]);
+        let kept = Arc::<super::KeptImports>::default();
+        let (x, y) = (bom_importer("x"), bom_importer("y"));
+        let (first, second) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join(module_model(&ctx, &kept, &x), module_model(&ctx, &kept, &y)),
+        )
+        .await
+        .expect("the modules do not wait for each other forever");
+        for error in [first.unwrap_err(), second.unwrap_err()] {
+            assert!(error.to_string().contains("cycle"), "{error}");
         }
     }
 
@@ -1184,47 +2336,14 @@ mod tests {
         );
     }
 
-    /// One repository per id in a build's list, an absent id counting as
-    /// the empty id: a lineage list keeps the first, an effective model's
-    /// replaces it unless its id is absent.
-    #[test]
-    fn a_builds_repositories_are_kept_one_per_id() {
-        let repo = |id: Option<&str>, url: &str| {
-            rv_repo::Repository::new(id.map(str::to_string), url, true, false)
-        };
-        let urls = |list: &super::BuildRepos| -> Vec<String> {
-            list.repos.iter().map(|repo| repo.url.clone()).collect()
-        };
-        let mut list = super::BuildRepos::default();
-        list.add(
-            vec![
-                repo(None, "https://first.example/"),
-                repo(Some("a"), "https://a.example/"),
-                repo(None, "https://second.example/"),
-                repo(Some(""), "https://empty.example/"),
-            ],
-            false,
-        );
-        assert_eq!(
-            urls(&list),
-            ["https://first.example/", "https://a.example/"]
-        );
-        list.add(
-            vec![
-                repo(Some("a"), "https://a2.example/"),
-                repo(None, "https://third.example/"),
-            ],
-            true,
-        );
-        assert_eq!(
-            urls(&list),
-            ["https://first.example/", "https://a2.example/"]
-        );
-        list.add(vec![repo(Some(""), "https://empty2.example/")], true);
-        assert_eq!(
-            urls(&list),
-            ["https://a2.example/", "https://empty2.example/"]
-        );
+    /// The repositories a build searches that the root list lacks.
+    fn build_searched(scope: &ModelScope<'_>) -> Vec<rv_repo::Repository> {
+        let root = scope.backend.root_repos_snapshot();
+        let searched = (scope.backend).parent_search_list(&scope.repo_ctx, &scope.model_build());
+        searched
+            .into_iter()
+            .filter(|repo| !root.contains(repo))
+            .collect()
     }
 
     fn declared_repo(id: &str, url: &str) -> rv_maven_model::Repository {
@@ -1274,11 +2393,17 @@ mod tests {
             // redirect authority. Only model observation may grant it.
             let repo = Repository::new(None, &repo_url, true, false);
             let backend = ModelService::new(&ctx, vec![repo.clone()]);
+            // Strict reading refuses the forged element in a local parent.
+            let forged = if local_parent {
+                ""
+            } else {
+                "<root_declared>true</root_declared>"
+            };
             let declarations = format!(
                 r#"
                 <properties><registry>{repo_url}</registry></properties>
                 <profiles><profile><id>active</id><activation><activeByDefault>true</activeByDefault></activation>
-                <repositories><repository><id>root</id><url>${{registry}}</url><root_declared>true</root_declared></repository></repositories>
+                <repositories><repository><id>root</id><url>${{registry}}</url>{forged}</repository></repositories>
                 </profile></profiles>"#
             );
             let base = tmp.path().join("child");
@@ -1340,13 +2465,7 @@ mod tests {
             };
             scope.observe_repositories(&[declared_repo("declared", url)]);
             assert_eq!(shared(&backend, url), merged, "{open} {trust:?}");
-            let in_build = scope
-                .build_repos
-                .lock()
-                .unwrap()
-                .repos
-                .iter()
-                .any(|repo| repo.url == url);
+            let in_build = (build_searched(&scope).iter()).any(|repo| repo.url == url);
             assert!(in_build || !open, "{trust:?}");
         }
 
@@ -1354,7 +2473,7 @@ mod tests {
         let scope = ModelScope::with_trust(&backend, LocalParents::none(), RepoTrust::Root);
         scope.enter_import();
         scope.observe_repositories(&[declared_repo("bom", "https://bom.example/")]);
-        assert_eq!(scope.import_repos.lock().unwrap()[0].repos.len(), 1);
+        assert_eq!(scope.import_repos.lock().unwrap()[0].added.len(), 1);
         scope.leave_import();
         assert!(scope.import_repos.lock().unwrap().is_empty());
         scope.observe_repositories(&[declared_repo("parent", "https://parent.example/")]);
@@ -1388,11 +2507,60 @@ mod tests {
                 scope.observe_repositories(&[declared_repo("corp", blocked)]);
             }
             scope.observe_repositories(&[declared_repo("corp", old)]);
-            scope.observe_effective_repositories(&[declared_repo("corp", blocked)]);
+            scope
+                .observe_effective_repositories(&[declared_repo("corp", blocked)])
+                .unwrap();
             assert!(
-                scope.build_repos().is_empty(),
+                build_searched(&scope).is_empty(),
                 "{child_first} {trust:?} {import}"
             );
+        }
+    }
+
+    /// A declaration whose URL as written holds an expression serves no
+    /// parent lookup without a mirror, but its id stays taken: a parent's
+    /// declaration under it is not searched, as in Maven's model resolver.
+    #[test]
+    fn an_unserved_expression_repository_keeps_its_id() {
+        let (written, alternate) = ("${corp.url}", "https://alternate.example/");
+        let idless = |url: &str| {
+            let mut repo = declared_repo("x", url);
+            repo.id = None;
+            repo
+        };
+        for import in [false, true] {
+            let backend = backend(true);
+            let scope =
+                ModelScope::with_trust(&backend, LocalParents::none(), RepoTrust::Transitive);
+            if import {
+                scope.enter_import();
+            }
+            scope.observe_repositories(&[idless(written)]);
+            scope.observe_repositories(&[idless(alternate)]);
+            let mut empty = declared_repo("x", alternate);
+            empty.id = Some(String::new());
+            scope.observe_repositories(&[empty]);
+            assert!(build_searched(&scope).is_empty(), "{import}");
+        }
+        for (trust, import) in [
+            (RepoTrust::Root, false),
+            (RepoTrust::Root, true),
+            (RepoTrust::Transitive, false),
+            (RepoTrust::Transitive, true),
+        ] {
+            let backend = backend(true);
+            let scope = ModelScope::with_trust(&backend, LocalParents::none(), trust);
+            if import {
+                scope.enter_import();
+            }
+            scope.observe_repositories(&[declared_repo("corp", written)]);
+            scope.observe_repositories(&[declared_repo("corp", alternate)]);
+            let searched = |url: &str| {
+                (build_searched(&scope).iter()).any(|repo| repo.url == url)
+                    || (backend.repos_snapshot().iter()).any(|repo| repo.url == url)
+            };
+            assert!(!searched(alternate), "{trust:?} {import}");
+            assert!(!searched(written), "{trust:?} {import}");
         }
     }
 }

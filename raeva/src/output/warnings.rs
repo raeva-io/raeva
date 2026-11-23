@@ -41,9 +41,6 @@ pub(crate) enum WarningCode {
     /// The store index or the metadata cache was damaged or not SQLite, so
     /// raeva deleted it and started a new one.
     DatabaseRecreated,
-    /// This raeva upgraded the store index or the metadata cache from an
-    /// older raeva's and dropped what it can no longer trust.
-    DatabaseUpgraded,
     /// A credential configured for a repository id was not sent to a
     /// repository a fetched POM declared, on an origin neither the
     /// configuration nor the project's POMs name.
@@ -58,6 +55,9 @@ pub(crate) enum WarningCode {
     /// A `<repository>` a POM declares was ignored because its URL has
     /// userinfo, a query or a fragment, which may hold a credential.
     RepoUrlSecretRefused,
+    /// A fetched POM's `<repository>` was ignored because its URL has a
+    /// `\`, which Maven's HTTP transport refuses.
+    RepoUrlBackslash,
     ProjectRepoUrlFromFetchedPom,
     /// A `<repository>` declared by a transitive POM was ignored.
     TransitiveRepoDropped,
@@ -105,33 +105,88 @@ pub(crate) enum WarningCode {
     ClassifierNotStored,
     /// export-m2 did not export system-scoped dependencies.
     ExportSystemScopedSkipped,
+    /// export-m2 could not read the modules' build plugins and extensions
+    /// to refuse the metadata of an artifact one without a version reads.
+    ExportPluginsUnchecked,
     /// export-m2 could not make a copied artifact writable by its owner.
     ExportPermissionsNotSet,
     /// export-m2 wrote into the Maven local repository other builds share,
     /// so it removed no metadata and `mvn -o` there is not a locked build.
     ExportSharedRepository,
+    /// An earlier export-m2 into the local repository did not finish, as
+    /// its `.raeva-export-unfinished` file shows.
+    ExportUnfinished,
+    /// Version ranges that lose mediation name no version export-m2 lists
+    /// otherwise; it listed theirs, or in the shared repository did not.
+    ExportLosingRangeVersions,
+    /// Repository ids export-m2 could write no version list under.
+    ExportRepositoryIdUnusable,
+    /// Origins raeva.lock records no repository id for, labelled `central`.
+    ExportRepositoryIdGuessed,
     ExportWarning,
     SystemScope,
     LowDiskSpace,
     /// raeva sync replaced a raeva.lock this raeva cannot use.
     LockfileRegenerated,
+    /// `lock verify --download` could not resolve raeva.lock again as
+    /// `sync --frozen` does.
+    FrozenResolutionFailed,
     /// A remote repository has no checksum file for a download, and the
     /// run accepted that.
     ChecksumMissing,
-    /// A POM is invalid, a local parent POM cannot be read, or a dependency
-    /// has a scope Maven does not know; raeva went on as Maven does.
+    /// `--frozen` checked a raeva.lock that pins files accepted without a
+    /// checksum file, and the run did not pass `--allow-missing-checksums`.
+    ChecksumMissingLocked,
+    /// A POM or version metadata is invalid, a local parent POM cannot be
+    /// read, or a dependency has a scope Maven does not know; raeva went on
+    /// as Maven does.
     PomProblem,
+    /// A POM repository has a URL raeva has no transport for, which Maven
+    /// skips too.
+    RepositoryIgnored,
     /// An environment variable or a configuration entry has a value raeva
     /// cannot use, so raeva went on without it.
     SettingIgnored,
     /// A `--vex` statement applied to no finding or package of the run.
     VexStatementUnused,
-    /// A POM read `java.version` without a JDK named by `JAVA_HOME` or
-    /// `JAVA_VERSION`, so it saw the stand-in 17.
+    /// A POM read `java.version` without a version from the JDK Maven runs
+    /// or `JAVA_VERSION`, so it saw the stand-in 17.
     JavaVersionDefaulted,
     /// A POM read a set environment variable outside the
     /// `allow_env_substitution` allowlist, which reads as unset.
     EnvVarHidden,
+    /// A `raeva doctor` check: raeva.lock pins no plugins or extensions.
+    PluginsNotLocked,
+    /// A `raeva doctor` check: raeva.lock lacks the plugin tables raeva.toml
+    /// asks for, or holds tables it does not ask for.
+    PluginTablesStale,
+    /// A `raeva doctor` check: the project declares build extensions.
+    BuildExtensions,
+    /// A `raeva doctor` check: the project uses Maven Polyglot.
+    PolyglotMaven,
+    /// A `raeva doctor` check: raeva.lock records only this machine's
+    /// platform.
+    HostPlatformOnly,
+    /// A `raeva doctor` check: raeva.lock records no section for this
+    /// machine's platform.
+    HostPlatformNotLocked,
+    /// A `raeva doctor` check: raeva.toml's `[lock] jdks` lists no JDK
+    /// that matches this one, or this JDK's version is unknown.
+    HostJdkNotLocked,
+    /// A `raeva doctor` check: the host JDK has the Base64 decoder of
+    /// CVE-2026-114938 (Java4Shell) and this CPU the instructions it uses,
+    /// and the JDK is dated before the update, or carries no date.
+    HostJdkJava4shell,
+    /// A `raeva doctor` check: raeva.lock cannot be read.
+    LockUnreadable,
+    /// A `raeva doctor` check: no CI file runs `raeva sync --frozen`.
+    CiCheckMissing,
+    /// A `raeva doctor` check: `.gitattributes` does not mark raeva.lock as
+    /// generated.
+    LockNotMarkedGenerated,
+    /// A `raeva doctor` check: `.gitattributes` turns off merging
+    /// raeva.lock.
+    LockMergeDisabled,
 }
 
 impl WarningCode {
@@ -657,10 +712,7 @@ mod tests {
         use super::{WarningCollector, WarningCollectorLayer};
         use tracing_subscriber::layer::SubscriberExt;
         for token in ["tokC-81", "tokD-82"] {
-            rv_config::register_masked_url(
-                &format!("https://mask.example/{token}/m2/"),
-                "https://mask.example/***/m2/",
-            );
+            crate::output::secrets::register_secret(token);
         }
         let collector = std::sync::Arc::new(WarningCollector::default());
         let sink = collector.clone();
@@ -698,8 +750,9 @@ mod tests {
         });
         let warnings = collector.take();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
+        // As the envelope prints them.
         assert!(warnings.iter().all(|warning| {
-            let json = warning.to_json().to_string();
+            let json = crate::output::json_document(warning.to_json().to_string());
             !json.contains("tokC-81") && !json.contains("tokD-82")
         }));
     }

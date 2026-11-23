@@ -44,8 +44,9 @@ url.workspace = true
 rustix.workspace = true
 
 [features]
-# Test-only inspection of the client's trust decisions, for other crates'
-# tests. Enabled only from [dev-dependencies]; release builds never have it.
+# Test-only inspection of the client's trust decisions, and the Maven Central
+# stand-in hook (`CENTRAL_TEST_ENV`), for other crates' tests. Enabled only
+# from [dev-dependencies]; release builds never have it.
 testing = []
 
 [dev-dependencies]

@@ -38,6 +38,11 @@ pub struct ModuleResolution {
     /// population uses these during the same sync; they are never restored
     /// from lockfile metadata.
     pub trusted_repositories: Vec<Repository>,
+    /// Each support POM an imported BOM's build read, by `g:a:v`, with
+    /// each repository only imported BOMs declare that the read searched:
+    /// Maven searches those for the BOMs' parents and imports alone, so
+    /// such a POM may come from one, and nothing else.
+    pub import_repositories: Vec<(String, Repository)>,
     /// Provenance for each support POM (parent / imported BOM) as
     /// `("g:a:v", provenance)`. A support POM can resolve from a different
     /// repository than its referencing child, so this preserves both the
@@ -52,9 +57,27 @@ pub struct ModuleResolution {
     pub support_pom_provenance: Vec<(String, SupportPomProvenance)>,
     /// Parent range selections for each model this module built.
     pub parent_ranges: Vec<rv_lock::ParentRange>,
+    /// The module's lineage parents from a repository, nearest first.
+    pub parents: Vec<String>,
+    /// The dependency ranges this module's resolution listed whose highest
+    /// version its graph does not hold, sorted.
+    pub evicted_ranges: Vec<rv_lock::EvictedRange>,
+    /// The versions this module's resolution took from repository metadata
+    /// that the pins alone do not give `mvn -o`, sorted.
+    pub metadata_versions: Vec<rv_lock::MetadataVersion>,
+    /// The version each range the graph holds took, by each repository
+    /// whose list named it, sorted.
+    pub range_versions: Vec<rv_lock::RangeVersion>,
+    /// The jars of the build extensions whose artifact handlers gave this
+    /// module's resolution a dependency type.
+    pub extensions: Vec<rv_lock::ExtensionJar>,
     /// What this module's builds read from the host, including what the
     /// builds it reused from other modules read.
     pub host_reads: std::collections::BTreeSet<rv_maven_model::HostInput>,
+    /// Each `group:artifact:version` whose POM it read or looked for,
+    /// losing versions and range candidates included, and those it found
+    /// none for. Not locked: the Maven 3.9 checks of the plugins read it.
+    pub pom_reads: rv_lock::PomReads,
 }
 
 /// One locked package of a module.
@@ -72,6 +95,9 @@ pub struct ResolvedPackage {
     pub workspace_module: Option<String>,
     /// The interpolated `<systemPath>` of a `system` dependency.
     pub system_path: Option<String>,
+    /// Where the module's dependency management declares the version it
+    /// supplied, when it did.
+    pub managed: Option<std::sync::Arc<rv_maven_types::ManagedSource>>,
     /// The bytes an external package resolved to. `None` for a reactor
     /// module and a `system` dependency.
     pub artifact: Option<ResolvedArtifact>,

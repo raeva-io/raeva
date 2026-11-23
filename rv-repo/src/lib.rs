@@ -35,18 +35,28 @@ mod transport;
 pub use artifact::ArtifactRequest;
 pub use auth::{CredentialFile, SentCredential};
 pub use client::{
-    FetchArtifact, Fetched, PomArrival, RepoClient, SnapshotResolution, announcing_poms,
+    FetchArtifact, Fetched, Freshness, PomArrival, RepoClient, SnapshotResolution, announcing_poms,
 };
-pub use error::{ErrorClass, IntegritySource, RedirectRejectionKind, RepoError};
+pub use error::{ErrorClass, IntegritySource, Missing, RedirectRejectionKind, RepoError};
+#[cfg(any(test, feature = "testing"))]
+pub use fetch::CENTRAL_TEST_ENV;
 pub use fetch::FetchProgress;
-pub use metadata::{Metadata, Snapshot, SnapshotCandidate, SnapshotVersion};
-pub use policy::{Admission, Declaration, Provenance, RepositoryPolicy, secret_url_refusal};
+pub use metadata::{Metadata, MetadataReader, Snapshot, SnapshotCandidate, SnapshotVersion};
+pub use mirror::{HTTP_BLOCKER_ID, listing_mirror};
+pub use policy::{
+    Admission, Declaration, Provenance, RepositoryPolicy, expression_id_refusal, layout_refusal,
+    matched_mirror, mirror_serves, secret_id_refusal, secret_part_refusal, secret_url_refusal,
+    shown_id,
+};
 pub use proxy::configured_proxies;
 pub use repository::{Repository, fresh_secs, normalize_repo_url};
 pub use repository_fallback::RepositoryFallback;
 pub use restore::{
-    DownloadResult, LockRepositorySelector, RestoreContext, count_missing, ensure_artifacts,
-    ensure_support_pom, index_restored, repository_for_package, restore_complete,
-    restore_needs_discovery, restore_pinned, select_lock_repository,
+    DownloadResult, LockRepositorySelector, RestoreContext, admitted_routes, cache_pinned_pom,
+    count_missing, ensure_artifacts, ensure_support_pom, index_restored, repository_for_package,
+    restore_complete, restore_needs_discovery, restore_pinned, select_lock_repository,
 };
-pub use routing::{RouteInfo, mirrored_repository};
+pub use routing::{
+    RouteInfo, cache_scope_repository, cache_scope_update_policy, map_scope_urls,
+    mirrored_repository, shareable_cache_scope,
+};

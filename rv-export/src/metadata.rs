@@ -37,7 +37,7 @@ use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
-use rv_maven_types::{Version, is_snapshot_timestamp};
+use rv_maven_types::{MavenMode, Version, is_snapshot_timestamp};
 
 use super::error::Result;
 
@@ -102,7 +102,7 @@ pub(crate) fn render_versioned_metadata(meta: &VersionedMetadata<'_>) -> String 
 pub(crate) struct ArtifactMetadata<'a> {
     pub group_id: &'a str,
     pub artifact_id: &'a str,
-    pub latest: &'a str,
+    pub latest: Option<&'a str>,
     pub release: Option<&'a str>,
     pub versions: Vec<String>,
     pub last_updated: &'a str,
@@ -114,7 +114,9 @@ pub(crate) fn render_artifact_metadata(meta: &ArtifactMetadata<'_>) -> String {
     element(&mut out, 2, "groupId", meta.group_id);
     element(&mut out, 2, "artifactId", meta.artifact_id);
     out.push_str("  <versioning>\n");
-    element(&mut out, 4, "latest", meta.latest);
+    if let Some(latest) = meta.latest {
+        element(&mut out, 4, "latest", latest);
+    }
     if let Some(release) = meta.release {
         element(&mut out, 4, "release", release);
     }
@@ -125,6 +127,21 @@ pub(crate) fn render_artifact_metadata(meta: &ArtifactMetadata<'_>) -> String {
     out.push_str("    </versions>\n");
     element(&mut out, 4, "lastUpdated", meta.last_updated);
     out.push_str("  </versioning>\n</metadata>\n");
+    out
+}
+
+/// Body of a group's `maven-metadata-<id>.xml`: the goal prefix of each
+/// plugin, as `(prefix, artifactId)`.
+pub(crate) fn render_group_metadata(plugins: &BTreeSet<(String, String)>) -> String {
+    let mut out = String::from(XML_DECLARATION);
+    out.push_str("  <plugins>\n");
+    for (prefix, artifact_id) in plugins {
+        out.push_str("    <plugin>\n");
+        element(&mut out, 6, "prefix", prefix);
+        element(&mut out, 6, "artifactId", artifact_id);
+        out.push_str("    </plugin>\n");
+    }
+    out.push_str("  </plugins>\n</metadata>\n");
     out
 }
 
@@ -159,23 +176,22 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Atomically write `contents` to `dest`, creating parent directories as
-/// needed, and say whether it wrote. A file that already holds `contents`
-/// is left alone: rewriting it costs a sync per file on every repeated
-/// export.
-pub(crate) fn write_atomic(dest: &Path, contents: &str) -> Result<bool> {
+/// needed. A file that already holds `contents` is left alone: rewriting it
+/// costs a sync per file on every repeated export.
+pub(crate) fn write_atomic(dest: &Path, contents: &str) -> Result<()> {
     if read_regular_file(dest)
         .ok()
         .flatten()
         .is_some_and(|bytes| bytes == contents.as_bytes())
     {
-        return Ok(false);
+        return Ok(());
     }
     let parent = dest.parent().ok_or_else(|| {
         super::error::ExportError::IoError(io::Error::other("destination has no parent directory"))
     })?;
     fs::create_dir_all(parent)?;
     replace_file(dest, contents.as_bytes())?;
-    Ok(true)
+    Ok(())
 }
 
 /// Replace `path` with `contents` through a temp file and a rename, so a
@@ -282,17 +298,6 @@ fn parse_existing_metadata(bytes: &[u8]) -> ExistingMetadata {
     else {
         return ExistingMetadata::default();
     };
-    // A control character or a noncharacter such as U+FFFE, which a
-    // character reference can carry, cannot be written back as XML 1.0, so
-    // such a value is dropped.
-    let non_empty = |value: Option<String>| {
-        value.map(|v| v.trim().to_string()).filter(|v| {
-            !v.is_empty()
-                && !v
-                    .chars()
-                    .any(|c| c.is_control() || matches!(c, '\u{FFFE}' | '\u{FFFF}'))
-        })
-    };
     ExistingMetadata {
         versions: versioning
             .versions
@@ -317,6 +322,53 @@ fn parse_existing_metadata(bytes: &[u8]) -> ExistingMetadata {
             })
             .collect(),
     }
+}
+
+/// `value` trimmed, when it is not empty and can be written back: a control
+/// character or a noncharacter such as U+FFFE, which a character reference
+/// can carry, cannot be written as XML 1.0.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_string()).filter(|v| {
+        !v.is_empty()
+            && !v
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{FFFE}' | '\u{FFFF}'))
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct GroupMetadataXml {
+    plugins: Option<PluginsXml>,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginsXml {
+    #[serde(default)]
+    plugin: Vec<PluginXml>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginXml {
+    prefix: Option<String>,
+    artifact_id: Option<String>,
+}
+
+/// The `(prefix, artifactId)` pairs of the group metadata file at `path`,
+/// read as [`read_existing_metadata`] reads a file.
+pub(crate) fn read_existing_prefixes(path: &Path) -> BTreeSet<(String, String)> {
+    let text = read_regular_file(path).ok().flatten();
+    let Some(Ok(GroupMetadataXml {
+        plugins: Some(plugins),
+    })) = (text.as_deref())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(quick_xml::de::from_str::<GroupMetadataXml>)
+    else {
+        return BTreeSet::new();
+    };
+    (plugins.plugin.into_iter())
+        .filter_map(|plugin| Some((non_empty(plugin.prefix)?, non_empty(plugin.artifact_id)?)))
+        .collect()
 }
 
 /// `entries` followed by the `existing` entries for a classifier and
@@ -386,7 +438,6 @@ pub(crate) struct MetadataAccumulator {
     /// The (group, artifact, `-SNAPSHOT` version) directories that get a
     /// plain `-SNAPSHOT` file whose build the lock does not name.
     pub plain_snapshots: BTreeSet<(String, String, String)>,
-    pub replaces_listings: bool,
     /// The ids, `local` among them, that get a version list naming nothing
     /// wherever the lock takes no version from them, so that `mvn -o` does
     /// not read a tail repository's list instead. Empty in the shared
@@ -395,6 +446,8 @@ pub(crate) struct MetadataAccumulator {
     /// The destination is the shared Maven local repository: see
     /// [`crate::ExportOptions::shared`].
     pub shared: bool,
+    /// The Maven line whose order sorts each version list.
+    pub mode: MavenMode,
 }
 
 #[derive(Debug, Default)]
@@ -408,6 +461,20 @@ pub(crate) struct SnapshotMetaState {
     pub pom_base: bool,
 }
 
+impl SnapshotMetaState {
+    /// Name the build `timestamp`-`build_number` unless a later one is
+    /// named: a repository's metadata names its latest build.
+    pub(crate) fn name_build(&mut self, timestamp: &str, build_number: Option<u32>) {
+        let named = (self.timestamp.as_deref()).map(|named| (named, self.build_number));
+        if named.is_some_and(|named| named >= (timestamp, build_number)) {
+            return;
+        }
+        self.timestamp = Some(timestamp.to_string());
+        self.build_number = build_number;
+        self.last_updated = compact_updated(timestamp).or(self.last_updated.take());
+    }
+}
+
 /// Per-artifact state used to render `<groupId>/<artifactId>/maven-metadata-<id>.xml`.
 ///
 /// The raw strings are rendered verbatim, ordered by Maven's version
@@ -416,12 +483,20 @@ pub(crate) struct SnapshotMetaState {
 pub(crate) struct ArtifactMetaState {
     versions: Vec<(Version, String)>,
     listed: HashSet<String>,
+    /// The versions listed only for ranges that lose mediation, which no
+    /// `<latest>` or `<release>` names: a `LATEST` or `RELEASE` elsewhere
+    /// resolves to a locked version.
+    losing: HashSet<String>,
     pub last_updated: Option<String>,
+    /// The `<release>` and `<latest>` the resolutions read, written in
+    /// place of the ones the versions give.
+    pub markers: Option<crate::plan::Markers>,
 }
 
 impl ArtifactMetaState {
     pub(crate) fn add_version(&mut self, version: &str) {
         if !self.listed.insert(version.to_string()) {
+            self.losing.remove(version);
             return;
         }
         // A version that does not parse still gets listed, sorted as `0`.
@@ -431,30 +506,51 @@ impl ArtifactMetaState {
         self.versions.push((parsed, version.to_string()));
     }
 
-    /// Sort the versions in ascending Maven order, once, before rendering.
-    pub(crate) fn finalize(&mut self) {
-        Version::sort_by_key(&mut self.versions, |(version, _)| version);
+    /// Sort the versions in ascending order of `mode`, once, before
+    /// rendering.
+    pub(crate) fn finalize(&mut self, mode: MavenMode) {
+        Version::sort_by_key_in(&mut self.versions, mode, |(version, _)| version);
+    }
+
+    /// List `version` for a range that loses mediation, unless it is
+    /// listed already.
+    pub(crate) fn add_losing_version(&mut self, version: &str) {
+        if !self.listed.contains(version) {
+            self.add_version(version);
+            self.losing.insert(version.to_string());
+        }
     }
 
     pub(crate) fn versions(&self) -> impl DoubleEndedIterator<Item = &str> {
         self.versions.iter().map(|(_, version)| version.as_str())
     }
 
-    /// Maven's `<latest>`. Assumes [`Self::finalize`] has been called.
+    /// Maven's `<latest>`, of the versions not listed only for a losing
+    /// range. Assumes [`Self::finalize`] has been called.
     pub(crate) fn latest(&self) -> Option<&str> {
-        self.versions().next_back()
+        if let Some(markers) = &self.markers {
+            return markers.latest.as_deref();
+        }
+        self.versions().rev().find(|v| !self.losing.contains(*v))
     }
 
-    /// Maven's `<release>`: the greatest non-SNAPSHOT version. Assumes
-    /// [`Self::finalize`] has been called.
+    /// Maven's `<release>`: the greatest non-SNAPSHOT version not listed
+    /// only for a losing range. Assumes [`Self::finalize`] has been called.
     pub(crate) fn release(&self) -> Option<&str> {
+        if let Some(markers) = &self.markers {
+            return markers.release.as_deref();
+        }
         self.versions()
             .rev()
-            .find(|v| !rv_maven_types::is_snapshot_version(v))
+            .find(|v| !rv_maven_types::is_snapshot_version(v) && !self.losing.contains(*v))
     }
 
+    /// Whether the list names no version and no marker. A `RELEASE` or
+    /// `LATEST` reads only its marker.
     pub(crate) fn is_empty(&self) -> bool {
         self.versions.is_empty()
+            && (self.markers.as_ref())
+                .is_none_or(|markers| markers.release.is_none() && markers.latest.is_none())
     }
 }
 
@@ -472,8 +568,16 @@ impl ArtifactMetaState {
 /// and fails. See the comment header Maven itself writes into the file.
 #[derive(Debug, Default)]
 pub(crate) struct RemoteRepositoriesAccumulator {
-    /// Version directory -> set of `(filename, repository-id)` entries.
-    dirs: BTreeMap<PathBuf, BTreeSet<(String, String)>>,
+    dirs: BTreeMap<PathBuf, DirMarkers>,
+}
+
+/// What one version directory's `_remote.repositories` gets.
+#[derive(Debug, Default)]
+struct DirMarkers {
+    /// `(filename, repository-id)` entries to add.
+    entries: BTreeSet<(String, String)>,
+    /// Files whose entries on disk go first.
+    forgotten: BTreeSet<String>,
 }
 
 impl RemoteRepositoriesAccumulator {
@@ -485,7 +589,22 @@ impl RemoteRepositoriesAccumulator {
         self.dirs
             .entry(dir.to_path_buf())
             .or_default()
+            .entries
             .insert((filename.to_string(), repo_id.to_string()));
+    }
+
+    /// Drop the entries already on disk for the file at `path`, whose bytes
+    /// the export replaces: the repositories they name did not serve the
+    /// new ones.
+    pub(crate) fn forget(&mut self, path: &Path) {
+        let (Some(dir), Some(filename)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        self.dirs
+            .entry(dir.to_path_buf())
+            .or_default()
+            .forgotten
+            .insert(filename.to_string_lossy().into_owned());
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -500,10 +619,10 @@ impl RemoteRepositoriesAccumulator {
     /// main jars), or another project's export that reaches the same file
     /// through another repository, adds its entries and drops none, since
     /// strict `mvn -o` refuses a file whose entries do not name one of the
-    /// build's repositories. A file whose entries are all there already is
-    /// not rewritten.
+    /// build's repositories. Only the entries of a forgotten file are
+    /// dropped. A file that would not change is not rewritten.
     pub(crate) fn write_all(&self) -> Result<()> {
-        for (dir, entries) in &self.dirs {
+        for (dir, markers) in &self.dirs {
             let dest = dir.join("_remote.repositories");
             let existing = match read_regular_file(&dest) {
                 Ok(bytes) => bytes.and_then(|bytes| String::from_utf8(bytes).ok()),
@@ -511,26 +630,29 @@ impl RemoteRepositoriesAccumulator {
                 Err(err) => return Err(err.into()),
             };
             let existing = existing.map(|text| parse_remote_repositories(&text));
+            let mut merged: BTreeSet<(String, String)> = (existing.iter().flatten())
+                .filter(|(filename, _)| !markers.forgotten.contains(filename))
+                .cloned()
+                .collect();
+            merged.extend(markers.entries.iter().cloned());
             if existing
                 .as_ref()
-                .is_some_and(|existing| entries.is_subset(existing))
+                .map_or(merged.is_empty(), |existing| *existing == merged)
             {
                 continue;
             }
-            let mut merged = existing.unwrap_or_default();
-            merged.extend(entries.iter().cloned());
             write_atomic(&dest, &render_remote_repositories(&merged))?;
         }
         Ok(())
     }
 }
 
-/// Parse a `_remote.repositories` file back into its `(filename,
-/// repository-id)` entries. Inverse of [`render_remote_repositories`]; used to
-/// merge a fresh export pass with markers already on disk. Comment and blank
-/// lines are skipped; unparseable lines are ignored rather than aborting an
-/// export over a hand-edited or foreign file.
-pub(crate) fn parse_remote_repositories(contents: &str) -> BTreeSet<(String, String)> {
+/// Parse a `_remote.repositories` file into its `(filename, repository-id)`
+/// entries, unescaped as `java.util.Properties` reads its keys: the markers
+/// already on disk that an export merges, or those a Maven build wrote.
+/// Comment and blank lines are skipped; unparseable lines are ignored
+/// rather than aborting over a hand-edited or foreign file.
+pub fn parse_remote_repositories(contents: &str) -> BTreeSet<(String, String)> {
     let mut entries = BTreeSet::new();
     for line in contents.lines() {
         let line = line.trim();
@@ -650,6 +772,24 @@ fn escape_properties_key(key: &str) -> String {
 mod tests {
     use super::*;
 
+    /// With no marker recorded, `<latest>` and `<release>` are the
+    /// greatest version in the order of the lock's Maven line.
+    #[test]
+    fn latest_and_release_follow_the_modes_order() {
+        for (mode, expected) in [
+            (MavenMode::Maven39, "alpha"),
+            (MavenMode::Maven310, "0.min"),
+        ] {
+            let mut state = ArtifactMetaState::default();
+            for version in ["0.min", "alpha"] {
+                state.add_version(version);
+            }
+            state.finalize(mode);
+            assert_eq!(state.latest(), Some(expected), "{mode:?}");
+            assert_eq!(state.release(), Some(expected), "{mode:?}");
+        }
+    }
+
     fn snap_entry(extension: &str, classifier: Option<&str>, value: &str) -> SnapshotVersionEntry {
         SnapshotVersionEntry {
             extension: extension.to_string(),
@@ -738,7 +878,7 @@ mod tests {
         let xml = render_artifact_metadata(&ArtifactMetadata {
             group_id: "com.example",
             artifact_id: "foo",
-            latest: "1.0-SNAPSHOT",
+            latest: Some("1.0-SNAPSHOT"),
             release: Some("1.0"),
             versions: vec!["1.0".to_string(), "1.0-SNAPSHOT".to_string()],
             last_updated: "20240101010101",

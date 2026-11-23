@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use tracing::warn;
 
 /// Starts a reqwest client builder with the ring crypto provider installed
-/// and the trust roots [`trust_roots`] reports.
+/// and the trust roots [`trust_roots`] reports, sending no `Referer`.
 ///
 /// reqwest is built without a provider of its own and panics when a client is
 /// built before one is installed for the process.
@@ -19,7 +19,9 @@ use tracing::warn;
 #[allow(clippy::disallowed_methods)]
 pub fn client_builder() -> reqwest::ClientBuilder {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let builder = reqwest::Client::builder();
+    // A redirect's `Referer` would carry the source URL, and a mirror URL
+    // may hold a token in its path, to the target.
+    let builder = reqwest::Client::builder().referer(false);
     match env_roots() {
         // The platform verifier asks the OS on macOS and Windows and would
         // ignore these variables there.

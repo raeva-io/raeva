@@ -19,6 +19,7 @@
 //! repository that served them. It has no garbage collection, so a blob stays on disk until
 //! the store directory is deleted.
 
+pub mod daily;
 mod durability;
 mod error;
 mod index;

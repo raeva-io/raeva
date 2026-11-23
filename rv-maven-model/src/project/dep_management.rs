@@ -49,7 +49,27 @@ pub(super) fn resolve_dependencies(
     });
     let mut resolved = Vec::with_capacity(deps.len());
     for dep in deps {
-        let mut dep = interpolate_dependency(dep, properties, project, deferred.as_ref())?;
+        let mut dep = interpolate_declared(dep, properties, project, deferred.as_ref())?;
+        if let Some(version) = &mut dep.version {
+            // Maven requests the version as written, which then matches no
+            // artifact, but its range parser trims after a closing bracket.
+            // A dependency's POM keeps the trimmed version: refusing it would
+            // drop its other dependencies, test ones included.
+            let java_space = |c: char| c <= ' ';
+            let trimmed = version.trim_matches(java_space);
+            if !transitive
+                && !trimmed.is_empty()
+                && (version.starts_with(java_space)
+                    || (version.ends_with(java_space) && !trimmed.starts_with(['[', '('])))
+            {
+                return Err(PomError::InvalidProject(dep.problem(
+                    "dependencies.dependency.version",
+                    "has whitespace around it, which Maven keeps in the version it requests, so \
+                     no artifact matches it",
+                )));
+            }
+            crate::pom::trim_str(version);
+        }
         if let Some(managed) = find_managed_dependency_indexed(&dep, &index) {
             apply_managed_dependency(&mut dep, managed);
         }
@@ -62,17 +82,34 @@ pub(super) fn resolve_dependencies(
             }
         }
         dep.validate_coordinates(false)?;
-        dep.validate_system_scope()?;
+        dep.validate_system_scope(&project.environment)?;
+        // Maven keeps a scope it does not know as written; the resolver
+        // refuses one of a dependency's POM that the lock cannot record.
+        if !transitive && !dep.effective_scope().recordable() {
+            return Err(PomError::InvalidProject(dep.problem(
+                "dependencies.dependency.scope",
+                "is a scope Maven does not know, which raeva.lock can record only as 1 to 255 \
+                 characters without whitespace, control or invisible characters; write a scope \
+                 Maven knows",
+            )));
+        }
+        if !transitive {
+            warn_unknown_scope(&dep, project.environment.maven_mode(), false);
+        }
         resolved.push(dep);
     }
-    // A dependency's POM is a complete model: no outer management supplies
-    // a version Maven's validation finds missing there, or empty.
-    if transitive
-        && let Some(dep) = resolved
-            .iter()
-            .find(|dep| dep.version.as_deref().is_none_or(str::is_empty))
+    // Maven validates the version after this model's own management, for a
+    // dependency's POM too: no outer management supplies one there.
+    if let Some(dep) = resolved
+        .iter()
+        .find(|dep| dep.version.as_deref().is_none_or(str::is_empty))
     {
-        return Err(dep.missing(false, "version"));
+        return Err(match transitive {
+            true => dep.missing(false, "version"),
+            false => {
+                PomError::InvalidProject(dep.missing_message("dependencies.dependency.version"))
+            }
+        });
     }
     // Maven's project validation only warns of an incomplete exclusion,
     // which excludes nothing.
@@ -100,6 +137,45 @@ pub(super) fn resolve_dependencies(
     Ok(resolved)
 }
 
+/// Warn, in Maven's words, of the scope of a project dependency, or of a
+/// `management` entry, that Maven's validator does not know, which Maven
+/// builds with.
+pub(super) fn warn_unknown_scope(
+    dep: &Dependency,
+    mode: rv_maven_types::MavenMode,
+    management: bool,
+) {
+    let Some(scope) = dep.scope.as_deref().filter(|scope| !scope.is_empty()) else {
+        return;
+    };
+    let mut known = vec!["provided", "compile"];
+    if mode == rv_maven_types::MavenMode::Maven310 {
+        known.push("compile-only");
+    }
+    known.extend(["runtime", "test", "system"]);
+    let field = if management {
+        known.push("import");
+        "dependencyManagement.dependencies.dependency.scope"
+    } else {
+        "dependencies.dependency.scope"
+    };
+    if known.contains(&scope) {
+        return;
+    }
+    tracing::warn!(
+        sec_code = "POM_PROBLEM",
+        "{}",
+        dep.problem(
+            field,
+            &format!(
+                "must be one of [{}] but is '{}'",
+                known.join(", "),
+                bounded(scope)
+            ),
+        )
+    );
+}
+
 /// Maven's validation of `deps`, the dependencies of a model whose
 /// management alone is used, as an imported BOM's: managed by
 /// `management`, they need their coordinates and a version.
@@ -120,13 +196,29 @@ pub(super) fn resolve_dependency(
     let resolved = interpolate_dependency(dep, properties, project, None)?;
     resolved.validate_coordinates(true)?;
     // Validate `<systemPath>` after interpolation so exporters cannot emit invalid entries.
-    resolved.validate_system_scope()?;
+    resolved.validate_system_scope(&project.environment)?;
     Ok(resolved)
 }
 
 /// `dep` interpolated, its version and exclusions through `deferred` when
 /// given.
-pub(super) fn interpolate_dependency(
+pub(crate) fn interpolate_dependency(
+    dep: Dependency,
+    properties: &PropertyMap,
+    project: &ProjectInfo,
+    deferred: Option<&ProjectInfo>,
+) -> Result<Dependency, PomError> {
+    let mut dep = interpolate_declared(dep, properties, project, deferred)?;
+    if let Some(version) = &mut dep.version {
+        crate::pom::trim_str(version);
+    }
+    Ok(dep)
+}
+
+/// [`interpolate_dependency`] with the version as interpolated: the POM's
+/// text is trimmed when it is read, so whitespace around it came from a
+/// host value or another property.
+fn interpolate_declared(
     dep: Dependency,
     properties: &PropertyMap,
     project: &ProjectInfo,
@@ -146,9 +238,10 @@ pub(super) fn interpolate_dependency(
         }
     }
     let deferred = deferred.unwrap_or(project);
-    // Trim whitespace from coordinate fields to match Maven's lenient parsing.
-    // Some POMs have stray whitespace in <groupId>, <artifactId>, or <version>
-    // (e.g. Quarkus `<groupId> jakarta.servlet</groupId>`).
+    refuse_secret_coordinate(&dep, properties, project, deferred)?;
+    // Trim whitespace from the ids to match Maven's lenient parsing. Some
+    // POMs have stray whitespace in <groupId> or <artifactId> (e.g. Quarkus
+    // `<groupId> jakarta.servlet</groupId>`).
     let trim_string = |s: String| {
         let trimmed = s.trim();
         if trimmed.len() == s.len() {
@@ -157,22 +250,91 @@ pub(super) fn interpolate_dependency(
             trimmed.to_string()
         }
     };
-    let trim_opt = |o: Option<String>| o.map(trim_string);
+    let group_id = trim_string(properties.interpolate_str(&dep.group_id, project)?);
+    let artifact_id = trim_string(properties.interpolate_str(&dep.artifact_id, project)?);
+    let type_ = properties.interpolate_opt(dep.type_.as_deref(), project)?;
+    let classifier = properties.interpolate_opt(dep.classifier.as_deref(), project)?;
+    let scope = properties.interpolate_opt(dep.scope.as_deref(), project)?;
+    let optional = properties.interpolate_opt(dep.optional.as_deref(), project)?;
+    let exclusions = (dep.exclusions.into_iter())
+        .map(|e| resolve_exclusion(e, properties, deferred))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (system_path, from_project) = match dep.system_path.as_deref() {
+        Some(path) => {
+            let (path, from_project) = properties.interpolate_from_project(path, project)?;
+            (Some(path), from_project)
+        }
+        None => (None, false),
+    };
     Ok(Dependency {
-        group_id: trim_string(properties.interpolate_str(&dep.group_id, project)?),
-        artifact_id: trim_string(properties.interpolate_str(&dep.artifact_id, project)?),
-        version: trim_opt(version),
-        type_: properties.interpolate_opt(dep.type_.as_deref(), project)?,
-        classifier: properties.interpolate_opt(dep.classifier.as_deref(), project)?,
-        scope: properties.interpolate_opt(dep.scope.as_deref(), project)?,
-        optional: properties.interpolate_opt(dep.optional.as_deref(), project)?,
-        exclusions: dep
-            .exclusions
-            .into_iter()
-            .map(|e| resolve_exclusion(e, properties, deferred))
-            .collect::<Result<Vec<_>, _>>()?,
-        system_path: properties.interpolate_opt(dep.system_path.as_deref(), project)?,
+        group_id,
+        artifact_id,
+        version,
+        type_,
+        classifier,
+        scope,
+        optional,
+        exclusions,
+        system_path,
+        system_path_from_project: crate::ProjectDirectory(from_project),
+        origin: dep.origin,
     })
+}
+
+/// Refuse `dep` when one of its coordinates reads a host input named like a
+/// secret ([`crate::HostSnapshot::with_secret_names`]), whose value raeva.lock
+/// and a repository request would take, its version and exclusions as
+/// `deferred` reads them.
+fn refuse_secret_coordinate(
+    dep: &Dependency,
+    properties: &PropertyMap,
+    project: &ProjectInfo,
+    deferred: &ProjectInfo,
+) -> Result<(), PomError> {
+    let exclusions = (dep.exclusions.iter())
+        .flat_map(|e| [("exclusion", &e.group_id), ("exclusion", &e.artifact_id)])
+        .map(|(field, text)| (field, Some(text.as_str()), deferred));
+    let fields = [
+        ("groupId", Some(dep.group_id.as_str()), project),
+        ("artifactId", Some(dep.artifact_id.as_str()), project),
+        ("version", dep.version.as_deref(), deferred),
+        ("type", dep.type_.as_deref(), project),
+        ("classifier", dep.classifier.as_deref(), project),
+        ("scope", dep.scope.as_deref(), project),
+    ];
+    let of = || {
+        let version = dep.version.as_deref().unwrap_or_default();
+        format!("dependency {}:{}:{version}", dep.group_id, dep.artifact_id)
+    };
+    refuse_secret_coordinates(properties, fields.into_iter().chain(exclusions), of)
+}
+
+/// Refuse the coordinates `fields`, each a field name, its text as written
+/// and the project that reads it, when one reads a host input named like a
+/// secret ([`crate::HostSnapshot::with_secret_names`]), whose value
+/// raeva.lock and a repository request would take. `of` names whose they
+/// are.
+pub(crate) fn refuse_secret_coordinates<'a>(
+    properties: &PropertyMap,
+    fields: impl IntoIterator<Item = (&'static str, Option<&'a str>, &'a ProjectInfo)>,
+    of: impl FnOnce() -> String,
+) -> Result<(), PomError> {
+    for (field, text, project) in fields {
+        if !project.environment.reads_secrets() {
+            continue;
+        }
+        let Some(text) = text.filter(|text| text.contains("${")) else {
+            continue;
+        };
+        let Ok((_, names)) = properties.interpolate_str_reading(text, project) else {
+            continue;
+        };
+        if let Some(input) = project.environment.secret_input(&names) {
+            let of = of();
+            return Err(PomError::SecretCoordinate { field, of, input });
+        }
+    }
+    Ok(())
 }
 
 fn resolve_exclusion(
@@ -213,7 +375,7 @@ pub(super) fn build_managed_dep_index(management: &DependencyManagement) -> Mana
     );
     let mut merged = Vec::new();
     for dep in &management.dependencies {
-        match index.entry(dep.management_key()) {
+        match index.entry(dep.maven_key()) {
             hash_map::Entry::Vacant(slot) => {
                 slot.insert(Slot::Entry(dep));
             }
@@ -237,15 +399,17 @@ pub(super) fn find_managed_dependency_indexed<'i>(
     dep: &Dependency,
     index: &'i ManagedIndex<'_>,
 ) -> Option<&'i Dependency> {
-    match *index.index.get(&dep.management_key())? {
+    match *index.index.get(&dep.maven_key())? {
         Slot::Entry(managed) => Some(managed),
         Slot::Merged(at) => Some(&index.merged[at]),
     }
 }
 
 pub(super) fn apply_managed_dependency(dep: &mut Dependency, managed: &Dependency) {
-    if dep.version.is_none() {
+    // The origin follows the version it names.
+    if dep.version.is_none() && managed.version.is_some() {
         dep.version.clone_from(&managed.version);
+        dep.origin.clone_from(&managed.origin);
     }
     // Maven semantics: dependency-management `scope` is a fill-in only. A
     // declared scope on the concrete dependency wins; the managed entry's
@@ -265,6 +429,7 @@ pub(super) fn apply_managed_dependency(dep: &mut Dependency, managed: &Dependenc
     // Maven's model merger fills a missing `<systemPath>` from dependencyManagement.
     if dep.system_path.is_none() {
         dep.system_path.clone_from(&managed.system_path);
+        dep.system_path_from_project = managed.system_path_from_project;
     }
     // Maven 3.9's DefaultDependencyManagementInjector copies the managed
     // exclusions only onto a dependency that declares none. The resolver
@@ -298,6 +463,8 @@ mod tests {
                 })
                 .collect(),
             system_path: None,
+            system_path_from_project: Default::default(),
+            origin: Default::default(),
         };
         for (declared, managed, expected) in [
             (

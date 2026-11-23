@@ -42,8 +42,14 @@ pub struct SystemFile {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SystemPathError {
-    /// Maven requires an absolute `<systemPath>` after interpolation.
-    #[error("systemPath {} is not an absolute path", shown(.path))]
+    /// The `<systemPath>`, absolute on the locked platform, is not a path
+    /// on the host, such as a drive path on Linux, so it names no file
+    /// inside the project.
+    #[error(
+        "systemPath {} is not a path on this host; raeva.lock records only system files inside \
+         the directory that holds it",
+        shown(.path)
+    )]
     NotAbsolute {
         /// The `<systemPath>` as given.
         path: PathBuf,

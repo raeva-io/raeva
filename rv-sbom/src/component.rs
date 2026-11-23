@@ -9,9 +9,10 @@ use crate::SbomError;
 ///
 /// - `name` and `version` are not blank.
 /// - `purl` parses and equals the form [`rv_maven_types::canonicalize_purl`]
-///   returns for it, and no two components in one document share a purl.
+///   returns for it.
+/// - no two components in one document share a [`Component::reference`].
 /// - each hash is hex of the length its algorithm produces.
-/// - each `dependencies` entry is the purl of a component in the same
+/// - each `dependencies` entry is the reference of a component in the same
 ///   document.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Component {
@@ -22,19 +23,58 @@ pub struct Component {
     /// Maven groupId, written as CycloneDX `group`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// Package URL in canonical form. It is the CycloneDX `bom-ref` and the
-    /// key `dependencies` entries refer to.
+    /// Package URL in canonical form.
     pub purl: String,
+    /// The CycloneDX `bom-ref` when it is not `purl`: that of a second
+    /// component with the purl of another, such as a reactor module and the
+    /// repository's artifact of its coordinates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bom_ref: Option<String>,
     /// Digests of the package artifact, written as CycloneDX `hashes`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub hashes: Vec<Hash>,
     /// Licenses from the effective POM, written as CycloneDX `licenses`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub licenses: Vec<crate::License>,
-    /// Purls of the components this one depends on directly, written as a
-    /// CycloneDX `dependsOn` list.
+    /// References of the components this one depends on directly, written
+    /// as a CycloneDX `dependsOn` list.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<String>,
+    /// Written as CycloneDX `scope`, left out when `None`. Not written for
+    /// the root component.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ComponentScope>,
+    /// Written as CycloneDX `properties`, in the order given. Names may
+    /// repeat. Not written for the root component.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub properties: Vec<Property>,
+}
+
+impl Component {
+    /// The CycloneDX `bom-ref`, which `dependencies` entries refer to.
+    pub fn reference(&self) -> &str {
+        self.bom_ref.as_deref().unwrap_or(&self.purl)
+    }
+}
+
+/// CycloneDX `scope` of a [`Component`].
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum ComponentScope {
+    /// `required`: the component is on the runtime call graph.
+    Required,
+    /// `excluded`: the component is used only outside runtime, such as by
+    /// tests.
+    Excluded,
+}
+
+/// A name/value pair written as a CycloneDX `properties` entry.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Property {
+    /// `name`.
+    pub name: String,
+    /// `value`.
+    pub value: String,
 }
 
 /// One digest of a component's artifact.
@@ -80,8 +120,8 @@ pub(crate) fn validate_components<'a>(
             }
             Some(_) => {}
         }
-        if !seen.insert(purl.as_str()) {
-            return invalid(format!("duplicate purl: {purl}"));
+        if !seen.insert(component.reference()) {
+            return invalid(format!("duplicate bom-ref: {}", component.reference()));
         }
         for hash in &component.hashes {
             let length = match hash.algorithm {
@@ -121,9 +161,12 @@ mod tests {
             version: "1.0.0".to_string(),
             group: None,
             purl: purl.to_string(),
+            bom_ref: None,
             hashes: vec![],
             licenses: vec![],
             dependencies: vec![],
+            scope: None,
+            properties: vec![],
         }
     }
 
@@ -159,7 +202,7 @@ mod tests {
                 vec![component(&format!("{purl}?type=jar&classifier=tests"))],
                 "non-canonical purl",
             ),
-            (vec![ok.clone(), ok.clone()], "duplicate purl"),
+            (vec![ok.clone(), ok.clone()], "duplicate bom-ref"),
             (vec![dangling], "unknown dependency"),
         ];
         for (components, expected) in cases {

@@ -34,7 +34,18 @@ impl Lineage {
         if policy.root {
             pom.mark_root_repositories();
         }
-        crate::inheritance::observe_lineage_repositories(source, &pom, Some(&ctx))?;
+        let settings = if policy.root {
+            ctx.settings_repositories.as_slice()
+        } else {
+            &[]
+        };
+        crate::inheritance::observe_lineage_repositories(
+            source,
+            &pom,
+            Some(&ctx),
+            policy.root,
+            settings,
+        )?;
         let (pom, fetched) =
             apply_inheritance_tracked(pom, source, policy, ParentLookup::Project, Some(&ctx))
                 .await?;
@@ -87,18 +98,18 @@ pub(crate) fn project_info(
     project_info_in(
         pom,
         properties,
-        ctx.base_dir.clone(),
+        (ctx.base_dir.clone(), ctx.root_directory()),
         ctx.interpolation_system_properties(),
         &ctx.model_environment(),
     )
 }
 
-/// [`project_info`] with the project directory, system properties and
-/// environment given apart, as an imported BOM is built.
+/// [`project_info`] with the project and root directories, system
+/// properties and environment given apart, as an imported BOM is built.
 pub(crate) fn project_info_in(
     pom: &Pom,
     properties: &PropertyMap,
-    basedir: Option<PathBuf>,
+    (basedir, root_directory): (Option<PathBuf>, Option<PathBuf>),
     system_properties: HashMap<String, String>,
     environment: &ModelEnvironment,
 ) -> Result<ProjectInfo, PomError> {
@@ -147,6 +158,7 @@ pub(crate) fn project_info_in(
         packaging: raw_packaging.trim().to_string(),
         parent,
         basedir: basedir.clone(),
+        root_directory,
         build: Build::clone(&pom.build),
         system_properties,
         environment: environment.clone(),
@@ -163,9 +175,13 @@ pub(crate) fn project_info_in(
     // What is left of a reference to the field being expanded, which no
     // property of its name defined.
     let names_itself = |value: &str, field: &str| {
-        ["project.", "pom.", ""]
-            .iter()
-            .any(|prefix| value.contains(&format!("${{{prefix}{field}}}")))
+        crate::properties::expression_names(value)
+            .into_iter()
+            .any(|name| {
+                ["project.", "pom.", ""]
+                    .iter()
+                    .any(|prefix| name.strip_prefix(prefix) == Some(field))
+            })
     };
     project.group_id.clear();
     let group_id = interpolate(raw_group_id, &project)?;
@@ -193,6 +209,25 @@ pub(crate) fn project_info_in(
         ));
     }
     project.version = version;
+    // raeva.lock records the project's coordinates, and a parent's are a
+    // repository request's path.
+    let parent = (pom.parent.iter()).flat_map(|parent| {
+        [
+            ("parent groupId", parent.group_id.as_str()),
+            ("parent artifactId", parent.artifact_id.as_str()),
+            ("parent version", parent.version.as_str()),
+        ]
+    });
+    let fields = [
+        ("groupId", raw_group_id),
+        ("artifactId", raw_artifact_id),
+        ("version", raw_version),
+    ];
+    crate::project::refuse_secret_coordinates(
+        properties,
+        (fields.into_iter().chain(parent)).map(|(field, raw)| (field, Some(raw), &project)),
+        || format!("project {raw_group_id}:{raw_artifact_id}:{raw_version}"),
+    )?;
     if let Some(lookup) = project.model_lookup.as_mut() {
         for (field, raw, value) in [
             ("groupId", raw_group_id, &project.group_id),

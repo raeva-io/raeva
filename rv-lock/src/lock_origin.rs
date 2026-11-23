@@ -2,8 +2,10 @@
 //!
 //! A `file:` repository inside the directory that holds raeva.lock is recorded
 //! as a project-relative token, `./<segment>/.../`, so a checkout at another
-//! path records the same origin. Every other origin is recorded as the URL it
-//! was declared with.
+//! path records the same origin. One outside it that shares a named directory
+//! with it is recorded from there, `../<segment>/.../`, with a `../` for each
+//! level up, so the tree holding both can move. Every other origin is
+//! recorded as the URL it was declared with.
 //!
 //! A token is only ever a lookup key: [`LockOrigins::declared`] maps a
 //! repository that current configuration or the current POMs declare to the
@@ -17,12 +19,14 @@ use std::path::{Component, Path, PathBuf};
 use url::Url;
 
 use rv_config::redact_url;
+use rv_maven_types::is_terminal_safe;
 
 use crate::error::LockError;
 use crate::lock::RepoIds;
 use rv_fs::plain_path;
 
 pub(crate) const PROJECT_RELATIVE_ORIGIN_PREFIX: &str = "./";
+pub(crate) const PARENT_ORIGIN_PREFIX: &str = "../";
 
 /// Lockfile `[metadata]` key under which `raeva sync` records `origin\tid` lines
 /// for the id'd repositories that backed resolution, so `raeva export-m2` can
@@ -86,50 +90,137 @@ pub fn is_http_origin(url: &str) -> bool {
 }
 
 /// True when `value` is spelled as a project-relative origin. Whether it is a
-/// valid one is [`validate_project_relative_origin`]'s question.
-pub(crate) fn is_project_relative_origin(value: &str) -> bool {
+/// valid one is `validate_project_relative_origin`'s question.
+pub fn is_project_relative_origin(value: &str) -> bool {
     value.trim_start().starts_with('.')
 }
 
-/// Check a project-relative origin exactly as written: `./`, then zero or more
-/// `segment/`. The text is split on `/` rather than parsed as a path, because
-/// path parsing drops repeated separators and `.` components that would then
-/// name a different directory than the text does. Segments are never
-/// percent-decoded, so `%` is refused outright.
+/// Check a project-relative origin exactly as written: `./` or one or more
+/// `../`, then zero or more `segment/`. The text is split on `/` rather than
+/// parsed as a path, because path parsing drops repeated separators and `.`
+/// components that would then name a different directory than the text
+/// does.
 pub(crate) fn validate_project_relative_origin(value: &str) -> Result<(), LockError> {
     // The value is not shown: text that fails this check may be a URL with
     // credentials behind a stray '.'.
     let invalid = || {
         LockError::Invalid(
             "a repository origin starting with '.' is not a valid project-relative origin; \
-             expected './' followed by '/'-terminated directory names"
+             expected './' or one or more '../' followed by '/'-terminated directory names"
                 .to_string(),
         )
     };
-    let rest = value
-        .strip_prefix(PROJECT_RELATIVE_ORIGIN_PREFIX)
-        .ok_or_else(invalid)?;
+    let (_, rest) = split_relative_origin(value).ok_or_else(invalid)?;
     if rest.is_empty() {
         return Ok(());
     }
     let inner = rest.strip_suffix('/').ok_or_else(invalid)?;
-    if inner.split('/').all(is_portable_segment) {
+    if inner
+        .split('/')
+        .all(|segment| decode_segment(segment).is_some())
+    {
         Ok(())
     } else {
         Err(invalid())
     }
 }
 
-/// A directory name a token may carry. `\` and `:` would read as a separator
-/// or a drive or stream on Windows, and tab and newline would break the
-/// `repo_ids` line codec.
-fn is_portable_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment != "."
-        && segment != ".."
-        && !segment
-            .chars()
-            .any(|c| matches!(c, '/' | '\\' | ':' | '%') || c.is_control())
+/// The levels a project-relative origin goes up, and the segments after
+/// them; `None` for text that starts with neither `./` nor `../`.
+fn split_relative_origin(value: &str) -> Option<(usize, &str)> {
+    if let Some(rest) = value.strip_prefix(PROJECT_RELATIVE_ORIGIN_PREFIX) {
+        return Some((0, rest));
+    }
+    let mut rest = value.strip_prefix(PARENT_ORIGIN_PREFIX)?;
+    let mut levels = 1;
+    while let Some(next) = rest.strip_prefix(PARENT_ORIGIN_PREFIX) {
+        rest = next;
+        levels += 1;
+    }
+    Some((levels, rest))
+}
+
+/// Whether a token segment spells `c` as `%` and the uppercase hex of its
+/// UTF-8 bytes, as a URL does: `%` and `\\`, the URL delimiters `#` and `?`,
+/// whitespace, and the control and invisible characters raeva.lock refuses
+/// in an origin.
+fn is_escaped(c: char) -> bool {
+    matches!(c, '%' | '\\' | '#' | '?')
+        || c.is_whitespace()
+        || !is_terminal_safe(c.encode_utf8(&mut [0; 4]))
+}
+
+/// The token segment for the directory `name`, if it has one: `name` with
+/// each character [`is_escaped`] reads percent-encoded. A `/` or `:` has no
+/// spelling, as either reads as a separator, a drive or a stream on Windows.
+fn encode_segment(name: &str) -> Option<String> {
+    if matches!(name, "" | "." | "..") || name.contains(['/', ':']) {
+        return None;
+    }
+    let mut segment = String::with_capacity(name.len());
+    for c in name.chars() {
+        if is_escaped(c) {
+            for byte in c.encode_utf8(&mut [0; 4]).bytes() {
+                segment.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            segment.push(c);
+        }
+    }
+    Some(segment)
+}
+
+/// The directory name a token segment spells. The segment must be exactly
+/// [`encode_segment`]'s spelling of that name, so each name has one.
+fn decode_segment(segment: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(segment.len());
+    let mut rest = segment.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        if byte == b'%' {
+            let hex = std::str::from_utf8(rest.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &rest[2..];
+        } else {
+            bytes.push(byte);
+        }
+    }
+    let name = String::from_utf8(bytes).ok()?;
+    (encode_segment(&name)? == segment).then_some(name)
+}
+
+/// The project-relative origin of `path` from `root`: `./` and the names
+/// below `root`, or, when `climb` allows it, a `../` for each directory of
+/// `root` below the deepest one both share. Paths that share no named
+/// directory, only a filesystem root, a drive or a share, have none: no move
+/// of one tree carries both, so their absolute URL is the portable spelling.
+fn relative_origin(root: &Path, path: &Path, climb: bool) -> Option<String> {
+    let root: Vec<Component<'_>> = root.components().collect();
+    let path: Vec<Component<'_>> = path.components().collect();
+    let shared = root.iter().zip(&path).take_while(|(a, b)| a == b).count();
+    let levels = root.len() - shared;
+    if levels > 0 && !(climb && is_named(&root[..shared])) {
+        return None;
+    }
+    let mut token = match levels {
+        0 => PROJECT_RELATIVE_ORIGIN_PREFIX.to_string(),
+        _ => PARENT_ORIGIN_PREFIX.repeat(levels),
+    };
+    for component in &path[shared..] {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        token.push_str(&encode_segment(name.to_str()?)?);
+        token.push('/');
+    }
+    validate_project_relative_origin(&token).ok()?;
+    Some(token)
+}
+
+/// Whether `components` name a directory below a filesystem root, drive or
+/// share.
+fn is_named(components: &[Component<'_>]) -> bool {
+    (components.iter()).any(|component| matches!(component, Component::Normal(_)))
 }
 
 /// A repository origin as recorded in raeva.lock, for messages and logs: a
@@ -147,7 +238,7 @@ pub fn redact_origin(value: &str) -> String {
 /// [`LockOrigins::declared`] keys: a project-relative origin as written, any
 /// other origin normalized.
 pub fn recorded_key(recorded: &str) -> String {
-    if is_project_relative_origin(recorded) {
+    if recorded.is_empty() || is_project_relative_origin(recorded) {
         recorded.to_string()
     } else {
         normalize_repo_url(recorded)
@@ -159,6 +250,10 @@ pub fn recorded_key(recorded: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct LockOrigins {
     roots: Vec<PathBuf>,
+    /// The plain form of the canonical root, which `../` counts from: the
+    /// lexical parent of a path through a link may be another directory
+    /// than its parent.
+    canonical: Option<PathBuf>,
 }
 
 impl LockOrigins {
@@ -176,10 +271,12 @@ impl LockOrigins {
             root
         };
         let mut roots = Vec::new();
-        if let Ok(canonical) = dunce::canonicalize(root) {
-            roots.push(plain_path(&canonical));
+        let canonical = dunce::canonicalize(root).ok().map(|canonical| {
+            let plain = plain_path(&canonical);
+            roots.push(plain.clone());
             roots.push(canonical);
-        }
+            plain
+        });
         let absolute = if root.is_absolute() {
             Some(root.to_path_buf())
         } else {
@@ -188,7 +285,7 @@ impl LockOrigins {
         roots.extend(absolute);
         let mut seen = BTreeSet::new();
         roots.retain(|root| seen.insert(root.clone()));
-        Self { roots }
+        Self { roots, canonical }
     }
 
     /// Origins relative to the directory that holds the lockfile at `path`.
@@ -211,6 +308,29 @@ impl LockOrigins {
         }
     }
 
+    /// Whether the lock records `origin`, empty for none: a project-relative
+    /// origin, or a URL some declaration could match ([`Self::declared`]).
+    pub fn is_recordable(&self, origin: &str) -> bool {
+        origin.is_empty()
+            || validate_project_relative_origin(origin).is_ok()
+            || self.declared(origin).is_some()
+    }
+
+    /// Whether the lock can record the origin of a repository declared
+    /// with `url`, empty for none: [`Self::declared`] reads it. A relative
+    /// path such as `./repo/`, which only a mirror can serve, cannot be
+    /// recorded: it would read back as a project-relative origin.
+    pub fn records_declaration(&self, url: &str) -> bool {
+        url.is_empty() || self.declared(url).is_some()
+    }
+
+    /// [`Self::declared`], or the empty origin for a declaration whose URL the
+    /// lock cannot record: a file only a mirror of it served is recorded
+    /// with no origin ([`Lockfile::relativize_origins`](crate::Lockfile)).
+    pub fn key(&self, url: &str) -> Option<String> {
+        (self.declared(url)).or_else(|| (!url.trim().is_empty()).then(String::new))
+    }
+
     /// The spelling the lock should record for an origin read from or about
     /// to be written to a lockfile. A project-relative origin is checked as
     /// written; a `file:` URL inside the project becomes one; anything else is
@@ -229,11 +349,40 @@ impl LockOrigins {
         Ok(value.to_string())
     }
 
+    /// The `file:` URL of the directory that the project-relative origin
+    /// `recorded` names; `None` for any other origin, for one that goes up
+    /// past the project's last named directory, and for one naming a
+    /// directory this OS cannot hold.
+    pub fn project_url(&self, recorded: &str) -> Option<String> {
+        validate_project_relative_origin(recorded).ok()?;
+        let (levels, rest) = split_relative_origin(recorded)?;
+        let mut directory = match levels {
+            0 => self.roots.first()?.clone(),
+            _ => self.canonical.clone()?,
+        };
+        for _ in 0..levels {
+            directory.pop();
+        }
+        if levels > 0 && !is_named(&directory.components().collect::<Vec<_>>()) {
+            return None;
+        }
+        for segment in rest.split('/').filter(|segment| !segment.is_empty()) {
+            let name = decode_segment(segment)?;
+            if cfg!(windows) && name.contains('\\') {
+                return None;
+            }
+            directory.push(name);
+        }
+        let url = Url::from_directory_path(directory).ok()?;
+        Some(url.to_string())
+    }
+
     /// Whether a lock origin names the repository declared with `url`: the
-    /// declaration's key equals the origin's. A declaration no fetch could use
-    /// matches nothing.
+    /// declaration's key ([`Self::key`]) equals the origin's. A declaration
+    /// whose URL the lock cannot record matches only the empty origin, which
+    /// stands for the one a mirror serves; no fetch could use its own URL.
     pub fn matches(&self, recorded: &str, url: &str) -> bool {
-        self.declared(url)
+        self.key(url)
             .is_some_and(|key| key == recorded_key(recorded))
     }
 
@@ -296,24 +445,24 @@ impl LockOrigins {
         })
     }
 
-    /// The token for a parsed `file:` URL inside the project, if it has one.
+    /// The token for a parsed `file:` URL, if it has one: inside the project
+    /// under any spelling of its root, outside it from the canonical root.
     /// `Url::parse` has already removed dot segments, as the fetch path does,
     /// so the token names the directory a read would open.
     fn project_relative(&self, url: &Url) -> Option<String> {
         let path = file_url_path(url)?;
-        self.roots.iter().find_map(|root| {
-            let rest = path.strip_prefix(root).ok()?;
-            let mut token = String::from(PROJECT_RELATIVE_ORIGIN_PREFIX);
-            for component in rest.components() {
-                let Component::Normal(name) = component else {
-                    return None;
-                };
-                let name = name.to_str().filter(|name| is_portable_segment(name))?;
-                token.push_str(name);
-                token.push('/');
-            }
-            validate_project_relative_origin(&token).ok()?;
-            Some(token)
+        let inside =
+            |path: &Path| (self.roots.iter()).find_map(|root| relative_origin(root, path, false));
+        inside(&path).or_else(|| {
+            // A path through a link, such as the shell's name for the
+            // launcher's directory, is read where it leads, which `../`
+            // counts to from the canonical root. A URL with a host names a
+            // network share on Windows, which is not resolved.
+            let resolved = match url.host() {
+                None => dunce::canonicalize(&path).map_or(path, |path| plain_path(&path)),
+                Some(_) => path,
+            };
+            inside(&resolved).or_else(|| relative_origin(self.canonical.as_ref()?, &resolved, true))
         })
     }
 }
@@ -474,7 +623,10 @@ pub(crate) fn encode_repo_id_lines(map: &RepoIds) -> Result<String, LockError> {
 /// writing; their ids are kept together.
 pub(crate) fn record_repo_ids(origins: &LockOrigins, ids: RepoIds) -> Result<RepoIds, LockError> {
     let mut recorded = RepoIds::new();
-    for (origin, ids) in ids {
+    for (origin, ids) in ids
+        .into_iter()
+        .filter(|(origin, _)| origins.is_recordable(origin))
+    {
         recorded
             .entry(origins.recorded(&origin)?)
             .or_default()
@@ -586,9 +738,14 @@ mod tests {
             (format!("{base}sub/%2e%2e/repo/"), "./repo/".into()),
             // `to_file_path` decodes `%2F` into a separator, and so does the read.
             (format!("{base}a%2Fb/"), "./a/b/".into()),
-            (file_url(&project.join("my repo")), "./my repo/".into()),
-            (percent.clone(), normalize_repo_url(&percent)),
-            (escaping.clone(), normalize_repo_url(&escaping)),
+            (file_url(&project.join("my repo")), "./my%20repo/".into()),
+            (file_url(&project.join("a#b?")), "./a%23b%3F/".into()),
+            (
+                file_url(&project.join("a\u{200b}b")),
+                "./a%E2%80%8Bb/".into(),
+            ),
+            (percent, "./a%25b/".into()),
+            (escaping, "../outside/".into()),
             (
                 "https://repo.example/m2".into(),
                 "https://repo.example/m2/".into(),
@@ -597,7 +754,7 @@ mod tests {
             assert_eq!(origins.declared(&url), Some(recorded), "{url}");
         }
         let sibling = file_url(&root.join("project-other"));
-        assert_eq!(origins.recorded(&sibling).unwrap(), sibling);
+        assert_eq!(origins.recorded(&sibling).unwrap(), "../project-other/");
         assert_eq!(origins.recorded("").unwrap(), "");
         for unusable in ["./repo/", "repo", "ftp://files.example/m2/"] {
             assert_eq!(origins.declared(unusable), None);
@@ -623,9 +780,106 @@ mod tests {
         }
     }
 
+    /// A project-relative origin reads back as the directory it names,
+    /// which the lock records as that origin again; nothing else does.
+    #[test]
+    fn a_project_relative_origin_names_its_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(temp.path()).unwrap();
+        let origins = origins(&root);
+        let url = origins.project_url("./repo/nested/").unwrap();
+        assert_eq!(url, file_url(&root.join("repo").join("nested")));
+        assert!(origins.matches("./repo/nested/", &url));
+        for other in [
+            "./../outside/",
+            "./a%2Fb/",
+            "https://repo.example/",
+            "file:///repo/",
+        ] {
+            assert_eq!(origins.project_url(other), None, "{other}");
+        }
+    }
+
+    /// A directory outside the project that shares a named directory with
+    /// it is recorded from the canonical root with `../`, and its origin
+    /// reads back as that directory; one sharing only the filesystem root
+    /// keeps its URL. A spelling through a link counts from the canonical
+    /// root too, whose parent is the directory's parent.
+    #[test]
+    fn a_directory_beside_the_project_is_recorded_from_the_directory_both_share() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(temp.path()).unwrap();
+        let project = base.join("a").join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let origins = origins(&project);
+        let mut cases = vec![
+            (base.join("a").join("x"), "../x/"),
+            (base.join("b").join("y"), "../../b/y/"),
+            (base.clone(), "../../"),
+            (base.join("a").join("p%q"), "../p%25q/"),
+        ];
+        if cfg!(unix) {
+            cases.push((base.join("a").join(r"p\q"), "../p%5Cq/"));
+        }
+        for (directory, token) in cases {
+            let url = file_url(&directory);
+            assert_eq!(origins.declared(&url).as_deref(), Some(token), "{url}");
+            let read = origins.project_url(token).expect(token);
+            assert_eq!(read, url, "{token}");
+            assert!(origins.matches(token, &url), "{token}");
+        }
+        let top = file_url(&PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" }));
+        let apart = format!("{top}raeva-nowhere/repo/");
+        if !base.starts_with(file_url_path(&Url::parse(&apart).unwrap()).unwrap()) {
+            assert_eq!(origins.declared(&apart), Some(apart.clone()));
+            assert_eq!(origins.recorded(&apart).unwrap(), apart);
+        }
+        let named = project
+            .components()
+            .filter(|component| matches!(component, Component::Normal(_)))
+            .count();
+        assert!(origins.project_url(&"../".repeat(named)).is_none());
+        assert!(origins.project_url(&"../".repeat(named - 1)).is_some());
+        assert_eq!(
+            origins.project_url("../p%5Cq/").is_none(),
+            cfg!(windows),
+            "a name Windows cannot hold"
+        );
+        let missing = LockOrigins::for_root(&base.join("missing"));
+        let sibling = file_url(&base.join("sibling"));
+        assert_eq!(missing.declared(&sibling), Some(sibling));
+        assert_eq!(missing.project_url("../sibling/"), None);
+
+        #[cfg(unix)]
+        {
+            let link = base.join("link");
+            std::os::unix::fs::symlink(&project, &link).unwrap();
+            let linked = LockOrigins::for_root(&link);
+            let through = format!("{}../x/", file_url(&link));
+            assert_eq!(linked.declared(&through).as_deref(), Some("../../x/"));
+            let read = linked.project_url("../../x/").unwrap();
+            assert_eq!(read, file_url(&base.join("x")));
+            assert_eq!(linked.declared(&read).as_deref(), Some("../../x/"));
+            assert_eq!(
+                linked.project_url("../x/").unwrap(),
+                file_url(&base.join("a/x"))
+            );
+        }
+    }
+
     #[test]
     fn token_validation_reads_the_text_as_written() {
-        for valid in ["./", "./repo/", "./a/b c/", "./ünïcode/"] {
+        for valid in [
+            "./",
+            "./repo/",
+            "./a/b%20c/",
+            "./ünïcode/",
+            "../",
+            "../../a/b/",
+            "./a%25b/",
+            "../a%5Cb/",
+            "../.../",
+        ] {
             validate_project_relative_origin(valid).unwrap();
         }
         for invalid in [
@@ -639,6 +893,22 @@ mod tests {
             "./a\\b/",
             "./c:/",
             "./a%2e/",
+            "./a/b c/",
+            "./a#b/",
+            "./a%41/",
+            "./a%E2%80/",
+            "./a%5c/",
+            "./a%2F/",
+            "./a%/",
+            "./a%2/",
+            "../a/../b/",
+            "../..",
+            "..//",
+            "../a",
+            ".././",
+            "./../",
+            "..",
+            "...//",
             "./a\tb/",
             " ./repo/",
             ".repo/",
@@ -696,6 +966,7 @@ mod tests {
         let elsewhere = dunce::canonicalize(elsewhere.path()).unwrap();
         let two_roots = LockOrigins {
             roots: vec![root.clone(), elsewhere.clone()],
+            canonical: None,
         };
         let there = file_url(&elsewhere.join("repo"));
         let alias = two_roots

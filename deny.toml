@@ -22,3 +22,11 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+[advisories]
+# chrono has no maintained release and no known flaw. raeva uses it for
+# the system zone's offsets, which come from the OS's tz data, and to parse
+# and format timestamps; replacing it is planned for 0.7.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, with no replacement release and no known flaw; replacing it is planned for 0.7" },
+]

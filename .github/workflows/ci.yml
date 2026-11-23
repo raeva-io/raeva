@@ -46,11 +46,20 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # macOS allows 256 open files by default, too few for the parallel
-      # integration tests.
+      # integration tests. On Linux the tests run in a network namespace
+      # with only loopback, so a test that needs a real host fails here and
+      # not when that host misbehaves. Locally:
+      #   unshare -rn sh -c 'ip link set lo up && cargo test --workspace --offline'
       - name: test
         shell: bash
         run: |
           if [ "$RUNNER_OS" = macOS ]; then ulimit -n 10240; fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            # Ubuntu's AppArmor keeps unprivileged users out of new user namespaces.
+            sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0 || true
+            cargo fetch --locked
+            exec unshare -rn sh -c 'ip link set lo up && exec cargo nextest run --workspace --locked --offline --profile ci'
+          fi
           cargo nextest run --workspace --locked --profile ci
 
       # nextest does not run doctests.

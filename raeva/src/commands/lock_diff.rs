@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Args;
-use rv_lock::{LockArtifact, LockPlatform, Lockfile, Platform, Scope};
+use rv_lock::{LockArtifact, LockModule, LockPlatform, Lockfile, Platform, PluginRole, Scope};
+use rv_maven_types::{ManagedKind, ManagedSource};
 use serde::Serialize;
 
 use crate::commands::util::{join_and, modules_phrase, plural};
@@ -35,16 +37,21 @@ pub(crate) struct LockDiffArgs {
 }
 
 pub(super) fn run(args: &LockDiffArgs, session: &Session) -> Result<Report> {
-    let new = args
-        .new
-        .clone()
-        .unwrap_or_else(|| session.project_root().join("raeva.lock"));
+    let root = session.project_root();
+    if args.new.is_none() && !root.exists() {
+        return Err(rv_config::ConfigError::ProjectRootMissing(root.to_path_buf()).into());
+    }
+    let new = (args.new.clone()).unwrap_or_else(|| root.join("raeva.lock"));
     // Only the project's own raeva.lock is one 'raeva sync' creates.
     let read = |path: &PathBuf, project: bool| {
         super::util::read_lockfile_at(path).map_err(|err| match err {
-            CliError::LockfileMissing { path, reactor, .. } => CliError::LockfileMissing {
+            CliError::LockfileMissing {
                 path,
-                sync_creates: project,
+                sync_creates,
+                reactor,
+            } => CliError::LockfileMissing {
+                path,
+                sync_creates: project && sync_creates,
                 reactor,
             },
             err => err,
@@ -66,6 +73,7 @@ struct LockDiffReport {
     old: String,
     new: String,
     changed: bool,
+    causes: Vec<Cause>,
     platforms_added: Vec<String>,
     platforms_removed: Vec<String>,
     module_changes: Vec<ModuleChange>,
@@ -73,12 +81,16 @@ struct LockDiffReport {
     changes: Vec<PackageChange>,
     edge_changes: Vec<EdgeChange>,
     pom_changes: Vec<PomChange>,
+    plugin_changes: Vec<PluginChange>,
+    checksum_markers: Vec<ChecksumMarker>,
     changed_inputs: Vec<String>,
     via_limited: bool,
     #[serde(skip)]
     host_inputs: Vec<String>,
+    /// Each text line, with the indexes into `changes` of the packages it
+    /// stands for.
     #[serde(skip)]
-    lines: Vec<(String, Option<usize>)>,
+    lines: Vec<(String, Vec<usize>)>,
 }
 
 #[derive(Serialize)]
@@ -119,6 +131,43 @@ impl ModuleChange {
     }
 }
 
+/// A locked file that `--allow-missing-checksums` accepted without a
+/// checksum file in the new lock only, or whose marker the new lock drops.
+#[derive(Serialize)]
+struct ChecksumMarker {
+    path: String,
+    change: &'static str,
+}
+
+impl ChecksumMarker {
+    fn between(old: &Lockfile, new: &Lockfile) -> Vec<Self> {
+        let (was, now) = (old.missing_checksum_files(), new.missing_checksum_files());
+        let pinned = new.pinned_paths();
+        let marked = (now.keys())
+            .filter(|path| !was.contains_key(*path))
+            .map(|path| (path, "marked"));
+        let cleared = (was.keys())
+            .filter(|path| !now.contains_key(*path) && pinned.contains_key(*path))
+            .map(|path| (path, "cleared"));
+        let mut markers: Vec<Self> = marked
+            .chain(cleared)
+            .map(|(path, change)| Self {
+                path: path.clone(),
+                change,
+            })
+            .collect();
+        markers.sort_by(|a, b| a.path.cmp(&b.path));
+        markers
+    }
+
+    fn line(&self) -> String {
+        match self.change {
+            "marked" => format!("  accepted without a checksum file: {}", self.path),
+            _ => format!("  now verified by a checksum file: {}", self.path),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ProfileChange {
     platform: String,
@@ -140,6 +189,347 @@ impl ProfileChange {
             side(&self.old),
             side(&self.new)
         )
+    }
+}
+
+/// A parent or BOM bump behind version changes that dependency management
+/// supplied, or a parent's property, from the `managed` lines: a source of
+/// the package in either lock whose versions among the module's support
+/// POMs differ between the locks, or a module of the reactor that changed
+/// (see [`ReactorPoms::source`]). A package whose two locks name two such
+/// sources has both, as `ambiguous`.
+#[derive(Serialize)]
+struct Cause {
+    sources: Vec<CauseSource>,
+    /// `property` for a parent that sets `property`, or when a BOM's import
+    /// version is written as `property` for every package it moved, else
+    /// `direct` for a parent, `imported` for a BOM, or `ambiguous`.
+    cause: &'static str,
+    property: Option<String>,
+    /// Indexes into `changes`: what the sources manage, and for `property`
+    /// what the module's lineage manages with it.
+    changes: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct CauseSource {
+    kind: &'static str,
+    pom: String,
+    old_versions: Vec<String>,
+    new_versions: Vec<String>,
+    /// A module of the reactor, which counts only where it changed.
+    #[serde(skip)]
+    reactor: bool,
+}
+
+impl CauseSource {
+    fn moved(&self) -> bool {
+        self.reactor
+            || (!self.old_versions.is_empty()
+                && !self.new_versions.is_empty()
+                && self.old_versions != self.new_versions)
+    }
+
+    /// The role, the `group:artifact`, and the versions that left and came;
+    /// a side where none did shows all of its versions. A reactor module
+    /// whose version stayed shows it once, as changed.
+    fn text(&self) -> String {
+        let (old, new) = (&self.old_versions, &self.new_versions);
+        let role = if self.kind == ManagedKind::Import.as_str() {
+            "BOM"
+        } else {
+            "parent"
+        };
+        if old == new {
+            return format!("{role} {} {} changed", self.pom, old.join(", "));
+        }
+        let gone: Vec<&str> = (old.iter())
+            .filter(|v| !new.contains(v))
+            .map(String::as_str)
+            .collect();
+        let came: Vec<&str> = (new.iter())
+            .filter(|v| !old.contains(v))
+            .map(String::as_str)
+            .collect();
+        let side = |changed: Vec<&str>, all: &[String]| {
+            if changed.is_empty() {
+                all.join(", ")
+            } else {
+                changed.join(", ")
+            }
+        };
+        format!(
+            "{role} {} {} -> {}",
+            self.pom,
+            side(gone, old),
+            side(came, new)
+        )
+    }
+}
+
+/// Whether the package has two moved sources, its moved sources, and the
+/// property of a parent that sets it, which keeps one cause per property.
+type CauseKey = (bool, Vec<CauseSource>, Option<String>);
+
+impl Cause {
+    fn of(
+        old: &Lockfile,
+        new: &Lockfile,
+        changes: &[(DepKey, Change)],
+        old_map: &HashMap<DepKey, DepEntry>,
+        new_map: &HashMap<DepKey, DepEntry>,
+    ) -> Vec<Self> {
+        let (before, after) = (SupportPoms::of(old), SupportPoms::of(new));
+        let reactor = (ReactorPoms::of(old), ReactorPoms::of(new));
+        let mut grouped: BTreeMap<CauseKey, (Vec<usize>, BTreeSet<Option<String>>)> =
+            BTreeMap::new();
+        for (index, (key, change)) in changes.iter().enumerate() {
+            if !matches!(change, Change::Version { .. }) {
+                continue;
+            }
+            let (Some(was), Some(now)) = (old_map.get(key), new_map.get(key)) else {
+                continue;
+            };
+            let place = (key.platform.as_str(), key.module_path.as_str());
+            let mut sources: Vec<(CauseSource, Vec<Option<String>>)> = Vec::new();
+            for managed in [&was.managed, &now.managed].into_iter().flatten() {
+                let kind = managed.kind.as_str();
+                let (old_versions, new_versions) = (
+                    before.versions(place, managed),
+                    after.versions(place, managed),
+                );
+                let source = if old_versions.is_empty() && new_versions.is_empty() {
+                    ReactorPoms::source(&reactor, place, managed, was, now)
+                } else {
+                    Some(CauseSource {
+                        kind,
+                        pom: managed.pom.clone(),
+                        old_versions,
+                        new_versions,
+                        reactor: false,
+                    })
+                };
+                let Some(source) = source else {
+                    continue;
+                };
+                // A reactor module's version is the reactor's, which its
+                // property names for the whole lineage.
+                let property = (!source.reactor)
+                    .then(|| managed.property.clone())
+                    .flatten();
+                match (sources.iter_mut()).find(|(s, _)| s.kind == kind && s.pom == managed.pom) {
+                    Some((_, properties)) => properties.push(property),
+                    None => sources.push((source, vec![property])),
+                }
+            }
+            sources.retain(|(source, _)| source.moved());
+            if sources.is_empty() {
+                continue;
+            }
+            // The new lock's property, which a parent bump may have renamed.
+            let set_by = match &sources[..] {
+                [(source, properties)] if source.kind == ManagedKind::Property.as_str() => {
+                    properties.last().cloned().flatten()
+                }
+                _ => None,
+            };
+            let key = (
+                sources.len() > 1,
+                sources.iter().map(|(source, _)| source.clone()).collect(),
+                set_by,
+            );
+            let (indexes, seen) = grouped.entry(key).or_default();
+            indexes.push(index);
+            seen.extend(sources.into_iter().flat_map(|(_, properties)| properties));
+        }
+        let mut causes: Vec<Self> = grouped
+            .into_iter()
+            .map(|((ambiguous, sources, set_by), (changes, seen))| {
+                let import = sources[0].kind == ManagedKind::Import.as_str();
+                let property = match seen.iter().collect::<Vec<_>>()[..] {
+                    _ if set_by.is_some() => set_by,
+                    [Some(property)] if import && !ambiguous => Some(property.clone()),
+                    _ => None,
+                };
+                let cause = match (ambiguous, &property, import) {
+                    (true, _, _) => "ambiguous",
+                    (false, Some(_), _) => "property",
+                    (false, None, true) => "imported",
+                    (false, None, false) => "direct",
+                };
+                Self {
+                    sources,
+                    cause,
+                    property,
+                    changes,
+                }
+            })
+            .collect();
+        // A property has one value in a module's lineage, so the BOM bump
+        // it caused also moved what the module's own POMs manage with it.
+        let mut by_property = HashMap::new();
+        for (at, cause) in causes.iter().enumerate() {
+            for &index in &cause.changes {
+                let key = &changes[index].0;
+                if let Some(property) = &cause.property {
+                    // Two BOM bumps with one property leave it to neither.
+                    by_property
+                        .entry((&key.platform, &key.module_path, property.clone()))
+                        .and_modify(|owner: &mut Option<usize>| {
+                            if *owner != Some(at) {
+                                *owner = None;
+                            }
+                        })
+                        .or_insert(Some(at));
+                }
+            }
+        }
+        let caused: HashSet<usize> = (causes.iter())
+            .flat_map(|cause| cause.changes.iter().copied())
+            .collect();
+        for (index, (key, change)) in changes.iter().enumerate() {
+            if caused.contains(&index) || !matches!(change, Change::Version { .. }) {
+                continue;
+            }
+            let (Some(was), Some(now)) = (old_map.get(key), new_map.get(key)) else {
+                continue;
+            };
+            let (Some(a), Some(b)) = (&was.managed, &now.managed) else {
+                continue;
+            };
+            if a != b || a.kind != ManagedKind::Pom {
+                continue;
+            }
+            if let Some(property) = &a.property
+                && let Some(&Some(at)) =
+                    by_property.get(&(&key.platform, &key.module_path, property.clone()))
+            {
+                causes[at].changes.push(index);
+            }
+        }
+        for cause in &mut causes {
+            cause.changes.sort_unstable();
+        }
+        causes
+    }
+
+    fn line(&self) -> String {
+        let sources: Vec<String> = self.sources.iter().map(CauseSource::text).collect();
+        let cause = match &self.property {
+            Some(property) => format!("property {property}"),
+            None => self.cause.to_string(),
+        };
+        format!("  {} ({cause})", sources.join(" and "))
+    }
+}
+
+/// Each lock's reactor modules, by platform and `group:artifact`, and its
+/// recorded POM digests, by platform and path.
+struct ReactorPoms<'a> {
+    modules: HashMap<(String, String), Vec<&'a rv_lock::LockModule>>,
+    digests: HashMap<(String, &'a str), &'a rv_maven_types::Sha256>,
+}
+
+impl<'a> ReactorPoms<'a> {
+    fn of(lock: &'a Lockfile) -> Self {
+        let (mut modules, mut digests) = (HashMap::<_, Vec<_>>::new(), HashMap::new());
+        for platform in &lock.platforms {
+            let id = platform.platform.to_string();
+            for module in &platform.modules {
+                let ga = format!("{}:{}", module.gav.group, module.gav.artifact);
+                modules.entry((id.clone(), ga)).or_default().push(module);
+            }
+            for (path, digest) in (platform.model_inputs.iter()).flat_map(|m| &m.pom_hashes) {
+                digests.insert((id.clone(), path.as_str()), digest);
+            }
+        }
+        Self { modules, digests }
+    }
+
+    /// The one reactor module `managed` names on the platform.
+    fn module(&self, platform: &str, managed: &ManagedSource) -> Option<&'a rv_lock::LockModule> {
+        match self
+            .modules
+            .get(&(platform.to_string(), managed.pom.clone()))?[..]
+        {
+            [module] => Some(module),
+            _ => None,
+        }
+    }
+
+    /// `managed` as a cause when it is the one module of the reactor with
+    /// its `group:artifact` in both locks, wherever it is, other than the
+    /// module at `place`, the package took its version from it in both
+    /// locks, and its recorded digest changed, which its version moving
+    /// does too. A user
+    /// property or a profile changes no digest, so it names no module; a
+    /// digest that covers the whole reactor changes with any module.
+    fn source(
+        (before, after): &(Self, Self),
+        (platform, path): (&str, &str),
+        managed: &ManagedSource,
+        was: &DepEntry,
+        now: &DepEntry,
+    ) -> Option<CauseSource> {
+        let (old, new) = (
+            before.module(platform, managed)?,
+            after.module(platform, managed)?,
+        );
+        let kept = [&was.managed, &now.managed].iter().all(|source| {
+            (source.as_deref()).is_some_and(|s| (s.kind, &s.pom) == (managed.kind, &managed.pom))
+        });
+        if old.path == path || new.path == path || !kept {
+            return None;
+        }
+        let digest = |pom: &Self, module: &LockModule| {
+            (pom.digests
+                .get(&(platform.to_string(), module.path.as_str())))
+            .copied()
+        };
+        (digest(before, old) != digest(after, new)).then(|| CauseSource {
+            kind: managed.kind.as_str(),
+            pom: managed.pom.clone(),
+            old_versions: vec![old.gav.version().to_string()],
+            new_versions: vec![new.gav.version().to_string()],
+            reactor: true,
+        })
+    }
+}
+
+/// Each lock module's support POMs, by platform and path.
+struct SupportPoms<'a>(HashMap<(String, &'a str), &'a LockModule>);
+
+impl<'a> SupportPoms<'a> {
+    fn of(lock: &'a Lockfile) -> Self {
+        let mut modules = HashMap::new();
+        for platform in &lock.platforms {
+            let id = platform.platform.to_string();
+            for module in &platform.modules {
+                modules.insert((id.clone(), module.path.as_str()), module);
+            }
+        }
+        Self(modules)
+    }
+
+    /// The versions of `managed.pom` the module at `place` read: of a BOM,
+    /// every one its resolution read; of a parent, the lineage's, since a
+    /// dependency's lineage may read others.
+    fn versions(&self, (platform, path): (&str, &str), managed: &ManagedSource) -> Vec<String> {
+        let Some(module) = self.0.get(&(platform.to_string(), path)) else {
+            return Vec::new();
+        };
+        let coordinates = match managed.kind {
+            ManagedKind::Import => &module.support_poms,
+            ManagedKind::Pom | ManagedKind::Property => &module.parents,
+        };
+        (coordinates.iter())
+            .filter_map(|coordinate| {
+                coordinate
+                    .strip_prefix(managed.pom.as_str())?
+                    .strip_prefix(':')
+            })
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -268,7 +658,9 @@ impl LockDiffReport {
             .difference(&diff.new_platforms)
             .cloned()
             .collect();
-        let lines = diff.lines(detail);
+        let mut lines = diff.lines(detail);
+        let checksum_markers = ChecksumMarker::between(old_lock, new_lock);
+        lines.extend((checksum_markers.iter()).map(|marker| (marker.line(), vec![])));
         Ok(Self {
             old,
             new,
@@ -276,11 +668,14 @@ impl LockDiffReport {
             platforms_added,
             platforms_removed,
             via_limited: changes.len() > VIA_CHANGE_CAP,
+            causes: diff.causes,
             module_changes: diff.module_changes,
             profile_changes: diff.profile_changes,
             changes,
             edge_changes: diff.edge_changes,
             pom_changes: diff.pom_changes,
+            plugin_changes: diff.plugin_changes,
+            checksum_markers,
             changed_inputs: diff.changed_inputs,
             host_inputs: diff.host_inputs,
             lines,
@@ -301,13 +696,17 @@ impl CommandOutput for LockDiffReport {
                 None => "  no dependency changes".to_string(),
             });
         }
-        for (line, index) in &self.lines {
+        for (line, at) in &self.lines {
             human.line(line)?;
-            // A direct dependency has no path to it.
-            if let Some(row) = index.and_then(|index| self.changes.get(index))
-                && !row.display_via.is_empty()
+            // A direct dependency has no path to it, and the places a line
+            // groups may reach the package by different paths.
+            let mut vias =
+                (at.iter()).filter_map(|&index| Some(&self.changes.get(index)?.display_via));
+            if let Some(via) = vias.next()
+                && !via.is_empty()
+                && vias.all(|other| other == via)
             {
-                human.line(format!("      via {}", row.display_via.join(" -> ")))?;
+                human.line(format!("      via {}", via.join(" -> ")))?;
             }
         }
         Ok(())
@@ -479,6 +878,7 @@ struct DepEntry {
     artifact: LockArtifact,
     direct_scope: Option<Scope>,
     scope: Scope,
+    managed: Option<Arc<ManagedSource>>,
 }
 
 impl DepEntry {
@@ -509,6 +909,8 @@ struct LockChanges {
     profile_changes: Vec<ProfileChange>,
     edge_changes: Vec<EdgeChange>,
     pom_changes: Vec<PomChange>,
+    plugin_changes: Vec<PluginChange>,
+    causes: Vec<Cause>,
     changed_inputs: Vec<String>,
     /// The [`host_inputs`], which `changed_inputs` ends with too.
     host_inputs: Vec<String>,
@@ -516,6 +918,9 @@ struct LockChanges {
 
 impl LockChanges {
     fn between(old: &Lockfile, new: &Lockfile, allowed: Option<&HashSet<String>>) -> Self {
+        let plugin_changes = plugin_changes(old, new, allowed);
+        // The plugin tables' rows are compared as their sets.
+        let (old, new) = (&old.without_plugins(), &new.without_plugins());
         let old_map = dep_map(old, allowed);
         let new_map = dep_map(new, allowed);
         let mut versions = HashMap::<DepKey, [usize; 2]>::new();
@@ -539,7 +944,7 @@ impl LockChanges {
         let old_platforms = platform_ids(old, allowed);
         let new_platforms = platform_ids(new, allowed);
         let keys: BTreeSet<&DepKey> = old_map.keys().chain(new_map.keys()).collect();
-        let changes = keys
+        let changes: Vec<(DepKey, Change)> = keys
             .into_iter()
             .filter(|key| {
                 old_platforms.contains(&key.platform) && new_platforms.contains(&key.platform)
@@ -551,6 +956,7 @@ impl LockChanges {
             .collect();
         let (module_changes, profile_changes) = model_changes(old, new, allowed);
         let edge_changes = edge_changes(old, new, allowed, &old_map, &new_map);
+        let causes = Cause::of(old, new, &changes, &old_map, &new_map);
         Self {
             old_map,
             new_map,
@@ -561,14 +967,26 @@ impl LockChanges {
             profile_changes,
             edge_changes,
             pom_changes: pom_pin_changes(old, new, allowed),
+            plugin_changes,
+            causes,
             changed_inputs: changed_inputs(old, new, allowed),
             host_inputs: host_inputs(old, new),
         }
     }
 
+    /// Each cause, then the packages it moved beneath it.
+    fn cause_lines(&self) -> Vec<(String, Vec<usize>)> {
+        let mut lines = Vec::new();
+        for cause in &self.causes {
+            lines.push((cause.line(), Vec::new()));
+            lines.extend(change_lines(self, &cause.changes, "    ", false));
+        }
+        lines
+    }
+
     /// The text lines. Without `detail`, the support POMs added or removed
     /// along with changed packages are one count.
-    fn lines(&self, detail: bool) -> Vec<(String, Option<usize>)> {
+    fn lines(&self, detail: bool) -> Vec<(String, Vec<usize>)> {
         // A module, profile, or pin change is one line for every platform
         // both locks record; a platform only one side records is already one
         // line of its own.
@@ -594,11 +1012,12 @@ impl LockChanges {
                     } else {
                         line
                     };
-                    (line, None)
+                    (line, Vec::new())
                 })
-                .collect::<Vec<(String, Option<usize>)>>()
+                .collect::<Vec<(String, Vec<usize>)>>()
         };
-        let mut lines: Vec<(String, Option<usize>)> = grouped(
+        let mut lines = self.cause_lines();
+        lines.extend(grouped(
             self.module_changes
                 .iter()
                 .map(|change| (change.line(), &change.platform))
@@ -608,10 +1027,18 @@ impl LockChanges {
                         .map(|change| (change.line(), &change.platform)),
                 )
                 .collect(),
-        );
-        let package_lines = change_lines(self);
-        let collapse = !detail && !package_lines.is_empty();
+        ));
+        let caused: HashSet<usize> = (self.causes.iter())
+            .flat_map(|cause| cause.changes.iter().copied())
+            .collect();
+        let uncaused: Vec<usize> = (0..self.changes.len())
+            .filter(|index| !caused.contains(index))
+            .collect();
+        let package_lines = change_lines(self, &uncaused, "  ", true);
+        let platform_lines = platform_lines(self);
+        let collapse = !detail && (!self.changes.is_empty() || !platform_lines.is_empty());
         lines.extend(package_lines);
+        lines.extend(platform_lines);
         lines.extend(grouped(
             self.edge_changes
                 .iter()
@@ -630,9 +1057,26 @@ impl LockChanges {
                 .map(|change| (change.line(), &change.platform))
                 .collect(),
         ));
+        lines.extend(grouped(
+            (self.plugin_changes.iter())
+                .map(|change| (change.line(), &change.platform))
+                .collect(),
+        ));
+        // A cause line already names the versions of its parents and BOMs.
+        let named: HashSet<String> = (self.causes.iter())
+            .flat_map(|cause| &cause.sources)
+            .flat_map(|source| {
+                (source.old_versions.iter())
+                    .chain(&source.new_versions)
+                    .map(|version| format!("{}:{version}", source.pom))
+            })
+            .collect();
         let mut added = BTreeSet::new();
         let mut removed = BTreeSet::new();
-        for change in self.pom_changes.iter().filter(churn) {
+        for change in (self.pom_changes.iter())
+            .filter(churn)
+            .filter(|change| !named.contains(&change.coordinate))
+        {
             let side = if change.change == "support_pom" {
                 &mut added
             } else {
@@ -651,7 +1095,7 @@ impl LockChanges {
                     "  support POMs (parents and BOMs): {}; -v lists them",
                     counts.join(", ")
                 ),
-                None,
+                Vec::new(),
             ));
         }
         lines
@@ -748,6 +1192,7 @@ fn dep_map(lock: &Lockfile, allowed: Option<&HashSet<String>>) -> HashMap<DepKey
                     artifact,
                     direct_scope: package.direct_scope,
                     scope: package.scope,
+                    managed: package.managed.clone(),
                 };
                 map.insert(key, entry);
             }
@@ -878,12 +1323,17 @@ impl Change {
     }
 }
 
-/// One line per change, sorted by package: the artifact ID (with the group
-/// ID when two changed packages share it), the change, and in parentheses
-/// the modules of a multi-module project and the platforms it applies to,
-/// when it is not all of them. A platform that only one side records is one
-/// line with its dependency count.
-fn change_lines(diff: &LockChanges) -> Vec<(String, Option<usize>)> {
+/// One line per change of `indexes`, sorted by package: the artifact ID
+/// (with the group ID when two of these packages share it), the change, and
+/// in parentheses the modules of a multi-module project and the platforms it
+/// applies to, when it is not all of them. `indent` leads each line, and
+/// `via` keeps the changes' indexes for the text's `via` line.
+fn change_lines(
+    diff: &LockChanges,
+    indexes: &[usize],
+    indent: &str,
+    via: bool,
+) -> Vec<(String, Vec<usize>)> {
     let LockChanges {
         old_map,
         new_map,
@@ -899,15 +1349,17 @@ fn change_lines(diff: &LockChanges) -> Vec<(String, Option<usize>)> {
         .collect();
     let multi_module = modules.len() > 1;
 
-    type Places = BTreeMap<String, (BTreeSet<String>, usize)>;
+    type Places = BTreeMap<String, (BTreeSet<String>, Vec<usize>)>;
     let mut grouped: BTreeMap<(PackageKey, Change), Places> = BTreeMap::new();
-    for (index, (key, change)) in diff.changes.iter().enumerate() {
-        let (platforms, _) = grouped
+    for &index in indexes {
+        let (key, change) = &diff.changes[index];
+        let (platforms, at) = grouped
             .entry((key.package.clone(), change.clone()))
             .or_default()
             .entry(key.module_path.clone())
-            .or_insert_with(|| (BTreeSet::new(), index));
+            .or_default();
         platforms.insert(key.platform.clone());
+        at.push(index);
     }
 
     let mut groups_by_artifact: HashMap<&str, BTreeSet<&str>> = HashMap::new();
@@ -924,7 +1376,7 @@ fn change_lines(diff: &LockChanges) -> Vec<(String, Option<usize>)> {
         } else {
             package.short_name()
         };
-        let mut row = |in_modules: BTreeSet<String>, on_platforms: &BTreeSet<String>, index| {
+        let mut row = |in_modules: BTreeSet<String>, on_platforms: &BTreeSet<String>, at| {
             let (text, word) = change.describe();
             let mut notes: Vec<String> = word.into_iter().map(str::to_string).collect();
             notes.extend(package.kind.label().map(str::to_string));
@@ -939,15 +1391,15 @@ fn change_lines(diff: &LockChanges) -> Vec<(String, Option<usize>)> {
             } else {
                 format!("{text} ({})", notes.join(", "))
             };
-            rows.push((name.clone(), text, index));
+            rows.push((name.clone(), text, at));
         };
         let (platforms, _) = places.values().next().expect("change has a module");
         if places.values().all(|(on, _)| on == platforms) {
-            let index = places.values().map(|(_, index)| *index).min().unwrap();
-            row(places.keys().cloned().collect(), platforms, index);
+            let at = (places.values()).flat_map(|(_, at)| at.iter().copied());
+            row(places.keys().cloned().collect(), platforms, at.collect());
         } else {
-            for (module, (platforms, index)) in places {
-                row(BTreeSet::from([module.clone()]), platforms, *index);
+            for (module, (platforms, at)) in places {
+                row(BTreeSet::from([module.clone()]), platforms, at.clone());
             }
         }
     }
@@ -958,11 +1410,25 @@ fn change_lines(diff: &LockChanges) -> Vec<(String, Option<usize>)> {
         .filter(|&width| width <= NAME_COLUMN_MAX)
         .max()
         .unwrap_or(0);
-    let mut lines: Vec<(String, Option<usize>)> = rows
-        .into_iter()
-        .map(|(name, text, index)| (format!("  {name:<width$}  {text}"), Some(index)))
-        .collect();
+    rows.into_iter()
+        .map(|(name, text, at)| {
+            let at = if via { at } else { Vec::new() };
+            (format!("{indent}{name:<width$}  {text}"), at)
+        })
+        .collect()
+}
 
+/// A platform that only one side records, as one line with its dependency
+/// count.
+fn platform_lines(diff: &LockChanges) -> Vec<(String, Vec<usize>)> {
+    let LockChanges {
+        old_map,
+        new_map,
+        old_platforms,
+        new_platforms,
+        ..
+    } = diff;
+    let mut lines = Vec::new();
     for (platform, map, word) in [
         (new_platforms.difference(old_platforms), new_map, "added"),
         (old_platforms.difference(new_platforms), old_map, "removed"),
@@ -977,7 +1443,10 @@ fn change_lines(diff: &LockChanges) -> Vec<(String, Option<usize>)> {
             .collect::<BTreeSet<_>>()
             .len();
         let count = plural(count, "dependency", "dependencies");
-        lines.push((format!("  platform {platform} {word} ({count})"), None));
+        lines.push((
+            format!("  platform {platform} {word} ({count})"),
+            Vec::new(),
+        ));
     }
     lines
 }
@@ -1034,7 +1503,7 @@ impl EdgeChange {
     }
 }
 
-type EdgeState = (Option<Scope>, bool);
+type EdgeState = (Scope, bool);
 type EdgeMap = BTreeMap<(DepKey, DepKey), BTreeSet<EdgeState>>;
 
 /// The edges of `lock`'s modules, but for those `other` records the same:
@@ -1101,12 +1570,7 @@ fn edge_changes(
     let after = edge_map(new, old, allowed, old_map, new_map);
     let mut changes = Vec::new();
     let empty = BTreeSet::new();
-    let describe = |(scope, optional): &EdgeState| {
-        format!(
-            "scope {}, optional {optional}",
-            scope.map_or("none", Scope::as_str)
-        )
-    };
+    let describe = |(scope, optional): &EdgeState| format!("scope {scope}, optional {optional}");
     let name = |key: &DepKey| match &key.version {
         Some(version) => format!("{}:{version}", key.package.name()),
         None => key.package.name(),
@@ -1115,8 +1579,7 @@ fn edge_changes(
         let key = (from.clone(), to.clone());
         let old = before.get(&key).unwrap_or(&empty);
         let new = after.get(&key).unwrap_or(&empty);
-        let mut removed = old.difference(new);
-        let mut added = new.difference(old);
+        let mut added: Vec<_> = new.difference(old).collect();
         let others = |change| match change {
             "added" => !old.is_empty(),
             "removed" => !new.is_empty(),
@@ -1137,7 +1600,6 @@ fn edge_changes(
                 to_name: name(to),
                 others: others(change),
                 state: state.map_or_else(String::new, |(scope, optional)| {
-                    let scope = scope.map_or("unscoped", Scope::as_str);
                     if *optional {
                         format!("{scope}, optional")
                     } else {
@@ -1146,30 +1608,30 @@ fn edge_changes(
                 }),
             });
         };
-        loop {
-            match (removed.next(), added.next()) {
-                (Some(a), Some(b)) => {
-                    if a.0 != b.0 {
-                        push(
-                            "scope",
-                            a.0.map(|s| s.to_string()),
-                            b.0.map(|s| s.to_string()),
-                            None,
-                        );
-                    }
-                    if a.1 != b.1 {
-                        push(
-                            "optional",
-                            Some(a.1.to_string()),
-                            Some(b.1.to_string()),
-                            None,
-                        );
-                    }
-                }
-                (Some(a), None) => push("removed", Some(describe(a)), None, Some(a)),
-                (None, Some(b)) => push("added", None, Some(describe(b)), Some(b)),
-                (None, None) => break,
+        // The one edge between the packages changed, or one of several
+        // turned optional or back. Any other difference is an edge removed
+        // and another added.
+        let single = old.len() == 1 && new.len() == 1;
+        for a in old.difference(new) {
+            let Some(index) = added.iter().position(|b| single || b.0 == a.0) else {
+                push("removed", Some(describe(a)), None, Some(a));
+                continue;
+            };
+            let b = added.remove(index);
+            if a.0 != b.0 {
+                push("scope", Some(a.0.to_string()), Some(b.0.to_string()), None);
             }
+            if a.1 != b.1 {
+                push(
+                    "optional",
+                    Some(a.1.to_string()),
+                    Some(b.1.to_string()),
+                    None,
+                );
+            }
+        }
+        for b in added {
+            push("added", None, Some(describe(b)), Some(b));
         }
     }
     changes
@@ -1221,7 +1683,10 @@ impl PomChange {
                 short(&self.new),
                 snapshot(&self.new_snapshot)
             ),
-            ("support_pom", None) => format!("  support POM added for {coordinate}"),
+            ("support_pom", None) => format!(
+                "  support POM added for {coordinate}{}",
+                snapshot(&self.new_snapshot)
+            ),
             ("support_pom", Some(_)) => {
                 format!(
                     "  support POM changed for {coordinate}: {}{} -> {}{}",
@@ -1236,7 +1701,10 @@ impl PomChange {
                 self.old.as_deref().unwrap_or("none"),
                 self.new.as_deref().unwrap_or("none")
             ),
-            _ => format!("  support POM removed for {coordinate}"),
+            _ => format!(
+                "  support POM removed for {coordinate}{}",
+                snapshot(&self.old_snapshot)
+            ),
         }
     }
 }
@@ -1375,6 +1843,165 @@ fn pom_pin_changes(
     changes
 }
 
+/// A plugin, extension, processor path or trace that one lock's plugin
+/// tables hold and the other's do not, or holds with other files.
+#[derive(Serialize)]
+struct PluginChange {
+    platform: String,
+    #[serde(serialize_with = "role_name")]
+    role: PluginRole,
+    name: String,
+    change: &'static str,
+    old: Option<String>,
+    new: Option<String>,
+}
+
+impl PluginChange {
+    fn line(&self) -> String {
+        let role = match self.role {
+            PluginRole::Trace => "plugin trace",
+            role => &role.as_str().replace('-', " "),
+        };
+        let side = |value: &Option<String>| value.as_deref().unwrap_or("none").to_string();
+        match self.change {
+            "added" => format!("  {role} {} added", self.name),
+            "removed" => format!("  {role} {} removed", self.name),
+            "version" => format!(
+                "  {role} {}: {} -> {}",
+                self.name,
+                side(&self.old),
+                side(&self.new)
+            ),
+            _ => format!("  {role} {}: its files changed", self.name),
+        }
+    }
+}
+
+/// The plugin sets of each platform both locks record, by role and name,
+/// each with the pinned files of its copies.
+fn role_name<S: serde::Serializer>(
+    role: &PluginRole,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(role.as_str())
+}
+
+fn plugin_sets(entry: &LockPlatform) -> BTreeMap<(PluginRole, String), Vec<Vec<String>>> {
+    let mut sets: BTreeMap<(PluginRole, String), Vec<Vec<String>>> = BTreeMap::new();
+    let Some(files) = entry.plugin_files() else {
+        return sets;
+    };
+    let pins: HashMap<_, _> = (files.artifacts.iter())
+        .map(|artifact| (&artifact.coordinate, artifact))
+        .collect();
+    for set in &files.tables.sets {
+        let name = match set.coordinates.is_empty() {
+            true => set.key.clone(),
+            false => set.coordinates.join(", "),
+        };
+        let mut pinned: Vec<String> = (set.artifacts.iter())
+            .map(|coordinate| {
+                let artifact = pins.get(coordinate);
+                let pin = artifact.and_then(|row| row.pin()).map(ToString::to_string);
+                let pom = artifact.and_then(|row| row.pom_sha256.as_ref());
+                format!(
+                    "{coordinate} {} {}",
+                    pin.unwrap_or_default(),
+                    pom.map(ToString::to_string).unwrap_or_default()
+                )
+            })
+            .chain(set.poms.iter().map(|pom| {
+                let pin = files.poms.get(pom).map(|row| row.sha256.to_string());
+                format!("{pom} {}", pin.unwrap_or_default())
+            }))
+            .collect();
+        pinned.sort();
+        sets.entry((set.role, name)).or_default().push(pinned);
+    }
+    for copies in sets.values_mut() {
+        copies.sort();
+    }
+    sets
+}
+
+fn plugin_changes(
+    old: &Lockfile,
+    new: &Lockfile,
+    allowed: Option<&HashSet<String>>,
+) -> Vec<PluginChange> {
+    let mut changes = Vec::new();
+    for entry in matching_platforms(new, allowed) {
+        let Some(previous) = (old.platforms.iter()).find(|other| other.platform == entry.platform)
+        else {
+            continue;
+        };
+        let (before, after) = (plugin_sets(previous), plugin_sets(entry));
+        let platform = entry.platform.to_string();
+        let change = |(role, name): &(PluginRole, String), change, old, new| PluginChange {
+            platform: platform.clone(),
+            role: *role,
+            name: name.clone(),
+            change,
+            old,
+            new,
+        };
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        for key in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+            match (before.get(key), after.get(key)) {
+                (Some(a), Some(b)) if a != b => changes.push(change(key, "files", None, None)),
+                (Some(_), None) => removed.push(key),
+                (None, Some(_)) => added.push(key),
+                _ => {}
+            }
+        }
+        // One version of a plugin on each side is a version change.
+        let split_version = |(role, name): &(PluginRole, String)| {
+            let parts: Vec<&str> = name.split(':').collect();
+            let versioned = !matches!(role, PluginRole::Trace | PluginRole::ProcessorPath);
+            (parts.len() == 3 && versioned).then(|| {
+                let base = format!("{}:{}", parts[0], parts[1]);
+                (*role, base, parts[2].to_string())
+            })
+        };
+        let count = |keys: &[&(PluginRole, String)], key: &(PluginRole, String)| {
+            (keys.iter())
+                .filter(|other| split_version(other).map(|(r, n, _)| (r, n)) == Some(key.clone()))
+                .count()
+        };
+        let mut paired = BTreeSet::new();
+        for old_key in &removed {
+            let Some((role, name, old_version)) = split_version(old_key) else {
+                continue;
+            };
+            let base = (role, name.clone());
+            if count(&removed, &base) != 1 || count(&added, &base) != 1 {
+                continue;
+            }
+            let new_key = (added.iter())
+                .find(|key| split_version(key).is_some_and(|(r, n, _)| (r, n) == base))
+                .expect("counted");
+            let new_version = split_version(new_key).expect("counted").2;
+            paired.insert(*new_key);
+            paired.insert(*old_key);
+            changes.push(change(
+                &base,
+                "version",
+                Some(old_version),
+                Some(new_version),
+            ));
+        }
+        for key in removed.into_iter().filter(|key| !paired.contains(key)) {
+            changes.push(change(key, "removed", None, None));
+        }
+        for key in added.into_iter().filter(|key| !paired.contains(key)) {
+            changes.push(change(key, "added", None, None));
+        }
+    }
+    changes.sort_by(|a, b| (&a.platform, &a.role, &a.name).cmp(&(&b.platform, &b.role, &b.name)));
+    changes
+}
+
 fn parent_range_selections(
     platform: &LockPlatform,
 ) -> BTreeMap<(&str, String, &str), &rv_lock::ParentRange> {
@@ -1471,10 +2098,10 @@ pub(super) fn lock_diff(
 ) -> Vec<String> {
     let allowed: HashSet<String> = platforms.iter().map(ToString::to_string).collect();
     let diff = LockChanges::between(old, new, Some(&allowed));
-    let lines: Vec<String> = diff
-        .lines(detail)
-        .into_iter()
+    let markers = ChecksumMarker::between(old, new);
+    let lines: Vec<String> = (diff.lines(detail).into_iter())
         .map(|(line, _)| line)
+        .chain(markers.iter().map(ChecksumMarker::line))
         .collect();
     if lines.is_empty() {
         inputs_line(&diff.changed_inputs, &diff.host_inputs)
@@ -1519,9 +2146,11 @@ mod tests {
         assert_eq!(
             report.to_json().unwrap(),
             json!({
-                "old": "old.lock", "new": "new.lock", "changed": false,
+                "old": "old.lock", "new": "new.lock", "changed": false, "causes": [],
                 "platforms_added": [], "platforms_removed": [], "module_changes": [], "profile_changes": [],
-                "changes": [], "edge_changes": [], "pom_changes": [], "changed_inputs": [],
+                "changes": [], "edge_changes": [], "pom_changes": [], "plugin_changes": [],
+                "checksum_markers": [],
+                "changed_inputs": [],
                 "via_limited": false,
             })
         );
@@ -1588,7 +2217,7 @@ mod tests {
                     None,
                 ));
         }
-        lock.platforms[0].modules[0].edges = vec![LockEdge::new(0, 1, Some(Scope::Compile), false)];
+        lock.platforms[0].modules[0].edges = vec![LockEdge::new(0, 1, Scope::Compile, false)];
         lock
     }
 
@@ -1604,12 +2233,12 @@ mod tests {
         ));
         module
             .edges
-            .push(LockEdge::new(0, 3, Some(Scope::Compile), false));
+            .push(LockEdge::new(0, 3, Scope::Compile, false));
         module
             .edges
-            .push(LockEdge::new(0, 1, Some(Scope::Runtime), false));
+            .push(LockEdge::new(0, 1, Scope::Runtime, false));
         let mut new = old.clone();
-        new.platforms[0].modules[0].edges = vec![LockEdge::new(0, 1, Some(Scope::Compile), false)];
+        new.platforms[0].modules[0].edges = vec![LockEdge::new(0, 1, Scope::Compile, false)];
         assert_eq!(
             super::format_frozen_diff(&old, &new),
             "  in pom.xml: com.example:lib no longer depends on g:one:jar:tests as runtime; \
@@ -1623,19 +2252,48 @@ mod tests {
         );
     }
 
+    /// With another edge between the same packages kept, a changed edge is
+    /// one removed and one added, not a scope change; one that only turns
+    /// optional is still an optional change.
+    #[test]
+    fn a_second_edge_that_changes_scope_is_removed_and_added() {
+        let mut old = edge_lock();
+        let edges = |scopes: [(Scope, bool); 2]| {
+            scopes.map(|(scope, optional)| LockEdge::new(0, 1, scope, optional))
+        };
+        old.platforms[0].modules[0].edges =
+            edges([(Scope::Compile, false), (Scope::Runtime, false)]).to_vec();
+        let mut new = old.clone();
+        new.platforms[0].modules[0].edges =
+            edges([(Scope::Compile, false), (Scope::Test, false)]).to_vec();
+        assert_eq!(
+            super::format_frozen_diff(&old, &new),
+            "  in pom.xml: com.example:lib no longer depends on g:one:jar:tests as runtime; \
+             another dependency stays\n  \
+             in pom.xml: com.example:lib now also depends on g:one:jar:tests (test)\n"
+        );
+        new.platforms[0].modules[0].edges =
+            edges([(Scope::Compile, false), (Scope::Runtime, true)]).to_vec();
+        assert_eq!(
+            super::format_frozen_diff(&old, &new),
+            "  in pom.xml: com.example:lib's dependency on g:one:jar:tests changed optional \
+             false -> true\n"
+        );
+    }
+
     #[test]
     fn edge_scope_and_optional_changes_group_compared_platforms() {
         for (change, edge, old_value, new_value, detail) in [
             (
                 "scope",
-                LockEdge::new(0, 1, None, false),
+                LockEdge::new(0, 1, Scope::Runtime, false),
                 json!("compile"),
-                json!(null),
-                "scope compile -> none",
+                json!("runtime"),
+                "scope compile -> runtime",
             ),
             (
                 "optional",
-                LockEdge::new(0, 1, Some(Scope::Compile), true),
+                LockEdge::new(0, 1, Scope::Compile, true),
                 json!("false"),
                 json!("true"),
                 "optional false -> true",
@@ -1780,14 +2438,14 @@ mod tests {
         let app = "  lib  1.0, scope compile -> test (in app, on windows-x86_64)";
         assert_eq!(
             changes.lines,
-            [(api.into(), Some(0)), (app.into(), Some(1))]
+            [(api.into(), vec![0]), (app.into(), vec![1])]
         );
         assert_eq!(
             super::format_frozen_diff(&old, &new),
             format!("{api}\n{app}\n")
         );
         for (line, index) in &changes.lines {
-            let row = &changes.changes[index.unwrap()];
+            let row = &changes.changes[index[0]];
             assert!(line.contains(row.module.trim_end_matches("/pom.xml")));
             assert!(line.contains(&row.platform));
         }
@@ -1799,7 +2457,7 @@ mod tests {
             uniform.lines,
             [(
                 "  lib  1.0, scope compile -> test (on linux-x86_64)".into(),
-                Some(0)
+                vec![0, 1]
             )]
         );
     }
@@ -1901,6 +2559,15 @@ mod tests {
         assert_eq!(pin.change, "support_pom_removed");
         assert_eq!(pin.new, None);
         assert_eq!(pin.old_snapshot.as_deref(), Some("20240101.010101-1"));
+        assert_eq!(
+            pin.line(),
+            "  support POM removed for g:parent:1-SNAPSHOT (snapshot 20240101.010101-1)"
+        );
+        let added = report(&new, &old);
+        assert_eq!(
+            added.pom_changes[0].line(),
+            "  support POM added for g:parent:1-SNAPSHOT (snapshot 20240101.010101-1)"
+        );
     }
 
     fn fan_lock() -> Lockfile {
@@ -1914,11 +2581,11 @@ mod tests {
             ));
             module
                 .edges
-                .push(LockEdge::new(index, 0, Some(Scope::Compile), false));
+                .push(LockEdge::new(index, 0, Scope::Compile, false));
         }
         module
             .edges
-            .push(LockEdge::new(0, 1, Some(Scope::Compile), false));
+            .push(LockEdge::new(0, 1, Scope::Compile, false));
         lock
     }
 
@@ -1970,6 +2637,38 @@ mod tests {
         assert_eq!(added.via, row.via);
     }
 
+    /// A line for several modules shows a `via` only when every module
+    /// reaches the package the same way.
+    #[test]
+    fn a_line_for_modules_with_other_paths_shows_no_via() {
+        let text = |throughs: [&str; 2]| {
+            let mut old = lock_from("https://repo.example/");
+            let base = old.platforms[0].modules.remove(0);
+            for (path, through) in ["a/pom.xml", "b/pom.xml"].into_iter().zip(throughs) {
+                let mut module = base.clone();
+                module.path = path.into();
+                module.packages[0].direct_scope = None;
+                module.packages.push(LockModulePackage::new(
+                    ArtifactCoord::new("g", through, "1", "jar", None),
+                    Some(Scope::Compile),
+                ));
+                module.edges = vec![LockEdge::new(1, 0, Scope::Compile, false)];
+                old.platforms[0].modules.push(module);
+            }
+            let mut new = old.clone();
+            for module in &mut new.platforms[0].modules {
+                module.packages[0].scope = Scope::Test;
+            }
+            let changed = report(&old, &new);
+            assert_eq!(changed.lines.len(), 1, "{:?}", changed.lines);
+            render(false, |human| changed.render_human(human)).0
+        };
+        let other = text(["core", "other"]);
+        assert!(!other.contains("via"), "{other}");
+        let same = text(["core", "core"]);
+        assert!(same.contains("      via core\n"), "{same}");
+    }
+
     #[test]
     fn via_work_is_capped_without_dropping_changes() {
         let mut new = lock_from("https://repo.example/");
@@ -2007,9 +2706,12 @@ mod tests {
         new.platforms[0].modules[0].packages[0].direct_scope = Some(Scope::Test);
         new.platforms[0].modules[0].packages[0].scope = Scope::Test;
         assert_eq!(report(&old, &new).changes[0].via.len(), 1);
-        new.platforms[0].modules[0]
-            .edges
-            .push(LockEdge::new(0, usize::MAX, None, false));
+        new.platforms[0].modules[0].edges.push(LockEdge::new(
+            0,
+            usize::MAX,
+            rv_lock::Scope::Compile,
+            false,
+        ));
         assert!(LockDiffReport::between("a".into(), "b".into(), &old, &new, true).is_err());
         new.platforms[0].modules.clear();
         assert!(report(&old, &new).changed);
@@ -2033,6 +2735,116 @@ mod tests {
             vec![package],
         ));
         lock
+    }
+
+    fn with_plugins(plugins: &[(&str, &str, &[u8])]) -> Lockfile {
+        use rv_maven_types::{Digest, Sha256};
+        let mut lock = lock_from("https://repo.example/");
+        let mut files = rv_lock::PluginFiles::new(Sha256::from_bytes(b"inputs"));
+        for (index, (role, gav, bytes)) in plugins.iter().enumerate() {
+            let mut parts = gav.split(':');
+            let (group, artifact, version) = (
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+            );
+            let key = format!("sha256:{}", format!("{index:x}").repeat(64));
+            let mut set = rv_lock::PluginSet::new(&key, role.parse().unwrap());
+            set.coordinates = vec![gav.to_string()];
+            let coordinate = ArtifactCoord::new(group, artifact, version, "jar", None);
+            set.artifacts = vec![coordinate.clone()];
+            set.modules = vec!["pom.xml".to_string()];
+            files.tables.sets.push(set);
+            let mut row = LockArtifact::new(coordinate, "https://repo.example/".to_string());
+            row.checksums = vec![Digest::Sha256(Sha256::from_bytes(bytes))];
+            files.artifacts.push(row);
+        }
+        lock.platforms[0]
+            .set_plugins(files, &rv_lock::RepoIds::new())
+            .unwrap();
+        lock
+    }
+
+    /// A plugin's sets show as plugin changes, its version paired, and
+    /// their rows as no dependency or POM change.
+    #[test]
+    fn plugin_sets_are_compared_as_sets() {
+        let old = with_plugins(&[
+            ("plugin", "p:surefire:1", b"a"),
+            ("plugin", "p:jar:1", b"a"),
+            ("core-extension", "e:old:1", b"a"),
+        ]);
+        let new = with_plugins(&[
+            ("plugin", "p:surefire:2", b"a"),
+            ("plugin", "p:jar:1", b"b"),
+            ("build-extension", "e:new:1", b"a"),
+        ]);
+        let report = report(&old, &new);
+        let json = report.to_json().unwrap();
+        assert_eq!(json["changes"], json!([]));
+        assert_eq!(json["pom_changes"], json!([]));
+        let lines: Vec<&str> = (report.lines.iter())
+            .map(|(line, _)| line.as_str())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "  build extension e:new:1 added",
+                "  core extension e:old:1 removed",
+                "  plugin p:jar:1: its files changed",
+                "  plugin p:surefire: 1 -> 2",
+            ]
+        );
+        assert_eq!(json["plugin_changes"][3]["change"], "version");
+        assert_eq!(json["plugin_changes"][3]["new"], "2");
+        assert!(!self::report(&old, &old).changed);
+        let bare = lock_from("https://repo.example/");
+        let added = self::report(&bare, &old);
+        assert_eq!(added.plugin_changes.len(), 3);
+        assert_eq!(added.to_json().unwrap()["changes"], json!([]));
+    }
+
+    #[test]
+    fn checksum_markers_added_and_cleared_are_listed() {
+        let lock = |marked: bool, pom: bool| {
+            let mut lock = lock_from("https://repo.example/");
+            let artifact = &mut lock.platforms[0].artifacts[0];
+            artifact.checksums = vec![rv_maven_types::Digest::Sha256(
+                "a".repeat(64).parse().unwrap(),
+            )];
+            artifact.pom_sha256 = Some("b".repeat(64).parse().unwrap());
+            artifact.missing_checksum = marked;
+            artifact.pom_missing_checksum = pom;
+            lock
+        };
+        let report = report(&lock(false, true), &lock(true, false));
+        let json = report.to_json().unwrap();
+        assert_eq!(json["changed"], true);
+        assert_eq!(
+            json["checksum_markers"],
+            json!([
+                {"path": "com/example/lib/1.0/lib-1.0.jar", "change": "marked"},
+                {"path": "com/example/lib/1.0/lib-1.0.pom", "change": "cleared"},
+            ])
+        );
+        let (stdout, _) = render(false, |human| report.render_human(human));
+        assert_eq!(
+            stdout,
+            "  accepted without a checksum file: com/example/lib/1.0/lib-1.0.jar\n  \
+             now verified by a checksum file: com/example/lib/1.0/lib-1.0.pom\n"
+        );
+        let removed = lock_from("https://repo.example/");
+        let json = super::LockDiffReport::between(
+            "old".into(),
+            "new".into(),
+            &lock(true, true),
+            &removed,
+            true,
+        )
+        .unwrap()
+        .to_json()
+        .unwrap();
+        assert_eq!(json["checksum_markers"], json!([]));
     }
 
     /// A POM edit that leaves the dependencies alone, such as a comment,
@@ -2215,6 +3027,7 @@ mod tests {
                 "lock-diff/round-trip.lock",
             ),
             ("lock-golden/snapshot/raeva.lock", "lock-diff/snapshot.lock"),
+            ("lock-diff/bom-before.lock", "lock-diff/bom-after.lock"),
             (
                 "lock-golden/single-module/raeva.lock",
                 "lock-golden/round-trip/raeva.lock",

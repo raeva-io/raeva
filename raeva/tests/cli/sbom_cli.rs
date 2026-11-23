@@ -1,4 +1,6 @@
-use crate::common::{assert_success, raeva_command, temp_project, write_demo_lock};
+use crate::common::{
+    assert_success, raeva_command, temp_project, write_demo_lock, write_with_sha256,
+};
 use rv_lock::{LockEdge, Scope};
 use std::fs;
 use std::path::Path;
@@ -16,7 +18,7 @@ fn sbom_defaults_to_reproducible_cyclonedx_on_stdout() {
             ("alpha", "jar", None, Scope::Compile),
             ("zeta", "test-jar", Some("tests"), Scope::Compile),
         ],
-        vec![LockEdge::new(1, 0, Some(Scope::Compile), false)],
+        vec![LockEdge::new(1, 0, Scope::Compile, false)],
     );
 
     let first = raeva_command(project.path(), home.path())
@@ -193,6 +195,47 @@ fn sbom_license_metadata_does_not_require_imported_boms() {
     );
 }
 
+/// A property cycle in a fetched parent's licenses is that parent's error
+/// (exit 5), not the project's.
+#[test]
+fn a_license_cycle_in_a_fetched_parent_is_the_parents() {
+    let (project, home) = temp_project();
+    let dir = project.path().join("repository/org/example/looped/1");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("looped-1.pom"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>\
+         <artifactId>looped</artifactId><version>1</version><packaging>pom</packaging>\
+         <properties><loop>${loop}</loop></properties><licenses><license>\
+         <name>${loop}</name></license></licenses></project>",
+    )
+    .unwrap();
+    let url = url::Url::from_directory_path(project.path().join("repository")).unwrap();
+    fs::write(
+        project.path().join("pom.xml"),
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.example</groupId>\
+             <artifactId>looped</artifactId><version>1</version><relativePath/></parent>\
+             <artifactId>demo</artifactId><repositories><repository><id>fixture</id>\
+             <url>{url}</url></repository></repositories></project>"
+        ),
+    )
+    .unwrap();
+    let sync = raeva_command(project.path(), home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .unwrap();
+    assert_success(&sync, "sync");
+    let output = sbom(project.path(), home.path());
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("org.example:looped:1: property cycle"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("File: pom.xml"), "{stderr}");
+}
+
 #[test]
 fn sbom_uses_reactor_licenses_and_root_user_properties() {
     let (project, home) = temp_project();
@@ -367,10 +410,8 @@ fn sbom_parent_ranges_keep_repository_scoped_selections_and_restore_offline() {
             &crate::schemas::validator(crate::schemas::RAEVA_LOCK_SCHEMA),
             &serde_json::to_value(document).unwrap(),
         );
-        assert_eq!(
-            lock.platforms[0].support_poms.len(),
-            2 + if lower_only { 2 } else { 1 }
-        );
+        // Maven's model cache keeps `a`'s `grand:[1,3)` for `b`.
+        assert_eq!(lock.platforms[0].support_poms.len(), 3);
         let module = lock.platforms[0]
             .modules
             .iter()
@@ -462,8 +503,12 @@ fn sbom_parent_ranges_keep_repository_scoped_selections_and_restore_offline() {
     }
 }
 
+/// Maven's model cache keeps the version the reactor read first under a
+/// parent range: `a`'s project build took `parent:[1,3)` and `grand:[1,3)`
+/// as 1 from `low`, so `b`'s build and `lib` in `b` take them too, though
+/// `b`'s repository lists 2 (Maven 3.9.12 and 3.10.0).
 #[test]
-fn sbom_parent_ranges_are_scoped_to_each_dependency_model() {
+fn sbom_parent_ranges_take_the_reactors_first_selection() {
     let (project, home) = range_parent_project(true, true);
     for (module, license) in [("a/pom.xml", "MIT"), ("b/pom.xml", "Apache-2.0")] {
         let document = assert_selected_license(project.path(), home.path(), module, license);
@@ -475,15 +520,10 @@ fn sbom_parent_ranges_are_scoped_to_each_dependency_model() {
             .unwrap();
         assert_eq!(
             lib["licenses"],
-            serde_json::json!([{"license": {"id": license}}])
+            serde_json::json!([{"license": {"id": "MIT"}}])
         );
     }
-    let combined = sbom(project.path(), home.path());
-    assert!(!combined.status.success());
-    assert!(
-        String::from_utf8_lossy(&combined.stderr)
-            .contains("g/lib@1 has different effective licenses")
-    );
+    assert_success(&sbom(project.path(), home.path()), "one lib license");
 }
 
 #[test]
@@ -508,6 +548,50 @@ fn sbom_fails_without_required_pinned_parent_evidence() {
     );
     assert!(error.contains("org.example:parent:1"), "{error}");
     assert!(error.contains("content store"), "{error}");
+}
+
+/// A FIFO in the store where a pinned POM's blob was is not opened through:
+/// `sbom` and `export-m2` find no stored copy, as for a link, rather than
+/// wait for a writer.
+#[cfg(unix)]
+#[test]
+fn store_readers_do_not_block_on_a_fifo_blob() {
+    let (project, home) = license_project();
+    let lock = rv_lock::Lockfile::read(&project.path().join("raeva.lock")).unwrap();
+    let pin = &lock.platforms[0].support_poms["org.example:parent:1"].sha256;
+    let store = rv_store::Store::open(&home.path().join("store")).unwrap();
+    let blob = store.get_path(&pin.to_string().parse().unwrap());
+    fs::remove_file(&blob).unwrap();
+    let made = std::process::Command::new("mkfifo").arg(&blob).status();
+    if !made.is_ok_and(|status| status.success()) {
+        return;
+    }
+    let m2 = home.path().join("m2");
+    let m2 = m2.to_str().unwrap();
+    for args in [
+        &["sbom", "--offline"][..],
+        &["export-m2", "--offline", "--plan-json"],
+        &["export-m2", "--offline", "--m2-path", m2],
+    ] {
+        let mut child = raeva_command(project.path(), home.path())
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(60) {
+                child.kill().unwrap();
+                panic!("{args:?} blocked on the FIFO");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(status.code(), Some(7), "{args:?}");
+    }
 }
 
 #[test]
@@ -670,7 +754,7 @@ fn sbom_covers_identical_targets_and_selects_without_fallback() {
 #[test]
 fn sbom_rejects_target_specific_root_licenses() {
     let (project, home) = target_project(
-        "<licenses><license><name>Private JDK ${java.version}</name></license></licenses>",
+        "<licenses><license><name>Private JDK ${java.specification.version}</name></license></licenses>",
     );
     let combined = sbom(project.path(), home.path());
     assert_eq!(combined.status.code(), Some(2));
@@ -781,7 +865,7 @@ fn sbom_rejects_target_specific_dependency_licenses_from_identical_pins() {
         .join("repository/org/example/inherited/1/inherited-1.pom");
     let pom = fs::read_to_string(&pom_path).unwrap().replace(
         "<license.name>MIT</license.name>",
-        "<license.name>Private JDK ${java.version}</license.name>",
+        "<license.name>Private JDK ${java.specification.version}</license.name>",
     );
     fs::write(pom_path, pom).unwrap();
     fs::write(
@@ -877,7 +961,7 @@ fn sbom_parent_ranges_use_snapshot_model_and_parent_aliases() {
     fs::remove_dir_all(project.path().join("low")).unwrap();
     for (module, root_license, dep_license) in [
         ("a/pom.xml", "MIT", "MIT"),
-        ("b/pom.xml", "Apache-2.0", "BSD-2-Clause"),
+        ("b/pom.xml", "Apache-2.0", "MIT"),
     ] {
         let document = assert_selected_license(project.path(), home.path(), module, root_license);
         let lib = document["components"]
@@ -966,12 +1050,14 @@ fn sbom_parent_range_changes_drift_even_with_identical_support_pom_union() {
             .replace("<version>[1,3)</version>", "<version>1</version>"),
     )
     .unwrap();
+    // Built first, `b` reads `grand:[1,3)` as 2 for every lineage.
     let root_path = project.path().join("pom.xml");
     fs::write(
         &root_path,
-        fs::read_to_string(&root_path)
-            .unwrap()
-            .replace("</modules>", "<module>c</module></modules>"),
+        fs::read_to_string(&root_path).unwrap().replace(
+            "<module>a</module><module>b</module>",
+            "<module>b</module><module>a</module><module>c</module>",
+        ),
     )
     .unwrap();
     let sync = raeva_command(project.path(), home.path())
@@ -1144,12 +1230,7 @@ fn a_reactor_dependency_keeps_the_parent_its_own_repositories_select() {
             files.push((format!("{artifact}-{version}.jar"), b"jar".to_vec()));
         }
         for (name, bytes) in files {
-            fs::write(dir.join(&name), &bytes).unwrap();
-            fs::write(
-                dir.join(format!("{name}.sha256")),
-                crate::common::sha256_hex(&bytes),
-            )
-            .unwrap();
+            write_with_sha256(&dir.join(name), &bytes);
         }
     };
     let parent = |dependency: &str, license: &str| {
@@ -1174,12 +1255,7 @@ fn a_reactor_dependency_keeps_the_parent_its_own_repositories_select() {
              <versions>{versions}</versions></versioning></metadata>"
         );
         let path = root.join(format!("{repo}/g/parent/maven-metadata.xml"));
-        fs::write(&path, &metadata).unwrap();
-        fs::write(
-            path.with_extension("xml.sha256"),
-            crate::common::sha256_hex(metadata.as_bytes()),
-        )
-        .unwrap();
+        write_with_sha256(&path, metadata.as_bytes());
     }
     let repository = |id: &str| {
         format!(
@@ -1257,12 +1333,7 @@ fn a_dependency_parent_range_can_select_a_reactor_module() {
         <artifactId>root</artifactId><version>[1,2)</version><relativePath/></parent>\
         <groupId>ext</groupId><artifactId>ext</artifactId><version>1</version></project>";
     for (name, bytes) in [("ext-1.pom", pom.as_bytes()), ("ext-1.jar", b"jar")] {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
     fs::write(
         root.join("pom.xml"),
@@ -1315,12 +1386,7 @@ fn a_dependency_parent_can_be_a_module_whose_version_a_remote_parent_decides() {
     let publish = |path: &str, name: &str, bytes: &[u8]| {
         let dir = root.join("repository").join(path);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     };
     publish(
         "g/remote/1",
@@ -1407,12 +1473,7 @@ fn a_dependency_with_an_unparseable_pom_has_no_licenses() {
         ("ext-1.pom", b"<project><licenses>".as_slice()),
         ("ext-1.jar", b"jar"),
     ] {
-        fs::write(dir.join(name), bytes).unwrap();
-        fs::write(
-            dir.join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .unwrap();
+        write_with_sha256(&dir.join(name), bytes);
     }
     fs::write(
         root.join("pom.xml"),
@@ -1442,4 +1503,185 @@ fn a_dependency_with_an_unparseable_pom_has_no_licenses() {
         .find(|component| component["name"] == "ext")
         .unwrap();
     assert!(ext.get("licenses").is_none(), "{ext}");
+}
+
+/// `shared` is test scope in `app` and compile scope in `lib`, `junit` is
+/// test scope in `app` only, and `api` is provided in `lib`.
+fn scope_project() -> (tempfile::TempDir, tempfile::TempDir) {
+    let (project, home) = temp_project();
+    for artifact in ["shared", "junit", "api"] {
+        let dir = project
+            .path()
+            .join("repository/org/example")
+            .join(artifact)
+            .join("1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{artifact}-1.pom")), format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId><artifactId>{artifact}</artifactId><version>1</version></project>"
+        )).unwrap();
+        fs::write(dir.join(format!("{artifact}-1.jar")), b"jar").unwrap();
+    }
+    let url = url::Url::from_directory_path(project.path().join("repository")).unwrap();
+    let dependency = |group: &str, artifact: &str, scope: &str| {
+        format!(
+            "<dependency><groupId>{group}</groupId><artifactId>{artifact}</artifactId><version>1</version><scope>{scope}</scope></dependency>"
+        )
+    };
+    let module = |artifact: &str, dependencies: &[String]| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>com.example</groupId><artifactId>root</artifactId><version>1</version></parent><artifactId>{artifact}</artifactId><dependencies>{}</dependencies></project>",
+            dependencies.concat()
+        )
+    };
+    fs::write(project.path().join("pom.xml"), format!("<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId><artifactId>root</artifactId><version>1</version><packaging>pom</packaging><modules><module>app</module><module>lib</module></modules><repositories><repository><id>fixture</id><url>{url}</url></repository></repositories></project>")).unwrap();
+    for (path, dependencies) in [
+        (
+            "app",
+            vec![
+                dependency("com.example", "lib", "compile"),
+                dependency("org.example", "shared", "test"),
+                dependency("org.example", "junit", "test"),
+            ],
+        ),
+        (
+            "lib",
+            vec![
+                dependency("org.example", "shared", "compile"),
+                dependency("org.example", "api", "provided"),
+            ],
+        ),
+    ] {
+        fs::create_dir_all(project.path().join(path)).unwrap();
+        fs::write(
+            project.path().join(path).join("pom.xml"),
+            module(path, &dependencies),
+        )
+        .unwrap();
+    }
+    let sync = raeva_command(project.path(), home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .unwrap();
+    assert_success(&sync, "sync scope fixture");
+    (project, home)
+}
+
+#[test]
+fn sbom_components_carry_each_modules_scope() {
+    let (project, home) = scope_project();
+    let document = |flags: &[&str]| {
+        let output = raeva_command(project.path(), home.path())
+            .args(["sbom", "--offline"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert_success(&output, &format!("sbom {flags:?}"));
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_schema_valid(&cyclonedx_validator(), &document);
+        document
+    };
+    let scopes = |document: &serde_json::Value| -> Vec<(String, String, Vec<String>)> {
+        document["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|component| {
+                let properties = component["properties"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|p| {
+                        format!(
+                            "{}={}",
+                            p["name"].as_str().unwrap(),
+                            p["value"].as_str().unwrap()
+                        )
+                    })
+                    .collect();
+                (
+                    component["name"].as_str().unwrap().to_string(),
+                    component["scope"].as_str().unwrap_or("").to_string(),
+                    properties,
+                )
+            })
+            .collect()
+    };
+    let row = |name: &str, scope: &str, properties: &[&str]| {
+        (
+            name.to_string(),
+            scope.to_string(),
+            properties
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        scopes(&document(&[])),
+        [
+            row("app", "required", &[]),
+            row("lib", "required", &["raeva:maven:scope=compile"]),
+            row("api", "required", &["raeva:maven:scope=provided"]),
+            row(
+                "junit",
+                "excluded",
+                &["cdx:maven:package:test=true", "raeva:maven:scope=test"]
+            ),
+            row(
+                "shared",
+                "required",
+                &[
+                    "raeva:maven:scope=test app/pom.xml",
+                    "raeva:maven:scope=compile lib/pom.xml"
+                ]
+            ),
+        ]
+    );
+    let app = document(&["--module", "app/pom.xml"]);
+    let shared = scopes(&app).into_iter().find(|(name, ..)| name == "shared");
+    assert_eq!(
+        shared,
+        Some(row(
+            "shared",
+            "excluded",
+            &["cdx:maven:package:test=true", "raeva:maven:scope=test"]
+        ))
+    );
+}
+
+/// A module reached only through its test-jar is not a component: the
+/// test-jar is.
+#[test]
+fn sbom_lists_a_reactor_test_jar_without_its_module() {
+    let (project, home) = temp_project();
+    fs::write(project.path().join("pom.xml"), "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId><artifactId>root</artifactId><version>1</version><packaging>pom</packaging><modules><module>app</module><module>lib</module></modules></project>").unwrap();
+    for (module, body) in [
+        (
+            "app",
+            "<dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId><version>1</version><type>test-jar</type><scope>test</scope></dependency></dependencies>",
+        ),
+        ("lib", ""),
+    ] {
+        fs::create_dir(project.path().join(module)).unwrap();
+        fs::write(project.path().join(module).join("pom.xml"), format!("<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId><artifactId>{module}</artifactId><version>1</version>{body}</project>")).unwrap();
+    }
+    let sync = raeva_command(project.path(), home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .unwrap();
+    assert_success(&sync, "sync test-jar fixture");
+    let output = raeva_command(project.path(), home.path())
+        .args(["sbom", "--offline", "--module", "app/pom.xml"])
+        .output()
+        .unwrap();
+    assert_success(&output, "sbom of app");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_schema_valid(&cyclonedx_validator(), &document);
+    let purls: Vec<&str> = document["components"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|component| component["purl"].as_str().unwrap())
+        .collect();
+    assert_eq!(purls, ["pkg:maven/com.example/lib@1?classifier=tests"]);
 }

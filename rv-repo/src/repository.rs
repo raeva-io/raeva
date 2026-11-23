@@ -25,10 +25,9 @@ pub struct Repository {
     /// Whether snapshot versions are fetched from it.
     pub snapshots_enabled: bool,
     /// How long cached snapshot metadata and `-SNAPSHOT` POMs stay fresh.
-    /// Defaults to [`UpdatePolicy::default`].
+    /// Defaults to [`UpdatePolicy::default`], `daily`, as in Maven.
     pub snapshots_update_policy: UpdatePolicy,
-    /// Update policy for release artifacts. Defaults to `daily` to match
-    /// Maven's `<releases><updatePolicy>daily</updatePolicy></releases>`.
+    /// Update policy for release artifacts, with the same default.
     pub releases_update_policy: UpdatePolicy,
     /// What a checksum mismatch on remote release `maven-metadata.xml`
     /// does after one refetch: `fail` refuses it (and also refuses metadata
@@ -39,6 +38,23 @@ pub struct Repository {
     pub snapshots_checksum_policy: ChecksumPolicy,
     /// Where this repository was declared. Not compared.
     provenance: Uncompared<Provenance>,
+    /// Whether a dependency's or imported BOM's POM declared it, and no
+    /// mirror replaces it. Not compared.
+    descriptor: Uncompared<bool>,
+    /// The URL as declared, which Maven 3.10 hashes into a repository
+    /// filter file's name and mirror patterns read. Not compared.
+    declared_url: Uncompared<String>,
+    /// The names a POM's model looked up to interpolate the URL
+    /// ([`rv_maven_model::Repository::url_reads`]). Not compared.
+    url_reads: Uncompared<Vec<String>>,
+    /// [`Self::url_reads`] for the id. Not compared.
+    id_reads: Uncompared<Vec<String>>,
+    /// The `<layout>` once interpolated, `None` for `default`, which
+    /// decides the mirror that serves it.
+    layout: Option<String>,
+    /// Why a POM's `<layout>` keeps raeva from reading it as Maven does
+    /// ([`rv_maven_model::Repository::layout_refusal`]). Not compared.
+    layout_refusal: Uncompared<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -74,16 +90,23 @@ impl Repository {
         releases_enabled: bool,
         snapshots_enabled: bool,
     ) -> Self {
+        let url = url.into();
         Self {
             id,
-            url: normalize_repo_url(&url.into()),
+            url: normalize_repo_url(&url),
+            declared_url: Uncompared(url.trim().to_string()),
             releases_enabled,
             snapshots_enabled,
             snapshots_update_policy: UpdatePolicy::default(),
-            releases_update_policy: UpdatePolicy::Daily,
+            releases_update_policy: UpdatePolicy::default(),
             releases_checksum_policy: ChecksumPolicy::default(),
             snapshots_checksum_policy: ChecksumPolicy::default(),
             provenance: Uncompared(Provenance::Caller),
+            descriptor: Uncompared(false),
+            url_reads: Uncompared(Vec::new()),
+            id_reads: Uncompared(Vec::new()),
+            layout: None,
+            layout_refusal: Uncompared(None),
         }
     }
 
@@ -97,10 +120,63 @@ impl Repository {
         self.provenance.0 = provenance;
     }
 
+    /// Whether a dependency's or imported BOM's POM declared it, and no
+    /// mirror replaces it: what Maven's remote repository manager calls a
+    /// descriptor repository.
+    pub(crate) fn descriptor(&self) -> bool {
+        self.descriptor.0
+    }
+
+    pub(crate) fn set_descriptor(&mut self, descriptor: bool) {
+        self.descriptor.0 = descriptor;
+    }
+
+    /// The URL as declared, before [`normalize_repo_url`].
+    pub fn declared_url(&self) -> &str {
+        &self.declared_url.0
+    }
+
+    /// The names a POM's model looked up to interpolate the URL; none for a
+    /// configured repository, whose URL is not interpolated.
+    pub fn url_reads(&self) -> &[String] {
+        &self.url_reads.0
+    }
+
+    /// [`Self::url_reads`] for the id.
+    pub fn id_reads(&self) -> &[String] {
+        &self.id_reads.0
+    }
+
+    /// The layout mirrors' `<mirrorOfLayouts>` match.
+    pub fn layout(&self) -> &str {
+        self.layout.as_deref().unwrap_or("default")
+    }
+
+    /// See [`rv_maven_model::Repository::layout_refusal`].
+    pub fn layout_refusal(&self) -> Option<&str> {
+        self.layout_refusal.0.as_deref()
+    }
+
+    /// Requests go to `url` instead, as through a mirror.
+    pub(crate) fn set_url(&mut self, url: &str) {
+        self.url = normalize_repo_url(url);
+        self.declared_url.0 = url.trim().to_string();
+    }
+
+    /// [`Self::set_url`] for a mirror, which declares its URL as written.
+    pub(crate) fn set_mirror_url(&mut self, mirror: &rv_config::MirrorConfig) {
+        self.set_url(&mirror.url);
+        if let Some(declared) = &mirror.declared_url {
+            self.declared_url.0 = declared.trim().to_string();
+        }
+    }
+
     pub(crate) fn from_config(config: &rv_config::RepoConfig) -> Self {
+        let declared = config.declared_url.as_deref().unwrap_or(&config.url);
         Self {
+            declared_url: Uncompared(declared.trim().to_string()),
             snapshots_update_policy: config.snapshots_update_policy.unwrap_or_default(),
-            releases_update_policy: config.releases_update_policy.unwrap_or(UpdatePolicy::Daily),
+            releases_update_policy: config.releases_update_policy.unwrap_or_default(),
             releases_checksum_policy: config.releases_checksum_policy.unwrap_or_default(),
             snapshots_checksum_policy: config.snapshots_checksum_policy.unwrap_or_default(),
             provenance: Uncompared(Provenance::Configured),
@@ -143,6 +219,15 @@ impl Repository {
             ),
             releases_checksum_policy: checksum(&repo.releases_checksum_policy),
             snapshots_checksum_policy: checksum(&repo.snapshots_checksum_policy),
+            declared_url: Uncompared(
+                (repo.declared_url.as_deref().unwrap_or(&repo.url))
+                    .trim()
+                    .to_string(),
+            ),
+            url_reads: Uncompared(repo.url_reads.clone()),
+            id_reads: Uncompared(repo.id_reads.clone()),
+            layout: repo.layout.clone().filter(|layout| layout != "default"),
+            layout_refusal: Uncompared(repo.layout_refusal()),
             provenance: Uncompared(if repo.root_declared {
                 Provenance::LocalPom
             } else {
@@ -355,30 +440,30 @@ impl Repository {
         }
     }
 
-    /// Seconds a copy for `version` fetched now stays fresh.
-    pub(crate) fn update_policy_ttl(&self, version: &str) -> i64 {
-        fresh_secs(self.update_policy_for(version), &chrono::Local::now())
+    /// How long a copy for `version` fetched now stays fresh.
+    pub(crate) fn update_policy_expiry(&self, version: &str) -> rv_store::metadata_cache::Expiry {
+        match self.update_policy_for(version) {
+            UpdatePolicy::Daily => rv_store::metadata_cache::Expiry::Daily,
+            policy => rv_store::metadata_cache::Expiry::After(policy.ttl_secs()),
+        }
     }
 }
 
-/// Seconds a copy written at `written` stays fresh under `policy`. As in
-/// Maven, `daily` lasts until the next local midnight.
+/// Seconds a check made at `written` stays fresh under `policy`. Maven
+/// decides `daily` anew at every read ([`rv_store::daily`]), so for it this
+/// is 0 once the check is due now, in this run's zone, and `i64::MAX` until
+/// then.
 pub fn fresh_secs(policy: UpdatePolicy, written: &chrono::DateTime<chrono::Local>) -> i64 {
     match policy {
-        UpdatePolicy::Daily => until_next_midnight(written),
+        UpdatePolicy::Daily => {
+            let now = chrono::Local::now().timestamp();
+            match rv_store::daily::due(written.timestamp(), now) {
+                true => 0,
+                false => i64::MAX,
+            }
+        }
         policy => policy.ttl_secs(),
     }
-}
-
-fn until_next_midnight<Tz: chrono::TimeZone>(now: &chrono::DateTime<Tz>) -> i64 {
-    let midnight = now
-        .date_naive()
-        .succ_opt()
-        .and_then(|day| day.and_hms_opt(0, 0, 0))
-        .and_then(|midnight| now.timezone().from_local_datetime(&midnight).earliest());
-    midnight.map_or(UpdatePolicy::Daily.ttl_secs(), |midnight| {
-        (midnight - now.clone()).num_seconds().max(1)
-    })
 }
 
 impl From<&rv_config::RepoConfig> for Repository {
@@ -415,19 +500,15 @@ pub(crate) fn unsupported_policy(repo: &Repository, kind: &str) -> crate::RepoEr
 mod tests {
     use super::Repository;
 
-    /// As Maven's update check, `daily` expires at the next local midnight,
-    /// however recently the copy was fetched, and `never` does not expire.
+    /// `never` does not expire, and `daily` is decided when read.
     #[test]
-    fn daily_lasts_until_midnight_and_never_does_not_expire() {
-        use chrono::TimeZone;
-        let zone = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
-        for (hour, minute, ttl) in [(23, 59, 60), (0, 0, 86_400), (12, 30, 41_400)] {
-            let now = zone.with_ymd_and_hms(2026, 3, 1, hour, minute, 0).unwrap();
-            assert_eq!(super::until_next_midnight(&now), ttl, "{now}");
-        }
+    fn never_does_not_expire_and_daily_is_decided_when_read() {
+        use rv_store::metadata_cache::Expiry;
         let mut repo = Repository::new(None, "https://example.com/", true, true);
         repo.releases_update_policy = rv_config::UpdatePolicy::Never;
-        assert_eq!(repo.update_policy_ttl("1.0"), i64::MAX);
+        assert_eq!(repo.update_policy_expiry("1.0"), Expiry::NEVER);
+        repo.releases_update_policy = rv_config::UpdatePolicy::Daily;
+        assert_eq!(repo.update_policy_expiry("1.0"), Expiry::Daily);
     }
 
     #[test]
@@ -533,6 +614,28 @@ mod tests {
         other.releases_checksum_policy = ChecksumPolicy::Unsupported;
         configured.merge_checksum_policies(&other);
         assert_eq!(configured.releases_checksum_policy, ChecksumPolicy::Fail);
+    }
+
+    /// As Maven Resolver's `RepositoryPolicy()`, an omitted update policy is
+    /// `daily` for snapshots too, so a range a repository serves both kinds
+    /// for keeps its listing until midnight.
+    #[test]
+    fn an_omitted_update_policy_is_daily() {
+        use rv_config::UpdatePolicy;
+
+        let declared = rv_maven_model::Repository::new(Some("r"), "https://example.com/");
+        let mut configured = rv_config::RepoConfig::new(Some("r"), "https://example.com/");
+        configured.snapshots = Some(true);
+        for repo in [
+            Repository::new(None, "https://example.com/", true, true),
+            Repository::from_maven_repo(&declared),
+            Repository::from_config(&configured),
+        ] {
+            assert_eq!(repo.snapshots_update_policy, UpdatePolicy::Daily);
+            assert_eq!(repo.releases_update_policy, UpdatePolicy::Daily);
+            let range = repo.version_listing(true).unwrap().unwrap();
+            assert_eq!(range.releases_update_policy, UpdatePolicy::Daily);
+        }
     }
 
     #[test]

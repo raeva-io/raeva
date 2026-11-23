@@ -19,6 +19,9 @@ pub struct Metadata {
     pub release: Option<String>,
     /// `<versioning><versions>`, in document order. Empty when absent.
     pub versions: Vec<String>,
+    /// How many of `versions` precede the first blank `<version>`, which
+    /// Maven's range resolver lists as the empty version.
+    pub blank_version_at: Option<usize>,
     /// `<versioning><lastUpdated>`, which picks among repositories'
     /// `<release>` and `<latest>`, and for legacy snapshot metadata.
     pub last_updated: Option<String>,
@@ -28,6 +31,19 @@ pub struct Metadata {
     /// `<versioning><snapshotVersions>`: the timestamped version of each
     /// classifier and extension. Empty when absent.
     pub snapshot_versions: Vec<SnapshotVersion>,
+    /// The `<artifactId>` and `<prefix>` of each `<plugins><plugin>`, which
+    /// group-level metadata lists. Only Maven 3.10's validation reads them.
+    pub plugins: Vec<(Option<String>, Option<String>)>,
+}
+
+/// Which Maven 3.10 resolver reads a `maven-metadata.xml`: each takes
+/// other fields for invalid when they hold a control character.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataReader {
+    /// `DefaultVersionRangeResolver`, for a range, `RELEASE` or `LATEST`.
+    VersionRange,
+    /// `DefaultVersionResolver`, for a `-SNAPSHOT` build.
+    Version,
 }
 
 /// The `<versioning><snapshot>` element of snapshot metadata. Its fields are
@@ -85,6 +101,20 @@ pub struct SnapshotVersion {
 struct MetadataXml {
     version: Option<String>,
     versioning: Option<VersioningXml>,
+    plugins: Option<PluginsXml>,
+}
+
+#[derive(Deserialize)]
+struct PluginsXml {
+    #[serde(default)]
+    plugin: Vec<PluginXml>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginXml {
+    artifact_id: Option<String>,
+    prefix: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -130,20 +160,20 @@ impl Metadata {
             ))
         })?;
         let versioning = parsed.versioning.unwrap_or_default();
+        let mut versions = Vec::new();
+        let mut blank_version_at = None;
+        for version in (versioning.versions.into_iter()).flat_map(|versions| versions.version) {
+            match trimmed(Some(version)) {
+                Some(version) => versions.push(version),
+                None => _ = blank_version_at.get_or_insert(versions.len()),
+            }
+        }
         Ok(Metadata {
             version: trimmed(parsed.version),
             latest: trimmed(versioning.latest),
             release: trimmed(versioning.release),
-            versions: versioning
-                .versions
-                .map(|versions| {
-                    versions
-                        .version
-                        .into_iter()
-                        .filter_map(|version| trimmed(Some(version)))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            versions,
+            blank_version_at,
             last_updated: trimmed(versioning.last_updated),
             snapshot: versioning.snapshot.map(trim_snapshot),
             snapshot_versions: versioning
@@ -156,7 +186,57 @@ impl Metadata {
                         .collect()
                 })
                 .unwrap_or_default(),
+            plugins: (parsed
+                .plugins
+                .map(|plugins| plugins.plugin)
+                .unwrap_or_default())
+            .into_iter()
+            .map(|plugin| (trimmed(plugin.artifact_id), trimmed(plugin.prefix)))
+            .collect(),
         })
+    }
+
+    /// `versions` as Maven's range resolver lists them, a blank one in its
+    /// place as the empty version.
+    pub fn listed_versions(&self) -> impl Iterator<Item = &str> {
+        let blank = |at| (self.blank_version_at == Some(at)).then_some("");
+        (self.versions.iter().enumerate())
+            .flat_map(move |(at, version)| blank(at).into_iter().chain([version.as_str()]))
+            .chain(blank(self.versions.len()))
+    }
+
+    /// Whether Maven 3.10 takes this metadata for invalid when `reader`
+    /// reads it, and so lists nothing from it. Its
+    /// `ValidatingMetadataXpp3Reader` refuses `..` and any `/`, `\` or `:`
+    /// in the versions, the snapshot timestamp, the snapshot versions and
+    /// the plugin names, and each resolver also refuses a control character
+    /// in the values it adopts.
+    pub fn has_invalid_token(&self, reader: MetadataReader) -> bool {
+        let (version, latest, release) = (&self.version, &self.latest, &self.release);
+        let versions = self.versions.iter();
+        let timestamp = (self.snapshot.as_ref()).and_then(|snapshot| snapshot.timestamp.as_ref());
+        let values = (self.snapshot_versions.iter()).map(|entry| &entry.value);
+        let plugins = (self.plugins.iter()).flat_map(|(artifact_id, prefix)| [artifact_id, prefix]);
+        let path_component = |value: &String| value == ".." || value.contains(['/', '\\', ':']);
+        let control = |value: &String| value.chars().any(char::is_control);
+        let mut read = (version
+            .iter()
+            .chain(latest)
+            .chain(release)
+            .chain(versions.clone()))
+        .chain(timestamp)
+        .chain(values.clone())
+        .chain(plugins.flatten());
+        let adopted: Vec<&String> = match reader {
+            MetadataReader::VersionRange => versions.chain(latest).chain(release).collect(),
+            MetadataReader::Version => latest
+                .iter()
+                .chain(release)
+                .chain(values)
+                .chain(timestamp)
+                .collect(),
+        };
+        read.any(path_component) || adopted.into_iter().any(control)
     }
 
     /// [`Metadata::parse`] for raw bytes.
@@ -297,7 +377,7 @@ fn trim_snapshot_version(mut entry: SnapshotVersion) -> SnapshotVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::{Metadata, SnapshotCandidate, SnapshotVersion};
+    use super::{Metadata, MetadataReader, SnapshotCandidate, SnapshotVersion};
 
     #[test]
     fn markers_are_trimmed() {
@@ -541,6 +621,19 @@ mod tests {
             metadata.versions,
             vec!["1.0".to_string(), "2.0".to_string()]
         );
+        assert_eq!(
+            metadata.listed_versions().collect::<Vec<_>>(),
+            ["1.0", "2.0", ""]
+        );
+        let metadata = Metadata::parse(
+            "<metadata><versioning><versions><version/><version>1</version><version> \
+             </version><version>2</version></versions></versioning></metadata>",
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.listed_versions().collect::<Vec<_>>(),
+            ["", "1", "2"]
+        );
     }
 
     /// Whitespace around a SNAPSHOT `<version>`, `<timestamp>`, extension, or
@@ -566,5 +659,84 @@ mod tests {
             metadata.snapshot_timestamped_version().as_deref(),
             Some("1.0-20240101.010101-7")
         );
+    }
+
+    /// Maven 3.10's readers refuse a value with `..`, `/`, `\` or `:` in
+    /// any version field, the timestamp or a plugin name, and each one a
+    /// control character in the values it adopts.
+    #[test]
+    fn maven_310_invalid_tokens_follow_each_reader() {
+        use MetadataReader::{Version, VersionRange};
+        let invalid = |versioning: &str, plugins: &str| {
+            let metadata = Metadata::parse(&format!(
+                "<metadata><versioning>{versioning}</versioning>{plugins}</metadata>"
+            ))
+            .unwrap();
+            (
+                metadata.has_invalid_token(VersionRange),
+                metadata.has_invalid_token(Version),
+            )
+        };
+        let snapshot = |timestamp: &str| {
+            format!(
+                "<snapshot><timestamp>{timestamp}</timestamp><buildNumber>1</buildNumber></snapshot>"
+            )
+        };
+        let value = |value: &str| {
+            format!(
+                "<snapshotVersions><snapshotVersion><extension>jar</extension>\
+                 <value>{value}</value></snapshotVersion></snapshotVersions>"
+            )
+        };
+        for (versioning, plugins, expected) in [
+            (
+                "<versions><version>1.0</version><version>1..</version></versions>".to_string(),
+                "",
+                (false, false),
+            ),
+            (
+                "<versions><version>..</version></versions>".to_string(),
+                "",
+                (true, true),
+            ),
+            ("<latest>1/2</latest>".to_string(), "", (true, true)),
+            ("<release>c:\\x</release>".to_string(), "", (true, true)),
+            ("<release>1&#x9;2</release>".to_string(), "", (true, true)),
+            (
+                "<versions><version>1&#x9;2</version></versions>".to_string(),
+                "",
+                (true, false),
+            ),
+            (snapshot("20240101.010101"), "", (false, false)),
+            (snapshot("20240101:010101"), "", (true, true)),
+            (snapshot("20240101&#x9;010101"), "", (false, true)),
+            (value("1.0-20240101.010101-1"), "", (false, false)),
+            (value("../1.0-20240101.010101-1"), "", (true, true)),
+            (value("1.0-20240101&#x9;.010101-1"), "", (false, true)),
+            (
+                String::new(),
+                "<plugins><plugin><prefix>a/b</prefix></plugin></plugins>",
+                (true, true),
+            ),
+            (
+                String::new(),
+                "<plugins><plugin><artifactId>a:b</artifactId></plugin></plugins>",
+                (true, true),
+            ),
+            (
+                String::new(),
+                "<plugins><plugin><artifactId>p</artifactId><prefix>p</prefix></plugin></plugins>",
+                (false, false),
+            ),
+        ] {
+            assert_eq!(
+                invalid(&versioning, plugins),
+                expected,
+                "{versioning}{plugins}"
+            );
+        }
+        let version =
+            Metadata::parse("<metadata><version>1.0/SNAPSHOT</version></metadata>").unwrap();
+        assert!(version.has_invalid_token(Version) && version.has_invalid_token(VersionRange));
     }
 }

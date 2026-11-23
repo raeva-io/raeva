@@ -1,5 +1,5 @@
 use indexmap::{Equivalent, IndexMap};
-use rv_maven_model::Dependency;
+use rv_maven_model::{ArtifactTypes, Dependency, ManagedOrigin};
 use rv_maven_types::bounded;
 
 use crate::error::{ResolveError, Result};
@@ -22,23 +22,40 @@ impl Equivalent<ManagementKey> for KeyRef<'_> {
 /// The root project's effective dependencyManagement (parents merged and BOMs
 /// imported by the model layer). Entries sharing a key merge as in Maven's
 /// ClassicDependencyManager: each field comes from the first entry that sets
-/// it, and the exclusions of all of them add up.
+/// it to a non-empty value, and the exclusions of all of them add up.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Management(IndexMap<ManagementKey, Dependency, foldhash::fast::RandomState>);
+pub(crate) struct Management {
+    entries: IndexMap<ManagementKey, Dependency, foldhash::fast::RandomState>,
+    types: ArtifactTypes,
+}
 
 impl Management {
-    pub(crate) fn new(entries: Vec<Dependency>) -> Self {
+    /// The management of `entries`, keyed by the artifact handlers of
+    /// `types`.
+    pub(crate) fn new(entries: Vec<Dependency>, types: ArtifactTypes) -> Self {
         let mut map = IndexMap::with_capacity_and_hasher(entries.len(), Default::default());
-        for entry in entries {
-            // A version-less entry may still manage scope or exclusions.
-            if entry.version.is_none() && entry.scope.is_none() && entry.exclusions.is_empty() {
+        let unset = |value: &Option<String>| value.as_deref().is_none_or(str::is_empty);
+        for mut entry in entries {
+            if unset(&entry.version) {
+                entry.version = None;
+            }
+            if unset(&entry.scope) {
+                entry.scope = None;
+            }
+            // A version-less entry may still manage scope, optional or
+            // exclusions.
+            if entry.version.is_none()
+                && entry.scope.is_none()
+                && entry.optional.is_none()
+                && entry.exclusions.is_empty()
+            {
                 continue;
             }
             let key = KeyRef(
                 &entry.group_id,
                 &entry.artifact_id,
-                entry.effective_type(),
-                entry.effective_classifier(),
+                entry.effective_type_in(&types),
+                entry.effective_classifier_in(&types),
             );
             let Some(managed) = map.get_mut(&key) else {
                 let key = (
@@ -50,14 +67,20 @@ impl Management {
                 map.insert(key, entry);
                 continue;
             };
-            if managed.version.is_none() {
+            // The origin follows the version it names.
+            if managed.version.is_none() && entry.version.is_some() {
                 managed.version = entry.version;
+                managed.origin = entry.origin;
             }
             if managed.scope.is_none() {
                 managed.scope = entry.scope;
             }
+            if managed.optional.is_none() {
+                managed.optional = entry.optional;
+            }
             if managed.system_path.is_none() {
                 managed.system_path = entry.system_path;
+                managed.system_path_from_project = entry.system_path_from_project;
             }
             for exclusion in entry.exclusions {
                 if !managed.exclusions.contains(&exclusion) {
@@ -65,7 +88,10 @@ impl Management {
                 }
             }
         }
-        Self(map)
+        Self {
+            entries: map,
+            types,
+        }
     }
 
     pub(crate) fn managed(&self, dependency: &Dependency) -> Option<&Dependency> {
@@ -78,24 +104,59 @@ impl Management {
         artifact_id: &str,
         like: &Dependency,
     ) -> Option<&Dependency> {
-        self.0.get(&KeyRef(
+        self.entries.get(&KeyRef(
             group_id,
             artifact_id,
-            like.effective_type(),
-            like.effective_classifier(),
+            like.effective_type_in(&self.types),
+            like.effective_classifier_in(&self.types),
         ))
     }
 }
 
+/// Where the version requested for `dependency` at `depth` comes from, when
+/// management supplied it, for a request that resolved to `group:artifact`:
+/// as [`resolve_version_str`] picks it, the management of a relocation
+/// target first, then the last management a chain of relocations applied
+/// on the way, which the caller keeps in the origin of a transitive
+/// `dependency` it relocates.
+pub(crate) fn version_origin(
+    management: &Management,
+    dependency: &Dependency,
+    depth: usize,
+    (group_id, artifact_id): (&str, &str),
+) -> ManagedOrigin {
+    let versioned = |entry: &&Dependency| entry.version.is_some();
+    let relocated = group_id != dependency.group_id || artifact_id != dependency.artifact_id;
+    if depth > 1 {
+        let target = relocated
+            .then(|| management.entry(group_id, artifact_id, dependency))
+            .flatten()
+            .filter(versioned);
+        if let Some(entry) = target {
+            return entry.origin.clone();
+        }
+        if relocated && dependency.origin.0.is_some() {
+            return dependency.origin.clone();
+        }
+        if let Some(entry) = management.managed(dependency).filter(versioned) {
+            return entry.origin.clone();
+        }
+        return ManagedOrigin::default();
+    }
+    // The model applied the management of a direct dependency.
+    dependency.origin.clone()
+}
+
 /// The version to request for `dependency` at `depth`. Like Maven's
-/// ClassicDependencyManager, management only fills a missing version of the
-/// root's own dependencies but overrides the declared version from depth 2.
+/// ClassicDependencyManager, management overrides the declared version from
+/// depth 2 only: the model already filled the root's own dependencies, and
+/// one it left without a version stays without.
 pub(crate) fn resolve_version_str<'a>(
     management: &'a Management,
     dependency: &'a Dependency,
     depth: usize,
 ) -> Result<&'a str> {
-    if depth > 1 || dependency.version.is_none() {
+    if depth > 1 {
         let managed = management
             .managed(dependency)
             .and_then(|entry| entry.version.as_deref());

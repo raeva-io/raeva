@@ -39,12 +39,16 @@ fn full_resolution_inputs() -> ResolutionInputs {
                 snapshots_checksum_policy: "Fail".to_string(),
             },
         ],
+        plugin_repositories: Vec::new(),
         allow_transitive_repositories: true,
         allow_env_substitution: strings(&["HOME", "CI", "HOME"]),
         transitive_repository_allowlist: strings(&["https://b.example/", "https://a.example/"]),
         jdks: Vec::new(),
+        maven: MavenMode::Maven39,
         settings_profiles: Vec::new(),
+        settings_model_repositories: Vec::new(),
         ambient: BTreeMap::new(),
+        repository_filters: None,
     }
 }
 
@@ -87,6 +91,16 @@ fn config_hash_frames_every_input() {
         "update policy": |i| i.repositories[1].releases_update_policy = "daily".into();
         "transitive repositories": |i| i.allow_transitive_repositories = false;
         "command line": |i| i.profile_selections.push("-Pci".into());
+        "maven mode": |i| i.maven = MavenMode::Maven310;
+        "repository filters": |i| i.repository_filters = Some(String::new());
+    }
+    let with_filters = || ResolutionInputs {
+        repository_filters: Some("file groupId-r1.txt 00".into()),
+        ..full_resolution_inputs()
+    };
+    each_change_differs! { config_hash, with_filters() => ResolutionInputs;
+        "filter text": |i| i.repository_filters.as_mut().unwrap().push('0');
+        "no filters": |i| i.repository_filters = None;
     }
     let with_profile_selections = || ResolutionInputs {
         profile_selections: strings(&["-Pci", "-P!slow"]),
@@ -99,6 +113,7 @@ fn config_hash_frames_every_input() {
     }
     each_change_differs! { config_hash, ambient_resolution_inputs() => ResolutionInputs;
         "profile order": |i| i.settings_profiles.reverse();
+        "settings model repository": |i| i.settings_model_repositories.push("sp".into());
         "profile content": |i| i.settings_profiles[0].content.push(' ');
         "no profiles": |i| i.settings_profiles.clear();
         "value": |i| drop(i.ambient.insert(AmbientInput::JavaVersion, Some("21".into())));
@@ -211,8 +226,8 @@ fn model_hash_is_stable() {
 
 #[test]
 fn model_hash_ignores_line_endings_and_profile_order_only() {
-    assert_eq!(pom_sha256(b"<p>\r\n</p>\r\n"), pom_sha256(b"<p>\n</p>\n"));
-    assert_ne!(pom_sha256(b"<p>\r</p>"), pom_sha256(b"<p>\n</p>"));
+    assert_eq!(text_sha256(b"<p>\r\n</p>\r\n"), text_sha256(b"<p>\n</p>\n"));
+    assert_ne!(text_sha256(b"<p>\r</p>"), text_sha256(b"<p>\n</p>"));
     let mut reordered = reactor_inputs();
     reordered.active_profiles = strings(&["ci", "linux"]);
     reordered.modules[1].active_profiles.reverse();
@@ -392,6 +407,7 @@ fn graph_digests_cover_the_names_each_graph_read() {
             &platform,
             platform.model_inputs.as_ref().unwrap(),
             Some("h"),
+            MavenMode::Maven39,
             &crate::TargetReads::default(),
         )
     };
@@ -413,18 +429,17 @@ fn graph_digests_cover_the_names_each_graph_read() {
     inputs
         .module_ambient_inputs
         .insert("app/pom.xml".into(), v());
-    let graphs = graph_digests(
-        &platform,
-        platform.model_inputs.as_ref().unwrap(),
+    bind(&mut platform, &crate::TargetReads::default());
+    assert!(platform.graphs_match(Some("h"), MavenMode::Maven39, &v(), &crate::RepoIds::new()));
+    assert!(!platform.graphs_match(
         Some("h"),
-        &crate::TargetReads::default(),
-    );
-    platform.model_inputs.as_mut().unwrap().graphs = graphs;
-    assert!(platform.graphs_match(Some("h"), &v(), &crate::RepoIds::new()));
-    assert!(!platform.graphs_match(Some("h"), &BTreeSet::new(), &crate::RepoIds::new()));
+        MavenMode::Maven39,
+        &BTreeSet::new(),
+        &crate::RepoIds::new()
+    ));
     platform.model_inputs = None;
     assert!(
-        !platform.graphs_match(Some("h"), &v(), &crate::RepoIds::new()),
+        !platform.graphs_match(Some("h"), MavenMode::Maven39, &v(), &crate::RepoIds::new()),
         "no digests prove nothing"
     );
 }
@@ -445,12 +460,9 @@ fn graph_digests_cover_what_a_target_read() {
     let digests =
         |platform: &LockPlatform, ids: &crate::RepoIds, ambient: &BTreeSet<AmbientInput>| {
             let reads = platform.reads(ids, ambient);
-            graph_digests(
-                platform,
-                platform.model_inputs.as_ref().unwrap(),
-                Some("h"),
-                &reads,
-            )
+            let mut bound = platform.clone();
+            bind(&mut bound, &reads);
+            bound.model_inputs.unwrap().graphs
         };
     let plain = lock.platforms[0].clone();
     let (no_ids, no_names) = (crate::RepoIds::new(), BTreeSet::new());
@@ -477,12 +489,269 @@ fn graph_digests_cover_what_a_target_read() {
 
     // A merge keeping one branch's graphs and the other's lists.
     let mut merged = plain.clone();
-    merged.model_inputs.as_mut().unwrap().graphs = all[1].clone();
-    assert!(merged.graphs_match(Some("h"), &no_names, &central()));
-    assert!(!merged.graphs_match(Some("h"), &no_names, &no_ids));
-    merged.model_inputs.as_mut().unwrap().graphs = all[2].clone();
-    assert!(merged.graphs_match(Some("h"), &jdk(), &no_ids));
-    assert!(!merged.graphs_match(Some("h"), &no_names, &no_ids));
+    let take = |merged: &mut LockPlatform, graphs: &BTreeMap<_, _>| {
+        (merged.model_inputs.as_mut().unwrap().graphs).clone_from(graphs);
+    };
+    take(&mut merged, &all[1]);
+    assert!(merged.graphs_match(Some("h"), MavenMode::Maven39, &no_names, &central()));
+    assert!(!merged.graphs_match(Some("h"), MavenMode::Maven39, &no_names, &no_ids));
+    take(&mut merged, &all[2]);
+    assert!(merged.graphs_match(Some("h"), MavenMode::Maven39, &jdk(), &no_ids));
+    assert!(!merged.graphs_match(Some("h"), MavenMode::Maven39, &no_names, &no_ids));
     merged.host_inputs = Some(BTreeSet::new());
-    assert!(!merged.graphs_match(Some("h"), &jdk(), &no_ids));
+    assert!(!merged.graphs_match(Some("h"), MavenMode::Maven39, &jdk(), &no_ids));
+}
+
+/// Record the graph digests of `platform`, a target of a lock whose
+/// `config_hash` is "h", as a write does.
+fn bind(platform: &mut LockPlatform, reads: &crate::TargetReads) {
+    let inputs = platform.model_inputs.as_ref().unwrap();
+    let graphs = graph_digests(platform, inputs, Some("h"), MavenMode::Maven39, reads);
+    platform.model_inputs.as_mut().unwrap().graphs = graphs;
+}
+
+/// A module's graph digest covers only the reactor modules its graph can
+/// name and the rows of those it depends on, so adding a module no graph
+/// names leaves the other digests as they are, while a module whose
+/// `group:artifact` a graph names, a change of its version, or a change of
+/// a reactor dependency's rows does not.
+#[test]
+fn graph_digests_cover_only_the_reactor_modules_a_graph_names() {
+    let (lock, _) = locked_and_current();
+    let mut base = lock.platforms[0].clone();
+    let lib = rv_maven_types::ArtifactCoord::new("com.example", "lib", "2.0", "jar", None);
+    let app = (base.modules.iter_mut())
+        .find(|m| m.path == "app/pom.xml")
+        .unwrap();
+    app.packages.push(crate::LockModulePackage::new(
+        lib.clone(),
+        Some(crate::Scope::Compile),
+    ));
+    let reads = crate::TargetReads::default();
+    bind(&mut base, &reads);
+    let digests = |platform: &LockPlatform| {
+        let mut platform = platform.clone();
+        bind(&mut platform, &reads);
+        platform.model_inputs.unwrap().graphs
+    };
+    let with = |path: &str, gav: Gav| {
+        let mut platform = base.clone();
+        let mut module = platform.modules[0].clone();
+        module.path = path.into();
+        module.gav = gav;
+        platform.modules.push(module);
+        platform
+    };
+    let before = base.model_inputs.clone().unwrap().graphs;
+    let unnamed = digests(&with(
+        "tools/pom.xml",
+        Gav::new("com.example", "tools", "1.0"),
+    ));
+    for path in ["pom.xml", "app/pom.xml"] {
+        assert_eq!(unnamed[path], before[path], "{path}");
+    }
+    // A reactor module with a group:artifact app's graph names, at any
+    // version, would have been a candidate for it.
+    let named = digests(&with("lib/pom.xml", Gav::new("com.example", "lib", "3.0")));
+    assert_ne!(named["app/pom.xml"], before["app/pom.xml"]);
+    assert_eq!(named["pom.xml"], before["pom.xml"]);
+    let mut bumped = base.clone();
+    bumped.modules[0].gav = Gav::new("com.example", "root", "1.1");
+    let bumped = digests(&bumped);
+    assert_ne!(bumped["pom.xml"], before["pom.xml"]);
+    assert_eq!(bumped["app/pom.xml"], before["app/pom.xml"]);
+
+    // The rows of a reactor module app depends on reach app's graph, so a
+    // branch that resolves that module again without editing its POM
+    // cannot merge with one that starts depending on it.
+    let root = base.modules[0].clone();
+    let mut depends = base.clone();
+    let app = (depends.modules.iter_mut())
+        .find(|m| m.path == "app/pom.xml")
+        .unwrap();
+    let mut package = crate::LockModulePackage::new(
+        rv_maven_types::ArtifactCoord::new("com.example", "root", root.gav.version(), "pom", None),
+        Some(crate::Scope::Compile),
+    );
+    package.workspace_module = Some(root.path.clone());
+    app.packages.push(package);
+    let mut moved = depends.clone();
+    let root_row = moved
+        .modules
+        .iter_mut()
+        .find(|m| m.path == root.path)
+        .unwrap();
+    root_row
+        .packages
+        .push(crate::LockModulePackage::new(lib, None));
+    let (depends, moved_graphs) = (digests(&depends), digests(&moved));
+    assert_ne!(moved_graphs["app/pom.xml"], depends["app/pom.xml"]);
+    let mut unrelated = base.clone();
+    let root_row = unrelated
+        .modules
+        .iter_mut()
+        .find(|m| m.path == root.path)
+        .unwrap();
+    root_row.packages.push(crate::LockModulePackage::new(
+        rv_maven_types::ArtifactCoord::new("com.example", "other", "1.0", "jar", None),
+        None,
+    ));
+    assert_eq!(digests(&unrelated)["app/pom.xml"], before["app/pom.xml"]);
+
+    // The Maven line binds every graph.
+    let inputs = base.model_inputs.as_ref().unwrap();
+    let maven310 = graph_digests(&base, inputs, Some("h"), MavenMode::Maven310, &reads);
+    assert!(
+        (maven310.iter()).all(|(path, digest)| *digest != before[path]),
+        "{maven310:?}"
+    );
+    let mut stale = base.clone();
+    assert!(stale.graphs_match(
+        Some("h"),
+        MavenMode::Maven39,
+        &BTreeSet::new(),
+        &crate::RepoIds::new()
+    ));
+    assert!(!stale.graphs_match(
+        Some("h"),
+        MavenMode::Maven310,
+        &BTreeSet::new(),
+        &crate::RepoIds::new()
+    ));
+    stale.model_inputs.as_mut().unwrap().graphs = maven310;
+    assert!(stale.graphs_match(
+        Some("h"),
+        MavenMode::Maven310,
+        &BTreeSet::new(),
+        &crate::RepoIds::new()
+    ));
+}
+
+/// A module's graph digest covers where its managed versions come from,
+/// and only its own.
+#[test]
+fn graph_digests_cover_the_managed_sources() {
+    let (lock, _) = locked_and_current();
+    let mut base = lock.platforms[0].clone();
+    let lib = rv_maven_types::ArtifactCoord::new("com.example", "lib", "2.0", "jar", None);
+    let app = (base.modules.iter_mut())
+        .find(|m| m.path == "app/pom.xml")
+        .unwrap();
+    app.packages.push(crate::LockModulePackage::new(
+        lib,
+        Some(crate::Scope::Compile),
+    ));
+    let reads = crate::TargetReads::default();
+    let digests = |platform: &LockPlatform| {
+        let mut platform = platform.clone();
+        bind(&mut platform, &reads);
+        platform.model_inputs.unwrap().graphs
+    };
+    let before = digests(&base);
+    let managed = |property: Option<&str>| {
+        let mut platform = base.clone();
+        let app = (platform.modules.iter_mut())
+            .find(|m| m.path == "app/pom.xml")
+            .unwrap();
+        let source = rv_maven_types::ManagedSource::new(
+            rv_maven_types::ManagedKind::Import,
+            "com.example",
+            "bom",
+            property,
+        );
+        app.packages.last_mut().unwrap().managed = source.map(std::sync::Arc::new);
+        digests(&platform)
+    };
+    let imported = managed(None);
+    assert_ne!(imported["app/pom.xml"], before["app/pom.xml"]);
+    assert_eq!(imported["pom.xml"], before["pom.xml"]);
+    let property = managed(Some("${bom.version}"));
+    assert_ne!(property["app/pom.xml"], imported["app/pom.xml"]);
+}
+
+/// A module's graph digest covers its evicted ranges, and a reactor module
+/// with an evicted range's `group:artifact` counts as one the graph names.
+#[test]
+fn graph_digests_cover_the_evicted_ranges() {
+    let (lock, _) = locked_and_current();
+    let reads = crate::TargetReads::default();
+    let digests = |platform: &LockPlatform| {
+        let mut platform = platform.clone();
+        bind(&mut platform, &reads);
+        platform.model_inputs.unwrap().graphs
+    };
+    let with_range = |versions: &[&str]| {
+        let mut platform = lock.platforms[0].clone();
+        let app = (platform.modules.iter_mut())
+            .find(|m| m.path == "app/pom.xml")
+            .unwrap();
+        app.evicted_ranges.push(crate::EvictedRange {
+            group: "com.example".into(),
+            artifact: "root".into(),
+            range: "[1.0,2)".into(),
+            origin: "https://repo.example/".into(),
+            versions: versions.iter().map(|v| v.to_string()).collect(),
+        });
+        platform
+    };
+    let bumped = |mut platform: LockPlatform| {
+        platform.modules[0].gav = Gav::new("com.example", "root", "1.1");
+        platform
+    };
+    let before = digests(&lock.platforms[0]);
+    let evicted = digests(&with_range(&["1.0"]));
+    assert_ne!(evicted["app/pom.xml"], before["app/pom.xml"]);
+    assert_eq!(evicted["pom.xml"], before["pom.xml"]);
+    assert_ne!(
+        digests(&with_range(&["1.0", "1.5"]))["app/pom.xml"],
+        evicted["app/pom.xml"]
+    );
+    assert_eq!(
+        digests(&bumped(lock.platforms[0].clone()))["app/pom.xml"],
+        before["app/pom.xml"]
+    );
+    assert_ne!(
+        digests(&bumped(with_range(&["1.0"])))["app/pom.xml"],
+        evicted["app/pom.xml"]
+    );
+}
+
+/// A module's graph digest covers the markers it read, and a reactor module
+/// with a marker's `group:artifact` counts as one the graph names: a
+/// reactor module stands in for the metadata.
+#[test]
+fn graph_digests_cover_the_metadata_versions() {
+    let (lock, _) = locked_and_current();
+    let reads = crate::TargetReads::default();
+    let digests = |platform: &LockPlatform| {
+        let mut platform = platform.clone();
+        bind(&mut platform, &reads);
+        platform.model_inputs.unwrap().graphs
+    };
+    let marked = |version: &str| {
+        let mut platform = lock.platforms[0].clone();
+        let app = (platform.modules.iter_mut())
+            .find(|m| m.path == "app/pom.xml")
+            .unwrap();
+        app.metadata_versions.push(crate::MetadataVersion {
+            group: "com.example".into(),
+            artifact: "root".into(),
+            kind: crate::MetadataVersionKind::Release,
+            version: version.into(),
+        });
+        platform
+    };
+    let bumped = |mut platform: LockPlatform| {
+        platform.modules[0].gav = Gav::new("com.example", "root", "1.1");
+        platform
+    };
+    let before = digests(&lock.platforms[0]);
+    let read = digests(&marked("1.0"));
+    assert_ne!(read["app/pom.xml"], before["app/pom.xml"]);
+    assert_eq!(read["pom.xml"], before["pom.xml"]);
+    assert_ne!(digests(&marked("1.5"))["app/pom.xml"], read["app/pom.xml"]);
+    assert_ne!(
+        digests(&bumped(marked("1.0")))["app/pom.xml"],
+        read["app/pom.xml"]
+    );
 }

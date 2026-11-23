@@ -26,6 +26,10 @@ pub enum ConfigError {
     /// it" an [`ConfigError::InvalidSettings`] gets.
     #[error("invalid settings.xml: {0}")]
     RefusedSettings(String),
+    /// A `-P` value that takes a host value raeva does not read, wherever
+    /// it is written, so the lock cannot follow what Maven selects.
+    #[error("{0}")]
+    UnreadHostProperty(String),
     /// A value or file that was read but rejected.
     #[error("invalid {origin}: {message}")]
     Invalid {
@@ -36,7 +40,7 @@ pub enum ConfigError {
     },
     /// A project input (a POM, `raeva.toml` or other file read with the size
     /// limit) that could not be opened or read.
-    #[error("failed to read project input {path}: {source}")]
+    #[error("failed to read project input {}: {source}", rv_fs::plain_path(path).display())]
     ProjectInputIo {
         /// The file being read.
         path: PathBuf,
@@ -45,7 +49,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     /// A project input larger than [`MAX_PROJECT_INPUT_SIZE`](crate::MAX_PROJECT_INPUT_SIZE).
-    #[error("project input {path} exceeds {limit}-byte limit")]
+    #[error("project input {} exceeds {limit}-byte limit", rv_fs::plain_path(path).display())]
     ProjectInputTooLarge {
         /// The file being read.
         path: PathBuf,
@@ -53,7 +57,7 @@ pub enum ConfigError {
         limit: usize,
     },
     /// A project input read as text that is not UTF-8.
-    #[error("project input {path} is not valid UTF-8")]
+    #[error("project input {} is not valid UTF-8", rv_fs::plain_path(path).display())]
     ProjectInputEncoding {
         /// The file being read.
         path: PathBuf,
@@ -121,6 +125,8 @@ pub enum ConfigOrigin {
     MavenSettingsSecurity(PathBuf),
     /// The project's `.mvn/maven.config`.
     MavenConfig(PathBuf),
+    /// The project's `.mvn/wrapper/maven-wrapper.properties`.
+    MavenWrapper(PathBuf),
     /// The `-D` and `-P` options given to `raeva`.
     CommandLine,
 }
@@ -135,7 +141,7 @@ impl std::fmt::Display for ConfigOrigin {
             Self::MavenSettingsSecurity(path) => {
                 write!(f, "Maven settings security file {}", path.display())
             }
-            Self::MavenConfig(path) => write!(f, "{}", path.display()),
+            Self::MavenConfig(path) | Self::MavenWrapper(path) => write!(f, "{}", path.display()),
             Self::CommandLine => write!(f, "-D or -P option"),
         }
     }

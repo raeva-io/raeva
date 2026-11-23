@@ -271,6 +271,7 @@ Parent POM not found: g:p:1-SNAPSHOT
   Suggestions:
     - SNAPSHOT parents require a repository with snapshots = true
     - If the parent is internal, add its repository to raeva.toml
+    - raeva does not search a file: repository that a fetched POM, a dependency's or a plugin's, declares, even with allow_transitive_repositories
     - A local <relativePath> parent is read only inside the project directory, or one level above a single module; run raeva from a directory that contains it
 
 ----
@@ -321,8 +322,8 @@ Dependency not found: g:a:1
   Blocked plain-HTTP repositories, which Maven's default HTTP blocker refuses too:
     - http://old.example/m2/ (declared by g:legacy:1)
 
-  To allow one, mirror it, or declare its URL in [[repositories]] in raeva.toml,
-  config.toml or settings.xml.
+  To allow one, mirror it, or declare its URL in [[repositories]] in raeva.toml
+  or config.toml.
 
   Ignored transitive repositories: raeva ignores dependency POM repositories by default.
   Maven would search these for this artifact:
@@ -387,7 +388,7 @@ Dependency not found: g:a:1
     - Run 'raeva doctor' to diagnose repository connectivity
 
 ----
-RESOLUTION Resolution
+REPOSITORY_CONFIG Config
 no snapshot-enabled repository available for g:a:1.0-SNAPSHOT: none of the configured repositories (central) have snapshots enabled
 
   Suggestions:
@@ -470,6 +471,14 @@ I/O error: /p/raeva.lock: io detail
 INTERNAL Failure
 internal error: x
 ----
+RESOLUTION Resolution
+While resolving the plugin t:p:1-SNAPSHOT:
+
+t:p:1-SNAPSHOT:jar is a SNAPSHOT build, which plugin locking does not pin
+----
+RESOLUTION Resolution
+two plugin sets read different bytes for t:p:1:jar
+----
 INTERNAL Failure
 reactor resolution stalled: no progress for 9s while resolving app
 
@@ -534,6 +543,13 @@ export error: A and a differ only in letter case or Unicode normalization, and t
 
   Suggestions:
     - Export with --m2-path to a volume that keeps the names apart: a case-sensitive one, though APFS treats names that differ only in Unicode normalization as one either way
+
+----
+LOCAL_REPOSITORY Config
+export error: A and a differ only in letter case or Unicode normalization, which a repository plan refuses on every volume, since the one it is rebuilt on may treat such names as one
+
+  Suggestions:
+    - Export with --m2-path in place of --plan-json to a volume that keeps the names apart: a case-sensitive one, though APFS treats names that differ only in Unicode normalization as one either way
 
 ----
 EXPORT Failure
@@ -626,11 +642,18 @@ raeva.lock has no section for platform linux-x86_64; it records macos-aarch64, w
     - Or check only the recorded platforms: 'raeva sync --frozen --platforms macos-aarch64,windows-x86_64'
 
 ----
-LOCKFILE_INVALID Config
-raeva.lock has schema version 9, which a newer raeva wrote; this raeva reads schema 8
+OTHER_PLATFORM_ORIGIN Config
+raeva.lock pins a file of org.test:s:1:jar from repository 'https://repo-b.example/', which only the build of windows-x86_64 declares, so a run without windows-x86_64 cannot trust it
 
   Suggestions:
-    - Upgrade raeva to a release that reads schema 9, here and where CI installs it
+    - Run 'raeva sync --frozen', or 'raeva sync', without --platforms: it resolves every platform, through the repositories each one's build declares
+
+----
+LOCKFILE_INVALID Config
+raeva.lock has schema version 10, which a newer raeva wrote; this raeva reads schema 9
+
+  Suggestions:
+    - Upgrade raeva to a release that reads schema 10, here and where CI installs it
 
 ----
 LOCKFILE_MISSING Config

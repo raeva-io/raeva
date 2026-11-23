@@ -16,6 +16,7 @@ mod escape;
 mod human;
 mod progress;
 mod report;
+pub(crate) mod secrets;
 mod table;
 mod warnings;
 
@@ -25,6 +26,7 @@ pub(crate) use human::testing;
 pub(crate) use human::{Human, Style};
 pub(crate) use progress::ProgressReporter;
 pub(crate) use report::{CommandOutput, Report};
+pub(crate) use secrets::redact_secrets_in_json;
 pub(crate) use table::{Table, stdout_width};
 pub(crate) use warnings::{Warning, WarningCode, WarningCollector, WarningCollectorLayer};
 
@@ -54,7 +56,7 @@ struct Inner {
     /// `-v` was given.
     verbose: bool,
     style: Style,
-    warnings: WarningCollector,
+    warnings: Arc<WarningCollector>,
     bars: MultiProgress,
     activity: progress::Activity,
 }
@@ -84,7 +86,7 @@ impl Output {
             command,
             verbose,
             style: Style { color },
-            warnings: WarningCollector::default(),
+            warnings: Arc::default(),
             bars: MultiProgress::new(),
             activity: progress::Activity::default(),
         }))
@@ -98,6 +100,24 @@ impl Output {
             false,
             false,
         )
+    }
+
+    /// This output without notes, progress or summary lines, for a step
+    /// inside the run: its warnings stay this run's.
+    pub(crate) fn quieted(&self) -> Self {
+        let mode = match self.0.mode {
+            Mode::Human { .. } => Mode::Human { quiet: true },
+            Mode::Json => Mode::Json,
+        };
+        Self(Arc::new(Inner {
+            mode,
+            command: self.0.command.clone(),
+            verbose: self.0.verbose,
+            style: self.0.style,
+            warnings: Arc::clone(&self.0.warnings),
+            bars: self.0.bars.clone(),
+            activity: progress::Activity::default(),
+        }))
     }
 
     pub(crate) fn is_json(&self) -> bool {
@@ -129,7 +149,8 @@ impl Output {
         &self.0.bars
     }
 
-    fn shows_progress(&self) -> bool {
+    /// Whether the progress line shows: on a terminal, and not quiet.
+    pub(crate) fn shows_progress(&self) -> bool {
         !self.is_quiet() && io::stderr().is_terminal()
     }
 
@@ -156,7 +177,8 @@ impl Output {
     /// The step a run is at, such as `Resolving dependencies...`: the
     /// progress line on a terminal, and a line on stderr otherwise.
     pub(crate) fn step(&self, text: &str) {
-        let text = terminal_text(text);
+        let text = secrets::redact_secrets(text);
+        let text = terminal_text(&text);
         if self.shows_progress() {
             self.0.activity.step(self, &text);
         } else {
@@ -179,15 +201,19 @@ impl Output {
     }
 
     fn eprint(&self, line: impl std::fmt::Display) {
+        let line = line.to_string();
+        let line = secrets::redact_secrets(&line);
         // eprintln! panics when stderr is full or closed; the line is lost
         // either way.
         self.bars()
             .suspend(|| drop(writeln!(io::stderr().lock(), "{line}")));
     }
 
-    pub(crate) fn stderr_writer(&self) -> impl Fn() -> StderrWriter + Send + Sync + 'static {
+    pub(crate) fn stderr_writer(
+        &self,
+    ) -> impl Fn() -> Redacting<StderrWriter> + Send + Sync + 'static {
         let bars = self.bars().clone();
-        move || StderrWriter { bars: bars.clone() }
+        move || Redacting(StderrWriter { bars: bars.clone() })
     }
 
     pub(crate) fn warning_layer(&self) -> WarningCollectorLayer {
@@ -205,6 +231,13 @@ impl Output {
         self.0.activity.clear(self);
         let report = outcome.unwrap_or_else(Report::error);
         let mut failure = report.failure.map(|error| error.diagnose(hints));
+        // `raeva vuln` and `raeva vuln triage` exit 1 for findings alone.
+        if let Some(failure) = &mut failure
+            && self.0.command.split(' ').next() == Some("vuln")
+            && failure.code != "VULNERABILITIES_FOUND"
+        {
+            failure.status = failure.status.of_failed_scan();
+        }
         let written = match report.body {
             Body::Document(text) => self.print_document(&text, failure.as_ref()),
             body if self.is_json() => match payload(body) {
@@ -237,11 +270,19 @@ impl Output {
         data: Option<serde_json::Map<String, serde_json::Value>>,
         failure: Option<&Diagnostic>,
     ) -> io::Result<()> {
+        self.write_envelope(&mut io::stdout().lock(), data, failure)
+    }
+
+    fn write_envelope(
+        &self,
+        out: &mut impl Write,
+        data: Option<serde_json::Map<String, serde_json::Value>>,
+        failure: Option<&Diagnostic>,
+    ) -> io::Result<()> {
         let warnings = self.0.warnings.take();
         let envelope = report::envelope(data, failure, &warnings);
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{}", json_document(envelope.to_string()))?;
-        stdout.flush()
+        writeln!(out, "{}", json_document(envelope.to_string()))?;
+        out.flush()
     }
 
     fn print_document(&self, text: &str, failure: Option<&Diagnostic>) -> io::Result<()> {
@@ -256,8 +297,19 @@ impl Output {
     fn print_human(&self, body: Body, failure: Option<&Diagnostic>) -> io::Result<()> {
         let written = match body {
             Body::Data(output) => {
-                let mut stdout = io::stdout().lock();
-                let mut stderr = io::stderr().lock();
+                // Recorded whole before it is redacted, as a value may span
+                // two writes, and replayed in the order it was written.
+                let recorded = std::cell::RefCell::new(Vec::new());
+                let (mut stdout, mut stderr) = (
+                    Recorder {
+                        writes: &recorded,
+                        stderr: false,
+                    },
+                    Recorder {
+                        writes: &recorded,
+                        stderr: true,
+                    },
+                );
                 let mut human = Human::new(
                     &mut stdout,
                     &mut stderr,
@@ -267,9 +319,21 @@ impl Output {
                 );
                 human.stdout_color =
                     supports_color(io::stdout().is_terminal(), console::Term::stdout);
-                output
-                    .render_human(&mut human)
-                    .and_then(|()| stdout.flush())
+                let rendered = output.render_human(&mut human);
+                let mut out = io::stdout().lock();
+                let mut written = rendered;
+                for (stderr, bytes) in recorded.into_inner() {
+                    let text =
+                        secrets::redact_secrets(&String::from_utf8_lossy(&bytes)).into_owned();
+                    if stderr {
+                        // A full stderr does not fail the command.
+                        drop(out.flush());
+                        drop(io::stderr().lock().write_all(text.as_bytes()));
+                    } else if written.is_ok() {
+                        written = out.write_all(text.as_bytes());
+                    }
+                }
+                written.and_then(|()| out.flush())
             }
             _ => Ok(()),
         };
@@ -283,12 +347,7 @@ impl Output {
     /// a JSON envelope, so the line that says how to list them names one
     /// that has it.
     fn print_warnings_and_error(&self, failure: Option<&Diagnostic>, document: bool) {
-        let command = &self.0.command;
-        let list_all = match (document, command.as_str()) {
-            (false, _) => format!("'raeva --json {command}' lists them"),
-            (true, "sbom") => "'raeva --json sbom -o FILE' lists them".to_string(),
-            (true, _) => format!("'raeva --json {command}' without --format lists them"),
-        };
+        let list_all = list_all(&self.0.command, document);
         for line in warnings::summarize(&self.0.warnings.take(), &list_all) {
             self.eprint(self.style().warning(&line));
         }
@@ -315,6 +374,49 @@ fn payload(body: Body) -> crate::error::Result<Option<serde_json::Map<String, se
             )),
         },
         Body::Document(_) | Body::Empty => Ok(None),
+    }
+}
+
+/// A writer that hides the value of each secret the configuration took
+/// ([`secrets::redact_secrets`]) from what goes through it. Each write is
+/// redacted whole, as the log writes each line in one.
+pub(crate) struct Redacting<W>(pub(crate) W);
+
+impl<W: io::Write> io::Write for Redacting<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        let text = String::from_utf8_lossy(buf);
+        self.0.write_all(secrets::redact_secrets(&text).as_bytes())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// What a human report writes to stdout or, with `stderr`, to stderr, in
+/// order, each run of writes to one stream kept together.
+struct Recorder<'a> {
+    writes: &'a std::cell::RefCell<Vec<(bool, Vec<u8>)>>,
+    stderr: bool,
+}
+
+impl io::Write for Recorder<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut writes = self.writes.borrow_mut();
+        match writes.last_mut() {
+            Some((stderr, bytes)) if *stderr == self.stderr => bytes.extend_from_slice(buf),
+            _ => writes.push((self.stderr, buf.to_vec())),
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -347,4 +449,78 @@ fn supports_color(terminal: bool, term: fn() -> console::Term) -> bool {
     std::env::var_os("NO_COLOR").is_none()
         && terminal
         && (!cfg!(windows) || term().features().colors_supported())
+}
+
+/// The command that lists every warning of `command` in a JSON envelope.
+fn list_all(command: &str, document: bool) -> String {
+    match (document, command) {
+        (false, _) => format!("'raeva --json {command}' lists them"),
+        (true, "sbom") => "'raeva --json sbom -o FILE' lists them".to_string(),
+        // A plan writes nothing, and so does the dry run that lists them.
+        (true, "export-m2") => "'raeva --json export-m2 --dry-run' lists them".to_string(),
+        (true, _) => format!("'raeva --json {command}' without --format lists them"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    /// A secret no other test registers, as the registry is global.
+    const SECRET: &str = "zqOUTPUTzq";
+
+    #[test]
+    fn the_json_envelope_hides_a_registered_secret() {
+        super::secrets::register_secret(SECRET);
+        let mut data = serde_json::Map::new();
+        data.insert("url".into(), format!("http://h/{SECRET}/a.pom").into());
+        let mut out = Vec::new();
+        (super::Output::for_tests())
+            .write_envelope(&mut out, Some(data), None)
+            .expect("written");
+        let out = String::from_utf8(out).expect("UTF-8");
+        // Other tests register short secrets too, so only this one's
+        // absence is certain.
+        let envelope: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        let url = envelope["data"]["url"].as_str().expect("url");
+        assert!(!out.contains(SECRET) && url.contains("/***/"), "{out}");
+    }
+
+    #[test]
+    fn the_log_hides_a_registered_secret() {
+        #[derive(Clone, Default)]
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buffer").write(buf)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        super::secrets::register_secret(SECRET);
+        let log = Shared::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || super::Redacting(writer.clone()))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(url = %format!("http://h/{SECRET}/"), "rejected {SECRET}");
+        });
+        let log = String::from_utf8(log.0.lock().expect("buffer").clone()).expect("UTF-8");
+        assert!(!log.contains(SECRET) && log.contains("/***/"), "{log}");
+    }
+
+    #[test]
+    fn the_warning_list_after_a_document_writes_nothing() {
+        assert_eq!(
+            super::list_all("export-m2", true),
+            "'raeva --json export-m2 --dry-run' lists them"
+        );
+        assert_eq!(
+            super::list_all("vuln", true),
+            "'raeva --json vuln' without --format lists them"
+        );
+    }
 }

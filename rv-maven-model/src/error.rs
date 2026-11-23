@@ -66,6 +66,41 @@ pub enum PomError {
         /// The 1-based column, in characters.
         column: usize,
     },
+    /// A coordinate takes the value of a host input named like a secret,
+    /// which raeva.lock, the store and a repository request would hold.
+    #[error(
+        "the {field} of {} takes {input}, which raeva.lock would record and a repository \
+         request would carry, and that name looks like a secret's; write the {field} out, or if \
+         the value is not a secret, rename {input}",
+        bounded(.of)
+    )]
+    SecretCoordinate {
+        /// The coordinate field, such as `version`.
+        field: &'static str,
+        /// Whose coordinate it is, such as `dependency g:a:${v}`, as its POM
+        /// writes it.
+        of: String,
+        /// How a message names the input.
+        input: String,
+    },
+    /// A POM of the project that Maven's strict model reader refuses, at
+    /// `path` when it is not the one being read, such as a parent at a
+    /// `<relativePath>`. Maven fails the build with "Malformed POM".
+    #[error(
+        "Malformed POM{}: {reason} at line {line}, column {column}; Maven reads the project's \
+         POMs strictly",
+        path.as_deref().map(|path| format!(" {}", bounded(path))).unwrap_or_default()
+    )]
+    Strict {
+        /// The POM's path.
+        path: Option<String>,
+        /// What strict reading refuses, with any name from the POM bounded.
+        reason: String,
+        /// The 1-based line of the decoded POM.
+        line: usize,
+        /// The 1-based column, in characters.
+        column: usize,
+    },
     /// The model has no `groupId`, `artifactId` or `version`, from the POM
     /// or its parent. The field names which.
     #[error("missing required field: {0}")]
@@ -127,6 +162,16 @@ pub enum PomError {
     /// the whole message.
     #[error("invalid model: {0}")]
     InvalidModel(String),
+    /// [`PomError::InvalidModel`] in the project's own effective model,
+    /// not in a POM fetched for it.
+    #[error("invalid model: {0}")]
+    InvalidProject(String),
+    /// A model Maven builds, but in a way raeva cannot lock the same, with
+    /// the whole message. Unlike [`PomError::InvalidModel`], it fails a
+    /// dependency's model too, as dropping its dependencies would lock what
+    /// Maven resolves differently.
+    #[error("unsupported model: {0}")]
+    Unlockable(String),
     /// A `system`-scoped dependency without an absolute `<systemPath>`, an
     /// error in Maven's validation of every model it builds.
     #[error("invalid model: {0}")]

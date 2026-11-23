@@ -219,6 +219,130 @@ fn profiles_are_selected_per_pom_like_maven() {
     }
 }
 
+/// A condition on a value raeva does not read refuses only when it decides
+/// which profiles that resolution reads Maven activates. An
+/// `activeByDefault` profile active when its own condition holds is active
+/// either way while no other profile of its POM is, as Maven 3.9.12 and
+/// 3.10.0 select it.
+#[test]
+fn an_unread_condition_refuses_only_where_it_decides_a_relevant_profile() {
+    let profile = |id: &str, activation: &str, artifact: Option<&str>| {
+        let body = artifact
+            .map(|artifact| {
+                format!(
+                    "<dependencies>{}</dependencies>",
+                    dep("g", artifact, "<version>1</version>")
+                )
+            })
+            .unwrap_or_default();
+        format!("<profile><id>{id}</id><activation>{activation}</activation>{body}</profile>")
+    };
+    let default = "<activeByDefault>true</activeByDefault>";
+    let known = "<property><name>!never.set</name></property>";
+    let never = "<property><name>never.set</name></property>";
+    let mut wrong = Vec::new();
+    let mut check = |profiles: &str, active: &str, inactive: &str, expected: Option<&str>| {
+        let mut ctx = ActivationContext::default();
+        ctx.active_profiles
+            .extend((!active.is_empty()).then(|| active.to_string()));
+        ctx.inactive_profiles
+            .extend((!inactive.is_empty()).then(|| inactive.to_string()));
+        let built = build(
+            project_pom("app", &format!("<profiles>{profiles}</profiles>")),
+            MemorySource::new(),
+            &ctx,
+        );
+        let matched = match (&built, expected) {
+            (Ok(project), Some(expected)) => summary(&project.dependencies).join(" ") == expected,
+            (Err(MemorySourceError::Model(PomError::Unlockable(_))), None) => true,
+            _ => false,
+        };
+        if !matched {
+            wrong.push(format!(
+                "{profiles} -P{active} -P!{inactive}: {built:?}, expected {expected:?}"
+            ));
+        }
+    };
+    for unread in [
+        "<property><name>java.vendor</name><value>Acme</value></property>",
+        "<property><name>java.vendor</name><value>!Acme</value></property>",
+        "<property><name>user.name</name><value>ci</value></property>",
+        "<file><exists>${user.home}/.m2</exists></file>",
+        "<os><name>!${user.name}</name></os>",
+    ] {
+        let fallback = format!("{default}{unread}");
+        for (profiles, expected) in [
+            (vec![profile("d", &fallback, Some("d"))], Some("d:1")),
+            (
+                vec![
+                    profile("i", default, None),
+                    profile("d", &fallback, Some("d")),
+                ],
+                Some("d:1"),
+            ),
+            (
+                vec![
+                    profile("d", &fallback, Some("d")),
+                    profile("q", never, Some("q")),
+                ],
+                Some("d:1"),
+            ),
+            (
+                vec![profile("u", unread, None), profile("q", known, Some("q"))],
+                Some("q:1"),
+            ),
+            (vec![profile("u", unread, None)], Some("")),
+            (
+                vec![
+                    profile("u", unread, None),
+                    profile("q", known, Some("q")),
+                    profile("e", default, Some("e")),
+                ],
+                Some("q:1"),
+            ),
+            (
+                vec![
+                    profile("d", &fallback, Some("d")),
+                    profile("q", known, Some("q")),
+                ],
+                None,
+            ),
+            (
+                vec![
+                    profile("d", &fallback, Some("d")),
+                    profile("e", default, Some("e")),
+                ],
+                None,
+            ),
+            (
+                vec![
+                    profile("d", &fallback, Some("d")),
+                    profile("u", unread, None),
+                ],
+                None,
+            ),
+            (
+                vec![profile("u", unread, None), profile("e", default, Some("e"))],
+                None,
+            ),
+            (vec![profile("u", unread, Some("u"))], None),
+        ] {
+            check(&profiles.concat(), "", "", expected);
+        }
+        // `-P!` leaves a default out of the fallback, and `-P` activates a
+        // profile whatever its conditions give.
+        let pair = [
+            profile("d", &fallback, Some("d")),
+            profile("e", default, Some("e")),
+        ]
+        .concat();
+        check(&pair, "", "e", Some("d:1"));
+        check(&pair, "d", "", Some("d:1"));
+        check(&pair, "e", "", None);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A declaration takes its version, scope, type, classifier, system path
 /// and exclusions from the first management entry with its group, artifact,
 /// type and classifier, but not `<optional>`; its own values win, and the
@@ -261,11 +385,6 @@ fn dependency_management_fills_in_declarations() {
         dep("m", "lib", "<classifier>tests</classifier>"),
         dep("m", "lib", "<type>zip</type>"),
         dep("m", "scoped", &exclusion("own")),
-        dep(
-            "m",
-            "scoped",
-            "<classifier>c</classifier><scope>runtime</scope>",
-        ),
         dep("m", "sys", "<scope>system</scope>"),
     ];
     let pom = project_pom(
@@ -286,14 +405,7 @@ fn dependency_management_fills_in_declarations() {
     .unwrap();
     assert_eq!(
         summary(&project.dependencies),
-        [
-            "lib:1",
-            "lib:2",
-            "lib:3",
-            "scoped:4:test",
-            "scoped:?:runtime",
-            "sys:5:system"
-        ]
+        ["lib:1", "lib:2", "lib:3", "scoped:4:test", "sys:5:system"]
     );
     let scoped = &project.dependencies[3];
     assert_eq!(scoped.optional, None);
@@ -304,7 +416,7 @@ fn dependency_management_fills_in_declarations() {
         .collect();
     assert_eq!(excluded, ["own"]);
     assert_eq!(
-        project.dependencies[5].system_path.as_deref(),
+        project.dependencies[4].system_path.as_deref(),
         Some("C:/lib/sys.jar")
     );
     assert_eq!(project.dependency_management.dependencies.len(), 6);
@@ -313,6 +425,88 @@ fn dependency_management_fills_in_declarations() {
             .version
             .as_deref(),
         Some("9")
+    );
+}
+
+/// A project's dependency still without a version after management,
+/// inheritance and the active profiles fails the build, as in Maven 3.9.12
+/// and 3.10.0: management under another spelling of its type or classifier
+/// supplies none, and neither does an empty managed version.
+#[test]
+fn a_project_dependency_without_a_version_is_refused() {
+    let managed = [
+        dep("m", "lib", "<version>1</version>"),
+        dep(
+            "m",
+            "lib",
+            "<version>2</version><classifier>tests</classifier>",
+        ),
+        dep("m", "bare", "<version>3</version><classifier/>"),
+        dep("m", "empty", "<version></version>"),
+    ];
+    let built = |declared: &str, profiles: &str| {
+        let pom = project_pom(
+            "app",
+            &format!(
+                "<dependencyManagement><dependencies>{}</dependencies></dependencyManagement>\
+                 <dependencies>{declared}</dependencies><profiles>{profiles}</profiles>",
+                managed.concat()
+            ),
+        );
+        build_with(
+            pom,
+            &MemorySource::new(),
+            ModelPolicy::PROJECT,
+            &ActivationContext::default(),
+        )
+        .map(|project| summary(&project.dependencies).join(" "))
+        .map_err(|error| error.to_string())
+    };
+    let profile = |active: bool, declared: &str| {
+        format!(
+            "<profile><id>{active}</id><activation><activeByDefault>{active}</activeByDefault>\
+             </activation><dependencies>{declared}</dependencies></profile>"
+        )
+    };
+    for (declared, profiles, missing) in [
+        (dep("m", "unmanaged", ""), String::new(), "m:unmanaged:jar"),
+        (
+            dep("m", "lib", "<type>test-jar</type>"),
+            String::new(),
+            "m:lib:test-jar",
+        ),
+        (
+            dep("m", "lib", "<classifier>c</classifier>"),
+            String::new(),
+            "m:lib:jar:c",
+        ),
+        (dep("m", "bare", ""), String::new(), "m:bare:jar"),
+        (dep("m", "empty", ""), String::new(), "m:empty:jar"),
+        (
+            dep("m", "own", "<version></version>"),
+            String::new(),
+            "m:own:jar",
+        ),
+        (
+            String::new(),
+            profile(true, &dep("m", "unmanaged", "")),
+            "m:unmanaged:jar",
+        ),
+    ] {
+        assert_eq!(
+            built(&declared, &profiles),
+            Err(format!(
+                "invalid model: 'dependencies.dependency.version' for {missing} is missing."
+            )),
+            "{declared}{profiles}"
+        );
+    }
+    assert_eq!(
+        built(
+            &dep("m", "lib", "<classifier>tests</classifier>"),
+            &profile(false, &dep("m", "unmanaged", ""))
+        ),
+        Ok("lib:2".to_string())
     );
 }
 
@@ -1064,6 +1258,286 @@ fn a_bom_dependency_may_take_its_version_from_the_bom() {
     );
 }
 
+/// Maven keeps an entry written with an empty `<classifier>` apart from
+/// one without it, by inheritance, profiles and management, and its
+/// collector takes the two as two declarations of one artifact. So does
+/// raeva: both stay, each managed under its own spelling. An empty
+/// `<classifier>` alone is no classifier.
+#[test]
+fn an_empty_classifier_twin_stays_a_declaration_of_its_own() {
+    let entry = |extra: &str| dep("g", "a", &format!("<version>1</version>{extra}"));
+    let dependencies = |entries: &str| format!("<dependencies>{entries}</dependencies>");
+    let parent = project_pom(
+        "parent",
+        &format!(
+            "<packaging>pom</packaging>{}",
+            dependencies(&entry(
+                "<exclusions><exclusion><groupId>*</groupId>\
+                                <artifactId>*</artifactId></exclusion></exclusions>"
+            ))
+        ),
+    );
+    let child = |body: &str| {
+        pom(&format!(
+            "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+             <version>1</version></parent><artifactId>app</artifactId>{body}</project>"
+        ))
+    };
+    let source = MemorySource::new().with_parent("g", "parent", "1", parent);
+    let build = |app| {
+        build_with(
+            app,
+            &source,
+            ModelPolicy::PROJECT,
+            &ActivationContext::default(),
+        )
+    };
+    let classifiers = |built: Result<Project, MemorySourceError>| {
+        (built.unwrap().dependencies.iter())
+            .map(|dep| dep.classifier.clone())
+            .collect::<Vec<_>>()
+    };
+    let twins = || vec![Some(String::new()), None];
+    let inherited = child(&dependencies(&entry("<classifier></classifier>")));
+    assert_eq!(classifiers(build(inherited)), twins());
+    let alone = project_pom("app", &dependencies(&entry("<classifier></classifier>")));
+    assert_eq!(summary(&build(alone).unwrap().dependencies), ["a:1"]);
+    // Only the effective model counts: an inactive profile's twin is never
+    // seen, and an active one's is.
+    let profiled = |activation: &str| {
+        let profile = format!(
+            "<profiles><profile><id>p</id><activation>{activation}</activation>{}\
+             </profile></profiles>",
+            dependencies(&entry("<classifier/><scope>test</scope>"))
+        );
+        build(child(&profile))
+    };
+    let inactive = profiled("<property><name>never.set</name></property>");
+    assert_eq!(classifiers(inactive), [None]);
+    assert_eq!(
+        classifiers(profiled("<activeByDefault>true</activeByDefault>")),
+        twins()
+    );
+    // A classifier that interpolates to empty is an empty one.
+    let interpolated = format!(
+        "<properties><c></c></properties>{}",
+        dependencies(&format!(
+            "{}{}",
+            entry("<classifier>${c}</classifier>"),
+            entry("<scope>test</scope>")
+        ))
+    );
+    assert_eq!(
+        classifiers(build(project_pom("app", &interpolated))),
+        twins()
+    );
+    // Maven injects a managed entry only into a dependency spelled as it is,
+    // and an entry for the other spelling leaves a dependency without a
+    // version, which Maven 3.9.12 and 3.10.0 refuse.
+    let managed_one = format!(
+        "<dependencyManagement>{}</dependencyManagement>{}",
+        dependencies(&dep("g", "a", "<scope>test</scope>")),
+        dependencies(&format!("{}{}", entry("<classifier/>"), entry("")))
+    );
+    let built = build(project_pom("app", &managed_one)).unwrap();
+    assert_eq!(summary(&built.dependencies), ["a:1", "a:1:test"]);
+    let other_spelling = format!(
+        "<dependencyManagement>{}</dependencyManagement>{}",
+        dependencies(&entry("<classifier/>")),
+        dependencies(&dep("g", "a", ""))
+    );
+    let error = build(project_pom("app", &other_spelling)).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid model: 'dependencies.dependency.version' for g:a:jar is missing."
+    );
+    // A type that implies a classifier names another file without one than
+    // with an empty one.
+    let test_jars = dependencies(&format!(
+        "{}{}",
+        entry("<type>test-jar</type>"),
+        dep(
+            "g",
+            "a",
+            "<version>2</version><type>test-jar</type><classifier/>"
+        )
+    ));
+    let built = build(project_pom("app", &test_jars)).unwrap();
+    let effective: Vec<_> = (built.dependencies.iter())
+        .map(|dep| dep.effective_classifier())
+        .collect();
+    assert_eq!(effective, [Some("tests"), None]);
+    // A dependency's POM keeps both too, whichever the resolution follows.
+    for scope in ["test", "runtime"] {
+        let twins = dependencies(&format!(
+            "{}{}",
+            entry(""),
+            entry(&format!("<classifier/><scope>{scope}</scope>"))
+        ));
+        let built = build_with(
+            project_pom("lib", &twins),
+            &MemorySource::new(),
+            ModelPolicy::DEPENDENCY,
+            &ActivationContext::default(),
+        );
+        assert_eq!(classifiers(built), [None, Some(String::new())], "{scope}");
+    }
+    // Through an import too, as Maven 3.9.12 and 3.10.0 import a BOM's
+    // entries under these keys: the importer's own bare entry replaces only
+    // the BOM's bare one, and the BOM's empty one stays (arrow-bom 19.0.0
+    // under a local arrow-vector override builds in both).
+    let imported = |bom_entries: &str, locals: &str| {
+        let bom = project_pom(
+            "bom",
+            &format!(
+                "<dependencyManagement>{}</dependencyManagement>",
+                dependencies(bom_entries)
+            ),
+        );
+        let importer = project_pom(
+            "app",
+            &format!(
+                "<dependencyManagement>{}</dependencyManagement>",
+                dependencies(&format!("{locals}{}", import("bom", "1")))
+            ),
+        );
+        let source = MemorySource::new().with_import("g", "bom", "1", bom);
+        build_with(
+            importer,
+            &source,
+            ModelPolicy::PROJECT,
+            &ActivationContext::default(),
+        )
+    };
+    let excluded = "<exclusions><exclusion><groupId>x</groupId><artifactId>x</artifactId>\
+                    </exclusion></exclusions>";
+    for (bom_entries, locals, kept) in [
+        (
+            entry("<optional>true</optional>"),
+            entry("<classifier/>"),
+            [Some(""), None],
+        ),
+        (
+            format!(
+                "{}{}",
+                entry(excluded),
+                entry(&format!("<classifier/>{excluded}"))
+            ),
+            dep("g", "a", "<version>2</version>"),
+            [None, Some("")],
+        ),
+    ] {
+        let built = imported(&bom_entries, &locals).unwrap();
+        let classifiers: Vec<_> = (built.dependency_management.dependencies.iter())
+            .map(|dep| dep.classifier.as_deref())
+            .collect();
+        assert_eq!(classifiers, kept);
+    }
+}
+
+#[test]
+fn a_project_refuses_an_import_with_a_classifier() {
+    for classifier in ["tests", "${c}"] {
+        let app = project_pom(
+            "app",
+            &format!(
+                "<properties><c></c></properties><dependencyManagement><dependencies>{}\
+                 </dependencies></dependencyManagement>",
+                dep(
+                    "g",
+                    "bom",
+                    &format!(
+                        "<version>1</version><type>pom</type><scope>import</scope>\
+                         <classifier>{classifier}</classifier>"
+                    )
+                )
+            ),
+        );
+        let source = MemorySource::new().with_import("g", "bom", "1", project_pom("bom", ""));
+        let built = build_with(
+            app,
+            &source,
+            ModelPolicy::PROJECT,
+            &ActivationContext::default(),
+        );
+        assert!(
+            matches!(&built, Err(MemorySourceError::Model(PomError::InvalidModel(message)))
+                if message.ends_with(&format!("g:bom:pom:{classifier} must be empty, imported POM cannot have a classifier."))),
+            "{built:?}"
+        );
+    }
+    // A parent from a repository is not checked, and Maven 3.9.12 and
+    // 3.10.0 import its BOM without the classifier; a profile is checked.
+    let classified = dep(
+        "g",
+        "bom",
+        "<version>1</version><type>pom</type><scope>import</scope><classifier>tests</classifier>",
+    );
+    let management = format!(
+        "<dependencyManagement><dependencies>{classified}</dependencies></dependencyManagement>"
+    );
+    let bom = project_pom(
+        "bom",
+        &format!(
+            "<dependencyManagement><dependencies>{}</dependencies></dependencyManagement>",
+            dep("g", "x", "<version>2</version>")
+        ),
+    );
+    let parent = project_pom("parent", &format!("<packaging>pom</packaging>{management}"));
+    let child = pom(
+        "<project><parent><groupId>g</groupId><artifactId>parent</artifactId><version>1</version>\
+         </parent><artifactId>app</artifactId></project>",
+    );
+    let profiled = project_pom(
+        "app",
+        &format!("<profiles><profile><id>p</id>{management}</profile></profiles>"),
+    );
+    let source = (MemorySource::new().with_import("g", "bom", "1", bom))
+        .with_parent("g", "parent", "1", parent);
+    let build = |app| {
+        build_with(
+            app,
+            &source,
+            ModelPolicy::PROJECT,
+            &ActivationContext::default(),
+        )
+    };
+    let managed = build(child).unwrap().dependency_management.dependencies;
+    assert_eq!(summary(&managed), ["x:2"]);
+    let built = build(profiled);
+    assert!(
+        matches!(&built, Err(MemorySourceError::Model(PomError::InvalidModel(message)))
+            if message.starts_with("'profiles.profile[p].dependencyManagement")),
+        "{built:?}"
+    );
+}
+
+/// Maven 3.9 and 3.10 refuse a project with modules whose packaging is not
+/// `pom`.
+#[test]
+fn an_aggregator_needs_pom_packaging() {
+    let modules = "<modules><module>child</module></modules>";
+    for (packaging, refused) in [
+        ("", true),
+        ("<packaging>jar</packaging>", true),
+        ("<packaging>pom</packaging>", false),
+    ] {
+        let app = project_pom("app", &format!("{packaging}{modules}"));
+        let built = build_with(
+            app,
+            &MemorySource::new(),
+            ModelPolicy::PROJECT,
+            &ActivationContext::default(),
+        );
+        assert_eq!(
+            matches!(&built, Err(MemorySourceError::Model(PomError::InvalidModel(message)))
+                if message.contains("Aggregator projects require 'pom' as packaging")),
+            refused,
+            "{packaging}: {built:?}"
+        );
+    }
+}
+
 /// Maven cannot convert a managed `<type/>` entry to an artifact and fails
 /// the build, even when nothing uses the entry.
 #[test]
@@ -1109,6 +1583,126 @@ fn an_import_scope_property_is_interpolated_before_import() {
         summary(&project.dependency_management.dependencies),
         ["leaf:2"]
     );
+}
+
+/// A managed entry whose scope property does not become `import` keeps its
+/// place, so it still wins over a later entry for the same dependency.
+#[test]
+fn a_scope_property_that_is_not_import_keeps_the_entry_in_place() {
+    for (artifact, scope) in [("${name}", "runtime"), ("leaf", "compile")] {
+        let importer = project_pom(
+            "app",
+            &format!(
+                "<properties><name>leaf</name><s>{scope}</s></properties>\
+                 <dependencyManagement><dependencies>{}{}</dependencies>\
+                 </dependencyManagement><dependencies>{}</dependencies>",
+                dep("g", artifact, "<version>1</version><scope>${s}</scope>"),
+                dep("g", "leaf", "<version>2</version>"),
+                dep("g", "leaf", ""),
+            ),
+        );
+        let project = build(importer, MemorySource::new(), &ActivationContext::default()).unwrap();
+        let first = format!("leaf:1:{scope}");
+        assert_eq!(
+            summary(&project.dependency_management.dependencies),
+            [first.as_str(), "leaf:2"]
+        );
+        assert_eq!(summary(&project.dependencies), [first]);
+    }
+}
+
+/// An import whose scope or type is a property is imported in document
+/// order with the literal ones: the first BOM to manage a dependency wins.
+#[test]
+fn an_interpolated_import_keeps_its_place_among_imports() {
+    let bom = |artifact: &str, version: &str| {
+        project_pom(
+            artifact,
+            &format!(
+                "<packaging>pom</packaging><dependencyManagement><dependencies>{}\
+                 </dependencies></dependencyManagement>",
+                dep("g", "leaf", &format!("<version>{version}</version>"))
+            ),
+        )
+    };
+    for entry in [
+        "<type>pom</type><scope>${s}</scope>",
+        "<type>${t}</type><scope>import</scope>",
+    ] {
+        let importer = project_pom(
+            "app",
+            &format!(
+                "<properties><s>import</s><t>pom</t></properties>\
+                 <dependencyManagement><dependencies>{}{}</dependencies>\
+                 </dependencyManagement>",
+                dep("g", "first", &format!("<version>1</version>{entry}")),
+                import("second", "1"),
+            ),
+        );
+        let source = MemorySource::new()
+            .with_import("g", "first", "1", bom("first", "2"))
+            .with_import("g", "second", "1", bom("second", "1"));
+        let project = build(importer, source, &ActivationContext::default()).unwrap();
+        assert_eq!(
+            summary(&project.dependency_management.dependencies),
+            ["leaf:2"],
+            "{entry}"
+        );
+    }
+}
+
+/// A version from a BOM names the import, with the property its version is
+/// written as, whether the import's scope is written as `import` or as a
+/// property, and whichever POM holds that property.
+#[test]
+fn an_import_through_a_scope_property_names_the_bom() {
+    let bom = project_pom(
+        "bom",
+        &format!(
+            "<packaging>pom</packaging><dependencyManagement><dependencies>{}</dependencies>\
+             </dependencyManagement>",
+            dep("g", "leaf", "<version>2</version>")
+        ),
+    );
+    for scope in ["import", "${s}"] {
+        for own in ["", "<bom.version>1</bom.version>"] {
+            let mut parent = project_pom(
+                "parent",
+                &format!(
+                    "<packaging>pom</packaging>\
+                     <properties><s>import</s><bom.version>1</bom.version></properties>\
+                     <dependencyManagement><dependencies>{}</dependencies>\
+                     </dependencyManagement>",
+                    dep(
+                        "g",
+                        "bom",
+                        &format!(
+                            "<version>${{bom.version}}</version><type>pom</type>\
+                             <scope>{scope}</scope>"
+                        )
+                    )
+                ),
+            );
+            parent.provenance = Some(crate::provenance::Provenance::RemoteParentOfRoot);
+            let child = pom(&format!(
+                "<project><parent><groupId>g</groupId><artifactId>parent</artifactId>\
+                 <version>1</version></parent><artifactId>app</artifactId>\
+                 <properties>{own}</properties><dependencies>{}</dependencies></project>",
+                dep("g", "leaf", "")
+            ));
+            let source = MemorySource::new()
+                .with_parent("g", "parent", "1", parent)
+                .with_import("g", "bom", "1", bom.clone());
+            let ctx = ActivationContext::default();
+            let project = build_with(child, &source, ModelPolicy::PROJECT, &ctx).unwrap();
+            let origin = project.dependencies[0].origin.0.as_ref();
+            assert_eq!(
+                origin.map(|source| source.to_string()).as_deref(),
+                Some("import g:bom (${bom.version})"),
+                "{scope} {own}"
+            );
+        }
+    }
 }
 
 /// Maven imports only an entry whose type is `pom`: one without a `<type>`,
@@ -1291,9 +1885,10 @@ fn os_properties_interpolate_like_maven_on_each_platform() {
                 .properties
                 .interpolate_str(&format!("${{{key}}}"), &info)
                 .unwrap();
+            // Windows releases each report their own, so raeva keeps it.
             if rust_os == "windows" && key == "n" {
                 assert_eq!(expected, "Windows 10");
-                assert_eq!(actual, "Windows 11");
+                assert_eq!(actual, "${os.name}");
             } else {
                 assert_eq!(actual, expected, "${{{key}}} on {rust_os}");
             }
@@ -1417,14 +2012,16 @@ fn build_coordinates_are_validated_like_maven() {
         )
         .unwrap()
     };
-    let error = |project: Project| match project.validate_build_coordinates() {
+    let error = |project: Project| match project
+        .validate_build_coordinates(rv_maven_types::MavenMode::Maven39)
+    {
         Err(PomError::InvalidModel(message)) => message,
         other => panic!("expected an invalid model, got {other:?}"),
     };
 
     assert!(
         project("org.ex_1-a", "A.b_c-9", "1.0:x")
-            .validate_build_coordinates()
+            .validate_build_coordinates(rv_maven_types::MavenMode::Maven39)
             .is_ok(),
         "a colon in the version is only a Maven warning"
     );
@@ -1464,7 +2061,7 @@ fn project_dependency_versions_are_validated_like_maven() {
                <dependency><groupId>p</groupId><artifactId>vlib</artifactId>\
                <version>[1.2.*]</version></dependency></dependencies></project>";
     let project = build(pom(xml), MemorySource::new(), &ActivationContext::default()).unwrap();
-    match project.validate_build_coordinates() {
+    match project.validate_build_coordinates(rv_maven_types::MavenMode::Maven39) {
         Err(PomError::InvalidModel(message)) => assert_eq!(
             message,
             "'dependencies.dependency.version' for p:vlib:jar must not contain any of these \
@@ -1834,3 +2431,5 @@ fn classifier_likes_are_the_models_own() {
         Some("suse,settings")
     );
 }
+
+mod maven_modes;

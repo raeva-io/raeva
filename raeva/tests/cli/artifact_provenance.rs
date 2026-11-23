@@ -9,7 +9,7 @@ use rv_test_support::http::{Response, StubServer};
 use tempfile::TempDir;
 
 use crate::common::{
-    assert_status, assert_success, local_central, raeva_command, run_raeva, sha1_hex,
+    assert_status, assert_success, local_central, raeva_command, run_raeva, serve_sha256, sha1_hex,
     write_repo_toml,
 };
 
@@ -71,102 +71,6 @@ fn assert_jar(project: &Path, jar: &[u8], url: &str) {
         Some(&BlobId::from_bytes(jar))
     );
     assert_eq!(row.repo_url, url);
-}
-
-fn legacy_home(home: &Path, url: &str) {
-    let root = home.join("store");
-    fs::create_dir_all(&root).unwrap();
-    let conn = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE artifacts (
-            group_id TEXT NOT NULL, artifact_id TEXT NOT NULL, version TEXT NOT NULL,
-            packaging TEXT NOT NULL, classifier TEXT NOT NULL, blob_id TEXT NOT NULL,
-            PRIMARY KEY (group_id, artifact_id, version, packaging, classifier)
-        );
-        CREATE TABLE artifact_origins_v2 (
-            group_id TEXT NOT NULL, artifact_id TEXT NOT NULL, version TEXT NOT NULL,
-            packaging TEXT NOT NULL, classifier TEXT NOT NULL, repo_url TEXT NOT NULL,
-            endpoint_url TEXT NOT NULL, blob_id TEXT NOT NULL, checksum_verified INTEGER NOT NULL,
-            PRIMARY KEY (group_id, artifact_id, version, packaging, classifier, repo_url, endpoint_url)
-        ) WITHOUT ROWID;
-        CREATE TABLE served_files (
-            group_id TEXT NOT NULL, artifact_id TEXT NOT NULL, version TEXT NOT NULL,
-            packaging TEXT NOT NULL, classifier TEXT NOT NULL, repo_url TEXT NOT NULL,
-            endpoint_url TEXT NOT NULL, blob_id TEXT NOT NULL,
-            PRIMARY KEY (group_id, artifact_id, version, packaging, classifier, repo_url, endpoint_url, blob_id)
-        ) WITHOUT ROWID;
-        PRAGMA user_version = 1;",
-    )
-    .unwrap();
-    let tampered_pom = [POM, b"<!-- tampered -->"].concat();
-    for (extension, bytes) in [("jar", b"tampered jar".as_slice()), ("pom", &tampered_pom)] {
-        let blob = seed_blob(home, bytes);
-        conn.execute(
-            "INSERT INTO artifacts VALUES ('test', 'lib', '1', ?1, '', ?2)",
-            rusqlite::params![extension, blob.as_str()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO artifact_origins_v2 VALUES ('test', 'lib', '1', ?1, '', ?2, ?2, ?3, 1)",
-            rusqlite::params![extension, url, blob.as_str()],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO served_files VALUES ('test', 'lib', '1', ?1, '', ?2, ?2, ?3)",
-            rusqlite::params![extension, url, blob.as_str()],
-        )
-        .unwrap();
-    }
-    let conn = rusqlite::Connection::open(home.join("metadata.db")).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE pom_cache_v3 (
-            repo_url TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL,
-            fetched_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-            checksum_checked INTEGER NOT NULL, content BLOB NOT NULL,
-            PRIMARY KEY (repo_url, path)
-        );
-        PRAGMA user_version = 1;",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO pom_cache_v3 VALUES (?1, 'test/lib/1/lib-1.pom', ?2, ?3, ?4, 1, ?5)",
-        rusqlite::params![
-            format!("{url}\u{1f}{url}\u{1f}id=repo"),
-            BlobId::from_bytes(&tampered_pom).as_str(),
-            rv_store::metadata_cache::now_epoch_seconds(),
-            i64::MAX,
-            tampered_pom
-        ],
-    )
-    .unwrap();
-    let conn = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
-    for (extension, bytes) in [("jar", b"repaired jar".as_slice()), ("pom", POM)] {
-        let blob = seed_blob(home, bytes);
-        conn.execute(
-            "INSERT INTO served_files VALUES ('test', 'lib', '1', ?1, '', ?2, ?2, ?3)",
-            rusqlite::params![extension, url, blob.as_str()],
-        )
-        .unwrap();
-    }
-}
-
-fn seed_blob(home: &Path, bytes: &[u8]) -> BlobId {
-    let id = BlobId::from_bytes(bytes);
-    let hash = id.as_str();
-    let dir = home.join("store/blobs").join(&hash[..2]).join(&hash[2..4]);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join(hash), bytes).unwrap();
-    id
-}
-
-fn repaired_file_repository(base: &Path) -> (std::path::PathBuf, String) {
-    let repo = base.join("repository");
-    let dir = repo.join("test/lib/1");
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("lib-1.pom"), POM).unwrap();
-    fs::write(dir.join("lib-1.jar"), b"repaired jar").unwrap();
-    let url = url::Url::from_directory_path(&repo).unwrap().to_string();
-    (repo, url)
 }
 
 #[test]
@@ -276,7 +180,7 @@ fn alternate_repository_pom_pin(body: &str, pinned: &str) {
     let pom = fs::read_to_string(app.join("pom.xml")).unwrap();
     fs::write(
         app.join("pom.xml"),
-        pom.replace("<dependencies>", "<name>edited</name><dependencies>"),
+        pom.replacen("</modelVersion>", "</modelVersion><name>edited</name>", 1),
     )
     .unwrap();
     let home = TempDir::new().unwrap();
@@ -328,80 +232,6 @@ fn alternate_repository_pom_pin(body: &str, pinned: &str) {
 }
 
 #[test]
-fn legacy_store_refetches_unpinned_files() {
-    let base = TempDir::new().unwrap();
-    let home = TempDir::new().unwrap();
-    let (_repo, url) = repaired_file_repository(base.path());
-    let fresh = base.path().join("fresh");
-    project(&fresh, &url);
-    legacy_home(home.path(), &url);
-    assert_success(&run_raeva(&fresh, home.path(), &["sync"]), "unpinned sync");
-    assert_jar(&fresh, b"repaired jar", &url);
-}
-
-#[test]
-fn legacy_store_restores_pinned_files_without_repository() {
-    let base = TempDir::new().unwrap();
-    let home = TempDir::new().unwrap();
-    let clean_home = TempDir::new().unwrap();
-    let (repo, url) = repaired_file_repository(base.path());
-    let locked = base.path().join("locked");
-    project(&locked, &url);
-    assert_success(
-        &run_raeva(&locked, clean_home.path(), &["sync"]),
-        "clean lock",
-    );
-    let lock = fs::read(locked.join("raeva.lock")).unwrap();
-    legacy_home(home.path(), &url);
-    fs::remove_dir_all(&repo).unwrap();
-    assert_success(
-        &run_raeva(&locked, home.path(), &["sync", "--frozen"]),
-        "restore pinned files from the upgraded store",
-    );
-    assert_eq!(fs::read(locked.join("raeva.lock")).unwrap(), lock);
-}
-
-#[test]
-fn legacy_repository_evidence_and_pom_cache_do_not_poison_a_new_lock() {
-    let base = TempDir::new().unwrap();
-    let home = TempDir::new().unwrap();
-    let clean_home = TempDir::new().unwrap();
-    let (url, server) = repository(b"repaired jar", true);
-    let locked = base.path().join("locked");
-    let fresh = base.path().join("fresh");
-    project(&locked, &url);
-    project(&fresh, &url);
-    assert_success(
-        &run_raeva(&locked, clean_home.path(), &["sync"]),
-        "clean lock",
-    );
-    legacy_home(home.path(), &url);
-    let before = server.requests().len();
-    assert_success(&run_raeva(&fresh, home.path(), &["sync"]), "unpinned sync");
-    assert_jar(&fresh, b"repaired jar", &url);
-    let lock = Lockfile::read(&fresh.join("raeva.lock")).unwrap();
-    assert_eq!(
-        lock.platforms[0].artifacts[0].pom_sha256,
-        Some(BlobId::from_bytes(POM))
-    );
-    let requests = server.requests();
-    for path in [JAR_PATH, "/test/lib/1/lib-1.pom"] {
-        assert!(
-            requests[before..]
-                .iter()
-                .any(|request| request.path == path),
-            "{path}"
-        );
-    }
-    let before = server.requests().len();
-    assert_success(
-        &run_raeva(&locked, home.path(), &["sync", "--frozen"]),
-        "restore pinned files from the upgraded store",
-    );
-    assert_eq!(server.requests().len(), before);
-}
-
-#[test]
 fn mirror_evidence_is_reused_only_for_the_same_endpoint() {
     let base = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
@@ -424,11 +254,9 @@ fn mirror_evidence_is_reused_only_for_the_same_endpoint() {
     )
     .unwrap();
     let mirrored = |args: &[&str]| {
-        raeva_command(&a, home.path())
-            .env(rv_config::MAVEN_USER_HOME_TEST_ENV, maven_home.path())
-            .args(args)
-            .output()
-            .unwrap()
+        let mut command = raeva_command(&a, home.path());
+        crate::common::isolate_maven_user_home(&mut command, maven_home.path(), "");
+        command.args(args).output().unwrap()
     };
     assert_success(&mirrored(&["sync"]), "mirror sync");
     assert_jar(&a, b"mirror jar", &origin);
@@ -750,7 +578,7 @@ fn other_bytes_for_a_pinned_release_file_are_not_kept() {
         let frozen = run_raeva(&a, home.path(), &["sync", "--frozen"]);
         assert_status(&frozen, 7, "frozen sync of other bytes");
         let pom = fs::read_to_string(a.join("pom.xml")).unwrap();
-        let edited = pom.replace("<version>1</version>", "<version>1</version><name>e</name>");
+        let edited = pom.replacen("</modelVersion>", "</modelVersion><name>e</name>", 1);
         fs::write(a.join("pom.xml"), edited).unwrap();
         assert_status(
             &run_raeva(&a, home.path(), &["sync"]),
@@ -929,9 +757,274 @@ fn a_stored_copy_other_than_the_pin_is_not_reused() {
         }
         fs::write(a.join("raeva.lock"), lock).unwrap();
         let pom = fs::read_to_string(a.join("pom.xml")).unwrap();
-        let edited = pom.replace("<version>1</version>", "<version>1</version><name>e</name>");
+        let edited = pom.replacen("</modelVersion>", "</modelVersion><name>e</name>", 1);
         fs::write(a.join("pom.xml"), edited).unwrap();
         assert_success(&run_raeva(&a, home.path(), args), "sync");
         assert_jar(&a, b"lib jar", &url);
+    }
+}
+
+fn warning_codes(output: &std::process::Output) -> Vec<String> {
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    (envelope["data"]["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten())
+    .map(|warning| warning["code"].as_str().unwrap_or_default().to_string())
+    .collect()
+}
+
+/// A jar accepted without a checksum file is marked on its row. A sync that
+/// admits it by its pin keeps the marker, `--frozen` warns about it unless
+/// the flag is passed again, a checksum file published later that disagrees
+/// with the pin fails a restore, and a download one verifies clears the
+/// marker, on a platform the sync keeps too.
+#[test]
+fn a_file_accepted_without_a_checksum_file_stays_marked_until_one_verifies_it() {
+    // No checksum file, then a wrong one, then the right one.
+    let state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let published = state.clone();
+    let server = StubServer::start(move |request| {
+        if request.path == format!("{JAR_PATH}.sha256") {
+            return match published.load(Ordering::SeqCst) {
+                0 => Response::new(404, ""),
+                1 => Response::new(200, BlobId::from_bytes(b"other").to_string()),
+                _ => Response::new(200, BlobId::from_bytes(b"jar bytes").to_string()),
+            };
+        }
+        serve(&request.path, b"jar bytes", true)
+    });
+    let url = format!("http://{}/", server.addr());
+    let base = TempDir::new().unwrap();
+    let app = base.path().join("app");
+    project(&app, &url);
+    let lock_path = app.join("raeva.lock");
+    let marked = || {
+        let lock = Lockfile::read(&lock_path).unwrap();
+        (lock.platforms.iter())
+            .map(|platform| {
+                let row = &platform.artifacts[0];
+                (row.missing_checksum, row.pom_missing_checksum)
+            })
+            .collect::<Vec<_>>()
+    };
+    let host = rv_lock::Platform::current().unwrap().to_string();
+    let other = if host == "linux-x86_64" {
+        "windows-x86_64"
+    } else {
+        "linux-x86_64"
+    };
+    let both = format!("{host},{other}");
+    // One home, so later runs find the files in the store.
+    let home = TempDir::new().unwrap();
+    let sync = |args: &[&str]| run_raeva(&app, home.path(), args);
+    assert_status(&sync(&["sync"]), 5, "missing checksum refused");
+    let allowed = sync(&["sync", "--allow-missing-checksums", "--platforms", &both]);
+    assert_success(&allowed, "allowed");
+    assert_eq!(marked(), [(true, false); 2]);
+    assert!(
+        fs::read_to_string(&lock_path)
+            .unwrap()
+            .contains("\nmissing_checksum = true\n")
+    );
+
+    let frozen = sync(&["--json", "sync", "--frozen"]);
+    assert_success(&frozen, "frozen");
+    assert!(warning_codes(&frozen).contains(&"CHECKSUM_MISSING_LOCKED".to_string()));
+    let frozen = sync(&["--json", "sync", "--frozen", "--allow-missing-checksums"]);
+    assert_success(&frozen, "frozen with the flag");
+    assert!(!warning_codes(&frozen).contains(&"CHECKSUM_MISSING_LOCKED".to_string()));
+
+    // Resolving again under the pin needs no flag and keeps the marker.
+    let pom = app.join("pom.xml");
+    let text = fs::read_to_string(&pom).unwrap();
+    fs::write(
+        &pom,
+        text.replacen(
+            "</modelVersion>",
+            "</modelVersion><description>x</description>",
+            1,
+        ),
+    )
+    .unwrap();
+    assert_success(&sync(&["sync"]), "resolve under the pin");
+    assert_eq!(marked(), [(true, false); 2]);
+
+    // A restore into an empty store asks for the checksum file again.
+    state.store(1, Ordering::SeqCst);
+    let restore = run_raeva(&app, TempDir::new().unwrap().path(), &["sync", "--frozen"]);
+    assert_status(&restore, 9, "a disagreeing checksum file");
+
+    state.store(2, Ordering::SeqCst);
+    assert_success(&sync(&["sync"]), "stored bytes");
+    assert_eq!(marked(), [(true, false); 2]);
+    // The flag lets a run take unverified stored bytes; `--update` asks
+    // for the checksum file of a marked one again. The platform this sync
+    // keeps pins the same file.
+    let update = sync(&[
+        "sync",
+        "--update",
+        "--allow-missing-checksums",
+        "--platforms",
+        &host,
+    ]);
+    assert_success(&update, "verified download");
+    assert_eq!(marked(), [(false, false); 2]);
+    assert!(
+        !fs::read_to_string(&lock_path)
+            .unwrap()
+            .contains("missing_checksum")
+    );
+}
+
+/// A plain sync that keeps the lock as written and downloads a marked file
+/// again, into an empty store, drops the marker a checksum file published
+/// since then verifies, and says so.
+#[test]
+fn a_plain_sync_that_downloads_a_marked_file_a_checksum_file_verifies_clears_it() {
+    let published = Arc::new(AtomicBool::new(false));
+    let sidecar = published.clone();
+    let server = StubServer::start(move |request| {
+        if request.path == format!("{JAR_PATH}.sha256") && !sidecar.load(Ordering::SeqCst) {
+            return Response::new(404, "");
+        }
+        serve(&request.path, b"jar bytes", true)
+    });
+    let url = format!("http://{}/", server.addr());
+    let base = TempDir::new().unwrap();
+    let app = base.path().join("app");
+    project(&app, &url);
+    let lock_path = app.join("raeva.lock");
+    let marked = || Lockfile::read(&lock_path).unwrap().platforms[0].artifacts[0].missing_checksum;
+    let home = TempDir::new().unwrap();
+    let allowed = run_raeva(&app, home.path(), &["sync", "--allow-missing-checksums"]);
+    assert_success(&allowed, "allowed");
+    assert!(marked());
+
+    published.store(true, Ordering::SeqCst);
+    let fresh = TempDir::new().unwrap();
+    let downloaded = run_raeva(&app, fresh.path(), &["sync"]);
+    assert_success(&downloaded, "downloaded again");
+    let said = String::from_utf8_lossy(&downloaded.stderr);
+    assert!(said.contains("now verified by a checksum file"), "{said}");
+    assert!(!marked());
+    assert_success(&run_raeva(&app, fresh.path(), &["sync"]), "stored");
+    assert!(!marked());
+}
+
+/// A POM marker clears as the jar's does, and a checksum file published
+/// later that disagrees with the pinned bytes is refused.
+#[test]
+fn a_pom_accepted_without_a_checksum_file_is_checked_by_one_published_later() {
+    let state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let published = state.clone();
+    let server = StubServer::start(move |request| {
+        if request.path == "/test/lib/1/lib-1.pom.sha256" {
+            return match published.load(Ordering::SeqCst) {
+                0 => Response::new(404, ""),
+                1 => Response::new(200, BlobId::from_bytes(b"other").to_string()),
+                _ => Response::new(200, BlobId::from_bytes(POM).to_string()),
+            };
+        }
+        serve(&request.path, b"jar bytes", true)
+    });
+    let url = format!("http://{}/", server.addr());
+    let base = TempDir::new().unwrap();
+    let app = base.path().join("app");
+    project(&app, &url);
+    let lock_path = app.join("raeva.lock");
+    let marked = || {
+        let lock = Lockfile::read(&lock_path).unwrap();
+        let row = &lock.platforms[0].artifacts[0];
+        (row.missing_checksum, row.pom_missing_checksum)
+    };
+    let home = TempDir::new().unwrap();
+    let sync = |args: &[&str]| run_raeva(&app, home.path(), args);
+    assert_success(&sync(&["sync", "--allow-missing-checksums"]), "allowed");
+    assert_eq!(marked(), (false, true));
+    assert!(
+        fs::read_to_string(&lock_path)
+            .unwrap()
+            .contains("\npom_missing_checksum = true\n")
+    );
+
+    state.store(1, Ordering::SeqCst);
+    assert_status(
+        &sync(&["sync", "--update"]),
+        9,
+        "a disagreeing checksum file",
+    );
+    assert_eq!(marked(), (false, true));
+
+    state.store(2, Ordering::SeqCst);
+    assert_success(&sync(&["sync", "--update"]), "verified download");
+    assert_eq!(marked(), (false, false));
+
+    // The cache keeps the POM as verified, so a lock written without the
+    // pin from that copy does not mark it.
+    fs::remove_file(&lock_path).unwrap();
+    let again = sync(&["sync", "--allow-missing-checksums", "--offline"]);
+    assert_success(&again, "from the cache");
+    assert_eq!(marked(), (false, false));
+}
+
+/// A jar only the second repository serves, restored on a fresh home by
+/// `sync --frozen` or `sync` with the lock, is found offline: the lock pin
+/// admits it there as it does in the first repository.
+#[test]
+fn a_restored_jar_of_a_later_repository_resolves_offline() {
+    let pom = "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>\
+               <artifactId>a</artifactId><version>1</version></project>";
+    let serve = |jar: bool| {
+        StubServer::start(move |request| {
+            serve_sha256(&request.path, |path| match path {
+                "/org/example/a/1/a-1.pom" => Some(pom),
+                "/org/example/a/1/a-1.jar" if jar => Some("a jar"),
+                _ => None,
+            })
+        })
+    };
+    let first = serve(false);
+    let second = serve(true);
+    let (_central, central) = local_central();
+    let project = TempDir::new().unwrap();
+    fs::write(
+        project.path().join("raeva.toml"),
+        format!(
+            "[[repositories]]\nid = \"first\"\nurl = \"http://{}/\"\n\
+             [[repositories]]\nid = \"second\"\nurl = \"http://{}/\"\n{central}",
+            first.addr(),
+            second.addr()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId>\
+         <artifactId>app</artifactId><version>1</version><dependencies><dependency>\
+         <groupId>org.example</groupId><artifactId>a</artifactId><version>1</version>\
+         </dependency></dependencies></project>",
+    )
+    .unwrap();
+    let sync = |home: &TempDir, args: &[&str]| run_raeva(project.path(), home.path(), args);
+    assert_success(&sync(&TempDir::new().unwrap(), &["sync"]), "sync");
+    for restore in [&["sync", "--frozen"][..], &["sync"]] {
+        let home = TempDir::new().unwrap();
+        assert_success(&sync(&home, restore), "restore");
+        assert_success(
+            &sync(&home, &["--offline", "sync", "--frozen"]),
+            &format!("offline frozen after {restore:?}"),
+        );
+        fs::write(
+            project.path().join("pom.xml"),
+            fs::read_to_string(project.path().join("pom.xml"))
+                .unwrap()
+                .replace("<project>", "<project><!-- edit -->"),
+        )
+        .unwrap();
+        assert_success(
+            &sync(&home, &["--offline", "sync"]),
+            &format!("offline sync after an edit, {restore:?}"),
+        );
     }
 }

@@ -8,6 +8,13 @@ lock-golden/round-trip/raeva.lock -> lock-diff/round-trip.lock
 lock-golden/snapshot/raeva.lock -> lock-diff/snapshot.lock
   snap  1.0-20240101.010101-7 -> 1.0-20240202.020202-9
 
+lock-diff/bom-before.lock -> lock-diff/bom-after.lock
+  BOM org.golden:golden-bom 1.0 -> 1.1 (property golden.version)
+    api   1.0 -> 1.1
+    core  1.0 -> 1.1
+  support POM added for org.golden:golden-bom:1.1
+  support POM removed for org.golden:golden-bom:1.0
+
 lock-golden/single-module/raeva.lock -> lock-golden/round-trip/raeva.lock
   module api/pom.xml added: org.golden.reactor:api:2.0
   module app/pom.xml added: org.golden.reactor:app:2.0

@@ -263,3 +263,79 @@ fn a_full_stderr_keeps_the_exit_status() {
     assert_status(&info, 0, "lock info, stderr full");
     assert!(!info.stdout.is_empty());
 }
+
+/// `resolved` counts the platforms the run checked or resolved, so a
+/// partial `--update` reports what a partial check of the same platform
+/// does, not what a platform it keeps adds.
+#[test]
+fn a_partial_sync_counts_the_platforms_it_names() {
+    let pom = |artifact: &str| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+             <artifactId>{artifact}</artifactId><version>1</version></project>"
+        )
+    };
+    let server = common::sha256_repository([
+        ("/g/common/1/common-1.pom", pom("common")),
+        ("/g/common/1/common-1.jar", "common".to_string()),
+        ("/g/mac-only/1/mac-only-1.pom", pom("mac-only")),
+        ("/g/mac-only/1/mac-only-1.jar", "mac".to_string()),
+    ]);
+    let project = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let root = project.path();
+    common::write_repo_toml(root, "stub", &format!("http://{}/", server.addr()));
+    let dependency = |artifact: &str| {
+        format!(
+            "<dependency><groupId>g</groupId><artifactId>{artifact}</artifactId>\
+             <version>1</version></dependency>"
+        )
+    };
+    fs::write(
+        root.join("pom.xml"),
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>app</groupId>\
+             <artifactId>app</artifactId><version>1</version><dependencies>{}</dependencies>\
+             <profiles><profile><id>mac</id><activation><os><family>mac</family></os>\
+             </activation><dependencies>{}</dependencies></profile></profiles></project>",
+            dependency("common"),
+            dependency("mac-only")
+        ),
+    )
+    .unwrap();
+    let raeva = |args: &[&str]| run_raeva(root, home.path(), args);
+    assert_success(
+        &raeva(&["sync", "--platforms", "linux-x86_64,macos-aarch64"]),
+        "sync both",
+    );
+    let resolved = |args: &[&str]| {
+        let output = raeva(args);
+        assert_success(&output, &args.join(" "));
+        common::envelope(&output)["data"]["resolved"].clone()
+    };
+    let update = resolved(&["--json", "sync", "--update", "--platforms", "linux-x86_64"]);
+    let check = resolved(&["--json", "sync", "--platforms", "linux-x86_64"]);
+    assert_eq!(update, 1);
+    assert_eq!(check, 1);
+}
+
+/// A SNAPSHOT dependency no repository with snapshots enabled can serve is
+/// a repository configuration raeva refuses: `REPOSITORY_CONFIG`, exit 3.
+#[test]
+fn a_snapshot_without_a_snapshot_repository_is_a_repository_config_error() {
+    let project = tempfile::TempDir::new().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let root = project.path();
+    fs::write(
+        root.join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>app</groupId>\
+         <artifactId>app</artifactId><version>1</version><dependencies><dependency>\
+         <groupId>g</groupId><artifactId>a</artifactId><version>1.0-SNAPSHOT</version>\
+         </dependency></dependencies></project>",
+    )
+    .unwrap();
+    let output = run_raeva(root, home.path(), &["--json", "sync"]);
+    assert_status(&output, 3, "snapshot without a snapshot repository");
+    let envelope = common::envelope(&output);
+    assert_eq!(envelope["code"], "REPOSITORY_CONFIG", "{envelope}");
+}

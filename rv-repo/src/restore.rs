@@ -1,10 +1,11 @@
 //! Restore what a lockfile pins into the store: artifacts, their companion
 //! POMs, and the support POMs export needs.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt};
 use rv_config::Config;
 use rv_lock::{LockArtifact, LockOrigins, Lockfile, OriginSelection, Platform, SupportPom};
@@ -37,8 +38,8 @@ type FetchDedupMap = Arc<Mutex<HashMap<ArtifactCoord, Arc<OnceCell<()>>>>>;
 type PomPins = HashMap<Gav, BlobId>;
 
 /// Each file a lockfile pins, with the origins its rows on every platform
-/// record for it, as [`pinned_files`] lists them.
-type FileOrigins<'a> = BTreeMap<(ArtifactCoord, Digest), BTreeSet<&'a str>>;
+/// record for it.
+type FileOrigins<'a> = rv_lock::PinnedFiles<'a>;
 
 /// The outcome of restoring one lockfile artifact row, with its companion POM,
 /// or one support POM.
@@ -105,7 +106,7 @@ async fn restore_pass(
         .flat_map(|platform| &platform.artifacts)
         .filter_map(|artifact| Some((artifact.pom_gav(), artifact.pom_sha256.clone()?)))
         .collect();
-    let file_origins = pinned_files(&lock.platforms, |_| true);
+    let file_origins = lock.pinned_files();
     let clients: Vec<_> = contexts
         .iter()
         .map(|context| context.client.clone().with_lock_pins(lock))
@@ -138,7 +139,9 @@ async fn restore_pass(
                 .iter()
                 .find(|entry| &entry.platform == platform)
                 .ok_or_else(|| {
-                    RepoError::NotFound(format!("platform '{platform}' not found in lockfile"))
+                    RepoError::NotFound(
+                        format!("platform '{platform}' not found in lockfile").into(),
+                    )
                 })?;
             packages.extend(
                 entry
@@ -354,8 +357,18 @@ async fn restore_pass(
     Ok(results)
 }
 
-/// [`restore_support_pom`] for the support POM `coord`, which `owners` record.
-async fn restore_support_entry(
+/// [`restore_support_pom`] for the support POM `coord`, which `owners`
+/// record, on the heap as [`ensure_package_artifacts`] is.
+fn restore_support_entry<'a>(
+    store: &'a Store,
+    checks: &'a Checks,
+    coord: &'a str,
+    owners: &'a [(&SyncInputs<'_>, &SupportPom)],
+) -> BoxFuture<'a, DownloadResult> {
+    Box::pin(restore_support(store, checks, coord, owners))
+}
+
+async fn restore_support(
     store: &Store,
     checks: &Checks,
     coord: &str,
@@ -417,7 +430,8 @@ fn support_pom_key(coord: &str, pin: &SupportPom) -> Option<ArtifactCoord> {
 /// # Errors
 ///
 /// [`RepoError::ChecksumMismatch`] when the repositories serve other bytes
-/// than the pin; the store is then unchanged.
+/// than the pin; the store is then unchanged. [`RepoError::UntrustedRepoUrl`]
+/// when no context declares the repository the lock records.
 pub async fn ensure_support_pom(
     store: &Store,
     contexts: &[RestoreContext<'_>],
@@ -458,6 +472,31 @@ pub async fn restore_pinned<'a>(
     fetch_pinned(&owners, key, pin).await
 }
 
+/// Cache the POM at `key`, which raeva.lock pins to `pinned` and the store
+/// holds, for an offline resolution through `repo`, as a restore caches a
+/// support POM. `client` holds the pin.
+///
+/// # Errors
+///
+/// The store's and the metadata cache's.
+pub async fn cache_pinned_pom(
+    store: &Store,
+    client: &RepoClient,
+    repo: &Repository,
+    key: &ArtifactCoord,
+    pinned: &rv_maven_types::Sha256,
+) -> Result<()> {
+    let request = ArtifactRequest::from(key);
+    if client
+        .unseeded_poms(&[(repo, request.clone(), pinned)])
+        .await?[0]
+    {
+        let endpoint = client.effective_repository(repo).url;
+        cache_route_pom(store, client, (repo, &endpoint), key, &request, pinned).await?;
+    }
+    Ok(())
+}
+
 /// Index `artifact`, a row of `lock`, under the repository it records in
 /// `context`, when the store holds its pinned bytes, as [`ensure_artifacts`]
 /// does for a row another platform restored. The only request is for a POM
@@ -472,7 +511,7 @@ pub async fn index_restored(
     context: &RestoreContext<'_>,
     artifact: &LockArtifact,
 ) -> Result<()> {
-    let (pom_pins, file_origins) = (PomPins::new(), pinned_files(&lock.platforms, |_| true));
+    let (pom_pins, file_origins) = (PomPins::new(), lock.pinned_files());
     let input = SyncInputs::of(store, context, &pom_pins, &file_origins);
     let key = artifact.coord();
     let Some(pin) = artifact.pin() else {
@@ -516,16 +555,7 @@ async fn restore_support_pom(
         .map(|(input, line)| (*input, line.repo_url.as_str()))
         .collect();
     if needs_download(store, checks, &owners, key, &pin, &coord).await? {
-        match fetch_pinned(&owners, key, &pin).await {
-            Err(RepoError::UntrustedRepoUrl(_)) => {
-                return Err(RepoError::NotFound(format!(
-                    "{coord}, which raeva.lock records as served by a repository no configuration or \
-                     POM declares now and no configured repository has, so add that repository to \
-                     raeva.toml"
-                )));
-            }
-            result => result?,
-        }
+        fetch_pinned(&owners, key, &pin).await?;
     }
     // Platforms can record one parent under different repositories; each
     // one's offline resolution reads it from its own.
@@ -563,10 +593,13 @@ async fn cache_route_pom(
 ) -> Result<()> {
     let served_by = store.served_by(key, blob).await?;
     let normalized = |url: &str| normalize_repo_url(url);
-    let route = (normalized(&repo.url), normalized(endpoint));
+    let route = (
+        normalized(rv_config::stored_repository(&repo.url)),
+        normalized(endpoint),
+    );
     let served = |(repo, endpoint): &(String, String)| (normalized(repo), normalized(endpoint));
     if served_by.iter().any(|row| served(row) == route) {
-        return (client.seed_pinned_pom(repo, request, blob, &store.get_path(blob))).await;
+        return (client.seed_pinned_pom(repo, request, blob, store)).await;
     }
     if served_by.iter().any(|row| served(row).0 == route.0) {
         return Ok(());
@@ -628,8 +661,17 @@ fn pinned_candidates(
 /// Fetch the file at `key`, pinned to `pin`, through each `(input,
 /// recorded origin)` in turn, as [`pinned_candidates`] lists the
 /// repositories to ask. A POM goes through the client's POM read, so the
-/// metadata cache holds it for an offline resolution later.
-async fn fetch_pinned(
+/// metadata cache holds it for an offline resolution later. On the heap
+/// as [`ensure_package_artifacts`] is.
+fn fetch_pinned<'a>(
+    owners: &'a [(&SyncInputs<'_>, &str)],
+    key: &'a ArtifactCoord,
+    pin: &'a Digest,
+) -> BoxFuture<'a, Result<()>> {
+    Box::pin(fetch_pinned_inner(owners, key, pin))
+}
+
+async fn fetch_pinned_inner(
     owners: &[(&SyncInputs<'_>, &str)],
     key: &ArtifactCoord,
     pin: &Digest,
@@ -811,7 +853,7 @@ impl PinnedSearch {
             failure => undeclared
                 .or(self.refusal)
                 .or(failure)
-                .unwrap_or_else(|| RepoError::NotFound(key.to_string())),
+                .unwrap_or_else(|| RepoError::NotFound(key.to_string().into())),
         }
     }
 }
@@ -890,7 +932,7 @@ pub async fn count_missing(
     lock: &Lockfile,
     contexts: &[RestoreContext<'_>],
 ) -> Result<(usize, usize, usize)> {
-    let files = pinned_files(&lock.platforms, |_| true);
+    let files = lock.pinned_files();
     let total = files.len();
     let parallelism = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 64));
     let pom_pins = PomPins::new();
@@ -929,6 +971,43 @@ pub async fn count_missing(
     Ok((missing, unserved, total))
 }
 
+/// A (repository, endpoint) pair that served a file.
+type ServedRoute = (String, String);
+
+/// Of the (repository, endpoint) routes `served` names for each file of
+/// `files`, a key and pin of `lock`, those that a restore through one of
+/// `contexts` takes as having served it: the rule [`count_missing`] and a
+/// frozen check apply to the store's own records.
+pub fn admitted_routes(
+    store: &Store,
+    lock: &Lockfile,
+    contexts: &[RestoreContext<'_>],
+    files: &[(&ArtifactCoord, &Digest, &[ServedRoute])],
+) -> Vec<Vec<ServedRoute>> {
+    let pinned = lock.pinned_files();
+    let pom_pins = PomPins::new();
+    let inputs: Vec<_> = (contexts.iter())
+        .map(|context| SyncInputs::of(store, context, &pom_pins, &pinned))
+        .collect();
+    let admitted = |key: &ArtifactCoord, pin: &Digest, route: &ServedRoute| {
+        let origins = pinned.get(&(key.clone(), pin.clone()));
+        inputs.iter().any(|input| {
+            let owners: Vec<_> = (origins.into_iter().flatten())
+                .map(|origin| (input, *origin))
+                .collect();
+            admits(&owners, key, pin, std::slice::from_ref(route))
+        })
+    };
+    (files.iter())
+        .map(|(key, pin, served)| {
+            (served.iter())
+                .filter(|route| admitted(key, pin, route))
+                .cloned()
+                .collect()
+        })
+        .collect()
+}
+
 async fn all_stored<'a>(
     store: &Store,
     lock: &Lockfile,
@@ -937,7 +1016,7 @@ async fn all_stored<'a>(
     include: impl Fn(&str) -> bool,
 ) -> Result<bool> {
     let parallelism = std::thread::available_parallelism().map_or(4, |n| n.get().clamp(1, 64));
-    let (pom_pins, file_origins) = (PomPins::new(), pinned_files(&lock.platforms, |_| true));
+    let (pom_pins, file_origins) = (PomPins::new(), lock.pinned_files());
     let input = &SyncInputs::of(store, context, &pom_pins, &file_origins);
     let mut checks = stream::iter(pinned_files(entries, include))
         .map(|((key, pin), origins)| async move {
@@ -965,38 +1044,13 @@ async fn all_stored<'a>(
 fn pinned_files<'a>(
     entries: impl IntoIterator<Item = &'a rv_lock::LockPlatform>,
     include: impl Fn(&str) -> bool,
-) -> BTreeMap<(ArtifactCoord, Digest), BTreeSet<&'a str>> {
-    let mut files: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
-    for entry in entries {
-        for artifact in &entry.artifacts {
-            if artifact.file_origins().any(&include)
-                && let Some(pin) = artifact.pin()
-            {
-                (files.entry((artifact.coord(), pin.clone())).or_default())
-                    .extend(artifact.file_origins());
-            }
-            if artifact.pom_origins().any(&include)
-                && let Some(sha256) = &artifact.pom_sha256
-            {
-                let pom = ArtifactCoord::of(artifact.pom_gav(), "pom", None);
-                (files
-                    .entry((pom, Digest::Sha256(sha256.clone())))
-                    .or_default())
-                .extend(artifact.pom_origins());
-            }
-        }
-        for (coord, pin) in &entry.support_poms {
-            if include(&pin.repo_url)
-                && let Some(key) = support_pom_key(coord, pin)
-            {
-                (files
-                    .entry((key, Digest::Sha256(pin.sha256.clone())))
-                    .or_default())
-                .insert(pin.repo_url.as_str());
-            }
-        }
-    }
-    files
+) -> FileOrigins<'a> {
+    rv_lock::pinned_once(
+        (entries
+            .into_iter()
+            .flat_map(rv_lock::LockPlatform::pinned_files))
+        .filter(|file| file.origins.iter().any(|origin| include(origin))),
+    )
 }
 
 /// Whether the store holds `pin`'s bytes for `key` as restoration through
@@ -1028,10 +1082,10 @@ struct SyncInputs<'a> {
     trusted_repositories: &'a [Repository],
     pom_pins: &'a PomPins,
     file_origins: &'a FileOrigins<'a>,
-    /// By lock key, the (repository, endpoint) of each configured or trusted
-    /// declaration there, under each id: ids that share a URL can reach it
-    /// through different mirrors.
-    routes: OnceLock<HashMap<String, HashSet<(String, String)>>>,
+    /// By lock key, the endpoint of each configured or trusted declaration
+    /// there, under each id: ids that share a URL can reach it through
+    /// different mirrors.
+    routes: OnceLock<HashMap<String, HashSet<String>>>,
 }
 
 impl<'a> SyncInputs<'a> {
@@ -1057,14 +1111,18 @@ impl<'a> SyncInputs<'a> {
         }
     }
 
-    fn routes(&self) -> &HashMap<String, HashSet<(String, String)>> {
+    fn routes(&self) -> &HashMap<String, HashSet<String>> {
         self.routes.get_or_init(|| {
             let mut routes: HashMap<_, HashSet<_>> = HashMap::new();
             for repo in unique_repositories(self.config, self.trusted_repositories, |_| true) {
-                if let Some(key) = self.selector.origins.declared(&repo.url) {
+                // The empty key is the mirror route of a repository whose URL
+                // the lock cannot record.
+                if let Some(key) = self.selector.origins.key(&repo.url) {
                     let endpoint = self.client.effective_repository(&repo).url;
-                    let route = (normalize_repo_url(&repo.url), normalize_repo_url(&endpoint));
-                    routes.entry(key).or_default().insert(route);
+                    routes
+                        .entry(key)
+                        .or_default()
+                        .insert(normalize_repo_url(&endpoint));
                 }
             }
             routes
@@ -1079,7 +1137,8 @@ impl<'a> SyncInputs<'a> {
 /// only bytes a repository the row records served directly, or a repository
 /// [`fetch_pinned`] would ask served through the endpoint it uses, stand in.
 /// A POM too: graph digests recomputed over an edited pin would not catch
-/// another project's.
+/// another project's. Bytes from a repository the remote repository filters
+/// refuse `key` from never stand in, as that repository is never asked.
 fn admits(
     owners: &[(&SyncInputs<'_>, &str)],
     key: &ArtifactCoord,
@@ -1099,21 +1158,50 @@ fn admits(
         .map(rv_lock::recorded_key)
         .collect();
     owners.iter().any(|(input, origin)| {
+        // A repository the filters refuse `key` from, as it is routed now,
+        // whatever endpoint served its copy; a URL two ids share counts
+        // only when both are refused.
+        let refused: HashSet<String> = if input.client.filters_active() {
+            let repos = unique_repositories(input.config, input.trusted_repositories, |_| true);
+            let stored =
+                |repo: &Repository| normalize_repo_url(rv_config::stored_repository(&repo.url));
+            let admitted: HashSet<String> = (repos.iter())
+                .filter(|repo| input.client.filters_admit(repo, key))
+                .map(stored)
+                .collect();
+            (repos.iter())
+                .map(stored)
+                .filter(|url| !admitted.contains(url))
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let served: Vec<_> = (served.iter())
+            .filter(|(repo, _)| !refused.contains(repo))
+            .collect();
         let direct = |(repo, endpoint): &(String, String)| {
             repo == endpoint
-                && (input.selector.origins.declared(repo))
-                    .is_some_and(|key| recorded.contains(&key))
+                && (input.selector.origins.key(repo)).is_some_and(|key| recorded.contains(&key))
         };
         let routes = input.routes();
-        let declared = |route| {
-            (recorded.iter()).any(|key| routes.get(key).is_some_and(|known| known.contains(route)))
+        // By key, as a seed names a repository whose URL the lock cannot
+        // record by the empty origin it stands for.
+        let declared = |(repo, endpoint): &(String, String)| {
+            (input.selector.origins.key(repo)).is_some_and(|key| {
+                recorded.contains(&key)
+                    && routes
+                        .get(&key)
+                        .is_some_and(|known| known.contains(endpoint))
+            })
         };
         served.iter().any(|route| direct(route) || declared(route))
             || (pinned_candidates(input, origin, key.version(), pin).unwrap_or_default())
                 .iter()
                 .any(|repo| {
                     let endpoint = input.client.effective_repository(repo).url;
-                    served.contains(&(normalize_repo_url(&repo.url), normalize_repo_url(&endpoint)))
+                    let stored = rv_config::stored_repository(&repo.url);
+                    let route = (normalize_repo_url(stored), normalize_repo_url(&endpoint));
+                    input.client.filters_admit(repo, key) && served.contains(&&route)
                 })
     })
 }
@@ -1142,7 +1230,23 @@ async fn restore_once<F: std::future::Future<Output = Result<()>>>(
     })
 }
 
-async fn ensure_package_artifacts(
+/// [`restore_package`] on the heap. Its future holds a whole download, and
+/// a debug build copies a future through the stack frame of each caller
+/// that awaits it, which overflowed a 2 MiB test thread on Windows.
+fn ensure_package_artifacts<'a>(
+    inputs: &'a SyncInputs<'_>,
+    package: &'a LockArtifact,
+    dedup: &'a FetchDedupMap,
+    checks: &'a Checks,
+    alongside: Option<&'a OnceLock<Holds>>,
+    pom_asked: Option<&'a AtomicBool>,
+) -> BoxFuture<'a, Result<()>> {
+    Box::pin(restore_package(
+        inputs, package, dedup, checks, alongside, pom_asked,
+    ))
+}
+
+async fn restore_package(
     inputs: &SyncInputs<'_>,
     package: &LockArtifact,
     dedup: &FetchDedupMap,
@@ -1493,7 +1597,7 @@ async fn verify_pin(
 /// different URLs map to is refused as ambiguous rather than guessed.
 ///
 /// This is the canonical trust policy for a lockfile origin; every caller
-/// that turns a recorded `repo_url` into a repository (`raeva lock --verify
+/// that turns a recorded `repo_url` into a repository (`raeva lock verify
 /// --download`, `raeva export-m2` classifier fetches) goes through it. Callers
 /// without a resolution pass an empty `trusted_repositories`, or the
 /// repositories the current local POMs declare: that slice carries origins
@@ -1544,6 +1648,9 @@ pub fn select_lock_repository(
 pub struct LockRepositorySelector {
     origins: LockOrigins,
     repositories: Vec<(String, Repository)>,
+    /// What the empty origin names: the one declaration whose URL the lock
+    /// cannot record, which only a mirror serves.
+    unrecorded: OriginSelection<Repository>,
     selections: Mutex<[HashMap<String, OriginSelection<Repository>>; 3]>,
 }
 
@@ -1564,9 +1671,28 @@ impl LockRepositorySelector {
             .iter()
             .filter(|repo| !crate::policy::http_repository_blocked(config, repo, true))
             .map(|repo| (repo.url.clone(), repo.clone()));
+        let repositories: Vec<_> = configured.chain(trusted).collect();
+        let mut unrecorded: Vec<&Repository> = Vec::new();
+        for (url, repo) in &repositories {
+            if !url.is_empty()
+                && !origins.records_declaration(url)
+                && crate::mirror::resolve_mirror(config.mirrors(), repo)
+                    .1
+                    .is_some()
+                && !(unrecorded.iter()).any(|known| known.id == repo.id && known.url == repo.url)
+            {
+                unrecorded.push(repo);
+            }
+        }
+        let unrecorded = match unrecorded.as_slice() {
+            [] => OriginSelection::Undeclared,
+            [repo] => OriginSelection::Declared((*repo).clone()),
+            _ => OriginSelection::Ambiguous,
+        };
         Self {
             origins: origins.clone(),
-            repositories: configured.chain(trusted).collect(),
+            repositories,
+            unrecorded,
             selections: Mutex::default(),
         }
     }
@@ -1600,6 +1726,9 @@ impl LockRepositorySelector {
             .iter()
             .filter(enabled)
             .chain(self.repositories.iter().filter(|repo| !enabled(repo)));
+        if repo_url.is_empty() {
+            return self.unrecorded.clone();
+        }
         let selection = match self.origins.select(
             repo_url,
             repositories.map(|(url, repo)| (url.as_str(), repo)),
@@ -1637,7 +1766,9 @@ mod tests {
         let mut search = PinnedSearch::default();
         search.keep(true, RepoError::NotFound("recorded".into()));
         search.keep(false, refused("fallback"));
-        assert!(matches!(search.finish(None, &key), RepoError::NotFound(url) if url == "recorded"));
+        assert!(
+            matches!(search.finish(None, &key), RepoError::NotFound(url) if url.to_string() == "recorded")
+        );
         let mut search = PinnedSearch::default();
         search.keep(true, RepoError::NotFound("first".into()));
         search.keep(true, refused("second"));
@@ -2113,6 +2244,152 @@ mod tests {
         }
     }
 
+    /// A stored copy that a fallback repository served stands in for a
+    /// pinned file, unless the remote repository filters refuse the file
+    /// from that repository: Maven never asks it, nor takes its cached copy,
+    /// so the recorded repository is asked.
+    #[tokio::test]
+    async fn a_filtered_fallback_copy_does_not_stand_in() {
+        use rv_test_support::http::{Response, StubServer};
+        const JAR: &[u8] = b"demo jar";
+        let server = StubServer::start(|req| match req.path.as_str() {
+            "/m2/com/example/demo/1.0/demo-1.0.jar" => Response::new(200, JAR),
+            _ => Response::new(404, ""),
+        });
+        let url = format!("http://{}/m2/", server.addr());
+        let fallback = "https://fallback.invalid/m2/";
+        for filtered in [false, true] {
+            let temp = tempdir().expect("temp dir");
+            let store = Store::open(&temp.path().join("store")).expect("store");
+            let paths = rv_config::ResolvedPaths::for_testing().expect("paths");
+            let repos = [("recorded", url.as_str()), ("r1", fallback)].map(|(id, url)| {
+                let mut repo = rv_config::RepoConfig::new(Some(id), url);
+                repo.releases = Some(true);
+                repo
+            });
+            let mut config =
+                Config::for_testing_with_repos(temp.path().to_path_buf(), paths, repos.to_vec());
+            config.network.retries = 0;
+            if filtered {
+                let on = [("aether.remoteRepositoryFilter.groupId", "true")];
+                let files: &[(&str, &str, &[u8])] =
+                    &[("groupId", "groupId-r1.txt", b"org.other\n")];
+                let filters = rv_config::RepositoryFilters::from_files(
+                    rv_maven_types::MavenMode::Maven39,
+                    &on,
+                    files,
+                )
+                .unwrap();
+                config = config.with_repository_filters(filters);
+            }
+            let client = RepoClient::new(&config).await.expect("client");
+            let jar = store.put_bytes(JAR).await.unwrap();
+            let mut package = pinned_package(&jar);
+            package.repo_url = url.clone();
+            served_from(&store, &package.coord(), &jar, fallback).await;
+            let asked = server.requests().len();
+            sync(&config, &store, &client, &PomPins::new(), &package)
+                .await
+                .expect("restored");
+            let jar_asked = (server.requests()[asked..].iter())
+                .any(|request| request.path.ends_with("demo-1.0.jar"));
+            assert_eq!(jar_asked, filtered, "filtered: {filtered}");
+        }
+
+        // The recorded repository served its copy directly, and a mirror
+        // whose rule file refuses the file serves it now.
+        let temp = tempdir().expect("temp dir");
+        let store = Store::open(&temp.path().join("store")).expect("store");
+        let paths = rv_config::ResolvedPaths::for_testing().expect("paths");
+        let mut recorded = rv_config::RepoConfig::new(Some("recorded"), url.as_str());
+        recorded.releases = Some(true);
+        let mirror_url = format!("http://{}/mirror/", server.addr());
+        let mut mirror = rv_config::MirrorConfig::new(Some("m1"), &mirror_url);
+        mirror.mirror_of = vec!["recorded".into()];
+        let on = [("aether.remoteRepositoryFilter.groupId", "true")];
+        let files: &[(&str, &str, &[u8])] = &[("groupId", "groupId-m1.txt", b"org.other\n")];
+        let filters = rv_config::RepositoryFilters::from_files(
+            rv_maven_types::MavenMode::Maven39,
+            &on,
+            files,
+        )
+        .unwrap();
+        let mut config =
+            Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![recorded])
+                .with_mirrors(vec![mirror])
+                .with_repository_filters(filters);
+        config.network.retries = 0;
+        let client = RepoClient::new(&config).await.expect("client");
+        let jar = store.put_bytes(JAR).await.unwrap();
+        let mut package = pinned_package(&jar);
+        package.repo_url = url.clone();
+        served_from(&store, &package.coord(), &jar, &url).await;
+        let asked = server.requests().len();
+        let result = sync(&config, &store, &client, &PomPins::new(), &package).await;
+        assert!(result.is_err(), "the refused repository's copy stood in");
+        assert_eq!(server.requests().len(), asked, "{:?}", server.requests());
+    }
+
+    /// A copy the mirror of a repository whose URL raeva.lock cannot record
+    /// served stands in for a row with the empty origin, unless the filters
+    /// now refuse the file from that mirror.
+    #[tokio::test]
+    async fn a_filtered_copy_of_an_unrecorded_repository_does_not_stand_in() {
+        use rv_test_support::http::{Response, StubServer};
+        const JAR: &[u8] = b"demo jar";
+        let server = StubServer::start(|req| match req.path.as_str() {
+            "/mirror/com/example/demo/1.0/demo-1.0.jar" => Response::new(200, JAR),
+            _ => Response::new(404, ""),
+        });
+        let mirror_url = format!("http://{}/mirror/", server.addr());
+        for filtered in [false, true] {
+            let temp = tempdir().expect("temp dir");
+            let store = Store::open(&temp.path().join("store")).expect("store");
+            let paths = rv_config::ResolvedPaths::for_testing().expect("paths");
+            let mut bad = rv_config::RepoConfig::new(Some("bad"), "http://[::1");
+            bad.releases = Some(true);
+            let mut mirror = rv_config::MirrorConfig::new(Some("m1"), &mirror_url);
+            mirror.mirror_of = vec!["bad".into()];
+            let mut config =
+                Config::for_testing_with_repos(temp.path().to_path_buf(), paths, vec![bad])
+                    .with_mirrors(vec![mirror]);
+            config.network.retries = 0;
+            if filtered {
+                let on = [("aether.remoteRepositoryFilter.groupId", "true")];
+                let files: &[(&str, &str, &[u8])] =
+                    &[("groupId", "groupId-m1.txt", b"org.other\n")];
+                let filters = rv_config::RepositoryFilters::from_files(
+                    rv_maven_types::MavenMode::Maven39,
+                    &on,
+                    files,
+                )
+                .unwrap();
+                config = config.with_repository_filters(filters);
+            }
+            let client = RepoClient::new(&config).await.expect("client");
+            let jar = store.put_bytes(JAR).await.unwrap();
+            let mut package = pinned_package(&jar);
+            package.repo_url = String::new();
+            let origin = rv_store::Origin {
+                repo_url: "http://[::1/".into(),
+                endpoint_url: mirror_url.clone(),
+                checksum_verified: true,
+                served: true,
+            };
+            let served = vec![(package.coord(), jar.clone(), origin)];
+            store.record_origins(served).await.unwrap();
+            let asked = server.requests().len();
+            let result = sync(&config, &store, &client, &PomPins::new(), &package).await;
+            match filtered {
+                false => {
+                    result.expect("the mirror's copy stands in");
+                    assert_eq!(server.requests().len(), asked);
+                }
+                true => assert!(result.is_err(), "the refused mirror's copy stood in"),
+            }
+        }
+    }
+
     /// The shared `(g, a, v, pom)` index row is last-writer-wins across
     /// projects. A pin in the store restores the row; no pin leaves it; a pin
     /// whose bytes are gone forces a fetch instead of adopting the row. A
@@ -2333,7 +2610,7 @@ mod tests {
     async fn a_pom_cached_with_other_bytes_is_seeded_with_the_pinned_ones() {
         let other = rv_maven_types::Sha256::from_bytes(b"<project/>");
         let spoil = format!(
-            "UPDATE pom_cache_v4 SET content = CAST('<project/>' AS BLOB), sha256 = '{other}'"
+            "UPDATE pom_cache_v5 SET content = CAST('<project/>' AS BLOB), sha256 = '{other}'"
         );
         restore_seeds_over(&spoil).await;
     }
@@ -2342,7 +2619,7 @@ mod tests {
     /// so an online resolution reads it from the cache.
     #[tokio::test]
     async fn an_expired_cached_pom_is_seeded_again() {
-        restore_seeds_over("UPDATE pom_cache_v4 SET expires_at = 0").await;
+        restore_seeds_over("UPDATE pom_cache_v5 SET expires_at = 0").await;
     }
 
     /// Restore twice, running `spoil` on the metadata cache in between, and
@@ -2399,8 +2676,9 @@ mod tests {
         let repo = Repository::from(&config.repositories()[0]);
         let request = ArtifactRequest::new("com.example", "demo", "1.0");
         assert_eq!(&offline.fetch_pom(&repo, &request).await.unwrap()[..], POM);
+        // A negative `expires_at` marks a `daily` row, decided when read.
         let expired: i64 = (cache.query_row(
-            "SELECT count(*) FROM pom_cache_v4 WHERE expires_at <= unixepoch()",
+            "SELECT count(*) FROM pom_cache_v5 WHERE expires_at BETWEEN 0 AND unixepoch()",
             [],
             |row| row.get(0),
         ))
@@ -3643,10 +3921,8 @@ mod tests {
         let fixture = support_fixture().await;
         let results = ensure(&fixture, &support_only_lock(GONE, &fixture.pinned)).await;
         let err = results[0].result.as_ref().expect_err("undeclared");
-        assert!(
-            err.to_string().contains("no configuration or POM declares"),
-            "{err}"
-        );
+        assert!(matches!(err, RepoError::UntrustedRepoUrl(_)), "{err:?}");
+        assert_eq!(err.class(), crate::ErrorClass::Config);
 
         let fixture = support_fixture().await;
         let never = BlobId::from_bytes(b"never published");
@@ -3761,6 +4037,57 @@ mod tests {
                     assert_eq!(row, None, "{extension}");
                 }
             }
+        }
+    }
+
+    /// A pinned non-unique `-SNAPSHOT` file the recorded repository lacks is
+    /// asked for under its pinned name from the next one, whose metadata may
+    /// name a newer build, whatever the client's freshness.
+    #[tokio::test]
+    async fn a_pinned_base_snapshot_file_falls_back_under_its_own_name() {
+        const JAR: &[u8] = b"demo jar";
+        const NEWER: &[u8] = b"newer build";
+        const METADATA: &str = "<metadata><version>1.0-SNAPSHOT</version><versioning>\
+            <snapshot><timestamp>20261025.010101</timestamp><buildNumber>1</buildNumber>\
+            </snapshot><snapshotVersions><snapshotVersion><extension>jar</extension>\
+            <value>1.0-20261025.010101-1</value></snapshotVersion></snapshotVersions>\
+            </versioning></metadata>";
+        let temp = tempdir().unwrap();
+        let dir = temp.path().join("second/com/example/demo/1.0-SNAPSHOT");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(temp.path().join("first")).unwrap();
+        std::fs::write(dir.join("demo-1.0-SNAPSHOT.jar"), JAR).unwrap();
+        std::fs::write(dir.join("demo-1.0-20261025.010101-1.jar"), NEWER).unwrap();
+        std::fs::write(dir.join("maven-metadata.xml"), METADATA).unwrap();
+        let repos = ["first", "second"].map(|id| {
+            let mut repo = file_repo(id, &temp.path().join(id));
+            repo.snapshots = Some(true);
+            repo
+        });
+        let paths = rv_config::ResolvedPaths::for_testing().unwrap();
+        let config = Config::for_testing_with_repos(temp.path().into(), paths, repos.into());
+        let origin = LockOrigins::for_root(temp.path())
+            .declared(&config.repositories()[0].url)
+            .unwrap();
+        let mut package = LockArtifact::new(demo("1.0-SNAPSHOT", "jar"), origin.clone());
+        package.checksums = vec![Digest::Sha256(BlobId::from_bytes(JAR))];
+        let mut lock = support_only_lock(&origin, &BlobId::from_bytes(b"unused"));
+        lock.platforms[0].support_poms.clear();
+        lock.platforms[0].artifacts = vec![package.clone()];
+        // Locked plugin files are restored by a client of either freshness.
+        for freshness in [crate::Freshness::Locked, crate::Freshness::Policy] {
+            let client = RepoClient::new(&config)
+                .await
+                .unwrap()
+                .with_lock_pins(&lock)
+                .with_freshness(freshness);
+            let store = Store::open(&temp.path().join(format!("{freshness:?}"))).unwrap();
+            let result = sync(&config, &store, &client, &PomPins::new(), &package).await;
+            result.expect("restored from `second` under the pinned name");
+            assert_eq!(
+                store.lookup_artifact(&package.coord()).await.unwrap(),
+                Some(BlobId::from_bytes(JAR))
+            );
         }
     }
 
@@ -4221,7 +4548,7 @@ mod tests {
         let mut other = lock.platforms[0].clone();
         other.platform = Platform::new("other", "arch").unwrap();
         lock.platforms.push(other);
-        assert_eq!(pinned_files(&lock.platforms, |_| true).len(), 1);
+        assert_eq!(lock.pinned_files().len(), 1);
         assert!(
             restore_complete(&fixture.store, &lock, &fixture.context())
                 .await

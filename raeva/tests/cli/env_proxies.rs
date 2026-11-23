@@ -130,6 +130,71 @@ fn sync_goes_through_the_http_proxy_variable() {
     assert!(!configured.requests().is_empty());
 }
 
+/// A settings.xml repository on the URL of a Maven 3.10 Central on plain
+/// HTTP is blocked as Central is: Maven's blocker takes every plain-HTTP
+/// repository but those on `localhost` or `127.0.0.1`.
+#[test]
+fn a_settings_repository_on_the_url_of_an_http_central_is_blocked() {
+    let (project, home) = project();
+    std::fs::write(
+        project.path().join("raeva.toml"),
+        "[lock]\nmaven = \"3.10\"\n",
+    )
+    .expect("write raeva.toml");
+    std::fs::create_dir_all(home.path().join(".m2")).expect("create .m2");
+    std::fs::write(
+        home.path().join(".m2").join("settings.xml"),
+        "<settings><profiles><profile><id>p</id><repositories><repository><id>own</id>\
+         <url>http://repo.test/maven/</url></repository></repositories></profile></profiles>\
+         <activeProfiles><activeProfile>p</activeProfile></activeProfiles></settings>",
+    )
+    .expect("write settings.xml");
+    let proxy = library_proxy();
+    let variable = format!(
+        "http://proxy-user:proxy-secret@127.0.0.1:{}",
+        proxy.addr().port()
+    );
+    let env = [
+        ("HTTP_PROXY", variable),
+        ("MAVEN_REPO_CENTRAL", "http://repo.test/maven/".to_string()),
+    ];
+    let output = sync(&project, &home, &env);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
+    let warnings = envelope(&output)["data"]["warnings"].to_string();
+    assert!(
+        warnings.contains("that settings.xml declares"),
+        "{warnings}"
+    );
+
+    // A POM's repository on that URL is not the user's: Maven's blocker
+    // refuses it even when a mirror of the user's serves Central.
+    let empty = TempDir::new().expect("mirror");
+    let empty = url::Url::from_directory_path(empty.path()).expect("url");
+    std::fs::write(
+        home.path().join(".m2").join("settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>corp</id><url>{empty}</url>\
+             <mirrorOf>central</mirrorOf></mirror></mirrors></settings>"
+        ),
+    )
+    .expect("write settings.xml");
+    std::fs::write(
+        project.path().join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+         <artifactId>app</artifactId><version>1</version><repositories><repository>\
+         <id>other</id><url>http://repo.test/maven/</url></repository></repositories>\
+         <dependencies><dependency><groupId>io.raeva</groupId><artifactId>lib</artifactId>\
+         <version>1.0</version></dependency></dependencies></project>",
+    )
+    .expect("write pom.xml");
+    let output = sync(&project, &home, &env);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(proxy.requests().is_empty(), "{:?}", proxy.requests());
+    let warnings = envelope(&output)["data"]["warnings"].to_string();
+    assert!(warnings.contains("that a POM declares"), "{warnings}");
+}
+
 /// A 407 is a proxy refusal whose hint names the variable, and a host
 /// `NO_PROXY` names goes direct.
 #[test]

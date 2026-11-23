@@ -16,9 +16,8 @@ use crate::error::RepoError;
 ///
 /// # Errors
 ///
-/// [`RepoError::Config`] for an unknown protocol, a malformed host, a
-/// settings.xml proxy port that is not a number or a proxy variable raeva
-/// cannot use, and
+/// [`RepoError::Config`] for an unknown protocol, a malformed host or a
+/// proxy variable raeva cannot use, and
 /// [`RepoError::AuthSetup`] when a bearer token is missing, its variable is
 /// unset, or it is not a valid header value.
 pub fn configured_proxies(config: &rv_config::Config) -> Result<Vec<reqwest::Proxy>, RepoError> {
@@ -258,7 +257,7 @@ pub(crate) fn build_proxy_url(host: &str, port: u16) -> Result<String, RepoError
 pub(crate) fn should_bypass_proxy(host: &str, non_proxy_hosts: &[String]) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     non_proxy_hosts.iter().any(|entry| {
-        let entry = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+        let entry = entry.trim_end_matches('.').to_ascii_lowercase();
         if entry.is_empty() {
             return false;
         }
@@ -337,6 +336,8 @@ mod tests {
             (&[(Some("http"), &["10.*", "*.corp.*"])], "https://10.0.0.5/repo/", None),
             (&[(Some("http"), &["10.*", "*.corp.*"])], "http://nexus.corp.example/", None),
             (&[(Some("http"), &["10.*", "*.corp.*"])], HTTPS, Some(0)),
+            // Maven matches an entry as written, spaces included.
+            (&[(Some("http"), &[" repo.example"]), (Some("http"), &[])], HTTP, Some(0)),
         ];
         for (spec, url, expected) in cases {
             let proxies: Vec<_> = spec.iter().map(|(p, hosts)| proxy(*p, hosts)).collect();

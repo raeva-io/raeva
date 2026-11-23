@@ -21,7 +21,11 @@
 //! A failed sync fails every later durability claim of this process, and
 //! the blobs it published in that batch are unlinked: their bytes may never
 //! reach the disk while staying readable from the page cache, and another
-//! process's later fsync need not report the error.
+//! process's later fsync need not report the error. The unlink takes no
+//! store lock, and covers the whole batch whichever path failed. Another
+//! process that found such a blob, its own sync proving nothing, then fails
+//! to index it, or has indexed it and its row names a missing file, which
+//! readers treat as not stored. Either way a later run fetches it again.
 //!
 //! On Linux 5.8 and later a large batch on ext4, XFS, Btrfs or F2FS is one
 //! `syncfs(2)` instead. From 5.8 the kernel reports a writeback error to

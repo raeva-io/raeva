@@ -155,6 +155,43 @@ fn sync_names_the_refused_settings_credentials() {
     }
 }
 
+/// A settings.xml mirror without an `<id>` is named `default`, as Maven's
+/// settings model names it, so the `<server>` with that id gives it its
+/// credentials. An empty `<id>` is refused, as Maven refuses it.
+#[test]
+fn a_mirror_without_an_id_takes_the_default_server() {
+    let server = StubServer::start(|request| match request.header("authorization") {
+        Some("Basic Y2k6czNjcmV0") => library_response(&request.path),
+        _ => Response::new(401, ""),
+    });
+    let base = format!("http://{}", server.addr());
+    let project = project(&base);
+    for (id, status) in [("", 0), ("<id> </id>", 3)] {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".m2")).expect("settings dir");
+        std::fs::write(
+            home.path().join(".m2/settings.xml"),
+            format!(
+                "<settings><mirrors><mirror>{id}<url>{base}/mirror/</url>\
+                 <mirrorOf>*</mirrorOf></mirror></mirrors><servers><server><id>default</id>\
+                 <username>ci</username><password>s3cret</password></server></servers>\
+                 </settings>"
+            ),
+        )
+        .expect("write settings.xml");
+        let output = run_raeva(project.path(), home.path(), &["sync"]);
+        assert_status(&output, status, id);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("s3cret"), "{stderr}");
+        if status != 0 {
+            assert!(
+                stderr.contains("a <mirror> has an empty <id>, which Maven refuses"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
 #[test]
 fn doctor_probes_the_pom_repository_that_needs_credentials() {
     let (base, _server) = spawn_registry();
@@ -253,15 +290,7 @@ fn fallback_repository(project: &TempDir, first: &StubServer, second: &StubServe
 fn check_repository_fallback(first: &str, reason: &str) {
     let second = tempfile::tempdir().expect("repository");
     for (name, bytes) in LIBRARY {
-        let name = name.trim_start_matches('/');
-        let path = second.path().join(name);
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("repository directory");
-        std::fs::write(&path, bytes).expect("repository file");
-        std::fs::write(
-            second.path().join(format!("{name}.sha256")),
-            crate::common::sha256_hex(bytes),
-        )
-        .expect("checksum");
+        crate::common::write_with_sha256(&second.path().join(name.trim_start_matches('/')), bytes);
     }
     let project = project(first);
     let url = url::Url::from_directory_path(second.path())
@@ -319,7 +348,10 @@ fn check_repository_fallback(first: &str, reason: &str) {
             .flat_map(|platform| &platform.artifacts)
             .collect();
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].repo_url, url);
+        assert_eq!(
+            artifacts[0].repo_url,
+            crate::common::recorded_origin(project.path(), &url)
+        );
         std::fs::remove_file(project.path().join("raeva.lock")).expect("remove lock");
     }
 }
@@ -405,7 +437,10 @@ fn sync_tries_the_next_repository_after_an_auth_refusal() {
                 .flat_map(|platform| &platform.artifacts)
                 .collect();
             assert_eq!(artifacts.len(), 1);
-            assert_eq!(artifacts[0].repo_url, url);
+            assert_eq!(
+                artifacts[0].repo_url,
+                crate::common::recorded_origin(project.path(), &url)
+            );
             assert!(
                 first
                     .requests()
@@ -529,4 +564,175 @@ fn sync_reports_all_auth_refusals_and_the_coordinate() {
         "{stdout}"
     );
     assert!(!project.path().join("raeva.lock").exists());
+}
+
+/// A credential the repository rejects while raeva downloads the locked
+/// files into a cold store, as an expired CI token does, is reported as
+/// rejected, by id and file, never by value, not as a missing `<server>`.
+/// A default credential names no id, and the repository is not called one
+/// without an id.
+#[test]
+fn a_rejected_credential_on_download_is_named_rejected() {
+    let server = StubServer::start(|request| {
+        if !request.path.starts_with("/maven/canary/") {
+            return Response::new(404, "");
+        }
+        match request.header("authorization") {
+            Some("Basic Y2k6Z29vZA==") => library_response(&request.path),
+            _ => Response::new(401, ""),
+        }
+    });
+    let base = format!("http://{}", server.addr());
+    let in_settings = |home: &TempDir, password: &str| {
+        std::fs::create_dir_all(home.path().join(".m2")).expect("settings dir");
+        std::fs::write(
+            home.path().join(".m2/settings.xml"),
+            format!(
+                "<settings><servers><server><id>raeva</id><username>ci</username>\
+                 <password>{password}</password></server></servers></settings>"
+            ),
+        )
+        .expect("write settings.xml");
+    };
+    let by_default = |home: &TempDir, password: &str| {
+        std::fs::write(
+            home.path().join("config.toml"),
+            format!(
+                "[[repositories]]\nid = \"corp\"\nurl = \"{base}/maven/canary/\"\n\n\
+                 [[auth]]\nusername = \"ci\"\npassword = \"{password}\"\n"
+            ),
+        )
+        .expect("write config.toml");
+    };
+    for default in [false, true] {
+        let credential = |home: &TempDir, password: &str| match default {
+            true => by_default(home, password),
+            false => in_settings(home, password),
+        };
+        let named = match default {
+            true => [
+                "the repository at ",
+                "default credentials from the user config.toml",
+            ],
+            false => ["'raeva' at ", "credentials for id 'raeva' from "],
+        };
+        let project = project(&base);
+        let home = tempfile::tempdir().expect("home");
+        credential(&home, "good");
+        assert_success(&run_raeva(project.path(), home.path(), &["sync"]), "sync");
+        for args in [&["sync"][..], &["sync", "--frozen"]] {
+            let cold = tempfile::tempdir().expect("cold home");
+            credential(&cold, "expired-secret-123");
+            let output = run_raeva(project.path(), cold.path(), args);
+            assert_status(&output, 3, "rejected credential");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for expected in named.into_iter().chain([
+                "The repository refused the credentials raeva sent",
+                "were sent but rejected",
+                "the token expired or was revoked",
+            ]) {
+                assert!(stderr.contains(expected), "{args:?}: {stderr}");
+            }
+            for refused in ["Add a <server>", "expired-secret-123", "without an id"] {
+                assert!(!stderr.contains(refused), "{args:?}: {stderr}");
+            }
+        }
+    }
+}
+
+/// A `<server>` whose Maven-encrypted password raeva cannot decrypt (no
+/// security file, or a wrong master) sends nothing for its id, as Maven
+/// sends nothing to a repository that never asks, so one that allows
+/// anonymous reads serves the sync.
+#[test]
+fn a_server_whose_password_is_dropped_reads_anonymously() {
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let server = StubServer::start(move |request| {
+        if let Some(value) = request.header("authorization") {
+            seen.lock().unwrap().push(value.to_string());
+        }
+        library_response(&request.path)
+    });
+    let base = format!("http://{}", server.addr());
+    for master in [None, Some("{jSMOWnoPFgsHVpMvz5VrIt5kRbzGpI8u+9EF1iFQyJQ=}")] {
+        let project = project(&base);
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir_all(home.path().join(".m2")).expect("settings dir");
+        std::fs::write(
+            home.path().join(".m2/settings.xml"),
+            "<settings><servers><server><id>raeva</id><username>ci</username>\
+             <password>{COQLCE6DU6GtcS5P=}</password></server></servers></settings>",
+        )
+        .expect("write settings.xml");
+        if let Some(master) = master {
+            std::fs::write(
+                home.path().join(".m2/settings-security.xml"),
+                format!("<settingsSecurity><master>{master}</master></settingsSecurity>"),
+            )
+            .expect("write settings-security.xml");
+        }
+        let output = run_raeva(project.path(), home.path(), &["sync"]);
+        let case = format!("master {master:?}");
+        assert_success(&output, &case);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("CREDENTIAL_DROPPED"), "{case}: {stderr}");
+        assert_eq!(*asked.lock().unwrap(), Vec::<String>::new(), "{case}");
+    }
+}
+
+/// A repository that needs the credential of a `<server>` whose password
+/// raeva could not decrypt: sync and doctor name the decryption, not a
+/// missing `<server>`, which a second entry with the id would not fix.
+#[test]
+fn a_401_after_a_dropped_password_names_the_decryption() {
+    let server = StubServer::start(|_| Response::new(401, ""));
+    let base = format!("http://{}", server.addr());
+    let project = project(&base);
+    let home = tempfile::tempdir().expect("home");
+    std::fs::create_dir_all(home.path().join(".m2")).expect("settings dir");
+    std::fs::write(
+        home.path().join(".m2/settings.xml"),
+        "<settings><servers><server><id>raeva</id><username>ci</username>\
+         <password>{COQLCE6DU6GtcS5P=}</password></server></servers></settings>",
+    )
+    .expect("write settings.xml");
+    // No security file, one that does not parse, and one without a master.
+    let security = home.path().join(".m2/settings-security.xml");
+    for content in [
+        None,
+        Some("<settingsSecurity><master>"),
+        Some("<settingsSecurity/>"),
+    ] {
+        if let Some(content) = content {
+            std::fs::write(&security, content).expect("write settings-security.xml");
+        }
+        let output = run_raeva(project.path(), home.path(), &["sync"]);
+        assert_status(&output, 3, "sync");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("the settings.xml password could not be decrypted")
+                && stderr.contains("server 'raeva' could not be decrypted")
+                && stderr.contains("as ~/.m2/settings-security.xml in the user home, or")
+                && stderr.contains("-Dsettings.security names, which replaces that one")
+                && stderr
+                    .contains("reason=no settings-security.xml with a master password was read"),
+            "{content:?}: {stderr}"
+        );
+        assert!(!stderr.contains("<id>raeva</id>"), "{stderr}");
+    }
+    let output = run_raeva(project.path(), home.path(), &["--json", "doctor"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).expect("doctor JSON");
+    let row = (envelope["data"]["checks"]
+        .as_array()
+        .expect("checks")
+        .iter())
+    .find(|check| check["check"] == "raeva (pom.xml)")
+    .unwrap_or_else(|| panic!("no row: {stdout}"));
+    let details = row["details"].as_str().expect("details");
+    assert!(
+        details.starts_with("401 (no credentials were sent; the encrypted password"),
+        "{details}"
+    );
 }

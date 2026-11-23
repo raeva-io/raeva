@@ -1107,3 +1107,32 @@ fn vuln_without_a_lock_says_only_that_it_is_missing() {
         "{stderr}"
     );
 }
+
+/// A proxy that wants credentials fails `vuln` as it fails `sync`:
+/// `PROXY_AUTH`, exit 3, whether it refuses the tunnel to an `https:` OSV
+/// or answers a plain `http:` request with 407.
+#[test]
+fn a_proxy_that_wants_credentials_is_proxy_auth() {
+    let proxy = rv_test_support::http::StubServer::start(|_| {
+        rv_test_support::http::Response::new(407, "")
+            .header("Proxy-Authenticate", "Basic realm=\"corp\"")
+    });
+    let proxy_url = format!("http://127.0.0.1:{}", proxy.addr().port());
+    for (variable, base_url) in [
+        ("HTTPS_PROXY", "https://osv.test/"),
+        ("HTTP_PROXY", "http://osv.test/"),
+    ] {
+        let (project, home) = temp_project();
+        write_demo_lock(project.path(), home.path(), DEMO, Vec::new());
+        let output = raeva_command(project.path(), home.path())
+            .env("RAEVA_OSV_BASE_URL", base_url)
+            .env(variable, &proxy_url)
+            .args(["--json", "vuln"])
+            .output()
+            .expect("run raeva vuln");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("JSON envelope");
+        assert_eq!(envelope["code"], "PROXY_AUTH", "{base_url}: {envelope}");
+        assert_status(&output, 3, base_url);
+    }
+}

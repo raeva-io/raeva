@@ -107,6 +107,7 @@ fn origins_guard(origins: HashSet<String>) -> RedirectGuard {
         root_issuer: None,
         exempt_hosts: ConfiguredHosts::new(exempt_hosts),
         proxies: ProxySet::default(),
+        redirect_targets: HashSet::new(),
     }
 }
 
@@ -140,7 +141,6 @@ fn repo(url: impl ToString) -> Repository {
 async fn fetch_redirect_test(client: &reqwest::Client, url: &Url) -> Result<Bytes> {
     let config = FetchConfig {
         retries: 0,
-        timeout: Duration::from_secs(5),
         ..Default::default()
     };
     fetch_bytes(client, url, None, None, &config, None).await
@@ -176,14 +176,15 @@ fn loopback_name_url(port: u16, path: &str) -> Url {
 }
 
 /// A cross-origin redirect, through a configured pair or from a root-POM
-/// grant, drops the credential and cookie the source received.
+/// grant, drops the credential and cookie the source received, and names
+/// no source URL, whose path may hold a token, in a `Referer`.
 #[tokio::test]
 async fn cross_origin_redirect_strips_sensitive_headers() {
     for root in [false, true] {
         let target = spawn_https_stub(|_| ok_response(b"artifact bytes"));
         let target_url = target.url("/artifact");
         let source = redirecting(&target_url);
-        let source_url = source.url("/start");
+        let source_url = source.url("/path-token/start");
         let client = if root {
             let client = screened_test_client(origins_guard(origin_set([target_url.as_str()])));
             client.trust_root_repositories(&[repo(&source_url)]);
@@ -218,6 +219,10 @@ async fn cross_origin_redirect_strips_sensitive_headers() {
             .unwrap()
             .to_ascii_lowercase();
         assert!(!at_target.contains("authorization:") && !at_target.contains("cookie:"));
+        assert!(
+            !at_target.contains("referer:") && !at_target.contains("path-token"),
+            "{at_target}"
+        );
     }
 }
 
@@ -241,12 +246,14 @@ fn redirect_guard_decisions() {
         origins: origin_set(["https://mirror.example", "https://nexus.corp"]),
         exempt_hosts: frozen_hosts(["mirror.example", "nexus.corp", "proxy.corp"]),
         proxies: ProxySet::default(),
+        redirect_targets: HashSet::new(),
     };
     let proxied = RedirectGuard {
         root_issuer: None,
         origins: origin_set(["https://mirror.example", "https://cdn.example"]),
         exempt_hosts: frozen_hosts(["mirror.example", "cdn.example", "proxy.corp"]),
         proxies: ProxySet::new(&[rv_config::ProxyConfig::new("proxy.corp", 3128)]).unwrap(),
+        redirect_targets: HashSet::new(),
     };
     // Guard, previous hops, target, and the rejection, if any. An unexempt
     // name is left to the resolver.
@@ -361,7 +368,7 @@ async fn redirect_rejections_end_to_end() {
     ));
     for (target, kind, message) in cases {
         let source = redirecting(&target);
-        let source_url = source.url("/start");
+        let source_url = source.url("/path-token/start");
         let client = redirect_test_client(origin_set([source_url.as_str()]));
         let result = fetch_redirect_test(&client, &source_url).await;
         assert_rejected(&result, kind);
@@ -448,6 +455,7 @@ fn proxied_set(origins: HashSet<String>, proxies: crate::proxy::ProxySet) -> Cli
         root_issuer: None,
         exempt_hosts: frozen_hosts(["127.0.0.1"]),
         proxies: proxies.clone(),
+        redirect_targets: HashSet::new(),
     };
     let options = BuildOptions {
         accept_invalid_certs: true,
@@ -664,6 +672,68 @@ fn environment_proxies_take_the_guarded_path() {
     }
 }
 
+/// Behind a proxy, a redirect to object storage, as repo.spring.io and
+/// repo.jenkins-ci.org send, is refused with the ways to follow it, and is
+/// followed once config.toml names its origin as a mirror of no repository.
+#[test]
+fn a_proxied_redirect_target_is_followed_once_a_mirror_names_it() {
+    let issuer = url("https://repo.spring.io/milestone/g/a/1/a-1.jar");
+    let target = url("https://bucket.s3.amazonaws.com/repo/a-1.jar?X-Amz-Signature=secret");
+    let repos = vec![rv_config::RepoConfig::new(
+        Some("spring-milestones"),
+        "https://repo.spring.io/milestone",
+    )];
+    let config = rv_config::Config::for_testing_with_repos(
+        ".".into(),
+        rv_config::ResolvedPaths::for_testing().unwrap(),
+        repos,
+    );
+    let proxies = environment_proxy_set(&[("HTTPS_PROXY", "proxy.corp:3128")]);
+    let refused = redirect_guard(&config, &proxies)
+        .unwrap()
+        .evaluate(std::slice::from_ref(&issuer), &target)
+        .unwrap_err();
+    assert_eq!(
+        refused.kind,
+        RedirectRejectionKind::ProxiedTargetNotConfigured
+    );
+    for next in [
+        "[[mirrors]] with id = \"bucket.s3.amazonaws.com\", url = \"https://bucket.s3.amazonaws.com/\"",
+        "add it to NO_PROXY",
+    ] {
+        assert!(refused.details.contains(next), "{}", refused.details);
+    }
+    assert!(!refused.details.contains("secret"), "{}", refused.details);
+
+    let trusted = config.with_mirrors(vec![rv_config::MirrorConfig::new(
+        Some("bucket.s3.amazonaws.com"),
+        "https://bucket.s3.amazonaws.com/",
+    )]);
+    let guard = redirect_guard(&trusted, &proxies).unwrap();
+    guard
+        .evaluate(std::slice::from_ref(&issuer), &target)
+        .unwrap();
+    let elsewhere = url("https://other.s3.amazonaws.com/repo/a-1.jar");
+    assert_eq!(
+        guard
+            .evaluate(std::slice::from_ref(&issuer), &elsewhere)
+            .unwrap_err()
+            .kind,
+        RedirectRejectionKind::ProxiedTargetNotConfigured
+    );
+    // The storage origin may only be reached: it issues no redirect and
+    // its requests get no configured trust.
+    assert_eq!(
+        guard
+            .evaluate(std::slice::from_ref(&target), &elsewhere)
+            .unwrap_err()
+            .kind,
+        RedirectRejectionKind::OriginNotConfigured
+    );
+    let clients = ClientSet::from_guard(guard, proxies, BuildOptions::default());
+    assert!(!clients.trusts_origin(&target));
+}
+
 /// A request through `HTTP_PROXY` carries the URL's credentials to the
 /// proxy only, and a 407 to the `CONNECT` of an `https:` URL is a proxy
 /// refusal that is not retried.
@@ -725,7 +795,6 @@ async fn environment_proxy_credentials_and_refusals() {
         let target = url("https://repo.test/a.jar");
         let config = FetchConfig {
             retries: 3,
-            timeout: Duration::from_secs(5),
             ..Default::default()
         };
         let error = fetch_bytes(
@@ -907,20 +976,32 @@ fn client_routing_follows_configuration_and_grants() {
     };
     let client = ClientSet::from_guard(guard, proxies, BuildOptions::default());
     assert_eq!(routed(&client, "http://proxy.corp:6379/a.pom"), direct);
-    assert_eq!(routed(&client, "https://proxy.corp:8443/a.pom"), screened);
     assert_eq!(routed(&client, "http://repo.example/a.pom"), screened);
-    // The proxy would resolve a loopback name on its side, out of the
-    // resolver's reach.
+    // The proxy would resolve the name on its side, out of the resolver's
+    // reach, so only a trusted origin's name goes through it. An address in
+    // the URL is screened here.
     for raw in [
         "https://localhost:8080/a.pom",
         "https://nexus.LOCALHOST./a.pom",
+        "https://metadata.google.internal/m2/a.pom",
+        "https://169.254.169.254.nip.io/a.pom",
+        "https://repo.example/a.pom",
+        "https://proxy.corp:8443/a.pom",
     ] {
         let refused = client.client_for(&url(raw));
         assert!(
-            matches!(refused, Err(RepoError::NonGlobalAddress { .. })),
+            matches!(refused, Err(RepoError::ProxiedUntrustedHost(_))),
             "{raw}"
         );
     }
+    let refused = client.client_for(&url("https://169.254.169.254/a.pom"));
+    assert!(
+        matches!(refused, Err(RepoError::NonGlobalAddress { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(routed(&client, "https://93.184.215.14/a.pom"), screened);
+    client.trust_repositories(&[repo("https://repo.example/m2/")]);
+    assert_eq!(routed(&client, "https://repo.example/a.pom"), runtime);
     assert_eq!(routed(&client, "http://localhost:8080/a.pom"), screened);
 }
 
@@ -1111,4 +1192,99 @@ async fn a_dead_http2_connection_is_replaced_quickly() {
     .await
     .expect("a dead connection must not hold requests for the request timeout");
     assert_eq!(connections, (2, 2));
+}
+
+/// A body an HTTP/2 server ends with a `NO_ERROR` reset short of its
+/// Content-Length is no complete file, which hyper does not check, for
+/// metadata and artifacts alike.
+#[tokio::test]
+async fn an_http2_body_short_of_its_length_fails() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(socket).await else {
+                    return;
+                };
+                while let Some(Ok((_, mut respond))) = conn.accept().await {
+                    tokio::spawn(async move {
+                        let head = http::Response::builder()
+                            .header("content-length", "1000")
+                            .body(())
+                            .unwrap();
+                        let mut body = respond.send_response(head, false).unwrap();
+                        body.send_data(Bytes::from_static(b"0123456789"), false)
+                            .unwrap();
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        body.send_reset(h2::Reason::NO_ERROR);
+                    });
+                }
+            });
+        }
+    });
+    let client = BuildOptions::default()
+        .builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let config = FetchConfig {
+        retries: 0,
+        ..FetchConfig::default()
+    };
+    let path = url(&format!("http://{addr}/g/a/maven-metadata.xml"));
+    let body = fetch_bytes(&client, &path, None, None, &config, None).await;
+    assert!(matches!(&body, Err(RepoError::Transfer(_))), "{body:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let store = rv_store::Store::open(dir.path()).unwrap();
+    let path = url(&format!("http://{addr}/g/a/1/a-1.jar"));
+    let fetched = crate::fetch::fetch_artifact_into_store(
+        &client,
+        &path,
+        None,
+        None,
+        &config,
+        None,
+        &store,
+        crate::fetch::ArtifactChecks::default(),
+    )
+    .await;
+    assert!(
+        matches!(&fetched, Err(RepoError::Transfer(_))),
+        "{:?}",
+        fetched.map(|verified| verified.size)
+    );
+}
+
+/// A configured repository whose URL does not parse names no origin, and
+/// its requests fail, as in Maven; a mirror that serves it is an origin,
+/// and the repository is not refused: Maven fetches through the mirror.
+#[test]
+fn a_repository_url_that_does_not_parse_names_no_origin() {
+    let repos = vec![
+        rv_config::RepoConfig::new(Some("bad"), "https://[secret"),
+        rv_config::RepoConfig::new(Some("good"), "https://repo.example/maven2/"),
+    ];
+    let config = rv_config::Config::for_testing_with_repos(
+        ".".into(),
+        rv_config::ResolvedPaths::for_testing().unwrap(),
+        repos,
+    );
+    let guard = redirect_guard(&config, &ProxySet::default()).unwrap();
+    assert!(guard.origins.contains("https://repo.example"));
+    let mut nothing = rv_config::MirrorConfig::new(Some("n"), "https://[secret");
+    nothing.mirror_of = vec![",".to_string()];
+    let guard = redirect_guard(
+        &config.clone().with_mirrors(vec![nothing]),
+        &ProxySet::default(),
+    );
+    assert!(guard.unwrap().redirect_targets.is_empty());
+
+    let mut mirror = rv_config::MirrorConfig::new(Some("m"), "https://mirror.example/");
+    mirror.mirror_of = vec!["bad".to_string()];
+    let guard = redirect_guard(&config.with_mirrors(vec![mirror]), &ProxySet::default())
+        .expect("a mirror serves it");
+    assert!(guard.origins.contains("https://mirror.example"));
+    assert!(guard.origins.contains("https://repo.example"));
+    assert!(!guard.origins.iter().any(|origin| origin.contains("secret")));
 }

@@ -53,6 +53,7 @@ fn load_config(home: &std::path::Path, config_toml: &str) -> Config {
         [
             ("HOME", Some(home.as_os_str())),
             ("USERPROFILE", Some(home.as_os_str())),
+            (rv_config::MAVEN_USER_HOME_TEST_ENV, Some(home.as_os_str())),
             ("RAEVA_HOME", Some(raeva_home.as_os_str())),
         ],
         || Config::load(&project).unwrap(),

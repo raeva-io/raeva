@@ -1,8 +1,9 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::{MAX_COMPONENT_BYTES, VersionError};
+use crate::{MAX_COMPONENT_BYTES, MavenMode, VersionError};
 
 /// A parsed Maven version ordered like maven-resolver's `GenericVersion`, the
 /// ordering Maven 3.9 uses for range matching, version listing and conflict
@@ -19,6 +20,11 @@ use crate::{MAX_COMPONENT_BYTES, VersionError};
 /// zero, whatever its text, so `alpha == 0 == beta` while `alpha < beta`. The
 /// order is not transitive: sort with [`Version::sort_by_key`], which
 /// tolerates that, and not with `slice::sort`, which may panic.
+///
+/// `Ord` is Maven 3.9's order. [`Version::cmp_in`] compares in the order of a
+/// [`MavenMode`]: maven-resolver 2.0.24, which Maven 3.10 ships, puts a
+/// version that starts with text below one that starts with a number, so
+/// `alpha < 0`.
 ///
 /// # Examples
 ///
@@ -54,7 +60,7 @@ impl Version {
         }
         Ok(Self {
             original: trimmed.to_string(),
-            items: parse_items(trimmed),
+            items: parse_items(trimmed, MavenMode::Maven39),
         })
     }
 
@@ -69,7 +75,7 @@ impl Version {
             items: if trimmed.len() > MAX_COMPONENT_BYTES {
                 Vec::new()
             } else {
-                parse_items(trimmed)
+                parse_items(trimmed, MavenMode::Maven39)
             },
         }
     }
@@ -82,16 +88,21 @@ impl Version {
     /// Sorts `items` ascending by the version `key` gives, keeping equal ones
     /// in their order, with a merge sort, which any comparison satisfies.
     pub fn sort_by_key<T>(items: &mut Vec<T>, key: impl Fn(&T) -> &Version) {
-        fn merge_sort<T>(mut left: Vec<T>, key: &impl Fn(&T) -> &Version) -> Vec<T> {
+        Self::sort_by_key_in(items, MavenMode::Maven39, key);
+    }
+
+    /// [`Self::sort_by_key`] in the order of `mode`.
+    pub fn sort_by_key_in<T>(items: &mut Vec<T>, mode: MavenMode, key: impl Fn(&T) -> &Version) {
+        fn merge_sort<T>(mut left: Vec<T>, less: &impl Fn(&T, &T) -> bool) -> Vec<T> {
             if left.len() < 2 {
                 return left;
             }
-            let right = merge_sort(left.split_off(left.len() / 2), key);
-            let left = merge_sort(left, key);
+            let right = merge_sort(left.split_off(left.len() / 2), less);
+            let left = merge_sort(left, less);
             let mut merged = Vec::with_capacity(left.len() + right.len());
             let (mut left, mut right) = (left.into_iter().peekable(), right.into_iter().peekable());
             while let (Some(first), Some(second)) = (left.peek(), right.peek()) {
-                let next = if key(second) < key(first) {
+                let next = if less(second, first) {
                     &mut right
                 } else {
                     &mut left
@@ -101,7 +112,71 @@ impl Version {
             merged.extend(left.chain(right));
             merged
         }
-        *items = merge_sort(std::mem::take(items), &key);
+        let less = |a: &T, b: &T| key(a).cmp_in(key(b), mode).is_lt();
+        *items = merge_sort(std::mem::take(items), &less);
+    }
+
+    /// `GenericVersion.compareTo` of the maven-resolver that `mode` ships.
+    /// Of two ASCII versions, equal in the 3.10 order implies equal in the
+    /// 3.9 order, so one `Hash` serves both.
+    pub fn cmp_in(&self, other: &Self, mode: MavenMode) -> Ordering {
+        if mode == MavenMode::Maven39 {
+            return self.cmp(other);
+        }
+        let (these, those) = (self.items_in(mode), other.items_in(mode));
+        let (these, those) = (&these[..], &those[..]);
+        if starts_with_text(these) != starts_with_text(those)
+            && let (Some(this), Some(that)) = (these.first(), those.first())
+        {
+            // It compares the first items by kind when one is a number and
+            // the other text.
+            return this.cmp(that);
+        }
+        compare(these, those)
+    }
+
+    /// The items the maven-resolver of `mode` splits this version into:
+    /// 2.0.24 splits one as 1.9 does but outside ASCII.
+    fn items_in(&self, mode: MavenMode) -> std::borrow::Cow<'_, [Item]> {
+        if mode == MavenMode::Maven310
+            && !self.original.is_ascii()
+            && self.original.len() <= MAX_COMPONENT_BYTES
+        {
+            return std::borrow::Cow::Owned(parse_items(&self.original, mode));
+        }
+        std::borrow::Cow::Borrowed(&self.items)
+    }
+
+    /// maven-resolver 1.9's `GenericVersion.hashCode`, which orders the
+    /// ranges of a union in its `HashSet`. Java lowers text outside ASCII
+    /// by locale, which this does not follow.
+    #[cfg(test)]
+    pub(crate) fn java_hash(&self) -> i32 {
+        self.java_hash_in(MavenMode::Maven39)
+    }
+
+    /// The `GenericVersion.hashCode` of the maven-resolver `mode` ships,
+    /// from the items it splits this version into, as [`Self::cmp_in`].
+    pub(crate) fn java_hash_in(&self, mode: MavenMode) -> i32 {
+        let string = |text: &str| {
+            (text.encode_utf16()).fold(0i32, |hash, unit| {
+                hash.wrapping_mul(31).wrapping_add(i32::from(unit))
+            })
+        };
+        self.items_in(mode).iter().fold(1i32, |hash, item| {
+            let (value, kind) = match item {
+                Item::Min => (string("min"), 0),
+                Item::Qualifier(value) => (i32::from(*value), 2),
+                Item::Text(text) => (string(text), 3),
+                Item::Number(Number(digits)) if digits.len() < 10 => {
+                    (digits.parse().unwrap_or_default(), 4)
+                }
+                Item::Number(Number(digits)) => (big_integer_hash(digits), 5),
+                Item::Max => (string("max"), 8),
+            };
+            hash.wrapping_mul(31)
+                .wrapping_add(value.wrapping_add(kind * 31))
+        })
     }
 
     /// Starts with text, or has no number but zero: equal to `0`.
@@ -144,29 +219,37 @@ impl PartialOrd for Version {
 /// `GenericVersion.compareTo`.
 impl Ord for Version {
     fn cmp(&self, other: &Self) -> Ordering {
-        let (these, those) = (&self.items, &other.items);
-        let mut number = true;
-        let mut index = 0;
-        loop {
-            let (this, that) = match (these.get(index), those.get(index)) {
-                (None, None) => return Ordering::Equal,
-                (None, Some(_)) => return compare_padding(those, index, None).reverse(),
-                (Some(_), None) => return compare_padding(these, index, None),
-                (Some(this), Some(that)) => (this, that),
+        compare(&self.items, &other.items)
+    }
+}
+
+/// The first item is text or a qualifier.
+fn starts_with_text(items: &[Item]) -> bool {
+    items.first().is_some_and(|item| !item.is_number())
+}
+
+fn compare(these: &[Item], those: &[Item]) -> Ordering {
+    let mut number = true;
+    let mut index = 0;
+    loop {
+        let (this, that) = match (these.get(index), those.get(index)) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return compare_padding(those, index, None).reverse(),
+            (Some(_), None) => return compare_padding(these, index, None),
+            (Some(this), Some(that)) => (this, that),
+        };
+        if this.is_number() != that.is_number() {
+            return if this.is_number() == number {
+                compare_padding(these, index, Some(number))
+            } else {
+                compare_padding(those, index, Some(number)).reverse()
             };
-            if this.is_number() != that.is_number() {
-                return if this.is_number() == number {
-                    compare_padding(these, index, Some(number))
-                } else {
-                    compare_padding(those, index, Some(number)).reverse()
-                };
-            }
-            match this.cmp(that) {
-                Ordering::Equal => number = this.is_number(),
-                rel => return rel,
-            }
-            index += 1;
         }
+        match this.cmp(that) {
+            Ordering::Equal => number = this.is_number(),
+            rel => return rel,
+        }
+        index += 1;
     }
 }
 
@@ -204,6 +287,26 @@ impl Item {
     }
 }
 
+/// `BigInteger.hashCode` of `digits`, over its 32-bit words from the most
+/// significant.
+fn big_integer_hash(digits: &str) -> i32 {
+    let mut words: Vec<u32> = Vec::new();
+    for digit in digits.bytes().map(|byte| u64::from(byte - b'0')) {
+        let mut carry = digit;
+        for word in &mut words {
+            let next = u64::from(*word) * 10 + carry;
+            *word = next as u32;
+            carry = next >> 32;
+        }
+        if carry > 0 {
+            words.push(carry as u32);
+        }
+    }
+    (words.iter().rev()).fold(0i32, |hash, word| {
+        hash.wrapping_mul(31).wrapping_add(*word as i32)
+    })
+}
+
 /// Digits without leading zeros, so the longer number is the larger.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Number(String);
@@ -234,35 +337,33 @@ fn compare_padding(items: &[Item], index: usize, number: Option<bool>) -> Orderi
         .unwrap_or(Ordering::Equal)
 }
 
-/// `GenericVersion.parse`, with its `Tokenizer`. Separators and digits are
-/// ASCII, so walking bytes splits only between characters.
-fn parse_items(version: &str) -> Vec<Item> {
-    let chars = version.as_bytes();
+/// `GenericVersion.parse`, with its `Tokenizer`, as the maven-resolver
+/// `mode` ships reads digits and qualifiers. Separators are ASCII.
+fn parse_items(version: &str, mode: MavenMode) -> Vec<Item> {
+    let mut chars = version.char_indices().peekable();
     let mut items = Vec::new();
-    let mut index = 0;
-    while index < chars.len() {
+    while let Some(&(start, _)) = chars.peek() {
         // -2 before the first character, -1 in text, 0 in leading zeros, 1 in a number.
         let mut state = -2;
-        let mut start = index;
-        let mut end = chars.len();
+        let mut digits = String::new();
+        let mut end = version.len();
         let mut before_digit = false;
-        while index < chars.len() {
-            let ch = chars[index];
-            if matches!(ch, b'.' | b'-' | b'_') {
+        while let Some(&(index, ch)) = chars.peek() {
+            if matches!(ch, '.' | '-' | '_') {
                 end = index;
-                index += 1;
+                chars.next();
                 break;
             }
-            if ch.is_ascii_digit() {
+            if let Some(digit) = digit(ch, mode) {
                 if state == -1 {
                     end = index;
                     before_digit = true;
                     break;
                 }
-                if state == 0 {
-                    start += 1;
+                state = if state > 0 || digit > 0 { 1 } else { 0 };
+                if state > 0 {
+                    digits.push(char::from(b'0' + digit));
                 }
-                state = if state > 0 || ch != b'0' { 1 } else { 0 };
             } else {
                 if state >= 0 {
                     end = index;
@@ -270,29 +371,69 @@ fn parse_items(version: &str) -> Vec<Item> {
                 }
                 state = -1;
             }
-            index += 1;
+            chars.next();
         }
-        let token = &version[start..end];
-        items.push(if token.is_empty() {
+        let last = chars.peek().is_none();
+        items.push(if state == -1 {
+            text_item(&version[start..end], last, before_digit, mode)
+        } else if digits.is_empty() {
             Item::Number(Number("0".to_string()))
-        } else if state >= 0 {
-            Item::Number(Number(token.to_string()))
         } else {
-            text_item(token, index >= chars.len(), before_digit)
+            Item::Number(Number(digits))
         });
     }
     trim_padding(&mut items);
     items
 }
 
-fn text_item(token: &str, last: bool, before_digit: bool) -> Item {
-    let token = token.to_lowercase();
-    let qualifier = match token.as_str() {
+/// The zeros of the BMP decimal digits Java's `Character.digit` reads
+/// outside ASCII, each the first of ten.
+const DIGIT_ZEROS: [u32; 36] = [
+    0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6, 0xD66, 0xDE6,
+    0xE50, 0xED0, 0xF20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90, 0x1B50,
+    0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0, 0xFF10,
+];
+
+/// The value of `ch` as a digit: maven-resolver 1.9 takes the decimal
+/// digits `Character.digit` reads in a Java `char`, 2.0 the ASCII ones.
+fn digit(ch: char, mode: MavenMode) -> Option<u8> {
+    if let Some(digit) = ch.to_digit(10) {
+        return u8::try_from(digit).ok();
+    }
+    if mode == MavenMode::Maven310 || ch.is_ascii() {
+        return None;
+    }
+    let code = u32::from(ch);
+    let index = DIGIT_ZEROS
+        .partition_point(|&zero| zero <= code)
+        .checked_sub(1)?;
+    u8::try_from(code - DIGIT_ZEROS[index])
+        .ok()
+        .filter(|digit| *digit < 10)
+}
+
+/// A text token: Java lower-cases it, then compares it ignoring case, and
+/// maven-resolver 1.9 looks it up among the qualifiers ignoring case, 2.0
+/// by its lower case.
+fn text_item(token: &str, last: bool, before_digit: bool, mode: MavenMode) -> Item {
+    let lower = token.to_lowercase();
+    let folded = match token.is_ascii() {
+        true => Cow::Borrowed(lower.as_str()),
+        false => Cow::Owned(token.chars().map(fold).collect()),
+    };
+    match &*folded {
         "min" if last => return Item::Min,
         "max" if last => return Item::Max,
-        "a" if before_digit => -5,
-        "b" if before_digit => -4,
-        "m" if before_digit => -3,
+        _ => {}
+    }
+    let name = match mode {
+        MavenMode::Maven39 => &*folded,
+        MavenMode::Maven310 => lower.as_str(),
+    };
+    let qualifier = match name {
+        "a" if before_digit && token.len() == 1 => -5,
+        "b" if before_digit && token.len() == 1 => -4,
+        "m" if before_digit && token.len() == 1 => -3,
         "alpha" => -5,
         "beta" => -4,
         "milestone" => -3,
@@ -300,9 +441,28 @@ fn text_item(token: &str, last: bool, before_digit: bool) -> Item {
         "snapshot" => -1,
         "ga" | "final" | "release" => 0,
         "sp" => 1,
-        _ => return Item::Text(token),
+        _ if token.is_ascii() => return Item::Text(lower),
+        _ => return Item::Text(lower.chars().map(fold).collect()),
     };
     Item::Qualifier(qualifier)
+}
+
+/// `c` as `String.compareToIgnoreCase` compares it: the lower case of its
+/// upper case, each as `Character` maps one character.
+fn fold(c: char) -> char {
+    fn single(mut mapped: impl Iterator<Item = char>, c: char) -> char {
+        match (mapped.next(), mapped.next()) {
+            (Some(one), None) => one,
+            _ => c,
+        }
+    }
+    if c.is_ascii() {
+        return c.to_ascii_lowercase();
+    }
+    match single(c.to_uppercase(), c) {
+        '\u{130}' => 'i',
+        upper => single(upper.to_lowercase(), upper),
+    }
 }
 
 /// `GenericVersion.trimPadding`: drop padding items from the end of each run
@@ -476,6 +636,106 @@ mod tests {
                 assert!(a <= b, "{a} and {b} are out of order");
             }
             corpus.rotate_left(7);
+        }
+    }
+
+    /// Rows where `GenericVersionScheme` from maven-resolver 2.0.24, shipped
+    /// with Maven 3.10.0, differs from 1.9.25 (the 3.9 order is in the
+    /// comment), and rows it keeps.
+    const RESOLVER_2: &[(&str, Ordering, &str)] = &[
+        ("alpha", Less, "0"),          // 3.9 ==
+        ("final", Less, "0"),          // 3.9 ==
+        ("foo", Less, "0.0.0"),        // 3.9 ==
+        ("foo", Less, "0-bar"),        // 3.9 ==
+        ("alpha1", Less, "0-alpha0"),  // 3.9 ==
+        ("alpha", Less, "0.min"),      // 3.9 >
+        ("ga", Less, "0"),             // 3.9 ==
+        ("sp", Less, "0"),             // 3.9 ==
+        ("0-alpha", Greater, "alpha"), // 3.9 ==
+        ("alpha2", Less, "0-alpha"),   // 3.9 ==
+        ("a1", Less, "0"),             // 3.9 ==
+        ("snapshot", Less, "0"),       // 3.9 ==
+        ("alpha", Less, "beta"),
+        ("final", Greater, "alpha"),
+        ("alpha", Less, "0.1"),
+        ("beta", Less, "0-alpha-1"),
+        ("r09", Less, "1.0"),
+        ("foo", Less, "0.max"),
+        ("min", Less, "alpha"),
+        ("max", Greater, "foo"),
+        ("min", Less, "0"),
+        ("1", Greater, "alpha"),
+        ("foo", Equal, "FOO"),
+        ("1.0", Equal, "1"),
+    ];
+
+    #[test]
+    fn orders_like_maven_resolver_2_in_the_310_mode() {
+        use crate::MavenMode::Maven310;
+        for &(a, expected, b) in RESOLVER_2 {
+            assert_eq!(v(a).cmp_in(&v(b), Maven310), expected, "{a} vs {b}");
+            assert_eq!(
+                v(b).cmp_in(&v(a), Maven310),
+                expected.reverse(),
+                "{b} vs {a}"
+            );
+        }
+        for &(a, expected, b) in MAVEN {
+            if !super::starts_with_text(&v(a).items) && !super::starts_with_text(&v(b).items) {
+                assert_eq!(v(a).cmp_in(&v(b), Maven310), expected, "{a} vs {b}");
+            }
+        }
+        let mut corpus: Vec<Version> = ["1", "alpha", "0", "beta", "0.1", "a1", "min", "foo"]
+            .into_iter()
+            .map(v)
+            .collect();
+        Version::sort_by_key_in(&mut corpus, Maven310, |version| version);
+        let sorted: Vec<&str> = corpus.iter().map(Version::as_str).collect();
+        assert_eq!(
+            sorted,
+            ["min", "alpha", "a1", "beta", "foo", "0", "0.1", "1"]
+        );
+        for pair in corpus.windows(2) {
+            assert!(pair[0].cmp_in(&pair[1], Maven310).is_le(), "{pair:?}");
+        }
+    }
+
+    /// Rows outside ASCII, where maven-resolver 1.9.25 reads more decimal
+    /// digits and qualifiers than 2.0.24 does: the order of each, 3.9 first.
+    const UNICODE: &[(&str, Ordering, Ordering, &str)] = &[
+        ("١", Equal, Less, "1"),
+        ("1٠", Equal, Less, "10"),
+        ("٠١", Equal, Less, "1"),
+        ("１.１", Equal, Less, "1.1"),
+        ("𝟙", Less, Less, "1"),
+        ("1.0-ſ", Equal, Equal, "1.0-s"),
+        ("1.0-ſ", Less, Less, "1.0-t"),
+        ("1-ſnapshot", Equal, Greater, "1-snapshot"),
+        ("1-ſnapshot", Less, Greater, "1"),
+        ("1-ı", Equal, Equal, "1-i"),
+        ("1-İ", Greater, Greater, "1-i"),
+        ("1-mİlestone", Equal, Greater, "1-milestone"),
+        ("1-MİN", Equal, Equal, "1-min"),
+        ("1.ς", Equal, Equal, "1.σ"),
+        ("1.ß", Greater, Greater, "1.ss"),
+    ];
+
+    #[test]
+    fn orders_unicode_digits_and_case_as_each_resolver() {
+        use crate::MavenMode::Maven310;
+        let hasher = std::collections::hash_map::RandomState::new();
+        for &(a, maven39, maven310, b) in UNICODE {
+            assert_eq!(v(a).cmp(&v(b)), maven39, "{a} vs {b}");
+            assert_eq!(v(b).cmp(&v(a)), maven39.reverse(), "{b} vs {a}");
+            assert_eq!(v(a).cmp_in(&v(b), Maven310), maven310, "{a} vs {b}");
+            assert_eq!(
+                v(b).cmp_in(&v(a), Maven310),
+                maven310.reverse(),
+                "{b} vs {a}"
+            );
+            if maven39.is_eq() {
+                assert_eq!(hasher.hash_one(v(a)), hasher.hash_one(v(b)), "{a} and {b}");
+            }
         }
     }
 

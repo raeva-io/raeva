@@ -1048,7 +1048,8 @@ pub(crate) struct ConditionReads {
 
 impl Activation {
     /// A property the JVM or the launcher sets whose value raeva does not
-    /// know, such as `java.vendor` or `os.version`, when this interpolated
+    /// know, such as `os.version`, or `java.vendor` where the JDK's
+    /// `release` file does not tell it, when this interpolated
     /// activation tests its value, reads it through `${...}`, or tests the
     /// presence of one only some JDKs set: no `-D` sets it and the other
     /// conditions do not already keep the profile off.
@@ -1122,6 +1123,14 @@ impl Activation {
                 && !user_set(name)
         };
         let unread = |name: &str| unread_path(name) || launcher(name);
+        // A `<property>` test of the host JDK's vendor, which the lock
+        // records with its outcome, though `${java.vendor}` stays unread.
+        let vendor_known = |name: &str| {
+            name == "java.vendor"
+                && ctx.environment.host_java_vendor().is_some()
+                && !ctx.environment.unread_system_property(name)
+                && !jvm_config.contains_key(name)
+        };
         let in_text = |text: &Option<String>, unread: &dyn Fn(&str) -> bool| {
             (crate::properties::expression_names(text.as_deref()?).into_iter())
                 .find(|read| unread(read))
@@ -1156,7 +1165,7 @@ impl Activation {
                 });
             let unread_name = match hidden_value_decides_nothing(property, ctx) {
                 true => unread_value(name) && !user_set(name),
-                false => unread(name),
+                false => unread(name) && !vendor_known(name),
             };
             // A presence test holds only where every JVM sets the name.
             let tested = (unread_name
@@ -1817,6 +1826,12 @@ fn property_active(
                 specification = java_specification_version(ctx.environment.host_java_version());
                 (Some(specification), Some(HostInput::JavaVersion))
             }
+            // Unknown, a value test of it refuses in `unread_host_property`,
+            // and a presence test holds on every JVM.
+            "java.vendor" if value.is_some() && ctx.environment.host_java_vendor().is_some() => (
+                ctx.environment.host_java_vendor(),
+                Some(HostInput::JavaVendor),
+            ),
             // The JVM or the launcher sets these on every host, so a presence
             // check holds. A value test of one raeva does not know refuses
             // the lock in `unread_host_property`.

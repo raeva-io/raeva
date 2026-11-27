@@ -60,8 +60,8 @@ where there is one. The main groups, all exit 3 unless noted:
   takes `${...}` or that a JVM option sets in a way raeva does not read:
   pass `-Duser.home=<dir>` on the command line of both raeva and `mvn`.
   A non-ASCII home or settings path needs a UTF-8 locale.
-- Options that pick files or projects raeva does not read: `-gs`, `-f`
-  or `-itr` in `MAVEN_ARGS` or `.mvn/maven.config`, and other options in
+- Options that pick files or projects raeva does not read: `-gs` or `-f`
+  in `MAVEN_ARGS` or `.mvn/maven.config`, `-itr` in `MAVEN_ARGS`, and other options in
   `MAVEN_CONFIG` that a Maven Wrapper script passes: take them out, or
   unset `MAVEN_CONFIG` ([Maven options](configuration.md#maven-options)).
 - A reactor selection (`-pl`, `-am`, `-amd`, `-rf` or `-N`) in

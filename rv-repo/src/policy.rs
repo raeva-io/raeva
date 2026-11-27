@@ -80,8 +80,8 @@ pub struct Admission {
 ///
 /// "Private address" is a direct connection to a host that resolves, or an
 /// IP literal that points, outside the public internet. "Redirect
-/// authority" lets the repository's origin send raeva on one cross-origin
-/// redirect, as a configured repository may.
+/// authority" lets the repository's origin start a chain of cross-origin
+/// redirects, as a configured repository may.
 #[derive(Clone)]
 pub struct RepositoryPolicy {
     config: Arc<Config>,

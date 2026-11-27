@@ -266,8 +266,9 @@ pub(crate) fn lock_text(
 
 /// Syncs `com.example:demo:1.0.0`, a project with no dependencies, offline,
 /// then makes its root module depend directly on the `org.example` artifacts
-/// `packages` lists at version 2.0.0, as (artifactId, packaging, classifier,
-/// scope), with `edges` between them. Every row gets a placeholder artifact SHA-256 and
+/// `packages` lists at version 2.0.0, as (artifactId, type, classifier,
+/// scope), with `edges` between them. A type is locked at the extension
+/// Maven's core handler gives it. Every row gets a placeholder artifact SHA-256 and
 /// a pinned companion POM in the store. Origins are Maven Central so a Fresh lock check
 /// (`sbom`, `vuln`) does not re-resolve the empty POM.
 pub(crate) fn write_demo_lock(
@@ -286,12 +287,14 @@ pub(crate) fn write_demo_lock(
     let platform = lock.platforms.first_mut().expect("generated platform");
     let store = rv_store::Store::open(&home.join("store")).expect("open fixture store");
     let runtime = tokio::runtime::Runtime::new().expect("fixture runtime");
-    for &(artifact_id, packaging, classifier, scope) in packages {
+    let types = rv_maven_model::ArtifactTypes::core(rv_maven_types::MavenMode::Maven39);
+    for &(artifact_id, type_, classifier, scope) in packages {
+        let extension = types.extension(type_);
         let coordinate = rv_maven_types::ArtifactCoord::new(
             "org.example",
             artifact_id,
             "2.0.0",
-            packaging,
+            extension,
             classifier,
         );
         let mut artifact =
@@ -306,12 +309,9 @@ pub(crate) fn write_demo_lock(
             .block_on(store.put_bytes(pom.as_bytes()))
             .expect("cache fixture POM");
         artifact.pom_sha256 = Some(blob.to_string().parse().unwrap());
-        platform.modules[0]
-            .packages
-            .push(rv_lock::LockModulePackage::new(
-                artifact.coordinate.clone(),
-                Some(scope),
-            ));
+        let mut package = rv_lock::LockModulePackage::new(artifact.coordinate.clone(), Some(scope));
+        package.type_ = (type_ != extension).then(|| type_.to_string());
+        platform.modules[0].packages.push(package);
         platform.artifacts.push(artifact);
     }
     platform.modules[0].edges = edges;

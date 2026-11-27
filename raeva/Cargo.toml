@@ -60,6 +60,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+
 [dev-dependencies]
 rv-config = { workspace = true, features = ["testing"] }
 rusqlite.workspace = true

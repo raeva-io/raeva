@@ -2152,3 +2152,104 @@ fn a_dependency_repository_gets_the_password_for_its_own_parent_only() {
         }
     }
 }
+
+/// `-itr` in `.mvn/maven.config`, as Quarkus has it: Maven 3.9.12 and
+/// 3.10.0 then read no repository a dependency's POM declares, not even
+/// for that POM's own parent, which they read from it without the flag.
+/// raeva locks the same way, whatever `[security]` admits: with `rx`
+/// allowlisted, `a`'s parent and dependency come from `rx` without the
+/// flag, and with it `rx` is never asked and the parent is not found.
+#[test]
+fn ignore_transitive_repositories_in_maven_config_reads_no_descriptor_repository() {
+    let own = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let address = std::sync::Arc::clone(&own);
+    let server = StubServer::start(move |request| {
+        let rx = format!("http://{}/rx/", address.get().expect("address"));
+        let declares = format!(
+            "<repositories><repository><id>rx</id><url>{rx}</url></repository></repositories>"
+        );
+        let parent =
+            "<parent><groupId>t</groupId><artifactId>p</artifactId><version>1</version></parent>";
+        with_sha1(
+            &request.path,
+            [
+                (
+                    "/r1/t/a/1/a-1.pom",
+                    pom(
+                        "a",
+                        &format!(
+                            "{parent}{declares}<dependencies>{}</dependencies>",
+                            dependency("x", "")
+                        ),
+                    ),
+                ),
+                ("/r1/t/a/1/a-1.jar", "a jar".to_string()),
+                ("/rx/t/p/1/p-1.pom", pom("p", "<packaging>pom</packaging>")),
+                ("/rx/t/x/1/x-1.pom", pom("x", "")),
+                ("/rx/t/x/1/x-1.jar", "x jar".to_string()),
+                ("/r1/t/q/1/q-1.pom", pom("q", &declares)),
+                ("/r1/t/q/1/q-1.jar", "q jar".to_string()),
+            ],
+        )
+    });
+    own.set(server.addr().to_string())
+        .expect("address set once");
+    let rx = format!("http://{}/rx/", server.addr());
+    let project = tempfile::tempdir().expect("project");
+    let home = tempfile::tempdir().expect("home");
+    fs::write(
+        home.path().join("config.toml"),
+        format!("[security]\ntransitive_repository_allowlist = [\"{rx}\"]\n"),
+    )
+    .expect("write config.toml");
+    write_repo_toml(
+        project.path(),
+        "r1",
+        &format!("http://{}/r1/", server.addr()),
+    );
+    let write_pom = |artifact: &str| {
+        fs::write(
+            project.path().join("pom.xml"),
+            pom(
+                "app",
+                &format!("<dependencies>{}</dependencies>", dependency(artifact, "")),
+            ),
+        )
+        .expect("write pom.xml");
+    };
+    let asked_rx = || {
+        (server.requests().iter())
+            .filter(|r| r.path.starts_with("/rx/"))
+            .count()
+    };
+
+    write_pom("a");
+    assert_success(
+        &run_raeva(project.path(), home.path(), &["sync"]),
+        "without -itr",
+    );
+    let lock = fs::read_to_string(project.path().join("raeva.lock")).expect("lock");
+    assert!(lock.contains("artifact = \"x\""), "{lock}");
+    assert!(asked_rx() > 0);
+
+    fs::create_dir_all(project.path().join(".mvn")).expect(".mvn");
+    fs::write(project.path().join(".mvn/maven.config"), "-B\n-itr\n").expect("maven.config");
+    let before = asked_rx();
+    let stale = run_raeva(project.path(), home.path(), &["sync", "--frozen"]);
+    assert_status(&stale, 7, "-itr makes the lock stale");
+    let output = run_raeva(project.path(), home.path(), &["sync", "--update"]);
+    assert_status(&output, 5, "the parent only rx holds");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("t:p:1"), "{stderr}");
+    assert!(!stderr.contains("-itr"), "{stderr}");
+    assert_eq!(asked_rx(), before, "rx is never asked under -itr");
+
+    write_pom("q");
+    let output = run_raeva(project.path(), home.path(), &["--json", "sync"]);
+    assert_success(
+        &output,
+        "a dependency that declares rx and needs nothing from it",
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("TRANSITIVE_REPO_DROPPED"));
+    assert_eq!(asked_rx(), before, "rx is never asked under -itr");
+}

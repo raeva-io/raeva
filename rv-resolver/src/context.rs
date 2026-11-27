@@ -17,7 +17,7 @@ use rv_maven_types::{BlobId, Coord, MavenMode, Version, VersionReq};
 use rv_repo::{Metadata, RepoClient, Repository};
 use rv_store::Store;
 
-use crate::error::{RepoSearchStatus, RepoStatus, ResolveError};
+use crate::error::{RepoSearchStatus, ResolveError};
 use crate::graph::ExactCoord;
 use crate::parent_resolver::LocalParentCache;
 use crate::parsed_pom_cache::ParsedPomCache;
@@ -264,7 +264,7 @@ pub(crate) struct ResolveContext {
     /// How the repositories answered for each parent or imported BOM found
     /// missing, by `group:artifact:version` as its POM declares it, the
     /// latest search first. Every module of the pass shares it, for the
-    /// error; see [`Self::naming_filtered_models`].
+    /// error; see [`Self::naming_model_searches`].
     pub(crate) model_misses: ModelMisses,
     /// Every version listing the pass read. Every module of the pass
     /// shares it; see `backend::refuse_split_listings`.
@@ -272,6 +272,11 @@ pub(crate) struct ResolveContext {
     /// What the modules of the pass read of their build extensions'
     /// realms. Every module of the pass shares it.
     pub(crate) extension_realms: Arc<Mutex<ExtensionRealms>>,
+    /// The parents and imported BOMs, by `group:artifact:version`, that
+    /// every module takes from the reactor's model cache before its
+    /// repositories, as Maven does: those an earlier pass read with
+    /// different bytes in two modules.
+    pub(crate) read_first: Arc<BTreeSet<String>>,
 }
 
 /// The version a version listing's search takes in [`ModelMisses`], which
@@ -491,6 +496,31 @@ impl ResolveContext {
         }
     }
 
+    /// This context for another pass that takes `read_first` from the
+    /// model cache, with nothing read yet.
+    pub(crate) fn reading_first(&self, read_first: BTreeSet<String>) -> Self {
+        lock(&self.model_misses).clear();
+        lock(&self.id_listings).clear();
+        *lock(&self.extension_realms) = ExtensionRealms::default();
+        self.reactor_through_dependencies
+            .store(false, Ordering::Relaxed);
+        Self {
+            state: self.state.emptied(),
+            read_first: Arc::new(read_first),
+            ..self.clone()
+        }
+    }
+
+    /// Whether `coord`'s POM is taken from the model cache before the
+    /// repositories; see [`Self::read_first`].
+    pub(crate) fn reads_first(&self, coord: &Coord) -> bool {
+        !self.read_first.is_empty()
+            && (self.read_first).contains(&format!(
+                "{}:{}:{}",
+                coord.group_id, coord.artifact_id, coord.version
+            ))
+    }
+
     /// This context with `likes` as the reactor's classifier likes.
     pub(crate) fn with_classifier_likes(
         mut self,
@@ -558,6 +588,7 @@ impl ResolveContext {
             model_misses: Arc::default(),
             id_listings: Arc::default(),
             extension_realms: Arc::default(),
+            read_first: Arc::default(),
             state,
         }
     }
@@ -744,21 +775,12 @@ impl ResolveContext {
     }
 
     /// `error` with how the repositories answered for a parent or imported
-    /// BOM it misses, when a remote repository filter kept one of them out.
-    pub(crate) fn naming_filtered_models(
-        misses: &ModelMisses,
-        error: ResolveError,
-    ) -> ResolveError {
+    /// BOM it misses ([`ResolveError::naming_model_searches`]).
+    pub(crate) fn naming_model_searches(misses: &ModelMisses, error: ResolveError) -> ResolveError {
         let misses = lock(misses);
-        error.naming_filtered_models(&|(group, artifact, version)| {
+        error.naming_model_searches(&|(group, artifact, version)| {
             let key = (group.to_string(), artifact.to_string(), version.to_string());
-            (misses.get(&key))
-                .filter(|searched| {
-                    searched
-                        .iter()
-                        .any(|entry| entry.status == RepoStatus::Filtered)
-                })
-                .cloned()
+            misses.get(&key).cloned()
         })
     }
 }

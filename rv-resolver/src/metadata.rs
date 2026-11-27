@@ -19,12 +19,7 @@ impl Workspace {
         platform: &Platform,
         evidence: &S,
     ) -> Result<EffectiveMetadata, S::Error> {
-        let base_dir = self
-            .root()
-            .join(&module.pom_path)
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let base_dir = module.pom_file().parent().unwrap().to_path_buf();
         let local = LocalParents::new(base_dir.clone(), self.local_parent_boundary())
             .cached_in(Arc::clone(&self.parents));
         let mut activation = build_activation_context(Some(base_dir), config, Some(platform));
@@ -86,7 +81,7 @@ impl Workspace {
         let mut pom = module.pom().clone();
         pom.group_id = Some(module.gav().group_id.clone());
         pom.artifact_id = Some(module.gav().artifact_id.clone());
-        anchor_parent_path(&mut pom, &self.root().join(&module.pom_path));
+        anchor_parent_path(&mut pom, module.pom_file());
         if module.local_parents().is_empty()
             && let Some(parent) = &mut pom.parent
             && parent.version.contains("${")

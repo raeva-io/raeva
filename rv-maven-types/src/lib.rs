@@ -44,7 +44,7 @@ pub use purl::{
     maven_purl_with_qualifiers,
 };
 pub use range::{VersionRange, VersionReq};
-pub use scope::{InvalidScope, Scope};
+pub use scope::{InvalidScope, Scope, decode_lock_text, encode_lock_text, lock_text_recordable};
 pub use snapshot::{
     SnapshotStamp, TimestampedSnapshot, is_listed_snapshot_version, is_snapshot_timestamp,
     is_snapshot_version, resolves_through_snapshot_metadata, snapshot_base_version,

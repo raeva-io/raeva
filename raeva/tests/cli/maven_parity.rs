@@ -279,13 +279,13 @@ fn artifact_sources(lock: &toml::Value, name: &str) -> Vec<String> {
 fn system_dependencies(lock: &toml::Value, name: &str) -> Vec<String> {
     let mut found = std::collections::BTreeSet::new();
     for module in platform(lock, name)["modules"].as_array().expect("modules") {
-        // Tab-separated columns; the sixth is the system path.
+        // Tab-separated columns; the seventh is the system path.
         let packages = module["packages"].as_str().expect("packages");
         for columns in packages
             .lines()
             .map(|line| line.split('\t').collect::<Vec<_>>())
         {
-            if columns.get(5).is_some_and(|path| !path.is_empty()) {
+            if columns.get(6).is_some_and(|path| !path.is_empty()) {
                 found.insert(columns[0].to_string());
             }
         }

@@ -13,7 +13,7 @@ Options:
           [possible values: component_not_present, vulnerable_code_not_present, vulnerable_code_not_in_execute_path, vulnerable_code_cannot_be_controlled_by_adversary, inline_mitigations_already_exist]
 
       --module <MODULE>
-          Select a module by root-relative POM path or unique groupId:artifactId
+          Select a module by its POM path in raeva.lock or unique groupId:artifactId
 
       --platform <OS-ARCH>
           Report only this recorded platform (default: all platforms)

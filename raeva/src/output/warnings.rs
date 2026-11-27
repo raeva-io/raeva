@@ -35,6 +35,9 @@ pub(crate) enum WarningCode {
     /// raeva accepted remote metadata under the repository policy although its
     /// checksum still did not match after a retry.
     MetadataChecksumMismatch,
+    /// raeva used metadata, a POM or an artifact whose `.sha256` did not
+    /// match while the `.sha1`, or the `.md5`, which Maven checks, did.
+    Sha256FileMismatch,
     /// Only a SHA-1 checksum sidecar was available for an artifact.
     WeakHashFallback,
     CrossHostMirror,
@@ -141,6 +144,10 @@ pub(crate) enum WarningCode {
     /// read, or a dependency has a scope Maven does not know; raeva went on
     /// as Maven does.
     PomProblem,
+    /// In the Maven 3.9 mode, a POM of the project declares a dependency or
+    /// managed dependency twice, which Maven 3.9 warns of and Maven 3.10
+    /// refuses. Hidden by `--quiet`, as `mvn -q` hides it.
+    DuplicateDependency,
     /// A POM repository has a URL raeva has no transport for, which Maven
     /// skips too.
     RepositoryIgnored,
@@ -458,6 +465,12 @@ pub(crate) fn summarize(warnings: &[Warning], list_all: &str) -> Vec<String> {
                     .map(|warning| format!("warning: {code}: {}", warning.message))
                     .collect::<Vec<_>>();
             }
+            // A file is warned about only when a run downloads it, but
+            // raeva.lock marks it, and `--frozen` lists the marks.
+            let list_all = match code {
+                WarningCode::ChecksumMissing => "'raeva sync --frozen' lists them",
+                _ => list_all,
+            };
             let mut line = describe(group[0]);
             if group.len() > 1 {
                 line.push_str(&format!(" and {} more ({list_all})", group.len() - 1));
@@ -671,6 +684,7 @@ mod tests {
                     &rv_repo::RepoError::HttpStatus {
                         status: reqwest::StatusCode::from_u16(status).unwrap(),
                         url: "https://corp.example/lib".to_string(),
+                        redirected_to: None,
                         retry_after: None,
                     },
                 );
@@ -733,6 +747,7 @@ mod tests {
                     &rv_repo::RepoError::HttpStatus {
                         status: reqwest::StatusCode::from_u16(500).unwrap(),
                         url: "https://mask.example/lib".to_string(),
+                        redirected_to: None,
                         retry_after: None,
                     },
                 );
@@ -786,6 +801,7 @@ mod tests {
                     &rv_repo::RepoError::Unauthorized {
                         status: reqwest::StatusCode::from_u16(status).unwrap(),
                         url: "https://private.example/lib".to_string(),
+                        redirected_to: None,
                         sent: (refusing == "corp").then(|| {
                             Box::new(rv_repo::SentCredential {
                                 id: Some("corp".to_string()),

@@ -102,6 +102,11 @@ impl Staged {
     pub fn blob(&self) -> &BlobId {
         &self.blob
     }
+
+    /// The SHA-1 of the bytes, when they were staged with it.
+    pub fn sha1(&self) -> Option<&Sha1> {
+        self.sha1.as_ref()
+    }
 }
 
 impl Store {

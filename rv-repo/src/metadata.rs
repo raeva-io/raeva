@@ -255,47 +255,42 @@ impl Metadata {
         Self::parse(xml)
     }
 
-    /// The timestamped version that `<version>` and `<snapshot>` name, such
-    /// as `1.0-20240101.010101-7`. `None` without a version, a timestamp or a
-    /// build number above zero, or when the timestamp is not
-    /// `YYYYMMDD.HHMMSS`.
-    pub fn snapshot_timestamped_version(&self) -> Option<String> {
-        let version = self.version.as_deref()?;
+    /// The file version `<snapshot>` gives the `SNAPSHOT` version
+    /// `version`, as `DefaultVersionResolver` builds it: `version` without
+    /// `SNAPSHOT`, then `<timestamp>-<buildNumber>`, so
+    /// `1.0-20240101.010101-7` for `1.0-SNAPSHOT`, and JitPack's
+    /// `main-0d99b1a098-1` for `main-SNAPSHOT`. Maven reads neither
+    /// `<version>` nor the timestamp's shape. `None` without a timestamp or
+    /// a build number above zero, or when `version` does not end in
+    /// `SNAPSHOT`.
+    pub fn snapshot_timestamped_version(&self, version: &str) -> Option<String> {
         let snapshot = self.snapshot.as_ref()?;
         let timestamp = snapshot.timestamp.as_deref()?;
-        // `DefaultVersionResolver` uses the `<snapshot>` only with a build
-        // number above zero.
         let build = snapshot.build_number.filter(|build| *build > 0)?;
-        // A malformed `<timestamp>` would round-trip into a filename Maven
-        // cannot resolve; the caller falls back to base-version semantics.
-        rv_maven_types::is_snapshot_timestamp(timestamp)
-            .then(|| rv_maven_types::timestamped_snapshot_version(version, timestamp, build))?
+        rv_maven_types::timestamped_snapshot_version(version, timestamp, build)
     }
 
-    /// The version to fetch for the file with `classifier` and `extension`:
-    /// its `<snapshotVersion>`, else the version `<snapshot>` names, else a
-    /// `-SNAPSHOT` `<version>` base version. `None` when none applies.
+    /// The version to fetch for the file with `classifier` and `extension`
+    /// of the `SNAPSHOT` version `version`: its `<snapshotVersion>`, else
+    /// the version `<snapshot>` names, else `version` itself.
     ///
     /// As in Maven, `<snapshot>` applies only without `<snapshotVersions>`,
-    /// and a file the entries omit, a POM included, keeps the base version.
+    /// and a file the entries omit, a POM included, keeps `version`.
     pub fn snapshot_version_for(
         &self,
+        version: &str,
         classifier: Option<&str>,
         extension: &str,
-    ) -> Option<String> {
+    ) -> String {
         self.snapshot_entry_for(classifier, extension)
             .map(|entry| entry.value.clone())
             .or_else(|| {
                 self.snapshot_versions
                     .is_empty()
-                    .then(|| self.snapshot_timestamped_version())
+                    .then(|| self.snapshot_timestamped_version(version))
                     .flatten()
             })
-            .or_else(|| {
-                self.version
-                    .clone()
-                    .filter(|version| rv_maven_types::resolves_through_snapshot_metadata(version))
-            })
+            .unwrap_or_else(|| version.to_string())
     }
 
     /// The comparison value for the requested snapshot file: its entry's
@@ -415,10 +410,8 @@ mod tests {
         );
         // As in Maven, a file the entries omit keeps the base version.
         assert_eq!(
-            metadata
-                .snapshot_version_for(Some("linux"), "jar")
-                .as_deref(),
-            Some("1.0-SNAPSHOT")
+            metadata.snapshot_version_for("1.0-SNAPSHOT", Some("linux"), "jar"),
+            "1.0-SNAPSHOT"
         );
         let with_snapshot = xml.replace(
             "<versioning>",
@@ -433,8 +426,8 @@ mod tests {
         assert_ne!(without_pom, with_snapshot);
         let with_snapshot = Metadata::parse(&with_snapshot).unwrap();
         assert_eq!(
-            with_snapshot.snapshot_version_for(None, "zip").as_deref(),
-            Some("1.0-SNAPSHOT")
+            with_snapshot.snapshot_version_for("1.0-SNAPSHOT", None, "zip"),
+            "1.0-SNAPSHOT"
         );
         assert_eq!(
             with_snapshot.snapshot_candidate(None, "zip"),
@@ -443,8 +436,8 @@ mod tests {
         // A POM the entries omit too, though `<snapshot>` names a build.
         let without_pom = Metadata::parse(&without_pom).unwrap();
         assert_eq!(
-            without_pom.snapshot_version_for(None, "pom").as_deref(),
-            Some("1.0-SNAPSHOT")
+            without_pom.snapshot_version_for("1.0-SNAPSHOT", None, "pom"),
+            "1.0-SNAPSHOT"
         );
         assert_eq!(
             without_pom.snapshot_candidate(None, "pom"),
@@ -476,10 +469,8 @@ mod tests {
             (None, "pom", "1.0-20240101.010101-7"),
         ] {
             assert_eq!(
-                metadata
-                    .snapshot_version_for(classifier, extension)
-                    .as_deref(),
-                Some(value)
+                metadata.snapshot_version_for("1.0-SNAPSHOT", classifier, extension),
+                value
             );
         }
     }
@@ -495,8 +486,8 @@ mod tests {
         .unwrap();
         for classifier in [None, Some("")] {
             assert_eq!(
-                metadata.snapshot_version_for(classifier, "jar").as_deref(),
-                Some("1.0-20240101.010101-3")
+                metadata.snapshot_version_for("1.0-SNAPSHOT", classifier, "jar"),
+                "1.0-20240101.010101-3"
             );
         }
     }
@@ -518,8 +509,8 @@ mod tests {
             ))
             .unwrap_or_else(|err| panic!("{entry}: {err}"));
             assert_eq!(
-                metadata.snapshot_version_for(None, "jar").as_deref(),
-                Some("1.0-SNAPSHOT"),
+                metadata.snapshot_version_for("1.0-SNAPSHOT", None, "jar"),
+                "1.0-SNAPSHOT",
                 "{entry}"
             );
             assert_eq!(
@@ -530,9 +521,10 @@ mod tests {
         }
     }
 
-    /// Without `<snapshotVersions>` the `<snapshot>` block names the build;
-    /// a non-unique snapshot keeps the base version, and a malformed
-    /// timestamp is dropped.
+    /// Without `<snapshotVersions>` the `<snapshot>` block names the build
+    /// of the version asked for, whatever `<version>` says and whatever the
+    /// timestamp's shape, as Maven 3.9.16's `DefaultVersionResolver` builds
+    /// it; a non-unique snapshot keeps the version asked for.
     #[test]
     fn snapshot_versions_fall_back_to_the_snapshot_block() {
         let metadata = |snapshot: &str| {
@@ -545,23 +537,54 @@ mod tests {
         let timestamped =
             metadata("<timestamp>20240101.010101</timestamp><buildNumber>7</buildNumber>");
         assert_eq!(
-            timestamped.snapshot_timestamped_version().as_deref(),
-            Some("1.2.3-20240101.010101-7")
-        );
-        assert_eq!(
-            timestamped.snapshot_version_for(None, "jar").as_deref(),
-            Some("1.2.3-20240101.010101-7")
-        );
-        assert_eq!(
-            metadata("<localCopy>true</localCopy>")
-                .snapshot_version_for(None, "jar")
+            timestamped
+                .snapshot_timestamped_version("1.2.3-SNAPSHOT")
                 .as_deref(),
-            Some("1.2.3-SNAPSHOT")
+            Some("1.2.3-20240101.010101-7")
+        );
+        assert_eq!(
+            timestamped.snapshot_version_for("1.2.3-SNAPSHOT", None, "jar"),
+            "1.2.3-20240101.010101-7"
+        );
+        assert_eq!(
+            metadata("<localCopy>true</localCopy>").snapshot_version_for(
+                "1.2.3-SNAPSHOT",
+                None,
+                "jar"
+            ),
+            "1.2.3-SNAPSHOT"
         );
 
-        let malformed =
+        // The caller checks the version before it goes in a path.
+        let odd_timestamp =
             metadata("<timestamp>evil-timestamp</timestamp><buildNumber>3</buildNumber>");
-        assert!(malformed.snapshot_timestamped_version().is_none());
+        assert_eq!(
+            odd_timestamp.snapshot_version_for("1.2.3-SNAPSHOT", None, "jar"),
+            "1.2.3-evil-timestamp-3"
+        );
+        // JitPack's branch snapshot: a commit hash for a timestamp, and the
+        // build in `<version>`.
+        let jitpack = Metadata::parse(
+            "<metadata modelVersion=\"1.0.0\"><groupId>com.github.x</groupId>\
+             <artifactId>y</artifactId><version>main-0d99b1a098-1</version><versioning>\
+             <snapshot><timestamp>0d99b1a098</timestamp><buildNumber>1</buildNumber>\
+             </snapshot></versioning></metadata>",
+        )
+        .unwrap();
+        assert_eq!(
+            jitpack.snapshot_version_for("main-SNAPSHOT", None, "jar"),
+            "main-0d99b1a098-1"
+        );
+        assert_eq!(
+            jitpack.snapshot_candidate(None, "jar"),
+            SnapshotCandidate::Generic
+        );
+        // Without `<version>` or `<snapshot>`, the version asked for.
+        let bare = Metadata::parse("<metadata><versioning/></metadata>").unwrap();
+        assert_eq!(
+            bare.snapshot_version_for("1.2.3-SNAPSHOT", None, "jar"),
+            "1.2.3-SNAPSHOT"
+        );
 
         // Maven's lenient reader takes a <buildNumber> that is not an int as
         // 0, and then uses the base version.
@@ -570,8 +593,8 @@ mod tests {
                 "<timestamp>20240101.010101</timestamp><buildNumber>{build}</buildNumber>"
             ));
             assert_eq!(
-                odd.snapshot_version_for(None, "jar").as_deref(),
-                Some("1.2.3-SNAPSHOT"),
+                odd.snapshot_version_for("1.2.3-SNAPSHOT", None, "jar"),
+                "1.2.3-SNAPSHOT",
                 "{build:?}"
             );
         }
@@ -652,11 +675,13 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.version.as_deref(), Some("1.0-SNAPSHOT"));
         assert_eq!(
-            metadata.snapshot_version_for(None, "jar").as_deref(),
-            Some("1.0-20240101.010101-7")
+            metadata.snapshot_version_for("1.0-SNAPSHOT", None, "jar"),
+            "1.0-20240101.010101-7"
         );
         assert_eq!(
-            metadata.snapshot_timestamped_version().as_deref(),
+            metadata
+                .snapshot_timestamped_version("1.0-SNAPSHOT")
+                .as_deref(),
             Some("1.0-20240101.010101-7")
         );
     }

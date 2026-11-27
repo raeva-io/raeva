@@ -33,10 +33,7 @@ pub enum RedirectRejectionKind {
     /// configured, but the target's scheme or port is not a configured
     /// origin.
     ExemptHostOriginMismatch,
-    /// The chain already crossed origins once; only one cross-origin hop
-    /// is followed.
-    SecondCrossOriginHop,
-    /// The chain reached 5 hops.
+    /// The chain followed 5 redirects and was redirected again.
     ChainLimit,
 }
 
@@ -60,8 +57,7 @@ impl RedirectRejectionKind {
             Self::ExemptHostOriginMismatch => {
                 "cross-origin redirect rejected: target host is configured but the target origin is not"
             }
-            Self::SecondCrossOriginHop => "cross-origin redirect rejected: second cross-origin hop",
-            Self::ChainLimit => "redirect rejected: chain exceeds 5 hops",
+            Self::ChainLimit => "redirect rejected: chain exceeds 5 redirects",
         }
     }
 }
@@ -142,10 +138,12 @@ pub enum RepoError {
     NotFound(Missing),
     /// Bytes that do not match a checksum. `check` says which promise
     /// failed; `expected` and `actual` use that checksum's algorithm.
-    #[error("checksum mismatch for {subject}: expected {expected}, got {actual} ({})", check.describe())]
+    #[error("checksum mismatch for {subject}: expected {expected}, got {actual} ({})", check.describe(expected))]
     ChecksumMismatch {
         /// The coordinate for a lock pin check (the URL path when no
-        /// coordinate is known), the repository path for a sidecar check. Boxed, like `artifact`, so `RepoError` stays small.
+        /// coordinate is known); for a sidecar check, the URL of a
+        /// downloaded artifact or the repository path of a model file.
+        /// Boxed, like `artifact`, so `RepoError` stays small.
         subject: Box<str>,
         /// The artifact the bytes were fetched for, when there is one.
         /// Metadata files have none.
@@ -161,9 +159,7 @@ pub enum RepoError {
     /// sidecar for a remote file and missing sidecars are not allowed.
     /// Holds the repository path.
     #[error(
-        "missing checksum for {0}: the repository publishes no usable .sha256, .sha1 or .md5 sidecar for this file. \
-         If you trust this repository without checksums, run 'raeva sync --allow-missing-checksums' and review \
-         raeva.lock (SUPPLY-CHAIN RISK: the bytes are not checked against a server-published checksum)"
+        "missing checksum for {0}: the repository publishes no usable .sha256, .sha1 or .md5 sidecar for this file"
     )]
     MissingChecksum(String),
     /// Remote metadata without a usable sidecar, from a repository whose
@@ -171,9 +167,7 @@ pub enum RepoError {
     /// repository path.
     #[error(
         "missing checksum for {0}: the repository publishes no usable .sha256, .sha1 or .md5 sidecar for this \
-         metadata, and its checksum policy is fail. The repository must publish one; to accept the metadata \
-         unverified, set that policy to warn or ignore and run 'raeva sync --allow-missing-checksums', then \
-         review raeva.lock"
+         metadata, and its checksum policy is fail, which no flag lifts"
     )]
     MissingMetadataChecksum(String),
     /// A lockfile row that [`ensure_artifacts`] would download records no
@@ -213,7 +207,8 @@ pub enum RepoError {
     /// The server refused the request: 401 or 403 from a repository, or 407
     /// from a proxy.
     #[error(
-        "auth error: {status} for {url}{}",
+        "auth error: {status} for {url}{}{}",
+        redirected_to.as_deref().map(|origin| format!(" (redirected to {origin})")).unwrap_or_default(),
         if *status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
             " - the proxy wants credentials: username and password (or token) in config.toml or settings.xml, or user:password@ in HTTPS_PROXY or HTTP_PROXY"
         } else {
@@ -223,8 +218,12 @@ pub enum RepoError {
     Unauthorized {
         /// 401, 403 or 407.
         status: StatusCode,
-        /// The redacted request URL.
+        /// The redacted request URL, or the origin of the redirect target
+        /// that refused it.
         url: String,
+        /// The origin that answered, when a redirect within the request's
+        /// origin moved it: its path and query may hold a download ticket.
+        redirected_to: Option<String>,
         /// The credential a refused 401 or 403 request carried, `None` when
         /// it carried none.
         sent: Option<Box<SentCredential>>,
@@ -286,12 +285,18 @@ pub enum RepoError {
     Cache(#[from] rv_store::metadata_cache::CacheError),
     /// An unsuccessful HTTP status other than 404 and the refusals in
     /// [`RepoError::Unauthorized`].
-    #[error("unexpected response: {status} for {url}")]
+    #[error(
+        "unexpected response: {status} for {url}{}",
+        redirected_to.as_deref().map(|origin| format!(" (redirected to {origin})")).unwrap_or_default()
+    )]
     HttpStatus {
         /// The status the server answered with.
         status: StatusCode,
         /// The redacted request URL.
         url: String,
+        /// The origin that answered, when a redirect moved the request: its
+        /// path and query may hold a download ticket, so only the origin.
+        redirected_to: Option<String>,
         /// The delay a busy answer's `Retry-After` asked for.
         retry_after: Option<std::time::Duration>,
     },
@@ -442,15 +447,18 @@ pub enum ErrorClass {
 pub enum IntegritySource {
     /// A checksum sidecar the repository published next to the file.
     Sidecar,
+    /// The checksum header the repository sent with the file.
+    Header,
     /// The pin raeva.lock records.
     LockPin,
 }
 
 impl IntegritySource {
-    fn describe(self) -> &'static str {
+    fn describe(self, expected: &Digest) -> String {
         match self {
-            Self::Sidecar => "the repository's checksum file",
-            Self::LockPin => "the raeva.lock pin",
+            Self::Sidecar => format!("the repository's .{} file", expected.algorithm().as_str()),
+            Self::Header => "the checksum header the repository sent".to_string(),
+            Self::LockPin => "the raeva.lock pin".to_string(),
         }
     }
 }
@@ -690,11 +698,13 @@ mod tests {
         let status = |code| RepoError::HttpStatus {
             status: StatusCode::from_u16(code).unwrap(),
             url: url(),
+            redirected_to: None,
             retry_after: None,
         };
         let unauthorized = |code| RepoError::Unauthorized {
             status: StatusCode::from_u16(code).unwrap(),
             url: url(),
+            redirected_to: None,
             sent: None,
         };
         let mismatch = |check| RepoError::ChecksumMismatch {
@@ -733,7 +743,7 @@ mod tests {
             (RepoError::Transfer(std::io::Error::other("stalled")), C::Transport { retried: true }, true, false, ""),
             (mismatch(IntegritySource::Sidecar), C::Integrity(IntegritySource::Sidecar), false, false,
                 "checksum mismatch for artifact.jar: expected sha256:ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb, \
-                got sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d (the repository's checksum file)"),
+                got sha256:3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d (the repository's .sha256 file)"),
             (mismatch(IntegritySource::LockPin), C::Integrity(IntegritySource::LockPin), false, false, ""),
             (RepoError::Io(disk()), C::Store, false, true, ""),
             (RepoError::Store(rv_store::StoreError::IoError(disk())), C::Store, false, false, ""),
@@ -746,8 +756,8 @@ mod tests {
             (RepoError::BlockedMirror("corp".to_string()), C::Config, false, true, "mirror 'corp' is blocked"),
             (RepoError::InvalidCoord("../x".to_string()), C::Other, false, false, ""),
             (RepoError::InvalidFileUrl("'file:/x'".to_string()), C::Other, false, false, "invalid file URL"),
-            (RepoError::MissingChecksum(path.to_string()), C::Other, false, false, "raeva sync --allow-missing-checksums"),
-            (RepoError::MissingMetadataChecksum(path.to_string()), C::Other, false, false, "checksum policy is fail"),
+            (RepoError::MissingChecksum(path.to_string()), C::Other, false, false, "sidecar for this file"),
+            (RepoError::MissingMetadataChecksum(path.to_string()), C::Other, false, false, "checksum policy is fail, which no flag lifts"),
             (RepoError::NonGlobalAddress { url: url(), addr: std::net::IpAddr::from([10, 0, 0, 5]) }, C::Other, false, true, ""),
             (RepoError::ProxiedUntrustedHost(url()), C::Other, false, true, "NO_PROXY"),
             (RepoError::Internal("task panicked".to_string()), C::Internal, false, false, "internal"),

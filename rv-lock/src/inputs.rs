@@ -47,6 +47,10 @@ pub struct ResolutionInputs {
     pub plugin_repositories: Vec<RepositoryInputs>,
     /// `[security] allow_transitive_repositories`.
     pub allow_transitive_repositories: bool,
+    /// `-itr` in `.mvn/maven.config`, which turns every transitive
+    /// repository off. Hashed only when set, so a configuration without it
+    /// keeps its hash.
+    pub ignore_transitive_repositories: bool,
     /// `[security] allow_env_substitution`.
     pub allow_env_substitution: Vec<String>,
     /// `[security] transitive_repository_allowlist`.
@@ -173,6 +177,10 @@ pub fn config_hash(inputs: &ResolutionInputs) -> String {
         "transitive_repository_allowlist",
         &inputs.transitive_repository_allowlist,
     );
+
+    if inputs.ignore_transitive_repositories {
+        hasher.update(b"ignore_transitive_repositories:");
+    }
 
     if !inputs.jdks.is_empty() {
         hasher.update(b"jdks:");
@@ -481,7 +489,7 @@ pub fn graph_digests(
         .collect();
     // A canonical copy when the row needs one, its packages, edges and
     // managed sources, and their digest.
-    type Encoded = (Option<LockModule>, String, String, String, [u8; 32]);
+    type Encoded = (Option<LockModule>, String, String, String, String, [u8; 32]);
     // One pass canonicalizes a row that needs it and encodes it.
     let encoded = rv_maven_types::par_map(&platform.modules, |module| -> Encoded {
         let canonical = (!crate::lock::is_canonical_module(module)).then(|| {
@@ -493,6 +501,7 @@ pub fn graph_digests(
         let packages = crate::codec::encode_packages(row);
         let edges = crate::codec::encode_edges(row);
         let managed = crate::codec::encode_managed(row);
+        let optional = crate::codec::encode_optional(row);
         let mut hasher = Sha256::new();
         hash_str(&mut hasher, &packages);
         hash_str(&mut hasher, &edges);
@@ -501,8 +510,12 @@ pub fn graph_digests(
         if !managed.is_empty() {
             hash_str(&mut hasher, &managed);
         }
+        if !optional.is_empty() {
+            hash_str(&mut hasher, "optional");
+            hash_str(&mut hasher, &optional);
+        }
         let digest: [u8; 32] = hasher.finalize().into();
-        (canonical, packages, edges, managed, digest)
+        (canonical, packages, edges, managed, optional, digest)
     });
     let rows: Vec<&LockModule> = (platform.modules.iter())
         .zip(&encoded)
@@ -512,7 +525,7 @@ pub fn graph_digests(
         .zip(&encoded)
         .map(|(row, (.., digest))| (row.path.as_str(), digest))
         .collect();
-    let digest = |&(row, (_, packages, edges, managed, _)): &(&LockModule, &Encoded)| {
+    let digest = |&(row, (_, packages, edges, managed, optional, _)): &(&LockModule, &Encoded)| {
         let mut hasher = Sha256::new();
         hash_str(&mut hasher, "graph");
         hash_str(&mut hasher, &context);
@@ -526,6 +539,10 @@ pub fn graph_digests(
         if !managed.is_empty() {
             hash_str(&mut hasher, "managed");
             hash_str(&mut hasher, managed);
+        }
+        if !optional.is_empty() {
+            hash_str(&mut hasher, "optional");
+            hash_str(&mut hasher, optional);
         }
         for range in &row.parent_ranges {
             hash_str(&mut hasher, &range.model);

@@ -62,7 +62,7 @@ fn mirror(id: Option<&str>, url: &str, mirror_of: &str) -> rv_config::MirrorConf
 fn query_ids_cover_recorded_configured_and_mirror_ids() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
+        "schema_version = 10\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
     )
     .expect("well-formed lines decode");
     let config =
@@ -92,7 +92,7 @@ fn stored_files_stand_in_for_the_repositories_the_project_trusts() {
     const M: &str = "https://m.example/";
     let root = tempfile::tempdir().unwrap();
     let mut lock = Lockfile::from_toml(&format!(
-        "schema_version = 9\n\n[metadata]\nrepo_ids = \"{R}\\tgood\\n{R}\\tevil\"\n"
+        "schema_version = 10\n\n[metadata]\nrepo_ids = \"{R}\\tgood\\n{R}\\tevil\"\n"
     ))
     .unwrap();
     let mut row = package("org.example", "lib", "1.0", "jar", None);
@@ -154,7 +154,7 @@ fn stored_files_stand_in_for_the_repositories_the_project_trusts() {
 fn marker_ids_follow_the_mirror_configured_now() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://repo1.maven.org/maven2/\\tcentral\\nhttps://nexus.corp/repo/\\tcorp\"\n",
+        "schema_version = 10\n\n[metadata]\nrepo_ids = \"https://repo1.maven.org/maven2/\\tcentral\\nhttps://nexus.corp/repo/\\tcorp\"\n",
     )
     .expect("well-formed lines decode");
     let config = config_with_repos(root.path(), &["https://configured.example/"]);
@@ -205,7 +205,7 @@ fn marker_ids_follow_the_mirror_configured_now() {
 fn an_id_less_configured_repository_takes_its_mirror_id() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
+        "schema_version = 10\n\n[metadata]\nrepo_ids = \"https://nexus.corp/repo/\\tcorp\"\n",
     )
     .expect("well-formed lines decode");
     let config = |mirrors| {
@@ -247,7 +247,7 @@ fn an_id_less_configured_repository_takes_its_mirror_id() {
 fn a_configured_id_joins_the_ids_recorded_for_its_url() {
     let root = tempfile::tempdir().unwrap();
     let lock = Lockfile::from_toml(
-        "schema_version = 9\n\n[metadata]\nrepo_ids = \"https://configured.example/\\trepo\\nhttps://configured.example/\\tsnapshots\"\n",
+        "schema_version = 10\n\n[metadata]\nrepo_ids = \"https://configured.example/\\trepo\\nhttps://configured.example/\\tsnapshots\"\n",
     )
     .expect("well-formed lines decode");
     let config = config_with_repos(root.path(), &["https://configured.example/"]);
@@ -531,7 +531,7 @@ fn a_recorded_directory_takes_the_mirror_its_spelled_declaration_picks() {
         "external:*,!central",
     )]);
     let lock = Lockfile::from_toml(
-        "schema_version = 9\n\n[metadata]\nrepo_ids = \"../plugins/\\tp\\n./repo/\\tlocal-repo\"\n",
+        "schema_version = 10\n\n[metadata]\nrepo_ids = \"../plugins/\\tp\\n./repo/\\tlocal-repo\"\n",
     )
     .unwrap();
     let in_project = url::Url::from_directory_path(project.join("repo"))

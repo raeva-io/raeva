@@ -10,10 +10,10 @@ use rv_store::metadata_cache::CacheTable;
 use rv_store::{Origin, PinCheck, Staged, Store};
 
 use super::models::PomRead;
-use super::requests::DeferredWarnings;
+use super::requests::{DeferredWarnings, wrong_sha256 as wrong_sha256_warning};
 use super::{RepoClient, file_path, filter_path};
 use crate::artifact::ArtifactRequest;
-use crate::error::{RepoError, Result};
+use crate::error::{IntegritySource, RepoError, Result};
 use crate::fetch::{ArtifactChecks, Transfer, fetch_artifact_staged, publish_artifact};
 use crate::routing::Route;
 
@@ -60,6 +60,8 @@ pub(super) struct Prefetched {
     generation: u64,
     warnings: DeferredWarnings,
     staged: Staged,
+    /// The SHA-1 the server sent with the file.
+    included: Option<Digest>,
 }
 
 /// The artifacts [`RepoClient::fetch_artifact`] stored, by the same key as
@@ -98,7 +100,7 @@ impl RepoClient {
     /// Whether `--update` downloads the file at `path` again instead of
     /// taking stored bytes no checksum file verified: raeva.lock marks it
     /// as accepted without one, and the download asks for one again.
-    fn rechecks(&self, path: &str) -> bool {
+    pub(super) fn rechecks(&self, path: &str) -> bool {
         self.updates() && self.lock_unverified.contains(path)
     }
 
@@ -185,7 +187,7 @@ impl RepoClient {
             });
             let download = std::pin::pin!(async {
                 let staged = fetch_artifact_staged(
-                    client.as_ref(),
+                    &client,
                     &url,
                     Some(&repository_root),
                     auth,
@@ -218,15 +220,15 @@ impl RepoClient {
             }
         };
         self.sidecar_hints.note_file(&repo.url, &staged);
-        let staged = staged
+        let (staged, _, included) = staged
             .inspect_err(|err| self.remember_absent(route, path, err, generation))
-            .ok()?
-            .0;
+            .ok()?;
         Some(Prefetched {
             generation,
             checksum: checksum.transpose(),
             warnings: warnings.after_logged(),
             staged,
+            included,
         })
     }
 
@@ -624,7 +626,7 @@ impl RepoClient {
         let fresh = prefetched.is_none();
         let download = || {
             fetch_artifact_staged(
-                client.as_ref(),
+                &client,
                 &url,
                 Some(&repository_root),
                 auth,
@@ -644,7 +646,10 @@ impl RepoClient {
                 // now, as one transfer that is already complete.
                 let transfer =
                     Transfer::arrived(self.progress.as_ref(), &url, prefetched.staged.size());
-                (prefetched.checksum, Ok((prefetched.staged, transfer)))
+                (
+                    prefetched.checksum,
+                    Ok((prefetched.staged, transfer, prefetched.included)),
+                )
             }
             None if pin.is_some() && !self.lock_unverified.contains(path) => {
                 (None, download().await)
@@ -680,9 +685,28 @@ impl RepoClient {
         }
         // A file that failed to download reports that failure, before any
         // of its sidecar: a missing file has no checksum file either.
-        let (staged, transfer) = staged?;
+        let (staged, transfer, included) = staged?;
         probed.emit();
-        let checksum = checksum.transpose()?;
+        // maven-resolver checks the SHA-1 the server sent with the file
+        // first: one that matches stands for the checksum files, as Central
+        // serves stale `.sha1` and `.md5` files for captcha-1.4.0.jar, and
+        // one that does not fails the bytes, whatever the files say.
+        let sha1 = staged.sha1().map(|sha1| Digest::Sha1(sha1.clone()));
+        if let (Some(expected), Some(actual)) = (&included, &sha1)
+            && expected != actual
+        {
+            return Err(RepoError::ChecksumMismatch {
+                subject: rv_config::redact_url(url.as_str()).into(),
+                artifact: options.index.map(|key| Box::new(key.clone())),
+                expected: expected.clone(),
+                actual: actual.clone(),
+                check: IntegritySource::Header,
+            });
+        }
+        let checksum = match included.filter(|_| sha1.is_some()) {
+            Some(included) => Some(Some(included)),
+            None => checksum.transpose()?,
+        };
         // A pin verifies or refuses the bytes without a sidecar: the
         // required one, or the one raeva.lock records when the bytes match it.
         let required = self.required_pin(path, options);
@@ -701,12 +725,56 @@ impl RepoClient {
             return Err(RepoError::MissingChecksum(path.to_string()));
         }
 
+        // A `.sha256` that disagrees leaves the bytes to the `.sha1`, else
+        // the `.md5`, as for a POM ([`RepoClient::maven_vouches`]); when
+        // that disagrees too, the `.sha256` mismatch is the error.
+        let mut wrong_sha256 = None;
+        let checksum = match checksum {
+            Some(sha256 @ Digest::Sha256(_)) if sha256 != Digest::Sha256(staged.blob().clone()) => {
+                match self.maven_checksum(route, path).await {
+                    Ok(Some(maven)) => {
+                        wrong_sha256 = Some(sha256);
+                        Some(maven)
+                    }
+                    _ => Some(sha256),
+                }
+            }
+            checksum => checksum,
+        };
+        let actual = Digest::Sha256(staged.blob().clone());
         let checks = ArtifactChecks {
             sidecar: checksum.as_ref(),
             pin: required,
             index: options.index,
         };
-        let verified = publish_artifact(&url, transfer, store, staged, checks).await?;
+        let verified = match (
+            publish_artifact(&url, transfer, store, staged, checks).await,
+            &wrong_sha256,
+        ) {
+            (
+                Err(RepoError::ChecksumMismatch {
+                    subject,
+                    artifact,
+                    check: IntegritySource::Sidecar,
+                    ..
+                }),
+                Some(expected),
+            ) => {
+                return Err(RepoError::ChecksumMismatch {
+                    subject,
+                    artifact,
+                    expected: expected.clone(),
+                    actual,
+                    check: IntegritySource::Sidecar,
+                });
+            }
+            (verified, _) => verified?,
+        };
+        if wrong_sha256.is_some()
+            && let Some(maven) = &checksum
+        {
+            wrong_sha256_warning(repo, path, maven.algorithm())();
+        }
 
         if checksum.is_some() || unverified {
             self.note_admission(path, checksum.is_some());

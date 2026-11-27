@@ -11847,7 +11847,7 @@ fn build_extensions_take_no_reactor_module() {
     assert!(
         packages
             .lines()
-            .any(|line| line == "t:lib:2\tjar\tcompile\t\tlib/pom.xml"),
+            .any(|line| line == "t:lib:2\tjar\tcompile\t\t\tlib/pom.xml"),
         "{packages}"
     );
     let m2 = home.path().join("m2");
@@ -14809,4 +14809,126 @@ fn no_byte_of_the_traced_builds_output_reaches_raeva() {
     assert_eq!(files, Vec::<String>::new());
     assert_eq!(trace_leftovers(home.path()), Vec::<String>::new());
     assert_eq!(trace_leftovers(tmp.path()), Vec::<String>::new());
+}
+
+/// A processor path names reactor module `proc`, whose POM gives its
+/// dependencies: `x:1` and `y`, at the `2` the project's management gives.
+/// `x:1` depends on `y:1` and `z:1`, and the project manages `z` to `2`.
+/// maven-compiler-plugin 3.11 and later collect the paths under no
+/// management, so the `-processorpath` takes `z:1` and Maven reads the POM
+/// of the losing `y:1`; 3.9.0 to 3.10.1 root a legacy request
+/// at the path, under its management. The set pins those files in both Maven
+/// modes, as Maven 3.10.0 reads them. Error Prone Support's
+/// `documentation-support` path reads `guava-33.5.0-jre.pom` this way.
+#[test]
+fn a_processor_path_the_reactor_builds_takes_its_dependencies() {
+    let server = repository_of(
+        |artifact| match artifact {
+            "x" => format!(
+                "<dependencies>{}</dependencies>",
+                dependencies(&["t:y:1", "t:z:1"])
+            ),
+            _ => String::new(),
+        },
+        &[],
+    );
+    let cases = [
+        ("3.16.0", "t:x:1\tjar\nt:y:2\tjar\nt:z:1\tjar", true),
+        ("3.10.1", "t:x:1\tjar\nt:y:2\tjar\nt:z:2\tjar", false),
+    ];
+    for maven in ["3.9", "3.10"] {
+        for (compiler, artifacts, loser) in cases {
+            let case = format!("Maven {maven}, compiler {compiler}");
+            let url = format!("http://{}/", server.addr());
+            let (project, home) = binding_project(&url, "unused");
+            let root = project.path();
+            fs::write(
+                root.join("raeva.toml"),
+                format!("[lock]\nmaven = \"{maven}\"\n\n[plugins]\nlock = true\n"),
+            )
+            .unwrap();
+            let parent = "<parent><groupId>t</groupId><artifactId>app</artifactId>\
+                          <version>1</version></parent>";
+            fs::write(
+                root.join("pom.xml"),
+                pom(
+                    "app",
+                    &format!(
+                        "<packaging>pom</packaging><modules><module>proc</module>\
+                         <module>user</module></modules><dependencyManagement><dependencies>\
+                         {}</dependencies></dependencyManagement>",
+                        dependencies(&["t:y:2", "t:z:2"])
+                    ),
+                ),
+            )
+            .unwrap();
+            for (module, body) in [
+                (
+                    "proc",
+                    format!(
+                        "{parent}<dependencies>{}<dependency><groupId>t</groupId>\
+                         <artifactId>y</artifactId></dependency></dependencies>",
+                        dependencies(&["t:x:1"])
+                    ),
+                ),
+                (
+                    "user",
+                    format!(
+                        "{parent}<build><plugins><plugin><artifactId>maven-compiler-plugin\
+                         </artifactId><version>{compiler}</version><configuration>\
+                         <annotationProcessorPaths><path><groupId>t</groupId>\
+                         <artifactId>proc</artifactId><version>1</version></path>\
+                         </annotationProcessorPaths></configuration></plugin></plugins>\
+                         </build>"
+                    ),
+                ),
+            ] {
+                fs::create_dir_all(root.join(module)).unwrap();
+                fs::write(root.join(module).join("pom.xml"), pom(module, &body)).unwrap();
+            }
+            let processor_path = || {
+                let lock = fs::read_to_string(root.join("raeva.lock")).unwrap();
+                let document: toml::Value = toml::from_str(&lock).unwrap();
+                let sets = document["platforms"][0]["plugins"]["sets"]
+                    .as_array()
+                    .unwrap();
+                let paths: Vec<_> = (sets.iter())
+                    .filter(|set| set["role"].as_str() == Some("processor-path"))
+                    .cloned()
+                    .collect();
+                assert_eq!(paths.len(), 1, "{case}\n{lock}");
+                let field =
+                    |key: &str| (paths[0].get(key)).map_or("", |rows| rows.as_str().unwrap());
+                (
+                    field("artifacts").to_string(),
+                    field("support_poms").to_string(),
+                )
+            };
+            assert_success(&run_raeva(root, home.path(), &["sync"]), &case);
+            let (rows, poms) = processor_path();
+            assert_eq!(rows, artifacts, "{case}");
+            assert_eq!(poms.lines().any(|line| line == "t:y:1"), loser, "{case}");
+            assert_success(&run_raeva(root, home.path(), &["sync", "--frozen"]), &case);
+            // The set follows the reactor POM: without `x`, only `y:2` is left.
+            fs::write(
+                root.join("proc/pom.xml"),
+                pom(
+                    "proc",
+                    &format!(
+                        "{parent}<dependencies><dependency><groupId>t</groupId>\
+                         <artifactId>y</artifactId></dependency></dependencies>"
+                    ),
+                ),
+            )
+            .unwrap();
+            let frozen = run_raeva(root, home.path(), &["sync", "--frozen"]);
+            assert!(!frozen.status.success(), "{case}: {}", stderr(&frozen));
+            assert_success(&run_raeva(root, home.path(), &["sync"]), &case);
+            assert_eq!(
+                processor_path(),
+                ("t:y:2\tjar".to_string(), String::new()),
+                "{case}"
+            );
+        }
+    }
 }

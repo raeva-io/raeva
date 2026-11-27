@@ -270,8 +270,10 @@ mod tests {
             repo_urls: vec!["https://repo.example/".to_string()],
             artifacts: vec![ResolvedPackage {
                 coordinate,
+                type_: None,
                 direct_scope: None,
                 scope: rv_lock::Scope::Runtime,
+                optional: false,
                 workspace_module: None,
                 system_path: None,
                 managed: None,

@@ -1,6 +1,7 @@
 //! Dependency types a build extension defines, as maven-hpi-plugin defines
 //! Jenkins' `executable-war`: a sync reads the extension's artifact
-//! handlers and pins its jar, and `--frozen` holds the jar to the pin.
+//! handlers and pins its jar, and `--frozen` holds the jar to the pin. A
+//! package is named by the type it is declared with, as Maven names it.
 
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -9,7 +10,8 @@ use rv_test_support::http::{Response, StubServer};
 use tempfile::TempDir;
 
 use crate::common::{
-    assert_success, pom, raeva_command, run_raeva, serve_sha256, sha1_hex, sha256_hex, with_sha256,
+    assert_success, pom, raeva_command, run_raeva, serve_sha256, sha1_hex, sha256_hex, stderr,
+    with_sha256,
 };
 
 /// A jar of stored `entries`.
@@ -459,6 +461,107 @@ fn a_plain_sync_fetches_an_extension_jar_stored_only_as_a_dependency() {
     }
 }
 
+/// A module's graph reads its build extension's realm, so the jars of the
+/// realm download while the reactor holds back the modules' artifacts.
+/// Here another module fails its own check on a BOM whose `.sha256`
+/// disagrees, which keeps the hold until every graph is in: the sync used
+/// to wait on itself until the stall timeout, and now fails on the BOM.
+#[test]
+fn a_build_extension_realm_downloads_while_the_reactor_holds_artifacts() {
+    let pom_of = |artifact: &str, body: &str| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>{artifact}</artifactId><version>1</version>{body}</project>"
+        )
+    };
+    let served = [
+        (
+            "t/ext/1/ext-1.pom",
+            pom_of(
+                "ext",
+                "<dependencies><dependency><groupId>t</groupId><artifactId>dep</artifactId>\
+                 <version>1</version></dependency></dependencies>",
+            ),
+        ),
+        ("t/dep/1/dep-1.pom", pom_of("dep", "")),
+        (
+            "t/bom/1/bom-1.pom",
+            pom_of("bom", "<packaging>pom</packaging>"),
+        ),
+    ];
+    let server = StubServer::start(move |request| {
+        let path = request.path.trim_start_matches('/');
+        if path == "t/bom/1/bom-1.pom.sha256" {
+            return Response::new(200, sha256_hex(b"other bytes"));
+        }
+        serve_sha256(path, |path| match path {
+            "t/ext/1/ext-1.jar" | "t/dep/1/dep-1.jar" => Some(jar(&[])),
+            _ => (served.iter())
+                .find(|(name, _)| *name == path)
+                .map(|(_, body)| body.clone().into_bytes()),
+        })
+    });
+    let url = format!("http://{}/", server.addr());
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    fs::write(
+        root.join("pom.xml"),
+        pom(
+            "demo",
+            "<packaging>pom</packaging><modules><module>a</module><module>b</module>\
+             </modules><build><extensions><extension><groupId>t</groupId>\
+             <artifactId>ext</artifactId><version>1</version></extension></extensions>\
+             </build>",
+        ),
+    )
+    .unwrap();
+    let parent = "<parent><groupId>t</groupId><artifactId>demo</artifactId>\
+                  <version>1</version></parent>";
+    let managed = |dependency: &str| {
+        format!(
+            "<dependencyManagement><dependencies>{dependency}</dependencies></dependencyManagement>"
+        )
+    };
+    // A type the core does not define makes a's graph read the realm.
+    let modules = [
+        (
+            "a",
+            managed(
+                "<dependency><groupId>t</groupId><artifactId>dep</artifactId>\
+                 <version>1</version><type>custom</type></dependency>",
+            ),
+        ),
+        (
+            "b",
+            managed(
+                "<dependency><groupId>t</groupId><artifactId>bom</artifactId>\
+                 <version>1</version><type>pom</type><scope>import</scope></dependency>",
+            ),
+        ),
+    ];
+    for (module, body) in modules {
+        fs::create_dir(root.join(module)).unwrap();
+        let body = format!("{parent}{body}");
+        fs::write(root.join(module).join("pom.xml"), pom(module, &body)).unwrap();
+    }
+    let home = home(&url);
+    let output = raeva_command(root, home.path())
+        .args(["sync"])
+        .env("RAEVA_WORKSPACE_STALL_TIMEOUT_SECS", "10")
+        .output()
+        .unwrap();
+    let stderr = stderr(&output);
+    assert!(!stderr.contains("stalled"), "{stderr}");
+    assert!(
+        stderr.contains("checksum mismatch") && stderr.contains("t/bom/1/bom-1.pom"),
+        "{stderr}"
+    );
+    assert!(
+        (server.requests().iter()).any(|request| request.path == "/t/dep/1/dep-1.jar"),
+        "the realm's jar was not fetched: {stderr}"
+    );
+}
+
 /// `lock verify` hashes the build extension jar raeva.lock pins, which
 /// `--download` puts back as the resolution fetches it.
 #[test]
@@ -717,7 +820,8 @@ fn a_handler_in_a_jar_the_extension_depends_on_types_a_dependency() {
     assert_success(&run(&home, &["sync"]), "sync");
     let lock_path = root.join("raeva.lock");
     let locked = fs::read_to_string(&lock_path).unwrap();
-    let packages = "packages = \"\"\"\nt:app:1\\twar\\tcompile\nt:lib:1\\tjar\"\"\"";
+    let packages =
+        "packages = \"\"\"\nt:app:1\\twar\\tcompile\\t\\texecutable-war\nt:lib:1\\tjar\"\"\"";
     assert!(locked.contains(packages), "{locked}");
     let pins = format!(
         "extensions = \"\"\"\nt:carrier:1\\t{}\nt:handlers:1\\t{}\"\"\"",
@@ -1071,7 +1175,10 @@ fn a_realm_refuses_a_handler_class_its_jars_define_differently() {
     assert_success(&run_raeva(root, home(&url).path(), &["sync"]), "sync");
     let lock_path = root.join("raeva.lock");
     let locked = fs::read_to_string(&lock_path).unwrap();
-    assert!(locked.contains("t:app:1\\twar\\tcompile\""), "{locked}");
+    assert!(
+        locked.contains("t:app:1\\twar\\tcompile\\t\\texecutable-war\""),
+        "{locked}"
+    );
     fs::remove_file(&lock_path).unwrap();
 
     *served.lock().unwrap() = realm(false);
@@ -1135,7 +1242,8 @@ fn a_seed_carries_a_classified_jar_of_an_extension_realm() {
     let run = |home: &TempDir, args: &[&str]| run_raeva(root, home.path(), args);
     assert_success(&run(&home, &["sync"]), "sync");
     let locked = fs::read_to_string(root.join("raeva.lock")).unwrap();
-    let packages = "packages = \"\"\"\nt:app:1\\twar\\tcompile\nt:lib:1\\tjar\"\"\"";
+    let packages =
+        "packages = \"\"\"\nt:app:1\\twar\\tcompile\\t\\texecutable-war\nt:lib:1\\tjar\"\"\"";
     assert!(locked.contains(packages), "{locked}");
     let pins = format!(
         "extensions = \"\"\"\nt:carrier:1\\t{}\nt:handlers:1:no_aop\\t{}\"\"\"",
@@ -2193,8 +2301,8 @@ fn tree_marks_optional_dependencies_of_extension_and_line_types() {
         assert_success(&output, "tree");
         let tree = String::from_utf8_lossy(&output.stdout);
         for line in [
-            "t:app:1:war (compile, optional)",
-            "t:lib:1 (compile, optional)",
+            "t:app:1:executable-war (compile, optional)",
+            "t:lib:1:fatjar (compile, optional)",
         ] {
             assert!(tree.contains(line), "{toml}{line}\n{tree}");
         }
@@ -2633,7 +2741,7 @@ fn frozen_holds_a_version_less_snapshot_extension_that_types_a_dependency() {
 /// A build extension a remote parent taken on its `.sha1` declares is
 /// downloaded with the jar's own checksum files, but the store indexes it
 /// only once that parent's `.sha256` has been checked: a parent whose
-/// `.sha256` holds another digest fails the sync and leaves no row for the
+/// `.sha256` a proxy refuses fails the sync and leaves no row for the
 /// extension it named.
 #[test]
 fn a_parent_that_fails_its_late_sha256_leaves_no_row_for_its_extension() {
@@ -2673,7 +2781,7 @@ fn a_parent_that_fails_its_late_sha256_leaves_no_row_for_its_extension() {
             (_, "") => Response::new(200, body.clone()),
             (_, "sha1") => Response::new(200, sha1_hex(body)),
             ("t/p1/1/p1-1.pom", _) => Response::new(404, ""),
-            ("t/p2/1/p2-1.pom", _) => Response::new(200, "0".repeat(64)).delayed(HELD),
+            ("t/p2/1/p2-1.pom", _) => Response::new(407, "").delayed(HELD),
             _ => Response::new(200, sha256_hex(body)),
         }
     });
@@ -2691,9 +2799,10 @@ fn a_parent_that_fails_its_late_sha256_leaves_no_row_for_its_extension() {
     .unwrap();
     let sync = run_raeva(project.path(), home.path(), &["sync"]);
     let stderr = String::from_utf8_lossy(&sync.stderr);
-    assert_eq!(sync.status.code(), Some(9), "{stderr}");
+    assert_eq!(sync.status.code(), Some(3), "{stderr}");
     assert!(
-        stderr.contains("checksum mismatch for t/p2/1/p2-1.pom"),
+        stderr.contains("407 Proxy Authentication Required for http://")
+            && stderr.contains("/t/p2/1/p2-1.pom.sha256"),
         "{stderr}"
     );
     assert!(
@@ -2797,4 +2906,255 @@ fn an_extension_descriptor_whose_size_lies_defines_its_type() {
     assert!(locked.contains("t:app:1\\twar\\ttest"), "{locked}");
     let frozen = run_raeva(root, home(&url).path(), &["sync", "--frozen"]);
     assert_success(&frozen, "sync --frozen");
+}
+
+/// The text of `raeva <args>` in `root`, which must succeed.
+fn stdout(root: &std::path::Path, home: &std::path::Path, args: &[&str]) -> String {
+    let output = run_raeva(root, home, args);
+    assert_success(&output, &args.join(" "));
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Each `coordinate` of a `raeva --json tree`, depth first.
+fn tree_coordinates(json: &str) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_str(json).unwrap();
+    let mut nodes: Vec<&serde_json::Value> = Vec::new();
+    for module in json["data"]["modules"].as_array().unwrap() {
+        nodes.extend(module["dependencies"].as_array().unwrap().iter().rev());
+    }
+    let mut found = Vec::new();
+    while let Some(node) = nodes.pop() {
+        found.push(node["coordinate"].as_str().unwrap().to_string());
+        nodes.extend(node["children"].as_array().unwrap().iter().rev());
+    }
+    found
+}
+
+/// The purls of the components of a `raeva sbom`.
+fn sbom_purls(json: &str) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_str(json).unwrap();
+    (json["components"].as_array().unwrap().iter())
+        .map(|component| component["purl"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A dependency whose type a build extension defines is locked at the
+/// extension's file, `war`, and named by its type, as `mvn dependency:list`
+/// names Jenkins' `executable-war`: in raeva.lock's package row, `raeva
+/// tree`, `--json tree`, `raeva why` and the purl of `raeva sbom`, which
+/// the CycloneDX Maven plugin writes with `type=executable-war`.
+#[test]
+fn a_package_is_named_by_its_declared_type() {
+    let server = repository(Arc::new(Mutex::new(extension_jar(b"one"))));
+    let url = format!("http://{}/", server.addr());
+    let project = TempDir::new().unwrap();
+    let root = project.path();
+    let home = home(&url);
+    fs::write(root.join("pom.xml"), executable_war_project()).unwrap();
+    assert_success(&run_raeva(root, home.path(), &["sync"]), "sync");
+    let locked = fs::read_to_string(root.join("raeva.lock")).unwrap();
+    let row = "t:app:1\\twar\\ttest\\t\\texecutable-war\n";
+    assert!(locked.contains(row), "{locked}");
+    assert!(locked.contains("[[platforms.artifacts]]"), "{locked}");
+    assert!(
+        locked.contains("artifact = \"app\"\nversion = \"1\"\npackaging = \"war\""),
+        "{locked}"
+    );
+
+    let tree = stdout(root, home.path(), &["tree"]);
+    assert!(tree.contains("t:app:1:executable-war (test)"), "{tree}");
+    let json = stdout(root, home.path(), &["--json", "tree"]);
+    let coordinates = tree_coordinates(&json);
+    assert!(
+        coordinates.contains(&"t:app:1:executable-war".to_string()),
+        "{json}"
+    );
+    for target in ["t:app:1:executable-war", "t:app:1:war", "t:app"] {
+        let why = stdout(root, home.path(), &["--json", "why", target]);
+        let why: serde_json::Value = serde_json::from_str(&why).unwrap();
+        assert_eq!(why["data"]["found"], true, "{target}: {why}");
+        assert_eq!(
+            why["data"]["modules"][0]["paths"][0],
+            serde_json::json!(["t:app:1:executable-war"]),
+            "{target}: {why}"
+        );
+    }
+    let sbom = stdout(root, home.path(), &["sbom"]);
+    assert!(
+        sbom_purls(&sbom).contains(&"pkg:maven/t/app@1?type=executable-war".to_string()),
+        "{sbom}"
+    );
+    let m2 = TempDir::new().unwrap();
+    let export = ["export-m2", "--m2-path", m2.path().to_str().unwrap()];
+    assert_success(&run_raeva(root, home.path(), &export), "export-m2");
+    assert!(m2.path().join("t/app/1/app-1.war").is_file());
+    assert!(!m2.path().join("t/app/1/app-1.executable-war").exists());
+
+    // An edited type is a lock `--frozen` refuses.
+    let typeless = locked.replace(row, "t:app:1\\twar\\ttest\n");
+    fs::write(root.join("raeva.lock"), &typeless).unwrap();
+    let output = run_raeva(root, home.path(), &["sync", "--frozen"]);
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    // So is a schema 9 lock, which raeva 0.6.0 wrote without the type, and
+    // a plain sync writes it again.
+    let schema = format!("schema_version = {}\n", rv_lock::LOCKFILE_SCHEMA_VERSION);
+    let old = typeless.replace(&schema, "schema_version = 9\n");
+    fs::write(root.join("raeva.lock"), &old).unwrap();
+    let output = run_raeva(root, home.path(), &["sync", "--frozen"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("without --frozen to regenerate"),
+        "{}",
+        stderr(&output)
+    );
+    assert_success(&run_raeva(root, home.path(), &["sync"]), "sync");
+    assert_eq!(fs::read_to_string(root.join("raeva.lock")).unwrap(), locked);
+}
+
+/// A repository with `t:lib:1`, a jar and its `tests` jar, `t:mid:1`,
+/// which declares `t:lib:1` as a `test-jar`, and `t:mid2:1`, which declares
+/// it as a jar with the `tests` classifier.
+fn test_jar_repository() -> StubServer {
+    let lib = pom("lib", "");
+    let mid = |artifact: &str, declared: &str| {
+        pom(
+            artifact,
+            &format!(
+                "<dependencies><dependency><groupId>t</groupId><artifactId>lib</artifactId>\
+                 <version>1</version>{declared}</dependency></dependencies>"
+            ),
+        )
+    };
+    crate::common::sha256_repository([
+        ("/t/lib/1/lib-1.pom", lib.into_bytes()),
+        ("/t/lib/1/lib-1.jar", b"lib".to_vec()),
+        ("/t/lib/1/lib-1-tests.jar", b"lib tests".to_vec()),
+        (
+            "/t/mid/1/mid-1.pom",
+            mid("mid", "<type>test-jar</type>").into_bytes(),
+        ),
+        ("/t/mid/1/mid-1.jar", b"mid".to_vec()),
+        (
+            "/t/mid2/1/mid2-1.pom",
+            mid("mid2", "<classifier>tests</classifier>").into_bytes(),
+        ),
+        ("/t/mid2/1/mid2-1.jar", b"mid2".to_vec()),
+    ])
+}
+
+/// `test-jar` is Maven's core type for the `tests` jar: raeva.lock pins
+/// `jar:tests` and the package is named `test-jar:tests`, whether the
+/// module or a dependency's POM declares it. One file declared both as a
+/// `test-jar` and as a jar with the `tests` classifier is one package,
+/// named by the declaration mediation keeps, the nearest. Maven 3.9.16's
+/// `dependency:list` and the CycloneDX Maven plugin 2.9.3 name each case
+/// so, the plugin with `type=jar` where raeva leaves out purl-spec's
+/// default.
+#[test]
+fn a_test_jar_is_named_by_its_type() {
+    let server = test_jar_repository();
+    let url = format!("http://{}/", server.addr());
+    let home = home(&url);
+    let lib = |extra: &str| {
+        format!(
+            "<dependency><groupId>t</groupId><artifactId>lib</artifactId>\
+             <version>1</version>{extra}</dependency>"
+        )
+    };
+    let mid = "<dependency><groupId>t</groupId><artifactId>mid</artifactId>\
+               <version>1</version></dependency>";
+    let typed = "t:lib:1:test-jar:tests";
+    let classified = "t:lib:1:jar:tests";
+    let cases = [
+        (
+            lib("<type>test-jar</type><scope>test</scope>"),
+            "t:lib:1\\tjar:tests\\ttest\\t\\ttest-jar",
+            typed,
+            "test",
+            "pkg:maven/t/lib@1?classifier=tests&type=test-jar",
+        ),
+        (
+            mid.to_string(),
+            "t:lib:1\\tjar:tests\\t\\t\\ttest-jar",
+            typed,
+            "compile",
+            "pkg:maven/t/lib@1?classifier=tests&type=test-jar",
+        ),
+        (
+            format!("{mid}{}", lib("<classifier>tests</classifier>")),
+            "t:lib:1\\tjar:tests\\tcompile",
+            classified,
+            "compile",
+            "pkg:maven/t/lib@1?classifier=tests",
+        ),
+        (
+            format!(
+                "{}{}",
+                mid.replace("mid", "mid2"),
+                lib("<type>test-jar</type>")
+            ),
+            "t:lib:1\\tjar:tests\\tcompile\\t\\ttest-jar",
+            typed,
+            "compile",
+            "pkg:maven/t/lib@1?classifier=tests&type=test-jar",
+        ),
+        // At one depth the first declaration wins.
+        (
+            format!("{mid}{}", mid.replace("mid", "mid2")),
+            "t:lib:1\\tjar:tests\\t\\t\\ttest-jar",
+            typed,
+            "compile",
+            "pkg:maven/t/lib@1?classifier=tests&type=test-jar",
+        ),
+        (
+            format!("{}{mid}", mid.replace("mid", "mid2")),
+            "t:lib:1\\tjar:tests",
+            classified,
+            "compile",
+            "pkg:maven/t/lib@1?classifier=tests",
+        ),
+    ];
+    for (dependencies, row, coordinate, scope, purl) in cases {
+        let project = TempDir::new().unwrap();
+        let root = project.path();
+        fs::write(
+            root.join("pom.xml"),
+            pom(
+                "demo",
+                &format!("<dependencies>{dependencies}</dependencies>"),
+            ),
+        )
+        .unwrap();
+        assert_success(&run_raeva(root, home.path(), &["sync"]), "sync");
+        let locked = fs::read_to_string(root.join("raeva.lock")).unwrap();
+        let rows = [format!("{row}\n"), format!("{row}\"")];
+        assert!(
+            rows.iter().any(|row| locked.contains(row)),
+            "{row}\n{locked}"
+        );
+        assert_eq!(locked.matches("t:lib:1\\t").count(), 1, "{locked}");
+
+        let tree = stdout(root, home.path(), &["tree"]);
+        assert!(tree.contains(&format!("{coordinate} ({scope})")), "{tree}");
+        let json = stdout(root, home.path(), &["--json", "tree"]);
+        assert!(
+            tree_coordinates(&json).contains(&coordinate.to_string()),
+            "{json}"
+        );
+        let why = stdout(root, home.path(), &["--json", "why", coordinate]);
+        let why: serde_json::Value = serde_json::from_str(&why).unwrap();
+        assert_eq!(why["data"]["found"], true, "{why}");
+        let sbom = stdout(root, home.path(), &["sbom"]);
+        assert!(sbom_purls(&sbom).contains(&purl.to_string()), "{sbom}");
+        assert_success(
+            &run_raeva(root, home.path(), &["sync", "--frozen"]),
+            "frozen",
+        );
+        // The repository layout takes the extension.
+        let m2 = TempDir::new().unwrap();
+        let export = ["export-m2", "--m2-path", m2.path().to_str().unwrap()];
+        assert_success(&run_raeva(root, home.path(), &export), "export-m2");
+        let tests = fs::read(m2.path().join("t/lib/1/lib-1-tests.jar")).unwrap();
+        assert_eq!(tests, b"lib tests");
+    }
 }

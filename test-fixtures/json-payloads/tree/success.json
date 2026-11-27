@@ -43,7 +43,7 @@
             },
             {
               "children": [],
-              "coordinate": "org.golden:lib:1.0:jar:tests",
+              "coordinate": "org.golden:lib:1.0:test-jar:tests",
               "optional": false,
               "scope": "test",
               "workspace": false

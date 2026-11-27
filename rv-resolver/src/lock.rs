@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use foldhash::{HashMap, HashMapExt};
-use rv_config::{Config, redact_url};
+use rv_config::{Config, redact_repository_url};
 use rv_lock::{
     AmbientInput, LockArtifact, LockError, LockModule, LockModulePackage, LockOrigins,
     LockPlatform, Lockfile, Platform, SupportPom, is_recordable_repo_id,
@@ -189,8 +189,12 @@ pub fn assemble(
                     if existing.blob != resolved.blob {
                         return Err(ResolveError::ConflictingArtifactBytes {
                             coord: package.coordinate.to_string(),
-                            first_module: existing.module_path.clone(),
-                            second_module: module.pom_path.clone(),
+                            first_origin: existing.first_reader.clone(),
+                            second_origin: format!(
+                                "{} from {}",
+                                module.pom_path,
+                                redact_repository_url(&resolved.repo_url)
+                            ),
                             first_blob: existing.blob.to_string(),
                             second_blob: resolved.blob.to_string(),
                         }
@@ -223,12 +227,17 @@ pub fn assemble(
                     insert_new(&mut pom_origins, pom_origin);
                 }
                 let blob = resolved.blob.clone();
+                let first_reader = format!(
+                    "{} from {}",
+                    module.pom_path,
+                    redact_repository_url(&resolved.repo_url)
+                );
                 artifacts.insert(
                     package.coordinate.clone(),
                     AggregateArtifact {
                         artifact: lock_artifact(package.coordinate, resolved),
                         blob,
-                        module_path: module.pom_path.clone(),
+                        first_reader,
                         repo_rank: rank,
                         origins,
                         pom_origins,
@@ -355,7 +364,7 @@ fn module_package(
         .map(|path| {
             rv_lock::SystemFile::record(project_root, Path::new(path)).map_err(|err| {
                 AssembleError::SystemFile {
-                    path: project_root.join(pom_path),
+                    path: crate::workspace::lexically_normal(&project_root.join(pom_path)),
                     reason: format!(
                         "system-scoped dependency {} for the locked platform {}: {err}{}",
                         rv_maven_types::bounded(&package.coordinate.to_string()),
@@ -370,6 +379,11 @@ fn module_package(
         let mut lock_package =
             LockModulePackage::new(package.coordinate.clone(), package.direct_scope);
         lock_package.scope = package.scope;
+        lock_package.optional = package.optional;
+        // A type raeva.lock cannot spell is left out, the row naming the
+        // extension, as 0.6.0 named every one.
+        lock_package.type_ =
+            (package.type_.clone()).filter(|type_| rv_maven_types::lock_text_recordable(type_));
         lock_package.workspace_module = package.workspace_module.clone();
         lock_package.system_path = system_file.as_ref().map(|file| file.path.clone());
         lock_package.system_sha256 = system_file.map(|file| file.sha256);
@@ -453,7 +467,8 @@ impl RepoOrder {
 struct AggregateArtifact {
     artifact: LockArtifact,
     blob: BlobId,
-    module_path: String,
+    /// The first module that read it, and the repository it read from.
+    first_reader: String,
     repo_rank: usize,
     /// Every repository that served it to a module.
     origins: BTreeSet<String>,
@@ -520,7 +535,12 @@ fn merge_companion_pom(
 ) -> Result<(), ResolveError> {
     let gav = &coordinate.gav;
     let repo = artifact.pom_repo_url.as_ref().unwrap_or(&artifact.repo_url);
-    let origin = || format!("{platform}/{module_path} from {}", redact_url(repo));
+    let origin = || {
+        format!(
+            "{platform}/{module_path} from {}",
+            redact_repository_url(repo)
+        )
+    };
     match aggregate.get_mut(gav) {
         Some(existing) if existing.blob.is_none() => {
             if artifact.companion_pom.is_some() {
@@ -586,9 +606,12 @@ fn merge_support_pom(
                 first_origin: format!(
                     "{} from {}",
                     existing.module_path,
-                    redact_url(&existing.provenance.repo_url)
+                    redact_repository_url(&existing.provenance.repo_url)
                 ),
-                second_origin: format!("{module_path} from {}", redact_url(&provenance.repo_url)),
+                second_origin: format!(
+                    "{module_path} from {}",
+                    redact_repository_url(&provenance.repo_url)
+                ),
                 first_sha256: existing.provenance.sha256.clone(),
                 second_sha256: provenance.sha256.clone(),
             })),

@@ -218,11 +218,13 @@ mod memory {
                     401 | 403 | 407 => RepoError::Unauthorized {
                         status,
                         url,
+                        redirected_to: None,
                         sent: None,
                     },
                     _ => RepoError::HttpStatus {
                         status,
                         url,
+                        redirected_to: None,
                         retry_after: None,
                     },
                 });

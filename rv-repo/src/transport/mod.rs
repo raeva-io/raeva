@@ -2,7 +2,6 @@ mod guard;
 #[cfg(test)]
 mod tests;
 
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
@@ -16,11 +15,41 @@ use crate::proxy::ProxySet;
 use crate::repository::Repository;
 
 pub(crate) use guard::redirect_rejection_from_reqwest;
-pub(crate) use guard::same_origin_redirect_policy;
 use guard::{
     ConfiguredHosts, ExemptHosts, GlobalOnlyResolver, RedirectGuard, TrustedHosts, TrustedOrigins,
-    ip_literal, is_globally_routable, origin_key, redirect_guard, trusted_redirect_policy,
+    ip_literal, is_globally_routable, origin_key, redirect_guard,
 };
+
+/// A client and the redirect rules of the requests it sends, see
+/// [`RedirectGuard`]. The client itself follows no redirect: `crate::fetch`
+/// follows each hop by these rules, on this same client, whose resolver the
+/// rules were written against.
+#[derive(Clone, Debug)]
+pub(crate) struct Routed {
+    pub(crate) client: Client,
+    redirects: Arc<RedirectGuard>,
+}
+
+impl Routed {
+    /// A client whose requests follow redirects within their own origin.
+    pub(crate) fn same_origin(client: Client) -> Self {
+        Self {
+            client,
+            redirects: Arc::default(),
+        }
+    }
+
+    /// Whether a request that went to `previous`, in order, may follow a
+    /// redirect to `target`.
+    pub(crate) fn may_follow(&self, previous: &[Url], target: &Url) -> Result<()> {
+        self.redirects
+            .evaluate(previous, target)
+            .map_err(|rejection| RepoError::RedirectRejected {
+                kind: rejection.kind,
+                details: rejection.details,
+            })
+    }
+}
 
 /// The clients one `RepoClient` sends requests through, and the sets their
 /// screens read.
@@ -110,10 +139,10 @@ impl ClientSet {
                 proxies: Vec::new(),
                 options: BuildOptions::default(),
                 built: OnceLock::from(Clients {
-                    configured: client.clone(),
-                    runtime: client.clone(),
-                    screened: client.clone(),
-                    direct: client,
+                    configured: Routed::same_origin(client.clone()),
+                    runtime: Routed::same_origin(client.clone()),
+                    screened: Routed::same_origin(client.clone()),
+                    direct: Routed::same_origin(client),
                 }),
                 building: Mutex::new(()),
             }),
@@ -191,9 +220,9 @@ impl ClientSet {
     /// applied here for direct requests: a literal outside the public
     /// internet is refused unless its origin is exempt. A root issuer's client
     /// exempts its own host, so its literal passes too.
-    pub(crate) fn client_for(&self, url: &Url) -> Result<Cow<'_, Client>> {
+    pub(crate) fn client_for(&self, url: &Url) -> Result<Routed> {
         if let Some(client) = self.root_redirects.client_for(url)? {
-            return Ok(Cow::Owned(client));
+            return Ok(client);
         }
         let origin = origin_key(url);
         let trusted = origin
@@ -218,7 +247,7 @@ impl ClientSet {
             }
         }
         let clients = self.clients.get()?;
-        Ok(Cow::Borrowed(match origin {
+        Ok(match origin {
             Some(origin) if self.configured_origins.contains(&origin) => &clients.configured,
             Some(_) if trusted => &clients.runtime,
             _ if url
@@ -229,7 +258,8 @@ impl ClientSet {
                 &clients.direct
             }
             _ => &clients.screened,
-        }))
+        }
+        .clone())
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -243,21 +273,21 @@ struct Clients {
     /// Requests to a configured repository or mirror origin. Its redirect
     /// policy and resolver read the frozen [`ConfiguredHosts`] set.
     /// It never consults runtime DNS trust. See [`ClientSet::client_for`].
-    configured: Client,
+    configured: Routed,
     /// Requests to an origin trusted at runtime by [`Grants::exempt`]. Its
     /// resolver reads the live [`TrustedHosts`] set so a grant taken
     /// mid-resolve is honoured without a rebuild, and its redirect policy is
     /// same-origin only, so that live set can never widen what a redirect
     /// may reach.
-    runtime: Client,
+    runtime: Routed,
     /// Requests to every other origin. Its resolver exempts only the proxy
     /// hosts, which it must reach to send a request through a proxy, and its
     /// redirect policy is same-origin only.
-    screened: Client,
+    screened: Routed,
     /// Requests to an origin nothing exempts whose host is a proxy host and
     /// that no proxy carries. It has no proxies and no exemptions, so the
     /// proxy host's exemption cannot cover another port on that host.
-    direct: Client,
+    direct: Routed,
 }
 
 /// [`Clients`] built on the first request: a client loads the system trust
@@ -297,29 +327,18 @@ impl LazyClients {
         // configuration, the variables' included, which is the path both
         // guards are told about.
         let clients = Clients {
-            configured: options.client(
-                trusted_redirect_policy(self.guard.clone()),
-                self.guard.exempt_hosts.clone(),
-                &self.proxies,
-            )?,
+            configured: Routed {
+                client: options.client(self.guard.exempt_hosts.clone(), &self.proxies)?,
+                redirects: Arc::new(self.guard.clone()),
+            },
             // Same-origin only, so nothing this client dials can be
             // redirected anywhere its live exemption set has not already
             // been asked about.
-            runtime: options.client(
-                same_origin_redirect_policy(),
-                self.trusted_hosts.clone(),
-                &self.proxies,
-            )?,
-            screened: options.client(
-                same_origin_redirect_policy(),
-                self.proxy_hosts.clone(),
-                &self.proxies,
-            )?,
-            direct: options.client(
-                same_origin_redirect_policy(),
-                ConfiguredHosts::default(),
-                &[],
-            )?,
+            runtime: Routed::same_origin(
+                options.client(self.trusted_hosts.clone(), &self.proxies)?,
+            ),
+            screened: Routed::same_origin(options.client(self.proxy_hosts.clone(), &self.proxies)?),
+            direct: Routed::same_origin(options.client(ConfiguredHosts::default(), &[])?),
         };
         Ok(clients)
     }
@@ -360,7 +379,7 @@ impl Grants {
         self.trusted_origins.insert(origin);
     }
 
-    /// Let `repo`'s origin issue one cross-origin redirect, as a configured
+    /// Let `repo`'s origin start a cross-origin redirect chain, as a configured
     /// repository may. Origins shared with such a declaration share its
     /// authority, irrespective of which POM later asks to use that endpoint.
     pub(crate) fn authorize_issuer(&self, repo: &Repository) {
@@ -402,15 +421,10 @@ impl BuildOptions {
         builder
     }
 
-    fn client(
-        self,
-        redirect: reqwest::redirect::Policy,
-        exempt_hosts: impl ExemptHosts,
-        proxies: &[reqwest::Proxy],
-    ) -> Result<Client> {
+    fn client(self, exempt_hosts: impl ExemptHosts, proxies: &[reqwest::Proxy]) -> Result<Client> {
         let builder = self
             .builder()
-            .redirect(redirect)
+            .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(GlobalOnlyResolver { exempt_hosts }));
         let builder = proxies
             .iter()
@@ -426,11 +440,11 @@ struct RootRedirectClients {
     guard: RedirectGuard,
     proxies: Vec<reqwest::Proxy>,
     options: BuildOptions,
-    clients: RwLock<HashMap<String, Option<Client>>>,
+    clients: RwLock<HashMap<String, Option<Routed>>>,
 }
 
 impl RootRedirectClients {
-    fn client_for(&self, url: &Url) -> Result<Option<Client>> {
+    fn client_for(&self, url: &Url) -> Result<Option<Routed>> {
         let Some(origin) = origin_key(url) else {
             return Ok(None);
         };
@@ -460,12 +474,13 @@ impl RootRedirectClients {
                 .chain(url.host_str().map(str::to_owned)),
         );
         let client = rv_maven_model::held::unheld(|| {
-            self.options.client(
-                trusted_redirect_policy(guard.clone()),
-                guard.exempt_hosts,
-                &self.proxies,
-            )
+            self.options
+                .client(guard.exempt_hosts.clone(), &self.proxies)
         })?;
+        let client = Routed {
+            client,
+            redirects: Arc::new(guard),
+        };
         *entry = Some(client.clone());
         Ok(Some(client))
     }

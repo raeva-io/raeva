@@ -297,15 +297,15 @@ fn a_cold_sync_reads_a_chain_of_poms_without_waiting_for_each_sha256() {
 }
 
 /// A POM taken on its `.sha1` while its `.sha256` was still pending fails the
-/// sync, before a lock is written, when the `.sha256` holds another digest,
-/// with the error a read that waited for it gives.
+/// sync, before a lock is written, when a proxy refuses the `.sha256`, with
+/// the error a read that waited for it gives.
 #[test]
 fn a_sync_fails_on_a_late_sha256_that_does_not_match() {
     const HELD: Duration = Duration::from_millis(500);
     const CHAIN: &[&str] = &["a", "b", "c"];
     let (server, _) = chain_repository(CHAIN, HELD, |body| {
         if !body.contains("<dependencies>") {
-            Response::new(200, "0".repeat(64))
+            Response::new(407, "")
         } else {
             Response::new(404, "")
         }
@@ -314,9 +314,10 @@ fn a_sync_fails_on_a_late_sha256_that_does_not_match() {
     let home = TempDir::new().unwrap();
     let synced = run_raeva(project.path(), home.path(), &["sync"]);
     let stderr = String::from_utf8_lossy(&synced.stderr);
-    assert_eq!(synced.status.code(), Some(9), "{stderr}");
+    assert_eq!(synced.status.code(), Some(3), "{stderr}");
     assert!(
-        stderr.contains("checksum mismatch for t/c/1/c-1.pom")
+        stderr.contains("407 Proxy Authentication Required for http://")
+            && stderr.contains("/t/c/1/c-1.pom.sha256")
             && stderr.contains("through t:a:1 -> t:b:1"),
         "{stderr}"
     );
@@ -325,7 +326,7 @@ fn a_sync_fails_on_a_late_sha256_that_does_not_match() {
 
 /// A pass that fails on a POM taken on its `.sha1` before it reaches the
 /// check, here a module's parent read for its inherited groupId, still fails
-/// with the mismatch of that POM's `.sha256`, as a read that waited for it.
+/// with the refusal of that POM's `.sha256`, as a read that waited for it.
 #[test]
 fn a_parent_taken_on_its_sha1_fails_on_its_sha256() {
     const HELD: Duration = Duration::from_millis(500);
@@ -342,7 +343,7 @@ fn a_parent_taken_on_its_sha1_fails_on_its_sha256() {
         match (file, sidecar) {
             (_, "") => Response::new(200, body.as_str()),
             (_, ".sha1") => Response::new(200, sha1_hex(body.as_bytes())),
-            ("/t/p2/1/p2-1", ".sha256") => Response::new(200, "0".repeat(64)).delayed(HELD),
+            ("/t/p2/1/p2-1", ".sha256") => Response::new(407, "").delayed(HELD),
             (_, ".sha256") => Response::new(404, "").delayed(HELD),
             _ => Response::new(404, ""),
         }
@@ -372,9 +373,10 @@ fn a_parent_taken_on_its_sha1_fails_on_its_sha256() {
     let home = TempDir::new().unwrap();
     let synced = run_raeva(project.path(), home.path(), &["sync"]);
     let stderr = String::from_utf8_lossy(&synced.stderr);
-    assert_eq!(synced.status.code(), Some(9), "{stderr}");
+    assert_eq!(synced.status.code(), Some(3), "{stderr}");
     assert!(
-        stderr.contains("checksum mismatch for t/p2/1/p2-1.pom"),
+        stderr.contains("407 Proxy Authentication Required for http://")
+            && stderr.contains("/t/p2/1/p2-1.pom.sha256"),
         "{stderr}"
     );
     assert!(!project.path().join("raeva.lock").exists(), "{stderr}");

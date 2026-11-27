@@ -4,7 +4,8 @@
 //! dependencies, as in Maven.
 
 use crate::common::{
-    assert_status, assert_success, lib_project, raeva_command, sha1_hex, with_sha1, write_repo_toml,
+    assert_status, assert_success, lib_project, raeva_command, sha1_hex, stderr, with_sha1,
+    write_repo_toml,
 };
 use rv_test_support::http::{Response, StubServer};
 use tempfile::TempDir;
@@ -508,6 +509,297 @@ fn a_lone_module_a_dependency_names_reads_the_parent_above_it() {
     assert!(lock.contains("com.example:app:2.5.0\\tjar\n"), "{lock}");
 }
 
+/// A directory of a larger project, synced on its own, reads its parent at
+/// `../pom.xml` as Maven does, also when the `<parent>` writes the version
+/// as the same `${...}` text that POM declares (dataease's `core`). Its
+/// managed version and property reach the modules in both Maven modes.
+#[test]
+fn a_reactor_reads_a_parent_above_it_written_as_an_expression() {
+    let server = StubServer::start(|request| {
+        with_sha1(
+            &request.path,
+            [
+                ("/org/example/lib/1.0/lib-1.0.pom", PLAIN_LIB_POM),
+                ("/org/example/lib/1.0/lib-1.0.jar", LIB_JAR),
+                (
+                    "/org/example/lib/2.0/lib-2.0.pom",
+                    &PLAIN_LIB_POM.replace("1.0", "2.0"),
+                ),
+                ("/org/example/lib/2.0/lib-2.0.jar", LIB_JAR),
+            ],
+        )
+    });
+    let url = format!("http://{}/", server.addr());
+    for maven in ["3.9", "3.10"] {
+        let dir = TempDir::new().expect("checkout");
+        write_expression_project(dir.path(), "${t.version}");
+        let core = dir.path().join("core");
+        write_repo_toml(&core, "fixture", &url);
+        let mut toml = std::fs::read_to_string(core.join("raeva.toml")).expect("read raeva.toml");
+        toml.push_str(&format!("\n[lock]\nmaven = \"{maven}\"\n"));
+        std::fs::write(core.join("raeva.toml"), toml).expect("write raeva.toml");
+        let home = TempDir::new().expect("home");
+
+        let output = raeva_command(&core, home.path())
+            .arg("sync")
+            .output()
+            .expect("run raeva sync");
+        assert_success(&output, &format!("sync under Maven {maven}"));
+        let lock = std::fs::read_to_string(core.join("raeva.lock")).expect("read raeva.lock");
+        assert!(lock.contains("gav = \"t:a:3.3.1\""), "{lock}");
+        assert!(lock.contains("org.example:lib:1.0"), "{lock}");
+
+        let parent = dir.path().join("pom.xml");
+        let edited = std::fs::read_to_string(&parent)
+            .expect("read parent")
+            .replace(
+                "<lib.version>1.0</lib.version>",
+                "<lib.version>2.0</lib.version>",
+            );
+        std::fs::write(&parent, edited).expect("edit parent");
+        let frozen = raeva_command(&core, home.path())
+            .args(["sync", "--frozen"])
+            .output()
+            .expect("run raeva sync --frozen");
+        assert_status(&frozen, 7, "frozen sync after a parent edit");
+        assert!(
+            stderr(&frozen).contains("lib  1.0 -> 2.0"),
+            "{}",
+            stderr(&frozen)
+        );
+    }
+}
+
+/// The parent's `<relativePath>` names a POM that declares the version as
+/// other text, or one two directories above the project, which raeva does
+/// not read. Both fail with what to change.
+#[test]
+fn a_parent_expression_raeva_cannot_read_says_why() {
+    let dir = TempDir::new().expect("checkout");
+    write_expression_project(dir.path(), "3.3.1");
+    let home = TempDir::new().expect("home");
+    let output = raeva_command(&dir.path().join("core"), home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .expect("run raeva sync");
+    assert_status(&output, 3, "a version that names no local parent");
+    let err = stderr(&output);
+    assert!(
+        err.contains("parent t:root:${t.version} cannot be resolved: no POM at its relativePath")
+            && err.contains("write them as the parent POM declares its own"),
+        "{err}"
+    );
+
+    write_expression_project(dir.path(), "${t.version}");
+    let output = raeva_command(&dir.path().join("core/a"), home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .expect("run raeva sync");
+    assert_status(&output, 3, "a parent two directories up");
+    let err = stderr(&output);
+    let parent = rv_fs::plain_path(
+        &std::fs::canonicalize(dir.path().join("pom.xml")).expect("canonical parent"),
+    );
+    assert!(
+        err.contains(&format!(
+            "parent t:root:${{t.version}} cannot be resolved: its relativePath names {}, more \
+             than one directory above the project",
+            parent.display()
+        )) && err.contains("run raeva from a directory at most one level below that POM"),
+        "{err}"
+    );
+}
+
+/// A `<relativePath>` that is a link to a POM outside the directories
+/// raeva reads is named as written, not by where the link leads.
+#[cfg(unix)]
+#[test]
+fn a_parent_beyond_the_project_is_named_as_written() {
+    let dir = TempDir::new().expect("checkout");
+    let elsewhere = TempDir::new().expect("elsewhere");
+    let target = elsewhere.path().join("zqTARGETzq.xml");
+    std::fs::write(
+        &target,
+        "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+         <artifactId>root</artifactId><version>1</version><packaging>pom</packaging></project>",
+    )
+    .expect("write target");
+    let project = dir.path().join("app");
+    std::fs::create_dir(&project).expect("mkdir");
+    std::os::unix::fs::symlink(&target, project.join("parent-link")).expect("symlink");
+    std::fs::write(
+        project.join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+         <artifactId>root</artifactId><version>${rev}</version>\
+         <relativePath>parent-link</relativePath></parent><artifactId>app</artifactId></project>",
+    )
+    .expect("write pom");
+    let home = TempDir::new().expect("home");
+    let output = raeva_command(&project, home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .expect("run raeva sync");
+    assert_status(&output, 3, "a parent beyond the project");
+    let err = stderr(&output);
+    assert!(err.contains("its relativePath names"), "{err}");
+    assert!(err.contains("parent-link"), "{err}");
+    assert!(!err.contains("zqTARGETzq"), "{err}");
+
+    // A link to a directory is named with the pom.xml read in it.
+    let outside = elsewhere.path().join("zqDIRzq");
+    std::fs::create_dir(&outside).expect("mkdir");
+    std::fs::copy(&target, outside.join("pom.xml")).expect("copy");
+    std::os::unix::fs::symlink(&outside, project.join("dir-link")).expect("symlink");
+    let pom = std::fs::read_to_string(project.join("pom.xml")).expect("read pom");
+    std::fs::write(
+        project.join("pom.xml"),
+        pom.replace("parent-link", "dir-link"),
+    )
+    .expect("write pom");
+    let output = raeva_command(&project, home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .expect("run raeva sync");
+    assert_status(
+        &output,
+        3,
+        "a parent beyond the project through a directory link",
+    );
+    let err = stderr(&output);
+    let named = (std::fs::canonicalize(&project).expect("canonical project"))
+        .join("dir-link")
+        .join("pom.xml");
+    assert!(err.contains(&named.display().to_string()), "{err}");
+    assert!(!err.contains("zqDIRzq"), "{err}");
+
+    // `..` after a link leads out of the link's target, so it is kept.
+    let sub = outside.join("sub");
+    std::fs::create_dir(&sub).expect("mkdir");
+    std::os::unix::fs::symlink(&sub, project.join("up-link")).expect("symlink");
+    std::fs::write(
+        project.join("pom.xml"),
+        pom.replace("parent-link", "up-link/../pom.xml"),
+    )
+    .expect("write pom");
+    let output = raeva_command(&project, home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .expect("run raeva sync");
+    assert_status(&output, 3, "a parent beyond the project after a link");
+    let err = stderr(&output);
+    let named =
+        (std::fs::canonicalize(&project).expect("canonical project")).join("up-link/../pom.xml");
+    assert!(err.contains(&named.display().to_string()), "{err}");
+}
+
+/// A POM above a reactor root that Maven's strict reader refuses fails
+/// the sync, though it is not the remote parent the root names, as Maven
+/// 3.9.12 and 3.10.0 fail it with "Malformed POM".
+#[test]
+fn a_malformed_pom_above_the_reactor_fails_as_in_maven() {
+    let server = StubServer::start(|request| {
+        with_sha1(
+            &request.path,
+            [(
+                "/g/parent/1/parent-1.pom",
+                "<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId>\
+                 <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\
+                 </project>",
+            )],
+        )
+    });
+    let dir = TempDir::new().expect("checkout");
+    std::fs::write(dir.path().join("pom.xml"), "<project><foo/></project>").expect("write");
+    let root = dir.path().join("proj");
+    for (path, text) in [
+        (
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>g</groupId>\
+             <artifactId>parent</artifactId><version>1</version></parent><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules><module>a</module><module>b</module></modules></project>",
+        ),
+        (
+            "a/pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version></parent><artifactId>a</artifactId>\
+             </project>",
+        ),
+        (
+            "b/pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version></parent><artifactId>b</artifactId>\
+             </project>",
+        ),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, text).expect("write");
+    }
+    write_repo_toml(&root, "central", &format!("http://{}/", server.addr()));
+    let home = TempDir::new().expect("home");
+    let output = raeva_command(&root, home.path())
+        .arg("sync")
+        .output()
+        .expect("run raeva sync");
+    let err = stderr(&output);
+    assert!(!output.status.success(), "{err}");
+    assert!(err.contains("foo"), "{err}");
+    assert!(!root.join("raeva.lock").exists());
+}
+
+const PLAIN_LIB_POM: &str = "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>\
+<artifactId>lib</artifactId><version>1.0</version></project>";
+
+/// dataease's layout: a root POM whose version is `${t.version}`, written
+/// as `root_version`, and below it `core`, a reactor of `a` and `b` whose
+/// `<parent>`s write `${t.version}`. `a` takes `org.example:lib`'s version
+/// from the root's management.
+fn write_expression_project(dir: &std::path::Path, root_version: &str) {
+    let module = |artifact: &str, body: &str| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+             <artifactId>core</artifactId><version>${{t.version}}</version></parent>\
+             <artifactId>{artifact}</artifactId>{body}</project>"
+        )
+    };
+    for (path, xml) in [
+        (
+            "pom.xml",
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+                 <artifactId>root</artifactId><version>{root_version}</version>\
+                 <packaging>pom</packaging><properties><t.version>3.3.1</t.version>\
+                 <lib.version>1.0</lib.version></properties><dependencyManagement><dependencies>\
+                 <dependency><groupId>org.example</groupId><artifactId>lib</artifactId>\
+                 <version>${{lib.version}}</version></dependency></dependencies>\
+                 </dependencyManagement></project>"
+            ),
+        ),
+        (
+            "core/pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>${t.version}</version></parent>\
+             <artifactId>core</artifactId><packaging>pom</packaging>\
+             <modules><module>a</module><module>b</module></modules></project>"
+                .to_string(),
+        ),
+        (
+            "core/a/pom.xml",
+            module(
+                "a",
+                "<dependencies><dependency><groupId>org.example</groupId>\
+                 <artifactId>lib</artifactId></dependency></dependencies>",
+            ),
+        ),
+        ("core/b/pom.xml", module("b", "")),
+    ] {
+        let path = dir.join(path);
+        std::fs::create_dir_all(path.parent().expect("parent dir")).expect("create dir");
+        std::fs::write(path, xml).expect("write pom.xml");
+    }
+}
+
 /// A relocation target whose parent is missing is named after the
 /// dependency that relocates to it.
 #[test]
@@ -644,4 +936,56 @@ fn a_module_s_missing_remote_parent_names_the_module() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("org.example:lib-parent:1.0"), "{stderr}");
     assert!(stderr.contains("In core/pom.xml"), "{stderr}");
+}
+
+/// An imported BOM that no repository has is reported as missing, with the
+/// repositories searched, not as a POM raeva read and refused (gravitee).
+#[test]
+fn a_missing_bom_names_the_repositories_searched() {
+    let server = StubServer::start(|_| Response::new(404, ""));
+    let project = TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join("pom.xml"),
+        "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+         <artifactId>app</artifactId><version>1</version><dependencyManagement><dependencies>\
+         <dependency><groupId>org.example</groupId><artifactId>bom</artifactId>\
+         <version>9.0.12</version><type>pom</type><scope>import</scope></dependency>\
+         </dependencies></dependencyManagement></project>",
+    )
+    .unwrap();
+    let url = format!("http://{}/", server.addr());
+    write_repo_toml(project.path(), "central", &url);
+    let home = TempDir::new().unwrap();
+    let output = raeva_command(project.path(), home.path())
+        .arg("sync")
+        .output()
+        .unwrap();
+    let stderr = stderr(&output);
+    assert!(!stderr.contains("Invalid POM metadata"), "{stderr}");
+    assert!(
+        stderr.contains("BOM not found: org.example:bom:9.0.12"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&format!("{url} (404)")), "{stderr}");
+
+    // An artifact id a message cannot show in full is cut there.
+    let artifact = format!("{}tail", "a".repeat(120));
+    std::fs::write(
+        project.path().join("pom.xml"),
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>app</artifactId><version>1</version><dependencyManagement>\
+             <dependencies><dependency><groupId>org.example</groupId>\
+             <artifactId>{artifact}</artifactId><version>1</version><type>pom</type>\
+             <scope>import</scope></dependency></dependencies></dependencyManagement></project>"
+        ),
+    )
+    .unwrap();
+    let output = raeva_command(project.path(), home.path())
+        .arg("sync")
+        .output()
+        .unwrap();
+    let err = crate::common::stderr(&output);
+    assert!(err.contains("BOM not found: org.example:aaaa"), "{err}");
+    assert!(!err.contains("tail"), "{err}");
 }

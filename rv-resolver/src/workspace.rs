@@ -22,8 +22,11 @@ use rv_maven_model::held::{Held, par_map_held};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct WorkspaceModule {
-    /// Canonical workspace-root-relative POM path using forward slashes.
+    /// The POM's path relative to the reactor root, with `/` separators and
+    /// any `..` parts first, as raeva.lock records it.
     pub pom_path: String,
+    /// The canonical path of the POM file, which discovery read.
+    file: PathBuf,
     /// The module's effective GAV, active profiles, `<module>` entries and
     /// repositories, as discovery computed them: from local parents only,
     /// with the reactor root's `.mvn/maven.config` `-D` values applied.
@@ -36,6 +39,12 @@ impl WorkspaceModule {
     /// The module's effective, interpolated GAV.
     pub fn gav(&self) -> &Gav {
         &self.descriptor.gav
+    }
+
+    /// The canonical path of the module's POM file. Read the module through
+    /// this, never by joining [`Self::pom_path`] to a directory.
+    pub fn pom_file(&self) -> &Path {
+        &self.file
     }
 
     /// Raw user-authored POM retained for workspace-aware model resolution.
@@ -154,44 +163,8 @@ impl Workspace {
             _ => Arc::default(),
         };
         let parents = Arc::new(LocalParentCache::new(parsed));
-        let strict = Self::scan(
-            &canonical_root,
-            &root_pom,
-            activation.clone(),
-            &canonical_root,
-            &config,
-            &parents,
-        );
-
-        // The reactor root's own `<relativePath>` parent always sits outside
-        // the root directory, so the strict boundary can never accept it. When
-        // the reactor turns out to be a single selected module, resolution
-        // *does* accept that immediate external parent
-        // (`local_parent_boundary`), and discovery must agree or it indexes a
-        // GAV resolution will never produce, or fails outright on a version
-        // interpolated from a property the parent defines. Rescan under the
-        // relaxed boundary and keep the result only while it stays one module.
-        let relaxed_root = local_parent_boundary(&canonical_root, 1);
-        let retry_relaxed = relaxed_root != canonical_root
-            && match &strict {
-                Ok(workspace) => workspace.len() == 1 && workspace.modules[0].pom.parent.is_some(),
-                Err(_) => true,
-            };
-        if retry_relaxed
-            && let Ok(relaxed) = Self::scan(
-                &canonical_root,
-                &root_pom,
-                activation,
-                &relaxed_root,
-                &config,
-                &parents,
-            )
-            && relaxed.len() == 1
-        {
-            return Ok(relaxed.with_local_parent_poms(&parents));
-        }
-
-        strict.map(|workspace| workspace.with_local_parent_poms(&parents))
+        Self::scan(&canonical_root, &root_pom, activation, &config, &parents)
+            .map(|workspace| workspace.with_local_parent_poms(&parents))
     }
 
     /// Record the local parent POMs resolution accepts for this reactor's
@@ -201,11 +174,10 @@ impl Workspace {
         let mut seen: HashSet<PathBuf> = self
             .modules
             .iter()
-            .filter_map(|module| fs::canonicalize(self.root.join(&module.pom_path)).ok())
+            .map(|module| module.file.clone())
             .collect();
         let accepted = |module: &WorkspaceModule| -> Vec<PathBuf> {
-            let pom_path = self.root.join(&module.pom_path);
-            accepted_local_parents(&pom_path, &module.pom, &boundary, Some(parents.parsed()))
+            accepted_local_parents(&module.file, &module.pom, &boundary, Some(parents.parsed()))
                 .into_iter()
                 .map(|parent| fs::canonicalize(&parent).unwrap_or(parent))
                 .collect()
@@ -233,14 +205,13 @@ impl Workspace {
         canonical_root: &Path,
         root_pom: &Path,
         activation: ActivationContext,
-        parent_boundary: &Path,
         config: &MavenConfig,
         parents: &Arc<LocalParentCache>,
     ) -> Result<Self, WorkspaceError> {
         let mut scanner = Scanner {
             parents: Arc::clone(parents),
             root: canonical_root.to_path_buf(),
-            parent_boundary: parent_boundary.to_path_buf(),
+            parent_boundary: local_parent_boundary(canonical_root),
             activation,
             maven_config: config.clone(),
             modules: Vec::new(),
@@ -278,10 +249,18 @@ impl Workspace {
         &self.root
     }
 
+    /// The canonical POM file of the module whose path is `pom_path`, or
+    /// `pom_path` joined to the root when no module has that path.
+    pub fn module_file(&self, pom_path: &str) -> PathBuf {
+        (self.modules.iter())
+            .find(|module| module.pom_path == pom_path)
+            .map_or_else(|| self.root.join(pom_path), |module| module.file.clone())
+    }
+
     /// Directory that this reactor's local `<relativePath>` parents must stay
     /// inside. See [`local_parent_boundary`].
     pub(crate) fn local_parent_boundary(&self) -> PathBuf {
-        local_parent_boundary(&self.root, self.modules.len())
+        local_parent_boundary(&self.root)
     }
 
     /// Canonical paths of the POMs outside the reactor's modules that
@@ -313,9 +292,8 @@ impl Workspace {
         let mut queue: Vec<(PathBuf, Pom, Option<&[String]>)> = (self.modules.iter())
             .map(|module| {
                 let active = module.descriptor.selected_profiles().first();
-                let path = self.root.join(&module.pom_path);
                 (
-                    path,
+                    module.file.clone(),
                     module.pom.clone(),
                     Some(active.map_or(&[][..], Vec::as_slice)),
                 )
@@ -328,12 +306,13 @@ impl Workspace {
                     .into_iter()
                     .map(|parent| fs::canonicalize(&parent).unwrap_or(parent)),
             );
-            let listed = (pom.modules.iter()).map(|entry| (entry, active.is_none()));
+            let listed = (pom.modules.iter()).map(|entry| (entry, active.is_none(), None));
             let profiles = (pom.profiles.iter()).flat_map(|profile| {
                 let inactive = active.is_none_or(|active| !active.contains(&profile.id));
-                profile.modules.iter().map(move |entry| (entry, inactive))
+                (profile.modules.iter())
+                    .map(move |entry| (entry, inactive, Some(profile.id.as_str())))
             });
-            for (entry, unread) in listed.chain(profiles) {
+            for (entry, unread, profile) in listed.chain(profiles) {
                 let declaring_pom = normalized_relative_pom(&self.root, &path);
                 if (unread || options) && entry.contains("${") {
                     return Err(WorkspaceError::InvalidModule {
@@ -344,7 +323,7 @@ impl Workspace {
                 if !unread {
                     continue;
                 }
-                let module = resolve_module(&self.root, &path, entry)?;
+                let module = resolve_module(&self.root, &path, entry, profile)?;
                 if !seen.insert(module.clone()) {
                     continue;
                 }
@@ -961,9 +940,12 @@ pub enum WorkspaceError {
         source: PomError,
     },
     /// A `<module>` entry canonicalizes, after following links, to a path
-    /// outside the reactor root.
+    /// outside the directory its `..` parts reach from the reactor root, or
+    /// it names one on another drive, which raeva.lock cannot record
+    /// relative to the root.
     #[error(
-        "module `{}` declared by {declaring_pom} escapes canonical workspace root {workspace_root}",
+        "module `{}` declared by {declaring_pom} escapes {workspace_root}, the directory its path \
+         reaches from the reactor root",
         bounded(module)
     )]
     ModuleEscapes {
@@ -971,7 +953,8 @@ pub enum WorkspaceError {
         module: String,
         /// Root-relative path of the POM that declares it.
         declaring_pom: String,
-        /// The canonical reactor root, without a Windows `\\?\` prefix.
+        /// The canonical directory the entry reaches, or the reactor root
+        /// for one on another drive, without a Windows `\\?\` prefix.
         workspace_root: String,
     },
     /// A `<module>` entry is empty or does not name a POM file or a
@@ -985,6 +968,25 @@ pub enum WorkspaceError {
         module: String,
         /// Root-relative path of the POM that declares it.
         declaring_pom: String,
+    },
+    /// A `<module>` entry names a directory or file that does not exist,
+    /// which Maven reports as a child module that does not exist.
+    #[error(
+        "child module `{}` ({}) declared by {declaring_pom}{} does not exist",
+        bounded(module),
+        bounded(module_pom),
+        profile.as_deref().map(|id| format!(" in profile {}", bounded(id))).unwrap_or_default()
+    )]
+    MissingModule {
+        /// The `<module>` entry, interpolated and trimmed.
+        module: String,
+        /// The POM file the entry names, relative to the reactor root.
+        module_pom: String,
+        /// Root-relative path of the POM that declares it.
+        declaring_pom: String,
+        /// The active profile whose `<modules>` list the entry, `None` for
+        /// the POM's own `<modules>`.
+        profile: Option<String>,
     },
     /// `<modules>` lead back to a POM that is still being visited.
     #[error("aggregation cycle detected: {}", path_cycle(.cycle))]
@@ -1047,8 +1049,7 @@ const DISCOVERY_POLICY: ModelPolicy = ModelPolicy {
 struct Scanner {
     root: PathBuf,
     /// Containment boundary for `<relativePath>` parents; see
-    /// [`local_parent_boundary`]. Usually `root`, widened by one directory
-    /// while probing a single selected module.
+    /// [`local_parent_boundary`].
     parent_boundary: PathBuf,
     activation: ActivationContext,
     /// Reactor root `.mvn/maven.config`, overlaid on every module POM before
@@ -1134,6 +1135,7 @@ impl Scanner {
             .push(index);
         self.modules.push(WorkspaceModule {
             pom_path,
+            file: canonical_pom.clone(),
             descriptor,
             pom,
             local_parents: Vec::new(),
@@ -1224,7 +1226,18 @@ impl Scanner {
         let modules = descriptor
             .modules
             .iter()
-            .map(|entry| resolve_module(&self.root, canonical_pom, entry))
+            .map(|entry| {
+                let profile = (!pom.modules.contains(entry))
+                    .then(|| {
+                        (pom.profiles.iter()).find(|profile| {
+                            profile.modules.contains(entry)
+                                && descriptor.active_profiles.contains(&profile.id)
+                        })
+                    })
+                    .flatten();
+                let profile = profile.map(|profile| profile.id.as_str());
+                resolve_module(&self.root, canonical_pom, entry, profile)
+            })
             .collect();
         Ok(Prepared {
             pom_path,
@@ -1241,6 +1254,7 @@ fn resolve_module(
     root: &Path,
     declaring_pom: &Path,
     module_entry: &str,
+    profile: Option<&str>,
 ) -> Result<PathBuf, WorkspaceError> {
     let declaring_pom_relative = normalized_relative_pom(root, declaring_pom);
     let module_entry = module_entry.trim();
@@ -1268,6 +1282,14 @@ fn resolve_module(
             } else {
                 candidate.join("pom.xml")
             };
+            if source.kind() == std::io::ErrorKind::NotFound {
+                return Err(WorkspaceError::MissingModule {
+                    module: module_entry.to_string(),
+                    module_pom: normalized_relative_pom(root, &pom_candidate),
+                    declaring_pom: declaring_pom_relative,
+                    profile: profile.map(str::to_string),
+                });
+            }
             return Err(WorkspaceError::Io {
                 path: display_path(&pom_candidate),
                 source,
@@ -1282,11 +1304,21 @@ fn resolve_module(
         canonical = canonicalize(&read, display_path(&read))?;
     }
 
-    if !canonical.starts_with(root) {
+    // Maven reads a module wherever its entry points. raeva reads one below
+    // the directory the entry's `..` parts reach from the root, not through
+    // a link to elsewhere, and records its path relative to the root.
+    let reach = match canonical.starts_with(root) {
+        true => Some(root.to_path_buf()),
+        false => entry_reach(root, &candidate, |path| fs::canonicalize(path).ok()),
+    };
+    if !reach
+        .as_deref()
+        .is_some_and(|reach| canonical.starts_with(reach))
+    {
         return Err(WorkspaceError::ModuleEscapes {
             module: module_entry.to_string(),
             declaring_pom: declaring_pom_relative,
-            workspace_root: display_path(root),
+            workspace_root: display_path(reach.as_deref().unwrap_or(root)),
         });
     }
     // As in Maven, an entry may name the module's POM file under any name.
@@ -1374,16 +1406,88 @@ fn display_path(path: &Path) -> String {
     rv_fs::plain_path(path).display().to_string()
 }
 
-/// `pom` relative to `root` with `/` between its parts, as raeva.lock names
-/// a module. A Windows root is verbatim (`\\?\`), which a joined `/` path
-/// takes `\` from.
+/// `pom` relative to `root` with `/` between its parts, any `..` parts
+/// first, as raeva.lock names a module, or the whole of `pom` when it is on
+/// another drive. A Windows root is verbatim (`\\?\`), which a joined `/`
+/// path takes `\` from.
 pub(crate) fn normalized_relative_pom(root: &Path, pom: &Path) -> String {
-    pom.strip_prefix(root)
-        .unwrap_or(pom)
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let parts = relative_parts(root, pom).unwrap_or_else(|| {
+        (pom.components())
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect()
+    });
+    parts.join("/")
+}
+
+/// The parts of `path` relative to `root`, `..` first, `None` when the two
+/// share no prefix or root. Both are canonical or lexically normal.
+fn relative_parts(root: &Path, path: &Path) -> Option<Vec<String>> {
+    let root: Vec<_> = root.components().collect();
+    let path: Vec<_> = path.components().collect();
+    let common = (root.iter().zip(&path))
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+    let up = std::iter::repeat_n("..".to_string(), root.len() - common);
+    let down = path[common..]
+        .iter()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned());
+    Some(up.chain(down).collect())
+}
+
+/// `path` with its `.` parts dropped and each `..` part taking off the part
+/// before it, without reading the file system.
+pub(crate) fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
+/// The ancestor of `root` that the module path `candidate` reaches: the
+/// deepest of the root's ancestors that `candidate`'s leading parts, read
+/// lexically, pass through by `canonical` path, `root` itself for a path
+/// below it. The canonical form settles any spelling: case on a file system
+/// that ignores it, a link to one of the root's directories, `\\?\` or
+/// not. A part whose canonical path is no deeper along the root's ancestors
+/// ends the walk, so a link to an ancestor reaches no further than the
+/// directory it sits in. `None` when not even the file system root of
+/// `candidate` is one of `root`'s, as on another drive.
+fn entry_reach(
+    root: &Path,
+    candidate: &Path,
+    canonical: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    let mut reach: Option<PathBuf> = None;
+    for component in lexically_normal(candidate).components() {
+        prefix.push(component);
+        // A prefix alone names no directory: `C:` is the drive's current
+        // directory and `\\?\C:` the volume itself.
+        if matches!(component, std::path::Component::Prefix(_)) || !prefix.has_root() {
+            continue;
+        }
+        let Some(next) = canonical(&prefix) else {
+            break;
+        };
+        let deeper = reach.as_ref().is_none_or(|reach| {
+            next.starts_with(reach) && next.components().count() > reach.components().count()
+        });
+        if !deeper || !root.starts_with(&next) {
+            break;
+        }
+        reach = Some(next);
+    }
+    reach
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1759,6 +1863,185 @@ mod tests {
         .expect("write POM");
     }
 
+    /// A reactor whose modules sit beside its root, as re3gistry's
+    /// `Re3gistry2-build-helper` lists `../Re3gistry2Model`, is read as Maven
+    /// reads it, each module path relative to the root with its `..` parts
+    /// first. A module two levels up, one declared by such a module, and one
+    /// an absolute entry names, as `${project.basedir}/../x` does, are too;
+    /// each module POM is known by its canonical path.
+    #[test]
+    fn discovers_modules_beside_the_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sources = dir.path().join("checkout").join("sources");
+        let helper = sources.join("helper");
+        let absolute = format!("{}/../absolute", helper.display());
+        write_pom(
+            &helper,
+            "helper",
+            &["../model", "../base", "../../tools", &absolute],
+        );
+        write_pom(&sources.join("model"), "model", &[]);
+        write_pom(&sources.join("base"), "base", &["../extra"]);
+        write_pom(&sources.join("extra"), "extra", &[]);
+        write_pom(&dir.path().join("checkout").join("tools"), "tools", &[]);
+        write_pom(&sources.join("absolute"), "absolute", &[]);
+
+        let workspace = Workspace::discover(&helper).expect("sibling reactor");
+        assert_eq!(
+            module_artifacts(&workspace),
+            [
+                ("pom.xml", "helper"),
+                ("../model/pom.xml", "model"),
+                ("../base/pom.xml", "base"),
+                ("../extra/pom.xml", "extra"),
+                ("../../tools/pom.xml", "tools"),
+                ("../absolute/pom.xml", "absolute"),
+            ]
+        );
+        let canonical = fs::canonicalize(sources.join("extra").join("pom.xml")).unwrap();
+        assert_eq!(workspace.modules()[3].pom_file(), canonical);
+    }
+
+    /// A module beside the root that is a link to elsewhere, or to an
+    /// ancestor, escapes the directory its `..` parts reach, as a link below
+    /// the root does. On Windows the link is a junction.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_module_beside_the_root_stays_where_its_entry_points() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fs::canonicalize(dir.path()).expect("canonical tempdir");
+        let sources = dir.join("sources");
+        let helper = sources.join("helper");
+        write_pom(&dir, "top", &[]);
+        write_pom(&dir.join("outside"), "outside", &[]);
+        fs::create_dir_all(&sources).expect("sources");
+        #[cfg(unix)]
+        let link = |target: &Path, at: &Path| std::os::unix::fs::symlink(target, at).unwrap();
+        #[cfg(windows)]
+        let link = |target: &Path, at: &Path| rv_test_support::create_junction(at, target).unwrap();
+        link(&dir.join("outside"), &sources.join("linked"));
+        link(&dir, &sources.join("up"));
+        for entry in ["../linked", "../up"] {
+            write_pom(&helper, "helper", &[entry]);
+            let error = Workspace::discover(&helper).expect_err(entry);
+            assert!(
+                matches!(&error, WorkspaceError::ModuleEscapes { workspace_root, .. }
+                    if *workspace_root == display_path(&sources)),
+                "{entry}: {error}"
+            );
+        }
+    }
+
+    /// An entry that spells the root's directories another way, through a
+    /// link to one of them, reaches no further than the same entry spelled
+    /// canonically: a link below the root to elsewhere still escapes. So
+    /// does a link to an ancestor of the root, as a module or on the way to
+    /// one.
+    #[cfg(unix)]
+    #[test]
+    fn a_module_entry_reaches_no_further_by_another_spelling() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = fs::canonicalize(dir.path()).expect("canonical tempdir");
+        let root = dir.join("real").join("p").join("root");
+        let link = |target: &Path, at: &Path| std::os::unix::fs::symlink(target, at).unwrap();
+        write_pom(&dir.join("outside"), "outside", &[]);
+        write_pom(&dir, "top", &[]);
+        write_pom(&dir.join("real"), "real", &[]);
+        fs::create_dir_all(&root).expect("root");
+        link(&dir.join("real"), &dir.join("alias"));
+        link(&dir.join("outside"), &root.join("linked"));
+        link(&dir.join("real"), &root.join("up"));
+        link(&dir, &dir.join("real").join("p").join("a"));
+        let aliased = format!("{}/alias/p/root/linked", dir.display());
+        for entry in [aliased.as_str(), "up", "../a"] {
+            write_pom(&root, "root", &[entry]);
+            let error = Workspace::discover(&root).expect_err(entry);
+            assert!(
+                matches!(error, WorkspaceError::ModuleEscapes { .. }),
+                "{entry}: {error}"
+            );
+        }
+    }
+
+    /// The directory an entry reaches is the deepest of the root's own
+    /// ancestors its parts pass through, by canonical path, as on a file
+    /// system that ignores case, where `C:\work` is `C:\Work`.
+    #[test]
+    fn an_entry_reaches_the_root_ancestor_its_parts_pass_through() {
+        let real = ["/", "/Work", "/Work/Root", "/Work/app", "/Other"];
+        let canonical = |path: &Path| {
+            let folded = path.to_string_lossy().replace('\\', "/").to_lowercase();
+            let link = (folded == "/work/root/link").then(|| PathBuf::from("/Other"));
+            link.or_else(|| {
+                (real.iter())
+                    .find(|real| real.to_lowercase() == folded)
+                    .map(PathBuf::from)
+            })
+        };
+        let root = Path::new("/Work/Root");
+        for (candidate, reach) in [
+            ("/work/Root/link/pom.xml", Some("/Work/Root")),
+            ("/WORK/root/../app/pom.xml", Some("/Work")),
+            ("/Work/Root/../app/pom.xml", Some("/Work")),
+            ("/Other/pom.xml", Some("/")),
+            ("/missing/pom.xml", Some("/")),
+        ] {
+            assert_eq!(
+                entry_reach(root, Path::new(candidate), canonical).as_deref(),
+                reach.map(Path::new),
+                "{candidate}"
+            );
+        }
+    }
+
+    /// A UNC root, which canonical form spells `\\?\UNC\`, reaches a
+    /// sibling on the same share that an absolute entry names plainly.
+    #[cfg(windows)]
+    #[test]
+    fn a_unc_entry_reaches_its_share() {
+        let canonical = |path: &Path| {
+            let plain = path.to_string_lossy();
+            let rest = plain.strip_prefix(r"\\server\share")?;
+            Some(PathBuf::from(format!(r"\\?\UNC\server\share{rest}")))
+        };
+        let root = Path::new(r"\\?\UNC\server\share\helper");
+        let candidate = Path::new(r"\\server\share\app\pom.xml");
+        assert_eq!(
+            entry_reach(root, candidate, canonical).as_deref(),
+            Some(Path::new(r"\\?\UNC\server\share\"))
+        );
+    }
+
+    /// A `\\?\` entry, as one joined to a canonical directory is, reaches
+    /// past its prefix, which alone names the volume or share, not its root
+    /// directory.
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_entry_reaches_past_its_prefix() {
+        let canonical = |path: &Path| {
+            let bare = [r"\\?\C:", r"\\?\UNC\server\share"].contains(&path.to_str()?);
+            (!bare).then(|| path.to_path_buf())
+        };
+        for (root, candidate, reach) in [
+            (
+                r"\\?\C:\work\root",
+                r"\\?\C:\work\app\pom.xml",
+                r"\\?\C:\work",
+            ),
+            (
+                r"\\?\UNC\server\share\root",
+                r"\\?\UNC\server\share\app\pom.xml",
+                r"\\?\UNC\server\share\",
+            ),
+        ] {
+            assert_eq!(
+                entry_reach(Path::new(root), Path::new(candidate), canonical).as_deref(),
+                Some(Path::new(reach)),
+                "{candidate}"
+            );
+        }
+    }
+
     /// Discovery warns in walk order and not past the module it fails on,
     /// though it reads the modules ahead of the walk.
     #[test]
@@ -2107,8 +2390,7 @@ mod tests {
         write_pom(&temp.path().join("module"), "module", &[]);
         let error = Workspace::discover(temp.path()).expect_err("module. is missing");
         assert!(
-            matches!(&error, WorkspaceError::Io { source, .. }
-                if source.kind() == std::io::ErrorKind::NotFound),
+            matches!(&error, WorkspaceError::MissingModule { module, .. } if module == "module."),
             "{error}"
         );
 

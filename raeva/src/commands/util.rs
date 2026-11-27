@@ -153,12 +153,33 @@ pub(crate) fn count_dependencies<'a>(
 
 /// `group:artifact:version`, with the type and classifier only when the
 /// artifact is not a plain jar.
-pub(crate) fn display_coordinate(coordinate: &rv_maven_types::ArtifactCoord) -> String {
-    let classifier = coordinate.classifier().filter(|c| !c.is_empty());
-    if coordinate.extension() == "jar" && classifier.is_none() {
-        return coordinate.gav.to_string();
+pub(crate) fn display_coordinate(package: &rv_lock::LockModulePackage) -> String {
+    if shown_type(package) == "jar" && package.coordinate.classifier().is_none() {
+        return package.coordinate.gav.to_string();
     }
-    coordinate.to_string()
+    package_coordinate(package)
+}
+
+/// `group:artifact:version:type[:classifier]`, with the Maven type the
+/// package was declared with, as `mvn dependency:list` names it, and not
+/// the extension raeva.lock's artifact rows use.
+pub(crate) fn package_coordinate(package: &rv_lock::LockModulePackage) -> String {
+    let coordinate = &package.coordinate;
+    let text = format!("{}:{}", coordinate.gav, shown_type(package));
+    match coordinate.classifier() {
+        Some(classifier) => format!("{text}:{classifier}"),
+        None => text,
+    }
+}
+
+/// The Maven type, or the extension for a type that a coordinate cannot
+/// carry so `raeva why` reads it back: one with `:`, whitespace or `%`.
+fn shown_type(package: &rv_lock::LockModulePackage) -> &str {
+    let type_ = package.maven_type();
+    match type_.contains(|c: char| c == ':' || c == '%' || c.is_whitespace()) {
+        true => package.coordinate.extension(),
+        false => type_,
+    }
 }
 
 pub(crate) fn module_roots(module: &rv_lock::LockModule, incoming: &[usize]) -> Vec<usize> {

@@ -430,7 +430,7 @@ fn a_lock_without_the_host_platform_warns() {
     write(root.path(), "pom.xml", POM);
     for (text, records) in [
         (lock.as_str(), format!("only {other}")),
-        ("schema_version = 9\n", "no platform".to_string()),
+        ("schema_version = 10\n", "no platform".to_string()),
     ] {
         write(root.path(), "raeva.lock", text);
         let found = preflight(root.path());
@@ -760,7 +760,7 @@ fn the_plugin_row_follows_the_lock_and_raeva_toml() {
     assert_eq!(status(true), "info");
     let mut lock = Lockfile::new();
     // A lock of no platform pins no plugin.
-    fs::write(&path, "schema_version = 9\n").expect("write");
+    fs::write(&path, "schema_version = 10\n").expect("write");
     assert_eq!(status(true), "warn PLUGIN_TABLES_STALE");
     lock.platforms.push(LockPlatform::single_module(
         Platform::new("linux", "x86_64").expect("platform"),

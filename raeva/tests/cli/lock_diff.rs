@@ -137,7 +137,7 @@ fn added_removed_and_added_platform_are_structured() {
     assert!(
         changes
             .iter()
-            .any(|row| row["coordinate"] == "org.golden:lib:jar:tests")
+            .any(|row| row["coordinate"] == "org.golden:lib:test-jar:tests")
     );
     let added = changes.iter().find(|row| row["change"] == "added").unwrap();
     assert!(added["old_version"].is_null());

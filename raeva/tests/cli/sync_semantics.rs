@@ -3227,6 +3227,202 @@ fn a_refused_pom_conflict_names_the_modules_that_read_each_pom() {
     }
 }
 
+/// `repo-a` and `repo-b` serve other bytes for `parent:1`, the parent of
+/// `api:1`, which manages `lib` at 1.0 and 2.0. `lib:1.0`'s own parent,
+/// `lp:1`, differs too. Maven 3.9.12 and 3.10.0 read a parent or an
+/// imported BOM once for the whole build: the first module to read it, a
+/// project build before any graph and graphs in the sorted order, decides
+/// the bytes every module gets, though another module reads only the other
+/// repository. raeva locks the same, and the lock stays as it is on a sync,
+/// `--frozen` and `--offline`.
+#[test]
+fn a_parent_two_repositories_serve_differently_comes_from_the_first_reader() {
+    let module = |name: &str, repo: &str, head: &str, dependencies: &str| {
+        let head = match head {
+            "" => "<parent><groupId>org.test</groupId><artifactId>root</artifactId>\
+                   <version>1</version></parent>"
+                .to_string(),
+            head => head.to_string(),
+        };
+        (
+            format!("{name}/pom.xml"),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion>{head}<artifactId>{name}</artifactId>\
+                 <repositories><repository><id>{repo}</id>\
+                 <url>file://${{project.basedir}}/../{repo}/</url></repository></repositories>\
+                 <dependencies>{dependencies}</dependencies></project>"
+            ),
+        )
+    };
+    let in_repo = |repo: &str, published: Vec<(String, String)>| -> Vec<(String, String)> {
+        (published.into_iter())
+            .map(|(path, text)| (path.replacen("repository/", &format!("{repo}/"), 1), text))
+            .collect()
+    };
+    let parent = |repo: &str| {
+        let version = if repo == "repo-a" { "1.0" } else { "2.0" };
+        format!(
+            "<packaging>pom</packaging><dependencyManagement><dependencies>{}\
+             </dependencies></dependencyManagement>",
+            dependency("lib", version)
+        )
+    };
+    let reactor = |maven: &str, order: [&str; 2], a: (&str, &str), b: (&str, &str)| {
+        let [first, second] = order;
+        let mut files = vec![
+            (
+                "pom.xml".to_string(),
+                format!(
+                    "<project><modelVersion>4.0.0</modelVersion><groupId>org.test</groupId>\
+                     <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+                     <modules><module>{first}</module><module>{second}</module></modules></project>"
+                ),
+            ),
+            (
+                "raeva.toml".to_string(),
+                format!("[lock]\nmaven = \"{maven}\"\n"),
+            ),
+            module("a", "repo-a", a.0, a.1),
+            module("b", "repo-b", b.0, b.1),
+        ];
+        let api = "<parent><groupId>org.test</groupId><artifactId>parent</artifactId>\
+                   <version>1</version></parent><dependencies><dependency>\
+                   <groupId>org.test</groupId><artifactId>lib</artifactId></dependency>\
+                   </dependencies>";
+        let lp = "<parent><groupId>org.test</groupId><artifactId>lp</artifactId>\
+                  <version>1</version></parent>";
+        for repo in ["repo-a", "repo-b"] {
+            let described = format!("<packaging>pom</packaging><description>{repo}</description>");
+            files.extend(in_repo(repo, release("parent", "1", &parent(repo))));
+            files.extend(in_repo(repo, release("lp", "1", &described)));
+            files.extend(in_repo(repo, release("api", "1", api)));
+            files.extend(in_repo(repo, release("lib", "1.0", lp)));
+            files.extend(in_repo(repo, release("lib", "2.0", "")));
+        }
+        let files: Vec<_> = (files.iter())
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        Project::with(&files)
+    };
+    let api = dependency("api", "1");
+    let on_a = format!(
+        "{api}<dependency><groupId>org.test</groupId><artifactId>a</artifactId>\
+         <version>1</version><type>pom</type></dependency>"
+    );
+    let own_parent = "<parent><groupId>org.test</groupId><artifactId>parent</artifactId>\
+                      <version>1</version><relativePath/></parent><groupId>org.test</groupId>\
+                      <version>1</version>";
+    let a_pom = "<packaging>pom</packaging>";
+    let import = "<parent><groupId>org.test</groupId><artifactId>root</artifactId>\
+                  <version>1</version></parent><dependencyManagement><dependencies>\
+                  <dependency><groupId>org.test</groupId><artifactId>parent</artifactId>\
+                  <version>1</version><type>pom</type><scope>import</scope></dependency>\
+                  </dependencies></dependencyManagement>";
+    let lib = "<dependency><groupId>org.test</groupId><artifactId>lib</artifactId></dependency>";
+    for maven in ["3.9", "3.10"] {
+        for (case, order, a, b, winner) in [
+            (
+                "a first",
+                ["a", "b"],
+                ("", api.as_str()),
+                ("", api.as_str()),
+                "repo-a",
+            ),
+            (
+                "b first",
+                ["b", "a"],
+                ("", api.as_str()),
+                ("", api.as_str()),
+                "repo-b",
+            ),
+            (
+                "b on a",
+                ["b", "a"],
+                ("", api.as_str()),
+                ("", on_a.as_str()),
+                "repo-a",
+            ),
+            (
+                "b's parent",
+                ["a", "b"],
+                ("", api.as_str()),
+                (own_parent, api.as_str()),
+                "repo-b",
+            ),
+            (
+                "imports",
+                ["a", "b"],
+                (import, lib),
+                (import, lib),
+                "repo-a",
+            ),
+        ] {
+            let case = format!("Maven {maven}, {case}");
+            let project = reactor(maven, order, a, b);
+            let edit = |module: &str, from: &str, to: &str| {
+                let path = project.root().join(module).join("pom.xml");
+                let pom = fs::read_to_string(&path).unwrap();
+                fs::write(&path, pom.replace(from, to)).unwrap();
+            };
+            if case.ends_with("b on a") {
+                let packaged = format!("<artifactId>a</artifactId>{a_pom}");
+                edit("a", "<artifactId>a</artifactId>", &packaged);
+            }
+            // Maven looks a project's parent up in its repositories as
+            // written, before `${project.basedir}` is set.
+            if case.ends_with("b's parent") {
+                let url = format!("file://{}/repo-b/", project.root().display());
+                edit("b", "file://${project.basedir}/../repo-b/", &url);
+            }
+            assert_success(&project.raeva(&["sync"]), &case);
+            let lock = rv_lock::Lockfile::read(&project.root().join("raeva.lock")).unwrap();
+            let platform = &lock.platforms[0];
+            let lib = if winner == "repo-a" { "1.0" } else { "2.0" };
+            for module in &platform.modules {
+                if module.path == "pom.xml" {
+                    continue;
+                }
+                let held: Vec<String> = (module.packages.iter())
+                    .map(|package| package.coordinate.gav.to_string())
+                    .filter(|gav| gav.starts_with("org.test:lib:"))
+                    .collect();
+                assert_eq!(
+                    held,
+                    [format!("org.test:lib:{lib}")],
+                    "{case}: {}",
+                    module.path
+                );
+            }
+            let read = |artifact: &str| {
+                let path = project
+                    .root()
+                    .join(format!("{winner}/org/test/{artifact}/1/{artifact}-1.pom"));
+                crate::common::sha256_hex(&fs::read(path).unwrap())
+            };
+            let pinned = |coordinate: &str| {
+                (platform.support_poms.get(coordinate)).map(|pom| pom.sha256.to_string())
+            };
+            assert_eq!(pinned("org.test:parent:1"), Some(read("parent")), "{case}");
+            if winner == "repo-a" {
+                assert_eq!(pinned("org.test:lp:1"), Some(read("lp")), "{case}");
+            }
+            let written = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
+            for args in [&["sync"][..], &["sync", "--frozen"], &["sync", "--offline"]] {
+                assert_success(&project.raeva(args), &format!("{case}: {args:?}"));
+                let again = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
+                assert_eq!(again, written, "{case}: {args:?}");
+            }
+            let m2 = export_to_m2(&project);
+            let labels =
+                fs::read_to_string(m2.join("org/test/parent/1/_remote.repositories")).unwrap();
+            assert!(
+                labels.contains(&format!("parent-1.pom>{winner}=")),
+                "{case}: {labels}"
+            );
+        }
+    }
+}
+
 /// `a` asks `pick` `[1.0-alpha-1,3.0)`, and `other:1.0` pins
 /// `[1.0-alpha-1]`. The repository lists `1.0-alpha-1`, `1.0-a1` and `2.0`,
 /// and the first two compare equal. Maven 3.9.12 takes `1.0-a1` for `a`'s

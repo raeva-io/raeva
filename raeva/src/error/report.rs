@@ -1,6 +1,6 @@
 use rv_config::redact_url;
 use rv_maven_model::PomError;
-use rv_maven_types::is_snapshot_version;
+use rv_maven_types::{bounded, is_snapshot_version};
 use rv_repo::{CredentialFile, RepoError, SentCredential};
 use rv_resolver::{CredentialTarget, DroppedRepo, RepoSearchStatus, RepoStatus, ResolveError};
 use rv_store::metadata_cache::CacheError;
@@ -171,6 +171,24 @@ pub(crate) fn render_repo_error(
             "Run 'raeva sync --update' to resolve again and write a lock that pins every artifact",
         );
     }
+    let unshared = match err {
+        RepoError::Shared(inner) => inner,
+        other => other,
+    };
+    match unshared {
+        RepoError::MissingChecksum(_) => out.hint(format!(
+            "If you trust this repository without checksum files, run '{}' and review \
+             raeva.lock (SUPPLY-CHAIN RISK: the bytes are not checked against a checksum the \
+             server publishes)",
+            crate::output::command_line("sync --allow-missing-checksums")
+        )),
+        RepoError::MissingMetadataChecksum(_) => out.hint(format!(
+            "The repository must publish one; to accept the metadata unverified, set its \
+             checksum policy to warn or ignore and run '{}', then review raeva.lock",
+            crate::output::command_line("sync --allow-missing-checksums")
+        )),
+        _ => {}
+    }
     if unproven {
         out.hint(format!(
             "Run '{}' online once, or restore a seed saved after one: its repositories' 404 \
@@ -194,16 +212,58 @@ pub(crate) fn render_repo_error(
             crate::output::command_line("sync --update")
         ));
     }
-    if class == ErrorClass::Integrity(rv_repo::IntegritySource::Sidecar) {
-        out.message.push_str(
-            "\n  The repository served bytes that do not match the checksum it publishes \
-             for them.\n",
-        );
+    if class == ErrorClass::Integrity(rv_repo::IntegritySource::Header) {
         out.hint(
-            "Run the command again later; an interrupted upload or a proxy that rewrites \
-             responses can cause this",
+            "A broken transfer gives this too, so run the command again; if the header \
+             disagrees again, the repository serves bytes its own checksum header does not \
+             vouch for: report it to the repository's operator",
         );
-        out.hint("If it persists, report it to the repository's operator");
+    }
+    if let RepoError::ChecksumMismatch {
+        expected,
+        check: rv_repo::IntegritySource::Sidecar,
+        ..
+    } = unshared
+    {
+        let sidecar = expected.algorithm().as_str();
+        // The search stops at the repository whose file failed its check.
+        let failed = searched.and_then(<[_]>::last);
+        let id =
+            (failed.and_then(|entry| entry.repo_id.as_deref())).map(crate::output::inline_text);
+        let mirror = (failed.and_then(|entry| entry.served_by.as_deref())).map(redact_url);
+        let server = match (mirror, &id) {
+            (Some(mirror), Some(id)) => format!("The mirror {mirror} of the repository '{id}'"),
+            (Some(mirror), None) => format!("The mirror {mirror}"),
+            (None, Some(id)) => format!("The repository '{id}'"),
+            (None, None) => "The repository".to_string(),
+        };
+        out.message.push_str(&format!(
+            "\n  {server} served bytes that do not match the .{sidecar} file it publishes \
+             for them.\n",
+        ));
+        let route_around = match id {
+            Some(id) => format!(
+                "mirror the repository id '{id}' in settings.xml to one that serves the file \
+                 with correct checksum files"
+            ),
+            None => "take the file from a repository that serves it with correct checksum \
+                     files"
+                .to_string(),
+        };
+        // A checksum file can stay wrong for years, so a second run tells
+        // a broken transfer from it rather than waiting.
+        out.hint(format!(
+            "If a second run gets the same checksum, the transfer is not at fault: compare \
+             the file's bytes with another repository's copy, and when they match, the \
+             repository's .{sidecar} file is wrong. Report it to the repository's operator, \
+             and until it is fixed, {route_around}"
+        ));
+        if expected.algorithm() == rv_maven_types::HashAlgorithm::Sha256 {
+            out.hint(
+                "No .sha1 or .md5 file of the repository, which Maven checks by default, \
+                 vouches for the bytes either",
+            );
+        }
     }
     out
 }
@@ -271,8 +331,10 @@ pub(crate) fn render_pom_error(err: &PomError) -> Rendered {
     match err {
         PomError::ParentNotFound(group, artifact, version) => {
             out.message = format!(
-                "Parent POM not found: {group}:{artifact}:{version}\n\n  This parent POM could \
-                 not be resolved.\n"
+                "Parent POM not found: {}:{}:{}\n\n  This parent POM could not be resolved.\n",
+                bounded(group),
+                bounded(artifact),
+                bounded(version)
             );
             if is_snapshot_version(version) {
                 out.hint("SNAPSHOT parents require a repository with snapshots = true");
@@ -286,6 +348,17 @@ pub(crate) fn render_pom_error(err: &PomError) -> Rendered {
                 "A local <relativePath> parent is read only inside the project directory, or \
                  one level above a single module; run raeva from a directory that contains it",
             );
+        }
+        PomError::ImportNotFound(group, artifact, version) => {
+            out.message = format!(
+                "BOM not found: {}:{}:{}\n\n  No repository searched has this BOM, which a \
+                 <dependencyManagement> imports.\n",
+                bounded(group),
+                bounded(artifact),
+                bounded(version)
+            );
+            out.hint("If the BOM is internal, add its repository to raeva.toml");
+            out.doctor_hint();
         }
         PomError::Unlockable(_) => {
             out.message = format!(
@@ -657,13 +730,18 @@ fn render_auth_error(
         && let RepoError::Unauthorized {
             status,
             url,
+            redirected_to,
             sent: Some(sent),
         } = err
     {
         downloaded = CredentialTarget {
             id: sent.id.clone(),
-            url: url.clone(),
+            url: match redirected_to {
+                Some(origin) => format!("{url} (redirected to {origin})"),
+                None => url.clone(),
+            },
             sent: Some((**sent).clone()),
+            redirect_target: false,
         };
         refused.push((&downloaded, status.as_u16()));
     }
@@ -695,7 +773,18 @@ fn render_auth_error(
                     "no credentials were sent: the settings.xml password could not be decrypted"
                         .to_string()
                 }
+                None if target.redirect_target => "no credentials were sent: a repository's \
+                    credentials go only to its own origin"
+                    .to_string(),
                 None => "no credentials were sent".to_string(),
+                Some(sent) if sent.file == CredentialFile::Redirect => match *code {
+                    403 => {
+                        "the Basic auth of the redirect's userinfo was sent but does not \
+                            grant access"
+                    }
+                    _ => "the Basic auth of the redirect's userinfo was sent but rejected",
+                }
+                .to_string(),
                 Some(sent) => {
                     let outcome = if *code == 403 {
                         "were sent but do not grant access"
@@ -717,9 +806,10 @@ fn render_auth_error(
                 .id
                 .as_deref()
                 .map(|id| format!("'{}'", crate::output::inline_text(id)))
-                .unwrap_or_else(|| match from_download {
-                    true => "the repository".to_string(),
-                    false => "repository without an id".to_string(),
+                .unwrap_or_else(|| match (target.redirect_target, from_download) {
+                    (true, _) => "the redirect target".to_string(),
+                    (false, true) => "the repository".to_string(),
+                    (false, false) => "repository without an id".to_string(),
                 });
             let _ = writeln!(
                 message,
@@ -835,7 +925,10 @@ fn render_auth_error(
              token = \"...\" only for HTTP Bearer authentication.\n",
         );
         out.hint(auth);
-    } else if unsent.iter().any(|target| target.id.is_none()) {
+    } else if unsent
+        .iter()
+        .any(|target| target.id.is_none() && !target.redirect_target)
+    {
         out.hint(format!(
             "Give the repository an id to configure its credentials in {} or the user \
              config.toml",
@@ -849,6 +942,12 @@ fn render_auth_error(
 /// What to check about a credential a repository refused. Names its source,
 /// never its value.
 fn sent_credential_hint(sent: &SentCredential, code: u16, env: &HintEnv) -> String {
+    if sent.file == CredentialFile::Redirect {
+        return "The repository redirected to a URL with credentials in it, which raeva sent \
+                as Basic auth, as Maven does; the repository chose them, so check with its \
+                operator"
+            .to_string();
+    }
     let label = credential_label(sent.id.as_deref());
     let file = credential_file(sent.file, &env.settings_location());
     if !sent.unset_variables.is_empty() {
@@ -891,6 +990,7 @@ pub(crate) fn credential_file(file: CredentialFile, settings: &str) -> String {
         CredentialFile::Project => "the project raeva.toml".to_string(),
         CredentialFile::User => "the user config.toml".to_string(),
         CredentialFile::Settings => settings.to_string(),
+        CredentialFile::Redirect => "the redirect's userinfo".to_string(),
     }
 }
 
@@ -991,10 +1091,12 @@ fn render_network_error(
     if let RepoError::HttpStatus {
         status,
         url,
+        redirected_to,
         retry_after,
     } = err.cause()
         && err.is_transient()
     {
+        let url = redirected_to.as_ref().unwrap_or(url);
         let host = url::Url::parse(url)
             .ok()
             .and_then(|url| url.host_str().map(str::to_string))
@@ -1325,6 +1427,7 @@ mod tests {
             id: id.map(str::to_string),
             url: served_by.to_string(),
             sent: None,
+            redirect_target: false,
         });
         status
     }
@@ -1336,9 +1439,48 @@ mod tests {
                 status: reqwest::StatusCode::from_u16(code).expect("status"),
                 url: "https://registry.raeva.io/maven/canary/io/raeva/lib/1.0/lib-1.0.pom"
                     .to_string(),
+                redirected_to: None,
                 sent: None,
             }),
             searched,
+        }
+    }
+
+    /// A redirect target on another origin that refused is named as such,
+    /// with what went to it, and no hint suggests configuring a repository
+    /// credential for it.
+    #[test]
+    fn a_refusing_redirect_target_is_named_with_what_it_was_sent() {
+        let target = "https://cdn.example/files/lib-1.0.pom";
+        let redirect = rv_repo::SentCredential {
+            id: None,
+            file: rv_repo::CredentialFile::Redirect,
+            unset_variables: Vec::new(),
+        };
+        for (sent, reason) in [
+            (
+                None,
+                "no credentials were sent: a repository's credentials go only to its own origin",
+            ),
+            (
+                Some(redirect),
+                "the Basic auth of the redirect's userinfo was sent but rejected",
+            ),
+        ] {
+            let mut status =
+                RepoSearchStatus::new("https://repo.example/m2/", RepoStatus::Http(401));
+            status.refused_by = Some(rv_resolver::CredentialTarget {
+                id: None,
+                url: target.to_string(),
+                sent,
+                redirect_target: true,
+            });
+            let rendered = render_resolve_error(&auth_failure(401, vec![status]));
+            let line = format!("the redirect target at {target} (HTTP 401: {reason})");
+            assert!(rendered.contains(&line), "{rendered}");
+            for hint in ["<server>", "[[auth]]", "Give the repository an id"] {
+                assert!(!rendered.contains(hint), "{rendered}");
+            }
         }
     }
 
@@ -1461,6 +1603,42 @@ mod tests {
         );
         assert!(
             rendered.contains("id = \"a\\u001B[2J<b>\\\"\""),
+            "{rendered}"
+        );
+    }
+
+    /// A repository without an id gives no id to mirror, so the hint does
+    /// not ask for one.
+    #[test]
+    fn a_wrong_checksum_file_of_a_repository_without_an_id() {
+        let mismatch = |searched| ResolveError::Repo {
+            coord: Some("test:lib:1".to_string()),
+            source: Box::new(rv_repo::RepoError::ChecksumMismatch {
+                subject: "https://repo.example/m2/test/lib/1/lib-1.jar".into(),
+                artifact: None,
+                expected: rv_maven_types::Digest::of_bytes(
+                    rv_maven_types::HashAlgorithm::Sha1,
+                    b"a",
+                ),
+                actual: rv_maven_types::Digest::of_bytes(rv_maven_types::HashAlgorithm::Sha1, b"b"),
+                check: rv_repo::IntegritySource::Sidecar,
+            }),
+            searched,
+        };
+        let status = RepoSearchStatus::new("https://repo.example/m2/", RepoStatus::Other);
+        let rendered = render_resolve_error(&mismatch(vec![status.clone()]));
+        assert!(
+            rendered.contains("The repository served bytes that do not match the .sha1 file")
+                && rendered.contains("take the file from a repository that serves it")
+                && !rendered.contains("repository id"),
+            "{rendered}"
+        );
+        let mut named = status;
+        named.repo_id = Some("corp\u{1b}[2J".to_string());
+        let rendered = render_resolve_error(&mismatch(vec![named]));
+        assert!(
+            rendered.contains("The repository 'corp\\u{1b}[2J' served")
+                && rendered.contains("mirror the repository id 'corp\\u{1b}[2J' in settings.xml"),
             "{rendered}"
         );
     }

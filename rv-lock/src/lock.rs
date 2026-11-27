@@ -22,7 +22,7 @@ use crate::platform::Platform;
 
 /// The only schema this build reads and writes. A lock of any other schema
 /// is refused, and a plain `raeva sync` regenerates it.
-pub const LOCKFILE_SCHEMA_VERSION: u32 = 9;
+pub const LOCKFILE_SCHEMA_VERSION: u32 = 10;
 
 /// Model hash given to a platform built in memory without one (see
 /// [`LockPlatform::single_module`]). `raeva sync` always records the real hash.
@@ -1485,6 +1485,20 @@ fn check_module_fields(module: &LockModule, mode: MavenMode, on: &str) -> Result
             &|| format!("package of {row}"),
             reactor,
         )?;
+        if let Some(type_) = package.type_.as_deref() {
+            if !rv_maven_types::lock_text_recordable(type_) {
+                return Err(LockError::Invalid(format!(
+                    "invalid package of {row}: its type must be 1 to 255 characters, none of \
+                     them a control or invisible character, and not '?'"
+                )));
+            }
+            if type_ == package.coordinate.extension() {
+                return Err(LockError::Invalid(format!(
+                    "invalid package of {row}: its type column must be empty when the type is \
+                     the extension"
+                )));
+            }
+        }
         if let Some(workspace_path) = package.workspace_module.as_deref() {
             validate_module_path(workspace_path, "workspace_module")?;
         }
@@ -1610,21 +1624,25 @@ fn check_model_inputs(inputs: &ModelInputs, platform: &Platform) -> Result<(), L
     })
 }
 
+/// A module's POM path, relative to the directory of raeva.lock: `..` parts
+/// first, for a module beside that directory as `<module>../x</module>`
+/// declares one, then at least one other part, none of them `.` or `..`.
 pub(crate) fn validate_module_path(path: &str, field: &str) -> Result<(), LockError> {
-    let invalid = path.is_empty()
-        || !is_terminal_safe(path)
-        || path.starts_with('/')
-        || path.starts_with('\\')
+    let parts: Vec<&str> = path.split('/').collect();
+    let below = &parts[parts.iter().take_while(|part| **part == "..").count()..];
+    let invalid = !is_terminal_safe(path)
         || path.contains('\\')
         // `C:/x/pom.xml` would replace the root it is joined to on Windows.
         || path.contains(':')
-        || path
-            .split('/')
-            .any(|component| component.is_empty() || component == "." || component == "..");
+        || below.is_empty()
+        || below
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..");
     // A `<module>` entry may name its POM file under any name, as in Maven.
     if invalid {
         return Err(LockError::Invalid(format!(
-            "{field} path {path:?} must be a normalized root-relative POM path"
+            "{field} path {path:?} must be a normalized POM path relative to the lock's \
+             directory, with any '..' parts first"
         )));
     }
     Ok(())
@@ -2372,7 +2390,9 @@ impl LockArtifact {
 #[non_exhaustive]
 pub struct LockModule {
     /// The module's `pom.xml`, relative to the directory that holds raeva.lock,
-    /// with `/` separators. Written as `path`.
+    /// with `/` separators, and `..` parts first for a module beside that
+    /// directory. Written as `path`. No command reads a file by this path:
+    /// it is compared with the paths discovery finds.
     pub path: String,
     /// The module's effective coordinates. Written as `gav`,
     /// `group:artifact:version`.
@@ -2635,8 +2655,14 @@ pub struct LockModulePackage {
     /// The node's coordinate. Written as the line's first two columns,
     /// `group:artifact:version` and `packaging[:classifier]`.
     pub coordinate: ArtifactCoord,
+    /// The `<type>` of the declaration that won mediation, when it is not
+    /// the extension: `test-jar` for `jar:tests`, or a type a build
+    /// extension defines, such as `executable-war` for `war`. Written as
+    /// the fifth column, spelled as a scope Maven does not know is
+    /// ([`rv_maven_types::encode_lock_text`]).
+    pub type_: Option<String>,
     /// For another reactor module, its POM path, which names a
-    /// [`LockModule`] of the same platform. Written as the fifth column.
+    /// [`LockModule`] of the same platform. Written as the sixth column.
     pub workspace_module: Option<String>,
     /// For a system-scoped file, its path relative to the directory that
     /// holds raeva.lock ([`crate::SystemFile`]). Set together with
@@ -2656,6 +2682,12 @@ pub struct LockModulePackage {
     /// imports, and the property the version is written as. Written in the
     /// module's `managed` lines, which name the package by its index.
     pub managed: Option<std::sync::Arc<rv_maven_types::ManagedSource>>,
+    /// Whether the node resolves as optional, as Maven's
+    /// SimpleOptionalitySelector picks it: a dependency the module declares
+    /// takes its own `<optional>`, another is optional when every path to
+    /// it passes an optional dependency. Written in the module's
+    /// `optional` line, which names the package by its index.
+    pub optional: bool,
 }
 
 impl LockModule {
@@ -2697,13 +2729,20 @@ impl LockModulePackage {
     pub fn new(coordinate: ArtifactCoord, direct_scope: Option<Scope>) -> Self {
         Self {
             coordinate,
+            type_: None,
             direct_scope,
             scope: direct_scope.unwrap_or(Scope::Compile),
             workspace_module: None,
             system_path: None,
             system_sha256: None,
             managed: None,
+            optional: false,
         }
+    }
+
+    /// The Maven type: [`Self::type_`], else the extension.
+    pub fn maven_type(&self) -> &str {
+        self.type_.as_deref().unwrap_or(self.coordinate.extension())
     }
 
     /// Where the package comes from.

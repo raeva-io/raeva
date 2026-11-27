@@ -13,7 +13,7 @@
           "platform": "<host-platform>"
         }
       ],
-      "schema_version": 9,
+      "schema_version": 10,
       "total_packages": 9,
       "unique_artifacts": 8,
       "warnings": []

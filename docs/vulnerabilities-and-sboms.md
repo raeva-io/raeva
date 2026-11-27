@@ -232,11 +232,17 @@ does not know, adds no property. CycloneDX has no registered property
 for the Maven scope, so the name is in the `raeva` namespace. The CycloneDX
 `scope` is `excluded` when every one of those modules resolves the
 component to `test`, and then the registered `cdx:maven:package:test`
-property is `true`. Otherwise `scope` is `required`, also for `provided`
-and `system`: the Maven scope does not tell an API the runtime supplies
-from a compile-only jar. A component that is test scope in one module and
-compile scope in another is `required`. So is a reactor module that no
-selected module depends on, which has no `raeva:maven:scope` property.
+property is `true`. It is `optional` when every module that resolves it
+outside tests resolves it as optional, as Maven does a dependency declared
+`<optional>true</optional>` and one reached only below such a dependency:
+a project that depends on the module does not get it. The CycloneDX Maven
+plugin writes `optional` for the same components. Otherwise `scope` is
+`required`, also for `provided` and `system`: the Maven scope does not
+tell an API the runtime supplies from a compile-only jar. A component that
+is test scope in one module and compile scope in another is `required`, as
+is one that is optional in one module and not in another. So is a reactor
+module that no selected module depends on, which has no
+`raeva:maven:scope` property.
 
 Licenses come from each component's effective POM, including inherited
 licenses and target-specific property interpolation. This includes the

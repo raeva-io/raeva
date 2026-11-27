@@ -77,6 +77,46 @@ fn an_inactive_jdk_profile_added_to_the_pom_passes_frozen() {
 /// A `<file>` condition is recorded relative to the project, so the lock
 /// passes after the project moves, and the file's appearance is drift. A
 /// profile that only configures the build is neither recorded nor listed.
+/// A `<file>` condition an edited raeva.lock names through a link out of
+/// the project is not tested: `--frozen` says the same whether or not the
+/// file it leads to exists.
+#[cfg(unix)]
+#[test]
+fn a_locked_file_condition_is_not_tested_through_a_link_out() {
+    let profiles = format!(
+        "<profiles>{}</profiles>",
+        file_profile(
+            "marked",
+            "${project.basedir}/marker.txt",
+            &format!("<dependencies>{LIB}</dependencies>")
+        ),
+    );
+    let project = Project::synced_with(&[("pom.xml", &pom("root", "repository/", &profiles))]);
+    let root = project.root();
+    let outside = tempfile::tempdir().expect("outside");
+    std::os::unix::fs::symlink(outside.path(), root.join("linked")).expect("symlink");
+    let lock_path = root.join("raeva.lock");
+    let lock = fs::read_to_string(&lock_path).unwrap();
+    let edited = lock.replace(
+        "file:marker.txt is false",
+        "file:linked/marker.txt is false",
+    );
+    assert_ne!(lock, edited);
+    fs::write(&lock_path, edited).unwrap();
+    let frozen = || {
+        let output = project.raeva(&["sync", "--frozen", "--offline"]);
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let absent = frozen();
+    fs::write(outside.path().join("marker.txt"), "x").unwrap();
+    let present = frozen();
+    assert_eq!(absent, present);
+    assert!(!present.1.contains("now true"), "{}", present.1);
+}
+
 #[test]
 fn file_profiles_record_project_relative_outcomes() {
     let profiles = format!(

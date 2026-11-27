@@ -568,22 +568,24 @@ fn baseline_comparison_keeps_versions_and_qualifiers_exact() {
     let (project, home) = temp_project();
     write_demo_lock(project.path(), home.path(), DEMO, Vec::new());
     let (url, server) = baseline_osv(None);
-    for (version, packaging, classifier) in [
-        ("1.0.0", "test-jar", Some("tests")),
-        ("2.0.0", "jar", Some("tests")),
-        ("2.0.0", "test-jar", Some("other")),
+    for (version, type_, classifier) in [
+        ("1.0.0", Some("test-jar"), "tests"),
+        ("2.0.0", None, "tests"),
+        ("2.0.0", Some("test-jar"), "other"),
     ] {
         let baseline = baseline_lock(project.path(), |lock| {
             let coordinate = rv_maven_types::ArtifactCoord::new(
                 "org.example",
                 "demo-lib",
                 version,
-                packaging,
-                classifier,
+                "jar",
+                Some(classifier),
             );
             let platform = &mut lock.platforms[0];
             platform.artifacts[0].coordinate = coordinate.clone();
-            platform.modules[0].packages[0].coordinate = coordinate;
+            let package = &mut platform.modules[0].packages[0];
+            package.coordinate = coordinate;
+            package.type_ = type_.map(str::to_string);
         });
         let output = raeva_command(project.path(), home.path())
             .env("RAEVA_OSV_BASE_URL", &url)

@@ -63,6 +63,10 @@ impl Component {
 pub enum ComponentScope {
     /// `required`: the component is on the runtime call graph.
     Required,
+    /// `optional`: the component is not installed at runtime unless
+    /// something else installs it, such as a Maven `<optional>` dependency
+    /// for a project that depends on the module.
+    Optional,
     /// `excluded`: the component is used only outside runtime, such as by
     /// tests.
     Excluded,

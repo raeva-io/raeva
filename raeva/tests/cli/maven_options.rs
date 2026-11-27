@@ -352,17 +352,21 @@ fn a_hidden_variable_in_a_profile_option_refuses() {
     );
 }
 
-/// `-itr` makes Maven also leave out the repositories a dependency's POM
-/// declares for its parent, which raeva follows, so it refuses in
-/// `.mvn/maven.config` as in `MAVEN_ARGS`; 0.6.0 ignored it in the file.
+/// `-itr` in `.mvn/maven.config` is read, as Quarkus has it; in
+/// `MAVEN_ARGS`, a host's own, it still refuses.
 #[test]
-fn ignoring_transitive_repositories_refuses() {
+fn ignoring_transitive_repositories_is_read_from_maven_config_only() {
     let project = Project::new();
     for option in ["-itr", "--ignore-transitive-repositories"] {
         project.write(".mvn/maven.config", &format!("{option}\n"));
-        let refused = project.raeva(&["sync", "--offline"]);
+        assert_success(&project.raeva(&["sync", "--offline"]), option);
+        let mut command = raeva_command(project.path(), project.home.path());
+        command
+            .env("MAVEN_ARGS", option)
+            .args(["sync", "--offline"]);
+        let refused = command.output().expect("run raeva");
         assert_status(&refused, 3, option);
-        assert!(stderr(&refused).contains("-itr"), "{}", stderr(&refused));
+        assert!(stderr(&refused).contains(option), "{}", stderr(&refused));
     }
 }
 

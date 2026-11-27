@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 /// What a model build read from the host: the JDK's `java.version`, its
-/// `java.home`, an allowlisted environment variable, the Linux release, a
-/// profile activation condition that tested one of the first three, or
+/// `java.home` or `java.vendor`, an allowlisted environment variable, the
+/// Linux release, a profile activation condition that tested one of those
+/// but the release, or
 /// whether a file a `<file>` condition names exists. A condition stands for
 /// its outcome, so a host whose values differ but give the same outcomes
 /// builds the same model.
@@ -18,6 +19,8 @@ pub enum HostInput {
     JavaVersion,
     /// The JDK's `java.home`, from `JAVA_HOME` or the `java` on `PATH`.
     JavaHome,
+    /// The `java.vendor` of that JDK ([`JdkRelease::java_vendor`]).
+    JavaVendor,
     /// The environment variable of this name.
     Env(String),
     /// The `ID`, `VERSION_ID` and `ID_LIKE` of the Linux release, which
@@ -26,8 +29,9 @@ pub enum HostInput {
     /// A `<jdk>` condition, as interpolated, that tested the host JDK
     /// version.
     Jdk(String),
-    /// A `<property>` condition that tested `java.version`, `java.home` or
-    /// an `env.NAME` variable of the host: the name as written, with its
+    /// A `<property>` condition that tested `java.version`, `java.home`,
+    /// `java.vendor` or an `env.NAME` variable of the host: the name as
+    /// written, with its
     /// `!`, and the `<value>` when it is not empty.
     Property {
         /// The `<name>` after activation interpolation, `!` included.
@@ -553,6 +557,7 @@ impl HostSnapshot {
                     .unwrap_or_else(|| DEFAULT_JAVA_VERSION.to_string()),
             ),
             HostInput::JavaHome => self.0.java_home.clone(),
+            HostInput::JavaVendor => self.0.java_vendor().map(str::to_string),
             HostInput::Env(name) if self.0.allowed.contains(name) => self.0.env.get(name).cloned(),
             HostInput::Env(_) => None,
             HostInput::OsRelease => self.0.linux_release.as_ref().map(|release| {
@@ -589,6 +594,8 @@ impl HostSnapshot {
                             .is_none_or(str::is_empty)
                             .then(|| "set".to_string())
                     }),
+                    // A vendor raeva cannot tell decides no outcome.
+                    "java.vendor" => Some(self.value(&HostInput::JavaVendor)?),
                     other => other
                         .strip_prefix("env.")
                         .and_then(|variable| self.value(&HostInput::Env(variable.to_string()))),
@@ -602,6 +609,7 @@ impl HostSnapshot {
             HostInput::File(path) => Some(Path::new(path).exists()),
             HostInput::JavaVersion
             | HostInput::JavaHome
+            | HostInput::JavaVendor
             | HostInput::Env(_)
             | HostInput::OsRelease
             | HostInput::FileLookup { .. }
@@ -860,6 +868,11 @@ pub(crate) enum LauncherSet<'a> {
 const CLASSWORLDS_LAUNCHER: &str = "org.codehaus.plexus.classworlds.launcher.Launcher";
 
 impl EnvironmentInner {
+    /// [`JdkRelease::java_vendor`] of the host JDK.
+    fn java_vendor(&self) -> Option<&str> {
+        self.jdk_release.as_ref()?.java_vendor()
+    }
+
     /// The variable `name` in the environment of the JVM `mvn` starts, as
     /// settings.xml interpolation reads `${env.name}`: by the name as set,
     /// or as `env.name` reads it ([`Self::maven_env`]).
@@ -1446,6 +1459,14 @@ impl ModelEnvironment {
         self.inner.java_home.as_deref()
     }
 
+    /// The `java.vendor` of the JDK `mvn` runs, when its `release` file
+    /// tells it. Under a `[lock] jdks` entry it is still the host JDK's: the
+    /// lock records what each condition on it gave, which every host checks
+    /// with its own JDK.
+    pub(crate) fn host_java_vendor(&self) -> Option<&str> {
+        self.inner.java_vendor()
+    }
+
     /// `env.JAVA_HOME` of Maven's JVM: the variable `mvn` picks the JDK of
     /// [`Self::host_java_home`] by, unless a `[lock] jdks` JDK other than
     /// the host's leaves that home unknown.
@@ -1818,6 +1839,8 @@ pub struct JdkRelease {
     /// Whether the file names OpenJ9, as an OpenJ9 JDK's `JVM_VARIANT`
     /// does: its JVM is not HotSpot.
     pub openj9: bool,
+    /// `IMPLEMENTOR`, such as `Eclipse Adoptium`.
+    pub implementor: Option<String>,
 }
 
 impl JdkRelease {
@@ -1833,8 +1856,8 @@ impl JdkRelease {
         Some(Self::parse(&contents))
     }
 
-    /// The `JAVA_VERSION=` and `JAVA_VERSION_DATE=` lines of a `release`
-    /// file's `contents`.
+    /// The `JAVA_VERSION=`, `JAVA_VERSION_DATE=` and `IMPLEMENTOR=` lines of
+    /// a `release` file's `contents`.
     pub fn parse(contents: &str) -> Self {
         let value = |key: &str| {
             contents.lines().find_map(|line| {
@@ -1846,7 +1869,18 @@ impl JdkRelease {
             version: value("JAVA_VERSION"),
             version_date: value("JAVA_VERSION_DATE"),
             openj9: contents.to_ascii_lowercase().contains("openj9"),
+            implementor: value("IMPLEMENTOR").filter(|value| !value.is_empty()),
         }
+    }
+
+    /// The JDK's `java.vendor`: its `IMPLEMENTOR` from JDK 11 on, where
+    /// Temurin, Corretto, Zulu, Semeru (OpenJ9) and the Arch Linux builds
+    /// report that. A JDK 8 can differ: Temurin 8's is `Temurin`. An
+    /// unbranded build's `N/A` is not measured.
+    pub fn java_vendor(&self) -> Option<&str> {
+        let feature = *self.version_numbers()?.first()?;
+        let implementor = self.implementor.as_deref().filter(|name| *name != "N/A")?;
+        (feature >= 11).then_some(implementor)
     }
 
     /// The numbers of the version, the feature release first: `1.8.0_442`
@@ -2012,6 +2046,36 @@ mod tests {
         assert!(!release.openj9);
         assert_eq!(JdkRelease::parse("JAVA_VERSION=\"8\"\n").version_date, None);
         assert!(JdkRelease::parse("JAVA_VERSION=\"21\"\nJVM_VARIANT=\"Openj9\"\n").openj9);
+        // As measured: Temurin 11 and 21, Semeru 17 and Temurin 8, whose
+        // `java.vendor` is `Temurin`.
+        for (release, vendor) in [
+            (
+                "IMPLEMENTOR=\"Eclipse Adoptium\"\nIMPLEMENTOR_VERSION=\"Temurin-21.0.13.1+2\"\n\
+              JAVA_VERSION=\"21.0.13.1\"\n",
+                Some("Eclipse Adoptium"),
+            ),
+            (
+                "JAVA_VERSION=\"11.0.33.1\"\nIMPLEMENTOR=\"Eclipse Adoptium\"\n",
+                Some("Eclipse Adoptium"),
+            ),
+            (
+                "IMPLEMENTOR=\"IBM Corporation\"\nJAVA_VERSION=\"17.0.13\"\nJVM_VARIANT=\"Openj9\"\n",
+                Some("IBM Corporation"),
+            ),
+            (
+                "JAVA_VERSION=\"1.8.0_514\"\nIMPLEMENTOR=\"Eclipse Adoptium\"\n",
+                None,
+            ),
+            ("JAVA_VERSION=\"21\"\nIMPLEMENTOR=\"\"\n", None),
+            ("JAVA_VERSION=\"21\"\nIMPLEMENTOR=\"N/A\"\n", None),
+            ("IMPLEMENTOR=\"Eclipse Adoptium\"\n", None),
+        ] {
+            assert_eq!(
+                JdkRelease::parse(release).java_vendor(),
+                vendor,
+                "{release}"
+            );
+        }
         for (version, numbers) in [
             ("1.8.0_442", Some(vec![8, 0, 442])),
             ("11", Some(vec![11])),

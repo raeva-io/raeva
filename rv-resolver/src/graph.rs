@@ -42,8 +42,14 @@ impl RepoRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Node {
     pub coord: Coord,
+    /// The `<type>` of the declaration that won mediation, when it is not
+    /// the extension `coord` holds.
+    pub type_: Option<String>,
     /// The scope conflict resolution picks.
     pub scope: Scope,
+    /// The optionality conflict resolution picks, as Maven's
+    /// SimpleOptionalitySelector does.
+    pub optional: bool,
     pub repo_url: Option<Arc<str>>,
     /// The repository whose metadata named this SNAPSHOT build. As in
     /// Maven, the build's files come from it alone.

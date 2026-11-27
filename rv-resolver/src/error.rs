@@ -12,6 +12,9 @@ pub struct RepoSearchStatus {
     /// substitution. Not redacted: it can hold userinfo, so pass it through
     /// [`rv_config::redact_url`] before showing it.
     pub repo_url: String,
+    /// The repository's id as configured or declared, which a settings.xml
+    /// `<mirrorOf>` names; `None` when it has none.
+    pub repo_id: Option<String>,
     /// How the repository answered.
     pub status: RepoStatus,
     /// The repository that answered 401 or 403, after mirror substitution:
@@ -33,6 +36,10 @@ pub struct CredentialTarget {
     pub url: String,
     /// The credential sent, `None` when the request carried none.
     pub sent: Option<rv_repo::SentCredential>,
+    /// Whether it answered a redirect to another origin rather than the
+    /// repository searched; [`Self::id`] is then `None` and [`Self::url`]
+    /// the redacted URL it answered for.
+    pub redirect_target: bool,
 }
 
 impl RepoSearchStatus {
@@ -40,6 +47,7 @@ impl RepoSearchStatus {
     pub fn new(repo_url: impl Into<String>, status: RepoStatus) -> Self {
         Self {
             repo_url: repo_url.into(),
+            repo_id: None,
             status,
             refused_by: None,
             served_by: None,
@@ -59,19 +67,34 @@ impl RepoSearchStatus {
         effective_repository: impl FnOnce(&rv_repo::Repository) -> rv_repo::Repository,
     ) -> Self {
         let mut status = Self::from_error(repo.url.as_str(), err);
+        status.repo_id = repo.id.clone();
         let served_by = effective_repository(repo);
         if served_by.url != repo.url {
             status.served_by = Some(served_by.url.clone());
         }
         if let rv_repo::RepoError::Unauthorized {
-            status: code, sent, ..
+            status: code,
+            sent,
+            url,
+            ..
         } = err
             && matches!(code.as_u16(), 401 | 403)
         {
-            status.refused_by = Some(CredentialTarget {
-                id: served_by.id,
-                url: served_by.url,
-                sent: sent.as_deref().cloned(),
+            let origin = |url: &str| url::Url::parse(url).ok().map(|url| url.origin());
+            let redirect_target = origin(url) != origin(&served_by.url);
+            status.refused_by = Some(match redirect_target {
+                true => CredentialTarget {
+                    id: None,
+                    url: url.clone(),
+                    sent: sent.as_deref().cloned(),
+                    redirect_target,
+                },
+                false => CredentialTarget {
+                    id: served_by.id,
+                    url: served_by.url,
+                    sent: sent.as_deref().cloned(),
+                    redirect_target,
+                },
             });
         }
         status
@@ -268,15 +291,17 @@ pub enum ResolveError {
     /// pin both. Returned by [`crate::lock::assemble`].
     #[error(
         "artifact {coord} resolved to different bytes in reactor modules \
-         {first_module} ({first_blob}) and {second_module} ({second_blob})"
+         {first_origin} ({first_blob}) and {second_origin} ({second_blob}); Maven reuses the \
+         copy of whichever module resolves it first in the build, so one lockfile cannot pin both"
     )]
     ConflictingArtifactBytes {
         /// The artifact coordinate as raeva.lock records it.
         coord: String,
-        /// POM path of the module whose row was recorded first.
-        first_module: String,
-        /// POM path of the module that disagreed.
-        second_module: String,
+        /// POM path of the module whose row was recorded first, and the
+        /// repository, redacted, that served its bytes.
+        first_origin: String,
+        /// POM path of the module that disagreed, and its repository.
+        second_origin: String,
         /// SHA-256 (the content-store blob id) of the first module's bytes.
         first_blob: String,
         /// SHA-256 of the second module's bytes.
@@ -328,7 +353,8 @@ pub enum ResolveError {
     /// repository that served it. Returned by [`crate::lock::assemble`].
     #[error(
         "companion POM for {} resolved to different bytes in {} ({}) and {} ({}); \
-         Maven has one local-repository path per coordinate, so one lockfile cannot pin both",
+         Maven reuses the copy of whichever module resolves it first in the build, so one \
+         lockfile cannot pin both",
         .0.coord, .0.first_origin, .0.first_sha256, .0.second_origin, .0.second_sha256
     )]
     ConflictingCompanionPomBytes(Box<ConflictingPom>),
@@ -487,11 +513,11 @@ pub enum ResolveError {
         coord: String,
     },
     /// A dependency has a scope Maven keeps as written and raeva.lock
-    /// cannot record, such as one with a space.
+    /// cannot record, such as one with a control character.
     #[error(
         "{}, a dependency of {}, has the scope {}, which Maven keeps as written and \
-         raeva.lock cannot record: a scope Maven does not know must be 1 to 255 characters without \
-         whitespace, control or invisible characters",
+         raeva.lock cannot record: a scope Maven does not know must be 1 to 255 characters, \
+         without control or invisible characters",
         bounded(dependency),
         bounded(parent),
         rv_maven_types::quoted(scope)
@@ -572,11 +598,11 @@ pub enum ResolveError {
     /// resolution task. Holds the description.
     #[error("internal error: {0}")]
     InternalError(String),
-    /// A parent or imported BOM that no repository served, where a remote
-    /// repository filter kept one of them out: `searched` says how each
-    /// answered.
+    /// A parent or imported BOM that no repository served, and how each
+    /// searched repository answered: for a BOM always, for a parent when a
+    /// remote repository filter kept one of them out.
     #[error("{error}")]
-    FilteredModel {
+    SearchedModel {
         /// The parent or BOM not found.
         error: Box<ResolveError>,
         /// Each repository searched for it, in order.
@@ -802,7 +828,7 @@ impl ResolveError {
     /// The failure without the [`ResolveError::Declared`] context around it.
     pub fn cause(&self) -> &ResolveError {
         match self {
-            Self::Declared { error, .. } | Self::FilteredModel { error, .. } => error.cause(),
+            Self::Declared { error, .. } | Self::SearchedModel { error, .. } => error.cause(),
             other => other,
         }
     }
@@ -841,9 +867,10 @@ impl ResolveError {
     /// This failure, raised while resolving the graph of the module at
     /// `module`. Failures that name their file or concern no dependency
     /// stay as they are.
-    /// This failure with how the repositories answered for a parent or
-    /// imported BOM it misses, when `search` holds a filter refusal for it.
-    pub(crate) fn naming_filtered_models(
+    /// This failure with how the repositories answered, by `search`, for
+    /// an imported BOM it misses, or for a parent it misses when a remote
+    /// repository filter kept one of them out.
+    pub(crate) fn naming_model_searches(
         self,
         search: &impl Fn((&str, &str, &str)) -> Option<std::sync::Arc<[RepoSearchStatus]>>,
     ) -> Self {
@@ -851,7 +878,7 @@ impl ResolveError {
             Self::Declared { module, via, error } => Self::Declared {
                 module,
                 via,
-                error: Box::new(error.naming_filtered_models(search)),
+                error: Box::new(error.naming_model_searches(search)),
             },
             Self::Plugin {
                 plugin,
@@ -860,23 +887,41 @@ impl ResolveError {
             } => Self::Plugin {
                 plugin,
                 searched,
-                error: Box::new(error.naming_filtered_models(search)),
+                error: Box::new(error.naming_model_searches(search)),
             },
             Self::MultipleArtifactErrors { first, rest } => Self::MultipleArtifactErrors {
-                first: Box::new(first.naming_filtered_models(search)),
+                first: Box::new(first.naming_model_searches(search)),
                 rest: (rest.into_iter())
-                    .map(|error| error.naming_filtered_models(search))
+                    .map(|error| error.naming_model_searches(search))
                     .collect(),
             },
-            Self::Pom(
-                rv_maven_model::PomError::ParentNotFound(ref group, ref artifact, ref version)
-                | rv_maven_model::PomError::ImportNotFound(ref group, ref artifact, ref version),
-            ) => match search((group, artifact, version)) {
-                Some(searched) => Self::FilteredModel {
+            Self::Pom(rv_maven_model::PomError::ImportNotFound(
+                ref group,
+                ref artifact,
+                ref version,
+            )) => match search((group, artifact, version)) {
+                Some(searched) => Self::SearchedModel {
                     error: Box::new(self),
                     searched: searched.to_vec(),
                 },
                 None => self,
+            },
+            Self::Pom(rv_maven_model::PomError::ParentNotFound(
+                ref group,
+                ref artifact,
+                ref version,
+            )) => match search((group, artifact, version)) {
+                Some(searched)
+                    if searched
+                        .iter()
+                        .any(|entry| entry.status == RepoStatus::Filtered) =>
+                {
+                    Self::SearchedModel {
+                        error: Box::new(self),
+                        searched: searched.to_vec(),
+                    }
+                }
+                _ => self,
             },
             other => other,
         }
@@ -937,6 +982,45 @@ pub(crate) fn undefined_property(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::ResolveError;
+
+    /// A refusal from the repository names it; one from a redirect target
+    /// on another origin names that target alone.
+    #[test]
+    fn a_refusing_redirect_target_is_named_in_place_of_the_repository() {
+        let repo = rv_repo::Repository::new(
+            Some("corp".to_string()),
+            "https://repo.example/m2/",
+            true,
+            false,
+        );
+        let sent = rv_repo::SentCredential {
+            id: None,
+            file: rv_repo::CredentialFile::Redirect,
+            unset_variables: Vec::new(),
+        };
+        for (url, redirect_target) in [
+            ("https://repo.example/files/a-1.pom", false),
+            ("https://cdn.example/files/a-1.pom", true),
+        ] {
+            let err = rv_repo::RepoError::Unauthorized {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                url: url.to_string(),
+                redirected_to: None,
+                sent: Some(Box::new(sent.clone())),
+            };
+            let status = super::RepoSearchStatus::from_fetch_error(&repo, &err, Clone::clone);
+            let target = status.refused_by.expect("refused");
+            assert_eq!(target.redirect_target, redirect_target, "{url}");
+            assert_eq!(target.sent.as_ref(), Some(&sent));
+            match redirect_target {
+                true => assert_eq!((target.id, target.url.as_str()), (None, url)),
+                false => assert_eq!(
+                    (target.id.as_deref(), target.url.as_str()),
+                    (Some("corp"), "https://repo.example/m2/")
+                ),
+            }
+        }
+    }
 
     #[test]
     fn an_undefined_property_ends_in_its_part() {

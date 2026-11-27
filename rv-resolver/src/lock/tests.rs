@@ -38,8 +38,10 @@ fn coordinate(artifact: &str, version: &str) -> ArtifactCoord {
 fn external(artifact: &str, repo_url: &str, blob: &[u8], pom: &[u8]) -> ResolvedPackage {
     ResolvedPackage {
         coordinate: coordinate(artifact, "1.0"),
+        type_: None,
         direct_scope: Some(rv_lock::Scope::Compile),
         scope: rv_lock::Scope::Compile,
+        optional: false,
         workspace_module: None,
         system_path: None,
         managed: None,
@@ -59,7 +61,9 @@ fn external(artifact: &str, repo_url: &str, blob: &[u8], pom: &[u8]) -> Resolved
 fn module(pom_path: &str, packages: Vec<ResolvedPackage>) -> WorkspaceModuleResolution {
     let root = Node {
         coord: Coord::parse(&format!("com.example:{pom_path}:1")).expect("coord"),
+        type_: None,
         scope: rv_maven_model::Scope::Compile,
+        optional: false,
         repo_url: None,
         build_repo: None,
         checksum: None,
@@ -172,6 +176,34 @@ fn modules_share_one_row_per_artifact() {
         matches!(&error, AssembleError::Resolve(error) if matches!(**error, ResolveError::ConflictingArtifactBytes { .. })),
         "{error:?}"
     );
+
+    // The refusal names the first module with the repository it read from,
+    // though a later module's earlier repository took the row.
+    let error = assemble_modules(
+        &config,
+        vec![
+            module("app", vec![external("lib", second, b"one", b"pom")]),
+            module("web", vec![external("lib", first, b"one", b"pom")]),
+            module("api", vec![external("lib", first, b"two", b"pom")]),
+        ],
+    )
+    .expect_err("one row cannot pin two files")
+    .to_string();
+    assert!(error.contains(&format!("app from {second}")), "{error}");
+
+    // A repository URL raeva.lock does not record, which only a mirror
+    // serves, stays out of the refusal, read first or second.
+    let hidden = "s3://bucket/private-marker/";
+    for (app, web) in [(hidden, first), (first, hidden)] {
+        let error = assemble_lib(
+            external("lib", app, b"one", b"pom"),
+            external("lib", web, b"two", b"pom"),
+        )
+        .expect_err("one row cannot pin two files")
+        .to_string();
+        assert!(!error.contains("private-marker"), "{error}");
+        assert!(error.contains(rv_config::UNRECORDED_URL), "{error}");
+    }
 }
 
 #[test]
@@ -182,8 +214,10 @@ fn a_system_file_is_recorded_relative_to_the_project() {
     let config = config(root.path(), &[]);
     let system = |path: String| ResolvedPackage {
         coordinate: coordinate("vendor", "1.0"),
+        type_: None,
         direct_scope: Some(rv_lock::Scope::System),
         scope: rv_lock::Scope::System,
+        optional: false,
         workspace_module: None,
         system_path: Some(path),
         managed: None,
@@ -464,4 +498,42 @@ fn a_carried_pom_keeps_the_build_it_was_read_at() {
     base.snapshot = stamp(1);
     carry_pom(&mut base, &other);
     assert!(base.pom_base && base.pom_build().is_none());
+}
+
+/// A declared type raeva.lock can spell is recorded, any text with its
+/// whitespace encoded; one it cannot is left out, the row naming the
+/// extension, so the sync still writes its lock.
+#[test]
+fn a_type_raeva_lock_cannot_spell_is_left_out() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let url = "https://first.example/maven2/";
+    let config = config(root.path(), &[url]);
+    let long = "x".repeat(256);
+    for (type_, kept) in [
+        ("my type", Some("my type")),
+        ("a:b", Some("a:b")),
+        ("50%", Some("50%")),
+        ("tab\there", None),
+        ("?", None),
+        (long.as_str(), None),
+    ] {
+        let mut package = external("lib", url, b"jar", b"pom");
+        package.type_ = Some(type_.to_string());
+        let assembled = assemble_modules(&config, vec![module("app", vec![package])]).expect(type_);
+        let lock = &assembled.lock;
+        assert_eq!(
+            lock.platforms[0].modules[0].packages[0].type_.as_deref(),
+            kept,
+            "{type_:?}"
+        );
+        let text = lock.to_toml().expect(type_);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("raeva.lock");
+        std::fs::write(&path, &text).expect("write lock");
+        let read = rv_lock::Lockfile::read(&path).expect(type_);
+        assert_eq!(
+            read.platforms[0].modules[0].packages[0].type_.as_deref(),
+            kept
+        );
+    }
 }

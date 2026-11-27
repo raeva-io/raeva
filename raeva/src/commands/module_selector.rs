@@ -8,7 +8,7 @@ pub(crate) struct ModuleSelector {
     #[arg(
         long,
         value_name = "MODULE",
-        help = "Select a module by root-relative POM path or unique groupId:artifactId"
+        help = "Select a module by its POM path in raeva.lock or unique groupId:artifactId"
     )]
     module: Option<String>,
 }

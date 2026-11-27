@@ -128,6 +128,16 @@ impl ModelSource for LocalParents {
         if !parent_has_expression(parent) {
             // A version that a repository lookup would reject fails here too.
             crate::resolver::parent_coord(parent)?;
+        } else if let Some((base_dir, boundary)) = &self.within
+            && let Some(path) = parent_beyond(base_dir, boundary, parent)
+        {
+            return Err(PomError::ParentBeyondProject {
+                parent: format!(
+                    "{}:{}:{}",
+                    parent.group_id, parent.artifact_id, parent.version
+                ),
+                path: rv_fs::plain_path(&path).display().to_string(),
+            });
         }
         Ok(None)
     }
@@ -286,6 +296,39 @@ fn local_parent_path(base_dir: &Path, boundary: &Path, parent: &Parent) -> Optio
     }
 }
 
+/// The POM `parent`'s `<relativePath>` names from `base_dir` when there is
+/// one but it lies outside `boundary`: as written, so a link is named and
+/// not where it leads, its `..` parts taken out when that names the same
+/// file, as a `..` after a link does not.
+fn parent_beyond(base_dir: &Path, boundary: &Path, parent: &Parent) -> Option<PathBuf> {
+    let relative = relative_path_text(parent);
+    if relative.is_empty() {
+        return None;
+    }
+    let mut path = rv_fs::join_pom_entry(base_dir, relative);
+    if path.is_dir() {
+        path = rv_fs::join_pom_entry_pom_xml(base_dir, relative);
+    }
+    let target = std::fs::canonicalize(&path).ok()?;
+    if !target.is_file() || path_within_root(&target, boundary) {
+        return None;
+    }
+    let mut named = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                named.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => named.push(part),
+        }
+    }
+    match std::fs::canonicalize(&named).is_ok_and(|folded| folded == target) {
+        true => Some(named),
+        false => Some(path),
+    }
+}
+
 /// The `pom.xml` read when `relative` names a directory. It can be a symlink
 /// out of the directory that passed the containment check, and on Windows it
 /// can sit in a sibling of it (`parent..` is checked as `parent`, its POM is
@@ -303,24 +346,18 @@ fn io_error_kind(error: &ConfigError) -> Option<std::io::ErrorKind> {
 }
 
 /// The directory a local `<relativePath>` parent must stay inside, for a
-/// reactor rooted at `root` with `module_count` active modules.
+/// reactor rooted at `root`.
 ///
-/// A discovered reactor is its own containment boundary. A one-module
-/// workspace can also be a deliberately selected submodule (for example
-/// `guava/guava`) whose Maven parent is the immediate `../pom.xml`, so exactly
-/// one directory level above the root is admitted; deeper escapes such as
-/// `../../etc/passwd` stay rejected. Multi-module roots already contain their
-/// local parents, so they keep the tighter boundary.
+/// The root can be a directory of a larger project (`guava/guava`, or
+/// dataease's `core`) whose Maven parent is the immediate `../pom.xml`, so
+/// exactly one directory level above the root is admitted; deeper escapes
+/// such as `../../etc/passwd` stay rejected.
 ///
 /// Reactor discovery, `raeva sync`'s model hashing, and resolution all derive
 /// their boundary here, so all three accept exactly the same set of local
 /// parents.
-pub(crate) fn local_parent_boundary(root: &Path, module_count: usize) -> PathBuf {
-    if module_count == 1 {
-        root.parent().unwrap_or(root).to_path_buf()
-    } else {
-        root.to_path_buf()
-    }
+pub(crate) fn local_parent_boundary(root: &Path) -> PathBuf {
+    root.parent().unwrap_or(root).to_path_buf()
 }
 
 /// Walk the chain of local parent POMs reachable from `pom_path` (parsed as
@@ -992,10 +1029,11 @@ mod tests {
     }
 
     #[test]
-    fn local_parent_boundary_widens_only_for_a_lone_module() {
-        let root = Path::new("/workspace/module");
-
-        assert_eq!(local_parent_boundary(root, 1), Path::new("/workspace"));
-        assert_eq!(local_parent_boundary(root, 2), root);
+    fn local_parent_boundary_is_one_level_above_the_root() {
+        assert_eq!(
+            local_parent_boundary(Path::new("/workspace/module")),
+            Path::new("/workspace")
+        );
+        assert_eq!(local_parent_boundary(Path::new("/")), Path::new("/"));
     }
 }

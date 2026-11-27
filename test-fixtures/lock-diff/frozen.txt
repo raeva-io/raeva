@@ -19,12 +19,12 @@ lock-golden/single-module/raeva.lock -> lock-golden/round-trip/raeva.lock
   module api/pom.xml added: org.golden.reactor:api:2.0
   module app/pom.xml added: org.golden.reactor:app:2.0
   module pom.xml: org.golden.app:single:1.0 -> org.golden.reactor:reactor-root:2.0 (jar -> pom)
-  api-spec       1.0 (removed, in the root module)
-  core           1.1 (added, in app)
-  core           1.1 (removed, in the root module)
-  lib            1.0 (added, in app)
-  lib            1.0 (removed, in the root module)
-  lib:jar:jdk11  1.0 (removed, in the root module)
-  lib:jar:tests  1.0 (removed, in the root module)
+  api-spec            1.0 (removed, in the root module)
+  core                1.1 (added, in app)
+  core                1.1 (removed, in the root module)
+  lib                 1.0 (added, in app)
+  lib                 1.0 (removed, in the root module)
+  lib:jar:jdk11       1.0 (removed, in the root module)
+  lib:test-jar:tests  1.0 (removed, in the root module)
   ... and 8 more; 'raeva sync' lists every change
 

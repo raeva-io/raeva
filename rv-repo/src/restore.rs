@@ -1756,6 +1756,7 @@ mod tests {
         let refused = |url: &str| RepoError::Unauthorized {
             status: reqwest::StatusCode::UNAUTHORIZED,
             url: url.into(),
+            redirected_to: None,
             sent: None,
         };
         let key = ArtifactCoord::of(

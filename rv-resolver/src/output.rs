@@ -87,10 +87,15 @@ pub struct ResolvedPackage {
     /// The coordinate raeva.lock records: a timestamped snapshot build under its
     /// `-SNAPSHOT` base version.
     pub coordinate: ArtifactCoord,
+    /// The declared `<type>`, when it is not the extension.
+    pub type_: Option<String>,
     /// The scope the module declares it with, for a direct dependency.
     pub direct_scope: Option<Scope>,
     /// The scope it resolves to, as Maven's JavaScopeSelector picks it.
     pub scope: Scope,
+    /// Whether it resolves as optional, as Maven's SimpleOptionalitySelector
+    /// picks it.
+    pub optional: bool,
     /// The reactor module this package is, by POM path, when it is one.
     pub workspace_module: Option<String>,
     /// The interpolated `<systemPath>` of a `system` dependency.

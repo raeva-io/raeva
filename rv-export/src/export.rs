@@ -3021,7 +3021,7 @@ enum Existing {
         sha1: String,
     },
     /// Nothing worth keeping: a link into the store where a copy was asked
-    /// for, or a link whose target is gone.
+    /// for, or a link to anything else.
     Replace,
     /// Other bytes, with their SHA-256 for the error.
     Differs {
@@ -3055,21 +3055,21 @@ fn existing_file(
     if linked.is_dir() {
         return Ok(Existing::Directory);
     }
-    if fs::metadata(dest).is_err() {
-        return Ok(if is_link {
-            Existing::Replace
-        } else {
-            Existing::Differs {
-                actual: "<unreadable>".to_string(),
-            }
-        });
-    }
+    // A symbolic link that does not name the blob is replaced unread: what
+    // it names may be anywhere, so its bytes are neither hashed nor shown.
     let same_target = match (dunce::canonicalize(src), dunce::canonicalize(dest)) {
         (Ok(src), Ok(dest)) => src == dest,
         _ => false,
     };
-    let shares_blob =
-        same_file::is_same_file(src, dest).unwrap_or(false) || (is_link && same_target);
+    if is_link && !same_target {
+        return Ok(Existing::Replace);
+    }
+    if fs::metadata(dest).is_err() {
+        return Ok(Existing::Differs {
+            actual: "<unreadable>".to_string(),
+        });
+    }
+    let shares_blob = is_link || same_file::is_same_file(src, dest).unwrap_or(false);
     if shares_blob {
         // Only `--link symlink` keeps a symbolic link: an earlier export's
         // would stay where Maven 3.10 does not read it.
@@ -3100,13 +3100,11 @@ fn existing_file(
     if sha256 != blob_id.as_str() {
         return Ok(Existing::Differs { actual: sha256 });
     }
-    // Symlinks that share the store blob returned above. Any other symlink
-    // still hashes through its target, so matching bytes here can point at a
-    // foreign path. A hard link to a foreign path is the same threat: another
-    // name for this inode can change what `mvn -o` reads without touching the
-    // store. Replace both. A separate file that only happens to match the
-    // digest stays; it does not share an inode with anything else.
-    if is_link || has_other_names(dest, &linked) {
+    // A hard link to a foreign path can change what `mvn -o` reads without
+    // touching the store, through another name for this inode, so it is
+    // replaced. A separate file that only happens to match the digest stays;
+    // it does not share an inode with anything else.
+    if has_other_names(dest, &linked) {
         return Ok(Existing::Replace);
     }
     Ok(Existing::UpToDate { sha1 })

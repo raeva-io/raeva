@@ -165,6 +165,7 @@ mod tests {
                 &RepoError::HttpStatus {
                     status: reqwest::StatusCode::from_u16(status).unwrap(),
                     url: repo.url.clone(),
+                    redirected_to: None,
                     retry_after: None,
                 },
             );
@@ -192,6 +193,7 @@ mod tests {
                 &RepoError::HttpStatus {
                     status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                     url: skipped.url.clone(),
+                    redirected_to: None,
                     retry_after: None,
                 },
             );
@@ -269,6 +271,7 @@ mod tests {
                 &RepoError::Unauthorized {
                     status: reqwest::StatusCode::UNAUTHORIZED,
                     url: refusing.url.clone(),
+                    redirected_to: None,
                     sent: None,
                 },
             );
@@ -297,6 +300,7 @@ mod tests {
                 &RepoError::Unauthorized {
                     status: reqwest::StatusCode::FORBIDDEN,
                     url: refusing.url.clone(),
+                    redirected_to: None,
                     sent: None,
                 },
             );

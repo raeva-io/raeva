@@ -68,7 +68,9 @@ impl ErrorClass {
                 ExitStatus::Config
             }
             Self::Network => ExitStatus::Network,
-            Self::Integrity(IntegritySource::Sidecar) => ExitStatus::Integrity,
+            Self::Integrity(IntegritySource::Sidecar | IntegritySource::Header) => {
+                ExitStatus::Integrity
+            }
             Self::Integrity(IntegritySource::LockPin) => ExitStatus::LockMismatch,
             Self::Store | Self::Internal => ExitStatus::Failure,
             Self::NotFound | Self::Offline | Self::Other => ExitStatus::Resolution,

@@ -5,7 +5,7 @@ use crate::error::IntegritySource;
 use crate::fetch::FetchConfig;
 use crate::mirror::MirrorSelector;
 use crate::routing::{Router, cache_scope_key};
-use crate::transport::{ClientSet, same_origin_redirect_policy};
+use crate::transport::ClientSet;
 use rv_config::{ChecksumPolicy, MirrorConfig, UpdatePolicy};
 use rv_maven_types::layout::metadata_path;
 use rv_maven_types::{ArtifactCoord, Coord, HashAlgorithm};
@@ -52,7 +52,7 @@ fn client_for(router: Router) -> (RepoClient, tempfile::TempDir) {
     let cache = MetadataCache::new(&tmp.path().join("metadata.db")).expect("cache");
     let http = rv_http::client_builder()
         .no_proxy()
-        .redirect(same_origin_redirect_policy())
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("client");
     let client = RepoClient::for_test(ClientSet::unscreened(http), router, cache);
@@ -183,7 +183,7 @@ async fn a_sha1_pin_decides_a_fetched_pom_before_its_checksum_file() {
 
 /// Metadata without a sidecar from a repository whose checksum policy is
 /// `fail` names that policy, with or without `--allow-missing-checksums`,
-/// since the flag cannot lift it; a POM there names the flag.
+/// since the flag cannot lift it; a POM there is a plain missing checksum.
 #[tokio::test]
 async fn a_fail_policy_on_metadata_without_a_sidecar_names_the_policy() {
     let server = model_stub(Arc::new(AtomicBool::new(false)));
@@ -202,17 +202,13 @@ async fn a_fail_policy_on_metadata_without_a_sidecar_names_the_policy() {
         );
         let message = err.to_string();
         assert!(
-            message.contains("warn or ignore and run 'raeva sync --allow-missing-checksums'"),
+            message.contains("checksum policy is fail, which no flag lifts"),
             "{message}"
         );
     }
     let req = ArtifactRequest::new("test", "demo", "1.0");
     let err = client.fetch_pom(&repo, &req).await.unwrap_err();
     assert!(matches!(err, RepoError::MissingChecksum(_)), "{err}");
-    assert!(
-        err.to_string()
-            .contains("raeva sync --allow-missing-checksums")
-    );
 }
 
 /// A POM or `maven-metadata.xml` cached under `--allow-missing-checksums`
@@ -348,20 +344,24 @@ fn metadata_checksum_mismatch_warns_after_retry_and_respects_cache_policy() {
             let metadata_coord = coord(&format!("com.example:demo:{version}"));
             let metadata = client.fetch_metadata(&repo, &metadata_coord).await.unwrap();
             assert_eq!(metadata.latest.as_deref(), Some("2"));
-            assert_eq!(server.answered(), 4, "both files are fetched twice");
+            assert_eq!(
+                server.answered(),
+                6,
+                "both files are fetched twice, then the .sha1 and .md5 hold no digest"
+            );
             client.fetch_metadata(&repo, &metadata_coord).await.unwrap();
-            assert_eq!(server.answered(), 4, "the daily cache applies");
+            assert_eq!(server.answered(), 6, "the daily cache applies");
             repo.releases_update_policy = UpdatePolicy::Always;
             repo.snapshots_update_policy = UpdatePolicy::Always;
             client.fetch_metadata(&repo, &metadata_coord).await.unwrap();
-            assert_eq!(server.answered(), 8, "a shorter update policy refetches");
+            assert_eq!(server.answered(), 12, "a shorter update policy refetches");
             repo.releases_checksum_policy = ChecksumPolicy::Fail;
             repo.snapshots_checksum_policy = ChecksumPolicy::Fail;
             assert!(matches!(
                 client.fetch_metadata(&repo, &metadata_coord).await,
                 Err(RepoError::ChecksumMismatch { .. })
             ));
-            assert_eq!(server.answered(), 12);
+            assert_eq!(server.answered(), 18);
         }
         let (client, cache) = test_client();
         let (mut repo, server) = metadata_checksum_stub(false);
@@ -375,7 +375,7 @@ fn metadata_checksum_mismatch_warns_after_retry_and_respects_cache_policy() {
                 cache,
             )
         };
-        for (run, answered) in [(client.clone(), 4), (client, 4), (later(), 8)] {
+        for (run, answered) in [(client.clone(), 6), (client, 6), (later(), 12)] {
             let snapshot = coord("com.example:demo:1.0-SNAPSHOT");
             let resolved = run.resolve_snapshot_version(&repo, &snapshot).await;
             assert_eq!(resolved.unwrap().version, "1.0-20261011.010101-2");
@@ -407,6 +407,118 @@ fn metadata_checksum_mismatch_warns_after_retry_and_respects_cache_policy() {
     assert!(!output.contains("user:"));
 }
 
+/// Metadata whose `.sha256` is stale while its `.sha1` matches, as on
+/// Central's snapshot repository for publishers that deploy only Maven's
+/// default checksums: Maven checks the `.sha1` and takes it under either
+/// policy, and so does raeva, with a warning that names the `.sha256`. A
+/// `.sha1` that disagrees too leaves the policy to decide.
+#[test]
+fn metadata_with_a_stale_sha256_and_a_matching_sha1_is_used() {
+    let body = "<metadata><version>1.0-SNAPSHOT</version><versioning><snapshot>\
+                <timestamp>20261011.010101</timestamp><buildNumber>3</buildNumber>\
+                </snapshot></versioning></metadata>";
+    let stub = |sha1: String| {
+        StubServer::start(move |request| match request.path.rsplit_once('.') {
+            Some((_, "sha256")) => Response::new(200, "0".repeat(64)),
+            Some((_, "sha1")) => Response::new(200, sha1.clone()),
+            Some((_, "md5")) => Response::new(404, ""),
+            _ => Response::new(200, body),
+        })
+    };
+    let sha1 = hex::encode(<sha1::Sha1 as sha1::Digest>::digest(body));
+    let snapshot = coord("com.example:demo:1.0-SNAPSHOT");
+    let output = capture_warn_output(async {
+        for policy in [ChecksumPolicy::Warn, ChecksumPolicy::Fail] {
+            let (client, _cache) = test_client();
+            let server = stub(sha1.clone());
+            let mut repo = http_repo(&server);
+            repo.snapshots_checksum_policy = policy;
+            let resolved = client.resolve_snapshot_version(&repo, &snapshot).await;
+            assert_eq!(resolved.unwrap().version, "1.0-20261011.010101-3");
+            assert_eq!(
+                server.answered(),
+                5,
+                "file and .sha256 twice, then the .sha1"
+            );
+        }
+        let (client, _cache) = test_client();
+        let server = stub("1".repeat(40));
+        let mut repo = http_repo(&server);
+        repo.snapshots_checksum_policy = ChecksumPolicy::Fail;
+        let refused = client.resolve_snapshot_version(&repo, &snapshot).await;
+        assert!(
+            matches!(&refused, Err(RepoError::ChecksumMismatch { expected, .. })
+                if expected.algorithm() == HashAlgorithm::Sha256),
+            "{refused:?}"
+        );
+    });
+    assert_eq!(
+        output.matches("SHA256_FILE_MISMATCH").count(),
+        2,
+        "{output}"
+    );
+    assert!(output.contains("matches its .sha1 file"), "{output}");
+    assert!(!output.contains("METADATA_CHECKSUM_MISMATCH"), "{output}");
+}
+
+/// A POM or jar whose `.sha256` is wrong is used, with a warning that names
+/// the repository, when its `.sha1` matches, as Maven checks only that one,
+/// under either policy. When the `.sha1` is wrong too, the `.sha256`
+/// mismatch is the error.
+#[test]
+fn a_wrong_sha256_leaves_a_pom_and_a_jar_to_their_sha1() {
+    let body = "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+                <artifactId>demo</artifactId><version>1.0</version></project>";
+    for sha1 in [
+        hex::encode(<sha1::Sha1 as sha1::Digest>::digest(body)),
+        "0".repeat(40),
+    ] {
+        let sha1_answer = sha1.clone();
+        let server = StubServer::start(move |request| match request.path.rsplit_once('.') {
+            Some((_, "sha256")) => Response::new(200, "0".repeat(64)),
+            Some((_, "sha1")) => Response::new(200, sha1_answer.clone()),
+            Some((_, "md5")) => Response::new(404, ""),
+            _ => Response::new(200, body),
+        });
+        let matches = sha1 != "0".repeat(40);
+        for policy in [ChecksumPolicy::Warn, ChecksumPolicy::Fail] {
+            let (client, _cache) = test_client();
+            let mut repo = http_repo(&server);
+            repo.id = Some("corp".to_string());
+            repo.releases_checksum_policy = policy;
+            let request = ArtifactRequest::new("com.example", "demo", "1.0");
+            let dir = tempfile::tempdir().unwrap();
+            let store = store_in(&dir);
+            let output = capture_warn_output(async {
+                let pom = client.fetch_pom(&repo, &request).await;
+                let jar = client
+                    .fetch_artifact_to_store(&repo, &request, &store)
+                    .await;
+                for result in [pom.map(|_| ()), jar.map(|_| ())] {
+                    match result {
+                        Ok(()) => assert!(matches, "{policy:?}"),
+                        Err(RepoError::ChecksumMismatch { expected, .. }) => {
+                            assert!(!matches, "{policy:?}");
+                            assert_eq!(expected.algorithm(), HashAlgorithm::Sha256);
+                        }
+                        Err(err) => panic!("{policy:?}: {err}"),
+                    }
+                }
+            });
+            let warned = output.matches("SHA256_FILE_MISMATCH").count();
+            assert_eq!(warned, if matches { 2 } else { 0 }, "{output}");
+            if matches {
+                assert!(
+                    output.contains("the repository 'corp'")
+                        && output.contains("com/example/demo/1.0/demo-1.0.jar")
+                        && output.contains(".sha1 file"),
+                    "{output}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn metadata_warn_policy_does_not_relax_artifact_or_pom_checksums() {
     for policy in [ChecksumPolicy::Warn, ChecksumPolicy::Ignore] {
@@ -425,7 +537,9 @@ async fn metadata_warn_policy_does_not_relax_artifact_or_pom_checksums() {
                 .await,
             Err(RepoError::ChecksumMismatch { .. })
         ));
-        assert_eq!(server.answered(), 4, "only metadata gets a checksum retry");
+        // The POM and the jar each: the file, its `.sha256`, then the
+        // `.sha1` and `.md5` Maven checks, which hold no digest here.
+        assert_eq!(server.answered(), 8, "only metadata gets a checksum retry");
     }
 }
 
@@ -931,8 +1045,9 @@ async fn checksum_probe_falls_back_to_sha1_only_when_sha256_is_unusable() {
 /// A client that checks `.sha256` answers late takes a POM on a `.sha1`
 /// that matches its bytes, once the repository has lacked another
 /// `.sha256` and the POM's release has not served one, and [`RepoClient::settle_checksums`] waits for its `.sha256`:
-/// a missing one gives the weak-hash warning then, and one that holds
-/// another digest fails the check and keeps the POM out of the cache. A
+/// a missing one gives the weak-hash warning then, one that holds another
+/// digest leaves the POM to the `.sha1` with a warning, and one the
+/// repository refuses fails the check and keeps the POM out of the cache. A
 /// `.sha1` that does not match waits for the `.sha256`, as does every read
 /// of a client that does not check late.
 #[test]
@@ -956,7 +1071,8 @@ fn a_late_sha256_is_checked_before_the_reads_are_settled() {
             ("stale" | "broken", ".sha1") => Response::new(200, "0".repeat(40)),
             (_, ".sha1") => Response::new(200, sha1(&body).hex().to_string()),
             ("stale" | "vouched", ".sha256") => Response::new(200, sha256_hex(&body)).delayed(HELD),
-            ("forged", ".sha256") => Response::new(200, "0".repeat(64)).delayed(HELD),
+            ("wrong", ".sha256") => Response::new(200, "0".repeat(64)).delayed(HELD),
+            ("refused", ".sha256") => Response::new(407, "").delayed(HELD),
             (_, ".sha256") => Response::new(404, "").delayed(HELD),
             _ => Response::new(404, ""),
         }
@@ -1002,18 +1118,23 @@ fn a_late_sha256_is_checked_before_the_reads_are_settled() {
             assert_eq!(cached.unwrap(), pom("matched").as_bytes());
             assert!(waited < HELD, "matched was not cached once checked");
 
-            let (forged, waited) = timed(&late, "forged").await;
-            assert_eq!(forged.unwrap(), pom("forged").as_bytes());
-            assert!(waited < HELD, "forged waited {waited:?} for its .sha256");
+            let (wrong, waited) = timed(&late, "wrong").await;
+            assert_eq!(wrong.unwrap(), pom("wrong").as_bytes());
+            assert!(waited < HELD, "wrong waited {waited:?} for its .sha256");
+            late.settle_checksums().await.unwrap();
+
+            let (refused, waited) = timed(&late, "refused").await;
+            assert_eq!(refused.unwrap(), pom("refused").as_bytes());
+            assert!(waited < HELD, "refused waited {waited:?} for its .sha256");
             let failed = late.settle_checksums().await;
             assert!(
-                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                matches!(failed, Err(RepoError::Unauthorized { .. })),
                 "{failed:?}"
             );
-            let (forged, waited) = timed(&plain, "forged").await;
+            let (refused, waited) = timed(&plain, "refused").await;
             assert!(
-                matches!(forged, Err(RepoError::ChecksumMismatch { .. })),
-                "a forged POM was kept: {forged:?}"
+                matches!(refused, Err(RepoError::Unauthorized { .. })),
+                "a refused POM was kept: {refused:?}"
             );
             assert!(waited >= HELD, "failed after {waited:?}");
 
@@ -1035,7 +1156,7 @@ fn a_late_sha256_is_checked_before_the_reads_are_settled() {
             );
             let failed = late.settle_checksums().await;
             assert!(
-                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                matches!(failed, Err(RepoError::Unauthorized { .. })),
                 "a failed client settled: {failed:?}"
             );
         });
@@ -1046,7 +1167,17 @@ fn a_late_sha256_is_checked_before_the_reads_are_settled() {
             .any(|line| line.contains(&format!("{artifact}-1.pom")))
     };
     assert!(weak("matched") && weak("other"), "{log}");
-    assert!(!weak("vouched") && !weak("forged"), "{log}");
+    assert!(
+        !weak("vouched") && !weak("wrong") && !weak("refused"),
+        "{log}"
+    );
+    let wrong: Vec<_> = (log.lines())
+        .filter(|line| line.contains("SHA256_FILE_MISMATCH"))
+        .collect();
+    assert!(
+        wrong.len() == 1 && wrong[0].contains("wrong-1.pom") && wrong[0].contains(".sha1 file"),
+        "{log}"
+    );
 }
 
 /// Every read of a POM taken on its `.sha1` shares its `.sha256` check:
@@ -1075,7 +1206,7 @@ fn every_read_of_a_late_pom_shares_its_check() {
             (_, "") => Response::new(200, body),
             ("first", ".sha256") => Response::new(404, ""),
             (_, ".sha1") => Response::new(200, sha1(&body).hex().to_string()),
-            ("forged", ".sha256") => Response::new(200, "0".repeat(64)).delayed(HELD),
+            ("refused", ".sha256") => Response::new(407, "").delayed(HELD),
             ("slow", ".sha256") => {
                 *asked.lock().unwrap() = Some(std::time::Instant::now());
                 Response::new(404, "").delayed(HELD * 3)
@@ -1106,27 +1237,27 @@ fn every_read_of_a_late_pom_shares_its_check() {
     let log = rv_test_support::capture_warnings(|| {
         runtime.block_on(async {
             read(&late, "first").await.0.unwrap();
-            for artifact in ["forged", "slow"] {
+            for artifact in ["refused", "slow"] {
                 let (fetched, waited) = read(&late, artifact).await;
                 assert_eq!(fetched.unwrap(), pom(artifact).as_bytes());
                 assert!(waited < HELD, "{artifact} waited {waited:?}");
             }
-            let (held, waited) = read(&other, "forged").await;
-            assert_eq!(held.unwrap(), pom("forged").as_bytes());
+            let (held, waited) = read(&other, "refused").await;
+            assert_eq!(held.unwrap(), pom("refused").as_bytes());
             assert!(waited < HELD, "the held POM waited {waited:?}");
-            let (waiting, _) = read(&plain, "forged").await;
+            let (waiting, _) = read(&plain, "refused").await;
             assert!(
-                matches!(waiting, Err(RepoError::ChecksumMismatch { .. })),
-                "a client that waits took a forged POM: {waiting:?}"
+                matches!(waiting, Err(RepoError::Unauthorized { .. })),
+                "a client that waits took a refused POM: {waiting:?}"
             );
             let failed = other.settle_checksums().await;
             assert!(
-                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                matches!(failed, Err(RepoError::Unauthorized { .. })),
                 "{failed:?}"
             );
             let failed = late.settle_checksums().await;
             assert!(
-                matches!(failed, Err(RepoError::ChecksumMismatch { .. })),
+                matches!(failed, Err(RepoError::Unauthorized { .. })),
                 "{failed:?}"
             );
             assert!(late.late_check_failed());
@@ -1143,10 +1274,10 @@ fn every_read_of_a_late_pom_shares_its_check() {
             let (cached, waited) = read(&plain, "slow").await;
             assert_eq!(cached.unwrap(), pom("slow").as_bytes());
             assert!(waited < HELD, "slow was not cached once checked");
-            let (forged, _) = read(&plain, "forged").await;
+            let (refused, _) = read(&plain, "refused").await;
             assert!(
-                matches!(forged, Err(RepoError::ChecksumMismatch { .. })),
-                "a forged POM was kept: {forged:?}"
+                matches!(refused, Err(RepoError::Unauthorized { .. })),
+                "a refused POM was kept: {refused:?}"
             );
         });
     });
@@ -1155,7 +1286,7 @@ fn every_read_of_a_late_pom_shares_its_check() {
             .filter(|line| line.contains("falling back to SHA-1"))
             .any(|line| line.contains(&format!("{artifact}-1.pom")))
     };
-    assert!(weak("slow") && !weak("forged"), "{log}");
+    assert!(weak("slow") && !weak("refused"), "{log}");
 }
 
 /// The POM [`late_server`] serves for `{artifact}`.
@@ -1315,6 +1446,30 @@ fn a_busy_answer_to_a_sidecar_no_read_needed_refuses_no_later_read() {
     }
 }
 
+/// A busy answer after a redirect is kept for the run as one without, so a
+/// later read of the file does not wait out the retries again.
+#[test]
+fn a_busy_answer_after_a_redirect_is_kept_for_the_run() {
+    use reqwest::StatusCode;
+    let path = "g/a/1/a-1.jar";
+    let busy = |redirected_to: Option<&str>| RepoError::Retried {
+        attempts: 3,
+        error: Box::new(RepoError::HttpStatus {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            url: format!("https://repo.example/{path}"),
+            redirected_to: redirected_to.map(str::to_string),
+            retry_after: None,
+        }),
+    };
+    for redirected_to in [None, Some("https://cdn.example")] {
+        let miss = super::models::Miss::of(&busy(redirected_to), path);
+        assert!(
+            matches!(miss, Some(super::models::Miss::Busy { .. })),
+            "{redirected_to:?}"
+        );
+    }
+}
+
 /// A needed `.sha1` takes the early one's refusal while it is in force, for
 /// every request, and once it is over is asked for again: one asked for then
 /// would meet the server's refusal afresh, so a `.md5` asked for after it
@@ -1335,6 +1490,7 @@ async fn a_needed_sidecar_whose_early_refusal_is_over_is_asked_again() {
         let error = RepoError::HttpStatus {
             status: StatusCode::TOO_MANY_REQUESTS,
             url: url.to_string(),
+            redirected_to: None,
             retry_after: Some(Duration::from_secs(301)),
         };
         (Err(error), refusal)
@@ -1368,11 +1524,12 @@ async fn a_needed_sidecar_whose_early_refusal_is_over_is_asked_again() {
 }
 
 /// Whether a refusal on an unneeded `.sha1` keeps the next `.sha1` from
-/// going out early changes nothing either: `next`'s `.sha256` refuses the
-/// server before its `.sha1` is needed, whether that `.sha1` went out
-/// beside it or would go out after it, so `next` fails the same way.
+/// going out early changes nothing either: a refusal on `next`'s `.sha256`,
+/// which Maven never reads, holds back only other optional requests, so
+/// `next` is read on its `.sha1`, whether that went out beside the
+/// `.sha256` or after it.
 #[test]
-fn an_unneeded_refusal_leaves_a_later_pair_to_fail_as_it_would() {
+fn an_unneeded_refusal_fails_no_later_pair() {
     let server = late_server(|artifact, sidecar| match (artifact, sidecar) {
         ("unused", ".sha256") => Some(
             Response::new(200, sha256_hex(late_pom("unused")))
@@ -1405,12 +1562,7 @@ fn an_unneeded_refusal_leaves_a_later_pair_to_fail_as_it_would() {
                 }
                 failures
             });
-            let case = format!("late {late}, {order:?}: {failures:?}");
-            assert_eq!(failures.len(), 1, "{case}");
-            assert!(
-                failures[0].contains("429") && failures[0].contains("next-1.pom.sha256"),
-                "{case}"
-            );
+            assert!(failures.is_empty(), "late {late}, {order:?}: {failures:?}");
         }
     }
 }
@@ -1540,15 +1692,13 @@ fn a_needed_sidecar_an_optional_refusal_kept_unsent_goes_out() {
 }
 
 /// Once a `.sha256` has been missing, the `.sha1` is sent beside the next
-/// one, and what a `Retry-After` longer than raeva waits on either does
-/// is the same whichever answers first: on the `.sha1`, which no read
-/// needs, nothing, and on the `.sha256` it refuses the server before the
-/// `.sha1` is needed, so the read fails, or with a late check its check
-/// does, as when the `.sha256` answers late. Each read is a client's first
-/// after `first`, which shows the `.sha256` missing, and checks the
-/// `.sha256` late or not.
+/// one, and a `Retry-After` longer than raeva waits on either fails no
+/// read, whichever answers first: on the `.sha1`, which no read needs once
+/// the `.sha256` matches, and on the `.sha256`, which Maven never reads, as
+/// when it answers late. Each read is a client's first after `first`,
+/// which shows the `.sha256` missing, and checks the `.sha256` late or not.
 #[test]
-fn a_busy_answer_to_a_sidecar_of_a_pair_counts_the_same_whichever_comes_first() {
+fn a_busy_answer_to_a_sidecar_of_a_pair_fails_no_read_whichever_comes_first() {
     fn refused() -> Response {
         Response::new(429, "").header("Retry-After", "600")
     }
@@ -1589,11 +1739,7 @@ fn a_busy_answer_to_a_sidecar_of_a_pair_counts_the_same_whichever_comes_first() 
                 (Err(err), Ok(())) | (Ok(()), Err(err)) => Some(format!("{err:?}")),
                 (Err(_), Err(_)) => panic!("case {case} late {late}: {read:?}"),
             };
-            match (case, &failed) {
-                (0, None) => {}
-                (1 | 2, Some(err)) if err.contains("429") && err.contains("busy-1.pom.sha256") => {}
-                _ => panic!("case {case} late {late}: {read:?}"),
-            }
+            assert!(failed.is_none(), "case {case} late {late}: {read:?}");
         }
     }
 }
@@ -1626,24 +1772,24 @@ fn settling_waits_for_the_check_of_a_pom_only_prefetched() {
 }
 
 /// A settlement that is cancelled keeps the checks it had not finished, so
-/// the next one still fails on a `.sha256` that holds another digest.
+/// the next one still fails on a `.sha256` the repository refuses.
 #[test]
 fn a_cancelled_settlement_keeps_its_checks() {
     const HELD: std::time::Duration = std::time::Duration::from_secs(1);
     let server = late_server(|artifact, sidecar| {
-        (artifact == "forged" && sidecar == ".sha256")
-            .then(|| Response::new(200, "0".repeat(64)).delayed(HELD))
+        (artifact == "refused" && sidecar == ".sha256")
+            .then(|| Response::new(407, "").delayed(HELD))
     });
     let (late, repo, _tmp, runtime) = late_client(&server);
     runtime.block_on(async {
-        late.fetch_pom(&repo, &late_request("forged"))
+        late.fetch_pom(&repo, &late_request("refused"))
             .await
             .unwrap();
         let cancelled = tokio::time::timeout(HELD / 4, late.settle_checksums()).await;
         assert!(cancelled.is_err(), "settled before the .sha256 answered");
         let settled = late.settle_checksums().await;
         assert!(
-            matches!(settled, Err(RepoError::ChecksumMismatch { .. })),
+            matches!(settled, Err(RepoError::Unauthorized { .. })),
             "{settled:?}"
         );
         assert!(late.late_check_failed());
@@ -1656,23 +1802,23 @@ fn a_cancelled_settlement_keeps_its_checks() {
 fn a_check_another_client_relies_on_outlives_the_client_that_started_it() {
     const HELD: std::time::Duration = std::time::Duration::from_millis(500);
     let server = late_server(|artifact, sidecar| {
-        (artifact == "forged" && sidecar == ".sha256")
-            .then(|| Response::new(200, "0".repeat(64)).delayed(HELD))
+        (artifact == "refused" && sidecar == ".sha256")
+            .then(|| Response::new(407, "").delayed(HELD))
     });
     let (late, repo, _tmp, runtime) = late_client(&server);
     let other = late.clone().checking_sha256_late();
     runtime.block_on(async {
-        late.fetch_pom(&repo, &late_request("forged"))
+        late.fetch_pom(&repo, &late_request("refused"))
             .await
             .unwrap();
         other
-            .fetch_pom(&repo, &late_request("forged"))
+            .fetch_pom(&repo, &late_request("refused"))
             .await
             .unwrap();
         drop(late);
         let settled = other.settle_checksums().await;
         assert!(
-            matches!(settled, Err(RepoError::ChecksumMismatch { .. })),
+            matches!(settled, Err(RepoError::Unauthorized { .. })),
             "{settled:?}"
         );
     });
@@ -1940,6 +2086,7 @@ async fn a_kept_busy_answer_keeps_its_retries() {
         error: Box::new(RepoError::HttpStatus {
             status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
             url: format!("{}{path}", repo.url),
+            redirected_to: None,
             retry_after: Some(Duration::from_secs(1)),
         }),
     };
@@ -1987,7 +2134,7 @@ async fn a_retry_after_past_the_cap_holds_back_the_other_requests() {
         "{sent:?}"
     );
     assert!(
-        matches!(&held, RepoError::HttpStatus { status, url, retry_after: Some(wait) }
+        matches!(&held, RepoError::HttpStatus { status, url, retry_after: Some(wait), .. }
             if status.as_u16() == 429
                 && url.ends_with("/first-1.0.0.pom")
                 && *wait > rv_http::retry::MAX_BUSY_WAIT
@@ -3995,16 +4142,18 @@ async fn a_miss_sent_before_the_credential_follows_is_asked_again() {
     );
 }
 
-/// A checksum probe that ran out of retries on one sidecar reports that
-/// failure over another sidecar's, so the repository search ends there. A
-/// read with a lock pin, which needs no sidecar, still gets the POM.
+/// A checksum probe that ran out of retries on the `.sha1` reports that
+/// failure over the `.md5`'s, so the repository search ends there; a failed
+/// `.sha256`, which Maven never reads, counts as none. A read with a lock
+/// pin, which needs no sidecar, still gets the POM.
 #[tokio::test]
 async fn a_retried_sidecar_failure_decides_the_probe() {
-    for (sha256, sha1) in [(500, 503), (503, 407)] {
+    for (sha256, sha1, md5) in [(503, 500, 503), (500, 503, 407)] {
         let server = StubServer::start(move |request| match request.path.rsplit('.').next() {
             Some("pom") => Response::new(200, "<project/>"),
             Some("sha256") => Response::new(sha256, ""),
             Some("sha1") => Response::new(sha1, ""),
+            Some("md5") => Response::new(md5, ""),
             _ => Response::new(404, ""),
         });
         let repo = http_repo(&server);
@@ -4014,7 +4163,7 @@ async fn a_retried_sidecar_failure_decides_the_probe() {
             .fetch_pom(&repo, &ArtifactRequest::new("g", "a", "1"))
             .await
             .unwrap_err();
-        assert_eq!(err.status_code(), Some(503), "{sha256} {sha1}: {err}");
+        assert_eq!(err.status_code(), Some(503), "{sha256} {sha1} {md5}: {err}");
         assert!(!err.moves_to_next_repository());
         let req = ArtifactRequest::new("g", "a", "1");
         let mut pinned = client.clone();
@@ -4477,4 +4626,38 @@ async fn a_cached_snapshot_row_a_read_takes_is_counted() {
         daily_from: Some(now),
     };
     assert_eq!(*client.snapshot_rows.lock().unwrap(), expected);
+}
+
+/// A refusal is kept across runs only when the credential the route sends
+/// went with it, as the run that reads it back reports that credential: not
+/// one whose redirect chain left the repository's origin, which withheld
+/// the credential, and came back to the URL asked for.
+#[test]
+fn a_refusal_without_the_routes_credential_is_not_kept() {
+    let mut auth = rv_config::AuthConfig::new(Some("corp"));
+    auth.token = Some(SecretString::from("dummy-token".to_string()));
+    let auth = AuthStore::from_auth_configs(&[auth])
+        .expect("auth")
+        .with_configured_urls(&[]);
+    let (client, _cache) = client_for(router(Vec::new(), auth));
+    let repo = Repository::new(
+        Some("corp".into()),
+        "https://repo.example/".to_string(),
+        true,
+        true,
+    );
+    let route = client.router.route(&repo);
+    let configured = route.auth().unwrap().expect("credential").sent.clone();
+    let path = "g/a/1/a-1.pom";
+    let kept = |sent: Option<crate::auth::SentCredential>| {
+        let refusal = RepoError::Unauthorized {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            url: format!("https://repo.example/{path}"),
+            redirected_to: None,
+            sent: sent.map(Box::new),
+        };
+        super::models::Miss::of(&refusal, path).and_then(|miss| miss.kept_status(&route, path))
+    };
+    assert_eq!(kept(Some(configured)), Some(401));
+    assert_eq!(kept(None), None);
 }

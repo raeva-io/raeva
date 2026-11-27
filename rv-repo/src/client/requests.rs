@@ -62,7 +62,7 @@ impl RepoClient {
         let request = |algorithm: HashAlgorithm| async move {
             let checksum_url = repo.url_for_path(&format!("{path}.{}", algorithm.as_str()))?;
             fetch_text(
-                self.transport.client_for(&checksum_url)?.as_ref(),
+                &self.transport.client_for(&checksum_url)?,
                 &checksum_url,
                 Some(&repo.base_url()?),
                 route.auth()?,
@@ -95,7 +95,7 @@ impl RepoClient {
         let mut sha1_done = None;
         let sha256 = match (sha1_early.as_mut(), late) {
             (Some(early), None) => {
-                let sha256 = Box::pin(admitted(true, request(HashAlgorithm::Sha256)));
+                let sha256 = Box::pin(admitted(true, sha256(request(HashAlgorithm::Sha256))));
                 match futures::future::select(sha256, early).await {
                     Either::Left((result, _)) => result,
                     Either::Right((sha1, sha256)) => {
@@ -107,7 +107,7 @@ impl RepoClient {
             // The `.sha256` request moves to its own task, to outlive the
             // read, once the `.sha1` has matched the bytes.
             (Some(early), Some((arrived, late))) => {
-                let mut sha256 = Box::pin(admitted(true, self.sha256_request(route, path)));
+                let mut sha256 = Box::pin(admitted(true, sha256(self.sha256_request(route, path))));
                 match futures::future::select(&mut sha256, early).await {
                     Either::Left((result, _)) => result,
                     Either::Right((sha1, _)) => {
@@ -126,6 +126,7 @@ impl RepoClient {
                                             answer: Spawned(tokio::spawn(sha256)),
                                             hints: self.sidecar_hints.clone(),
                                             origin: origin.clone(),
+                                            repository: Arc::new(repo.clone()),
                                             path: path.to_string(),
                                             sha1: (cooldowns.clone())
                                                 .zip(repo.url_for_path(&sha1_path).ok())
@@ -142,7 +143,7 @@ impl RepoClient {
                     }
                 }
             }
-            (None, _) => request(HashAlgorithm::Sha256).await,
+            (None, _) => sha256(request(HashAlgorithm::Sha256)).await,
         };
         self.sidecar_hints
             .note_sha256_answer(&origin, path, &sha256);
@@ -185,6 +186,33 @@ impl RepoClient {
         })
     }
 
+    /// The digest of `path`'s `.sha1`, else of its `.md5`: the checksum
+    /// files Maven checks by default, in its order. `None` when neither
+    /// holds one.
+    pub(super) async fn maven_checksum(
+        &self,
+        route: &Route<'_>,
+        path: &str,
+    ) -> Result<Option<Digest>> {
+        let repo = &route.endpoint;
+        let mut first_err = None;
+        for algorithm in [HashAlgorithm::Sha1, HashAlgorithm::Md5] {
+            let url = repo.url_for_path(&format!("{path}.{}", algorithm.as_str()))?;
+            let text = fetch_text(
+                &self.transport.client_for(&url)?,
+                &url,
+                Some(&repo.base_url()?),
+                route.auth()?,
+                &self.fetch,
+            )
+            .await;
+            if let Some(outcome) = checksum_outcome(path, algorithm, text, &mut first_err) {
+                return outcome;
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) async fn fetch_path(&self, route: &Route<'_>, path: &str) -> Result<Bytes> {
         let repo = &route.endpoint;
         if self.offline && !repo.is_local() {
@@ -201,7 +229,7 @@ impl RepoClient {
         let url = repo.url_for_path(path)?;
 
         let fetched = fetch_bytes(
-            self.transport.client_for(&url)?.as_ref(),
+            &self.transport.client_for(&url)?,
             &url,
             Some(&repo.base_url()?),
             route.auth()?,
@@ -221,7 +249,7 @@ impl RepoClient {
         let repo = &route.endpoint;
         let request = (|| {
             let url = repo.url_for_path(&format!("{path}.{}", HashAlgorithm::Sha256.as_str()))?;
-            let client = self.transport.client_for(&url)?.into_owned();
+            let client = self.transport.client_for(&url)?;
             Ok::<_, RepoError>((client, url, repo.base_url()?, route.auth()?.cloned()))
         })();
         let mut config = self.fetch.clone();
@@ -236,6 +264,13 @@ impl RepoClient {
             fetch_text(&client, &url, Some(&root), auth.as_ref(), &config).await
         }
     }
+}
+
+/// A `.sha256` request, run as [`optional`]: Maven reads none, so a busy
+/// answer to one holds back only other optional requests to the server.
+/// Boxed, as the probe's future would otherwise outgrow a thread's stack.
+async fn sha256<T>(request: impl Future<Output = T>) -> T {
+    Box::pin(optional(request)).await.0
 }
 
 /// The SHA-1 of a file's bytes, once they have arrived.
@@ -314,6 +349,7 @@ pub(super) struct LateSha256 {
     answer: Spawned<Result<String>>,
     hints: SidecarHints,
     origin: String,
+    repository: Arc<crate::Repository>,
     path: String,
     /// The cooldown of the server and the URL of the `.sha1` that vouched,
     /// which stood in for one asked for once the `.sha256` answered.
@@ -323,8 +359,9 @@ pub(super) struct LateSha256 {
 impl LateSha256 {
     /// Check `bytes`, which match the `.sha1`, in a task of its own, as the
     /// probe would have had it waited for the `.sha256`: it fails as the
-    /// probe would have, such as on another SHA-256, and otherwise says
-    /// whether the `.sha1` alone vouched for them. `failed` runs before a
+    /// probe would have, and otherwise says which checksum file vouched for
+    /// them. A `.sha256` that disagrees leaves them to the `.sha1`, as the
+    /// probe does. `failed` runs before a
     /// failure is seen, and when the task is cancelled. The task is not
     /// cancelled with the check, so every read that shares the check gets
     /// its answer; it is cancelled once `checks` and every other client's
@@ -336,6 +373,7 @@ impl LateSha256 {
         checks: &LateChecks,
     ) -> LateCheck {
         let path: Arc<str> = Arc::from(self.path.as_str());
+        let repository = Arc::clone(&self.repository);
         let on_failure = OnFailure(Some(Box::new(failed)));
         let task = tokio::spawn(async move {
             let mut on_failure = on_failure;
@@ -345,9 +383,10 @@ impl LateSha256 {
             let mut first_err = None;
             let outcome =
                 match checksum_outcome(&self.path, HashAlgorithm::Sha256, answer, &mut first_err) {
-                    Some(Ok(Some(sha256))) => {
-                        verify_checksum(&bytes, &sha256, &self.path).map(|()| false)
-                    }
+                    Some(Ok(Some(sha256))) => match verify_checksum(&bytes, &sha256, &self.path) {
+                        Ok(()) => Ok(Vouched::Sha256),
+                        Err(_) => Ok(Vouched::Sha1OverWrongSha256),
+                    },
                     Some(Err(err)) => Err(err),
                     // A `.sha1` asked for now would be refused unsent, and
                     // the probe would fail as it does when the `.sha256`
@@ -357,9 +396,9 @@ impl LateSha256 {
                             Some((status, retry_after)) => Err(first_err
                                 .filter(RepoError::is_transient)
                                 .unwrap_or_else(|| refusers.refused(url, status, retry_after))),
-                            None => Ok(true),
+                            None => Ok(Vouched::Sha1),
                         },
-                        None => Ok(true),
+                        None => Ok(Vouched::Sha1),
                     },
                 };
             if outcome.is_ok() {
@@ -371,6 +410,7 @@ impl LateSha256 {
         let owner = Arc::new(Ownership(task.abort_handle()));
         let check = LateCheck {
             path,
+            repository,
             owner: Arc::downgrade(&owner),
             outcome: futures::FutureExt::shared(Box::pin(joined_check(task)) as LateFuture),
         };
@@ -411,16 +451,27 @@ impl Drop for Ownership {
 
 type LateFuture = std::pin::Pin<Box<dyn Future<Output = LateOutcome> + Send>>;
 
-/// Whether a late check found the file vouched for by its `.sha1` alone,
-/// or the error its read would have failed with, shared by every read of
-/// the check; see [`unshared`].
-pub(super) type LateOutcome = std::result::Result<bool, Arc<RepoError>>;
+/// Which checksum file a late check found vouching for the file, or the
+/// error its read would have failed with, shared by every read of the
+/// check; see [`unshared`].
+pub(super) type LateOutcome = std::result::Result<Vouched, Arc<RepoError>>;
+
+/// The checksum file that vouched for bytes a `.sha1` matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Vouched {
+    Sha256,
+    /// The `.sha1` alone: the repository has no `.sha256`.
+    Sha1,
+    /// The `.sha1`, as Maven checks it, while the `.sha256` disagrees.
+    Sha1OverWrongSha256,
+}
 
 /// The `.sha256` check of a POM read on its `.sha1`, shared by every read
 /// of those bytes.
 #[derive(Clone)]
 pub(super) struct LateCheck {
     path: Arc<str>,
+    repository: Arc<crate::Repository>,
     /// The task that asks for the `.sha256`, which a client relying on the
     /// check keeps from being cancelled.
     owner: std::sync::Weak<Ownership>,
@@ -441,6 +492,7 @@ impl LateCheck {
         });
         LateCheck {
             path: Arc::clone(&self.path),
+            repository: Arc::clone(&self.repository),
             owner: self.owner.clone(),
             outcome: futures::FutureExt::shared(Box::pin(joined_check(task)) as LateFuture),
         }
@@ -451,15 +503,22 @@ impl LateCheck {
         self.outcome.ptr_eq(&other.outcome)
     }
 
-    /// Wait for the check; `Ok(true)` when the `.sha1` alone vouched for
-    /// the bytes.
+    /// Wait for the check.
     pub(super) async fn outcome(&self) -> LateOutcome {
         self.outcome.clone().await
     }
 
-    /// The warning for bytes the `.sha1` alone vouched for.
-    pub(super) fn weak_hash(&self) -> impl FnOnce() + Send + 'static {
-        weak_hash(&self.path, HashAlgorithm::Sha1)
+    /// The warning for bytes `vouched` vouched for, if they need one.
+    pub(super) fn warning(&self, vouched: Vouched) -> Option<Box<dyn FnOnce() + Send>> {
+        match vouched {
+            Vouched::Sha256 => None,
+            Vouched::Sha1 => Some(Box::new(weak_hash(&self.path, HashAlgorithm::Sha1))),
+            Vouched::Sha1OverWrongSha256 => Some(Box::new(wrong_sha256(
+                &self.repository,
+                &self.path,
+                HashAlgorithm::Sha1,
+            ))),
+        }
     }
 }
 
@@ -481,18 +540,26 @@ pub(super) fn unshared(err: Arc<RepoError>) -> RepoError {
             actual: actual.clone(),
             check: *check,
         },
-        RepoError::Unauthorized { status, url, sent } => RepoError::Unauthorized {
+        RepoError::Unauthorized {
+            status,
+            url,
+            redirected_to,
+            sent,
+        } => RepoError::Unauthorized {
             status: *status,
             url: url.clone(),
+            redirected_to: redirected_to.clone(),
             sent: sent.clone(),
         },
         RepoError::HttpStatus {
             status,
             url,
+            redirected_to,
             retry_after,
         } => RepoError::HttpStatus {
             status: *status,
             url: url.clone(),
+            redirected_to: redirected_to.clone(),
             retry_after: *retry_after,
         },
         RepoError::AuthSetup(reason) => RepoError::AuthSetup(reason.clone()),
@@ -501,6 +568,31 @@ pub(super) fn unshared(err: Arc<RepoError>) -> RepoError {
 }
 
 /// The warning for a file checked against its `.sha1` or `.md5`.
+/// The warning for `path`, whose `.sha256` file at `repo` does not match
+/// the bytes while its `.{algorithm}` file, which Maven checks, does.
+pub(super) fn wrong_sha256(
+    repo: &crate::Repository,
+    path: &str,
+    algorithm: HashAlgorithm,
+) -> impl FnOnce() + Send + 'static {
+    let repository_url = rv_config::redact_repository_url(&repo.url);
+    let repository = match repo.id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => format!("'{}' ({repository_url})", rv_maven_types::bounded(id)),
+        None => repository_url.clone(),
+    };
+    let path = path.to_string();
+    let algorithm = algorithm.as_str();
+    move || {
+        warn!(
+            sec_code = "SHA256_FILE_MISMATCH",
+            repository_url = %repository_url,
+            path,
+            "{path} does not match the .sha256 file of the repository {repository} but \
+             matches its .{algorithm} file, which Maven checks; using it"
+        );
+    }
+}
+
 fn weak_hash(path: &str, algorithm: HashAlgorithm) -> impl FnOnce() + Send + 'static {
     // `sec_code` is mirrored into the JSON envelope's warnings, which
     // `--json` runs still show.
@@ -520,7 +612,8 @@ fn weak_hash(path: &str, algorithm: HashAlgorithm) -> impl FnOnce() + Send + 'st
 }
 
 /// What one sidecar answer decides: `Some` ends the probe, `None` moves on
-/// to the next algorithm, recording a failure in `first_err`.
+/// to the next algorithm, recording a failure other than a `.sha256`'s in
+/// `first_err`.
 fn checksum_outcome(
     path: &str,
     algorithm: HashAlgorithm,
@@ -556,6 +649,10 @@ fn checksum_outcome(
             let retried = first_err.take().filter(RepoError::is_transient);
             return Some(Err(retried.unwrap_or(err)));
         }
+        // Maven reads no `.sha256`, so any other failure of one is no
+        // `.sha256`, as a 404 is: repo.dotcms.com redirects every miss to a
+        // server that may answer 429.
+        Err(_) if algorithm == HashAlgorithm::Sha256 => {}
         // Transient failures here have already used their retries, and one
         // is kept over other failures: it ends the repository search.
         Err(err) => {
@@ -824,7 +921,11 @@ impl LateChecks {
             };
             relied_on.remove(at);
             match outcome {
-                Ok(true) if warns => settled.warnings.push(check.weak_hash()),
+                Ok(vouched) if warns => {
+                    if let Some(warning) = check.warning(vouched) {
+                        settled.warnings.push(warning);
+                    }
+                }
                 Ok(_) => {}
                 Err(err) => {
                     settled.failure.get_or_insert(err);

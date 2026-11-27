@@ -56,6 +56,7 @@ pub(crate) fn resolution_inputs(
             .map(|repo| repository_inputs(config, repo))
             .collect(),
         allow_transitive_repositories: config.security.allow_transitive_repositories,
+        ignore_transitive_repositories: config.ignores_transitive_repositories(),
         allow_env_substitution: config.security.allow_env_substitution.clone(),
         transitive_repository_allowlist: config.security.transitive_repository_allowlist.clone(),
         jdks: config.lock.jdks.clone(),
@@ -409,9 +410,13 @@ pub(crate) fn recorded_inputs(
         .iter()
         .filter(|input| matches!(input, HostInput::Jdk(_) | HostInput::Property { .. }))
         .count();
+    // A short root and a module past `MAX_PATH` canonicalize to a plain and
+    // a `\\?\` path, so both are compared in their plain form.
     let roots = [
         Some(config.project_root.clone()),
-        dunce::canonicalize(&config.project_root).ok(),
+        dunce::canonicalize(&config.project_root)
+            .ok()
+            .map(|root| rv_fs::plain_path(&root)),
     ];
     let refuse = |reason: String| CliError::InvalidProjectInput {
         path: config.project_root.join("pom.xml"),
@@ -421,11 +426,24 @@ pub(crate) fn recorded_inputs(
         base_dir
             .as_ref()
             .map(|base| {
-                let base = dunce::canonicalize(base).unwrap_or_else(|_| base.clone());
+                let base =
+                    rv_fs::plain_path(&dunce::canonicalize(base).unwrap_or_else(|_| base.clone()));
+                // A module beside the root, as raeva.lock names its path.
+                let beside = || {
+                    let root = roots[1].as_deref()?;
+                    let common = root
+                        .ancestors()
+                        .find(|ancestor| base.starts_with(ancestor))?;
+                    let up = root.components().count() - common.components().count();
+                    let below = base.strip_prefix(common).ok()?;
+                    let up = std::iter::repeat_n(Component::ParentDir, up);
+                    Some(up.chain(below.components()).collect::<PathBuf>())
+                };
                 let relative = roots
                     .iter()
                     .flatten()
-                    .find_map(|root| base.strip_prefix(root).ok())
+                    .find_map(|root| base.strip_prefix(root).ok().map(Path::to_path_buf))
+                    .or_else(beside)
                     .ok_or_else(|| {
                         refuse("a private file activation is based outside the project root".into())
                     })?;
@@ -433,6 +451,7 @@ pub(crate) fn recorded_inputs(
                     .components()
                     .map(|component| match component {
                         Component::Normal(name) => name.to_str(),
+                        Component::ParentDir => Some(".."),
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>()
@@ -651,6 +670,7 @@ fn ambient_input(host: &HostSnapshot, input: &HostInput, conditions: bool) -> Op
     let condition = match input {
         HostInput::JavaVersion => return Some(AmbientInput::JavaVersion),
         HostInput::JavaHome => return Some(AmbientInput::JavaHome),
+        HostInput::JavaVendor => return Some(AmbientInput::JavaVendor),
         HostInput::OsRelease => return Some(AmbientInput::OsRelease),
         // The allowlist admits only names raeva.lock can record.
         HostInput::Env(name) => return AmbientInput::env(name).ok(),
@@ -686,6 +706,7 @@ fn ambient_input(host: &HostSnapshot, input: &HostInput, conditions: bool) -> Op
             let name = name.strip_prefix('!').unwrap_or(name);
             match name {
                 "java.home" => Some(AmbientInput::JavaHome),
+                "java.vendor" => Some(AmbientInput::JavaVendor),
                 "java.version" | "java.specification.version" => Some(AmbientInput::JavaVersion),
                 _ => AmbientInput::env(name.strip_prefix("env.")?).ok(),
             }
@@ -711,6 +732,7 @@ pub(crate) fn current_value(config: &Config, name: &AmbientInput) -> Option<Stri
     match name {
         AmbientInput::JavaVersion => host.value(&HostInput::JavaVersion),
         AmbientInput::JavaHome => host.value(&HostInput::JavaHome),
+        AmbientInput::JavaVendor => host.value(&HostInput::JavaVendor),
         AmbientInput::OsRelease => host.value(&HostInput::OsRelease),
         AmbientInput::Env(name) => host.value(&HostInput::Env(name.clone())),
         AmbientInput::SettingsProperty(name) => config.settings_property_value(name),
@@ -736,7 +758,16 @@ fn condition_holds(config: &Config, condition: &HostCondition) -> Option<bool> {
             name: name.clone(),
             value: value.clone(),
         },
-        HostCondition::File(path) => return Some(config.project_root.join(path).exists()),
+        HostCondition::File(path) => {
+            // Recorded only where the path stays in the project, which an
+            // edited raeva.lock need not keep to: such a path is not tested.
+            let file = config.project_root.join(path);
+            let inside = rv_fs::canonicalize_existing_prefix(&file).is_ok_and(|target| {
+                rv_fs::canonicalize_existing_prefix(&config.project_root)
+                    .is_ok_and(|root| target.starts_with(root))
+            });
+            return inside.then(|| file.exists());
+        }
         HostCondition::Settings(key) => {
             return config.settings_condition(key).map(|(_, holds)| holds);
         }
@@ -1102,7 +1133,6 @@ impl ReactorModel {
 /// input, never the URL, which may be inherited from a local parent, or the
 /// value.
 fn refuse_secret_repositories(
-    root: &Path,
     config: &Config,
     modules: &[&rv_resolver::WorkspaceModule],
     secrets: &[(String, String)],
@@ -1156,7 +1186,7 @@ fn refuse_secret_repositories(
                 continue;
             };
             return Err(CliError::InvalidProjectInput {
-                path: root.join(&module.pom_path),
+                path: module.pom_file().to_path_buf(),
                 reason,
             });
         }
@@ -1169,7 +1199,6 @@ fn refuse_secret_repositories(
 /// once, from the first project its build order reaches, and every project
 /// reads that one.
 fn refuse_settings_repositories_filled_apart(
-    root: &Path,
     modules: &[&rv_resolver::WorkspaceModule],
     ids: &[String],
 ) -> Result<()> {
@@ -1230,7 +1259,7 @@ fn refuse_settings_repositories_filled_apart(
         };
         if let Some((module, reason)) = reason {
             return Err(CliError::InvalidProjectInput {
-                path: root.join(&module.pom_path),
+                path: module.pom_file().to_path_buf(),
                 reason,
             });
         }
@@ -1288,16 +1317,10 @@ pub(crate) fn discover_reactor_model(config: &Config, platform: &Platform) -> Re
 
     let mut modules: Vec<_> = workspace.modules().iter().collect();
     modules.sort_by(|left, right| left.pom_path.cmp(&right.pom_path));
-    refuse_secret_repositories(
-        workspace.root(),
-        config,
-        &modules,
-        &secrets,
-        &config.secret_input_names(),
-    )?;
+    refuse_secret_repositories(config, &modules, &secrets, &config.secret_input_names())?;
     let environment = config.model_environment(platform.os(), platform.arch(), platform.jdk());
     let ids = config.settings_model_repository_ids(&environment);
-    refuse_settings_repositories_filled_apart(workspace.root(), &modules, &ids)?;
+    refuse_settings_repositories_filled_apart(&modules, &ids)?;
 
     // The settings.xml profiles a condition activates add only repositories,
     // which config_hash covers, so only the explicit ids count.
@@ -1306,7 +1329,7 @@ pub(crate) fn discover_reactor_model(config: &Config, platform: &Platform) -> Re
     let mut resolution_contexts = workspace.resolution_contexts();
     let mut covers = BTreeMap::new();
     for module in modules {
-        let bytes = rv_config::read_project_input(&workspace.root().join(&module.pom_path))?;
+        let bytes = rv_config::read_project_input(module.pom_file())?;
         active_profiles.extend(module.descriptor.active_profiles.iter().cloned());
         let gav = module.gav();
         module_inputs.push(ModuleInput {
@@ -1370,6 +1393,17 @@ fn discovery_error(project_root: &Path, err: WorkspaceError) -> CliError {
             }
         }
         WorkspaceError::Io { path, source } => CliError::io_at(path)(source),
+        WorkspaceError::MissingModule {
+            ref declaring_pom,
+            ref profile,
+            ..
+        } => CliError::InvalidProjectInput {
+            path: project_root.join(declaring_pom),
+            reason: match profile {
+                Some(_) => format!("{err}; select the profiles the build uses with -P"),
+                None => err.to_string(),
+            },
+        },
         WorkspaceError::InvalidPom { path, source } => CliError::InvalidProjectInput {
             path: path.into(),
             reason: source.to_string(),
@@ -1437,7 +1471,7 @@ pub(crate) fn local_project(
             .iter()
             .map(|module| rv_export::ProjectPom {
                 local_parents: module.local_parents().to_vec(),
-                path: model.workspace.root().join(&module.pom_path),
+                path: module.pom_file().to_path_buf(),
             })
             .collect(),
         modules: model

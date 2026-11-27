@@ -16,7 +16,7 @@ as CI variables; this Linux shell step stops at the first failure:
 
 ```sh
 set -eu
-: "${RAEVA_VERSION:?set RAEVA_VERSION to the pinned release, such as 0.6.0}"
+: "${RAEVA_VERSION:?set RAEVA_VERSION to the pinned release, such as 0.6.1}"
 : "${RAEVA_SHA256:?set RAEVA_SHA256 to the archive's SHA-256 from sha256.sum}"
 RAEVA_ARCHIVE=raeva-x86_64-unknown-linux-musl.tar.gz
 curl --proto '=https' --tlsv1.2 -fsSL -o raeva.tar.gz \
@@ -73,7 +73,9 @@ the trace, so `--frozen` inside the block refuses a lock traced elsewhere.
 ## Name the JDK
 
 POM profiles can activate by JDK version, so raeva needs the JDK the build
-uses. It takes the one `mvn` would run, from `JAVA_HOME` or else `PATH`. When
+uses. It takes the one `mvn` would run, from `JAVA_HOME` or else `PATH`. On
+a host with none, such as a bot's, and no `JAVA_VERSION`, `raeva sync` fails
+(exit 3) where the JDK version decides what is locked. When
 CI builds on several JDKs, list them in `raeva.toml` and run `raeva sync`;
 `--frozen` then passes on each:
 
@@ -464,16 +466,24 @@ In the repository's `renovate.json`:
 }
 ```
 
+The `packageRules` line groups the Maven updates into one branch, as
+above; the rest works without it.
+
 Renovate gives the command only `HOME`, `PATH`, `LANG`, `LC_ALL` and `CI`. raeva
 then evaluates POM profiles for the `java` on `PATH`, which may not be the JDK
 CI builds with, so a project whose profiles activate by JDK lists its JDKs in
-`[lock] jdks`. `RAEVA_HOME`
+`[lock] jdks`. Without them, on a host with no `java` on `PATH`, `raeva sync`
+fails (exit 3) where the JDK version decides what is locked
+([The JDK version](configuration.md#the-jdk-version)). `RAEVA_HOME`
 defaults to a directory under that `HOME`; unless it persists between runs,
 each run downloads the locked files again. A variable that `settings.xml`
 reads as `${env.NAME}`, such as a private registry's token, reaches the
 command only through Renovate's `env` option, which the admin
 configuration's `allowedEnv` must admit; otherwise put a `settings.xml`
-that works without it under that `HOME`.
+that works without it in `.m2` under the home of the user Renovate runs as.
+raeva, like Maven, takes that home from `user.home`, the user's passwd
+entry, not from `HOME` ([Configuration](configuration.md)); where the two
+differ, pass `MAVEN_OPTS=-Duser.home=...` through `env` as well.
 
 **Hosted Renovate** (the Mend app) runs no commands of yours. Use the relock
 workflow, accept `renovate[bot]` in its relock job's `if:`, and list the lock

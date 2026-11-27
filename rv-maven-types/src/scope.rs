@@ -63,24 +63,26 @@ impl Scope {
         text.parse().unwrap_or_else(|_| Self::Other(intern(text)))
     }
 
-    /// The scope `text` names in raeva.lock: [`Scope::declared`], or `None`
-    /// for text the lock cannot record (see [`Scope::recordable`]).
+    /// The scope `text`, as [`Scope::lock_text`] spells it, names in
+    /// raeva.lock, or `None` for text the lock cannot hold: another spelling
+    /// of a scope, or one [`Scope::recordable`] refuses.
     pub fn read(text: &str) -> Option<Scope> {
-        Some(Self::declared(text)).filter(|scope| scope.recordable())
+        let scope = Self::declared(&decode_lock_text(text)?);
+        (scope.recordable() && scope.lock_text() == text).then_some(scope)
+    }
+
+    /// How raeva.lock spells this scope: [`Scope::as_str`] with each
+    /// whitespace character, which separates an edge line's fields, and `%`
+    /// percent-encoded, as Maven keeps `provided, test` as written.
+    pub fn lock_text(self) -> std::borrow::Cow<'static, str> {
+        encode_lock_text(self.as_str())
     }
 
     /// Whether raeva.lock can record this scope: a scope Maven does not know
-    /// must be 1 to 255 characters with no whitespace, which separates an edge
-    /// line's fields, no control or invisible character, and not `?`, the
-    /// empty scope's mark.
+    /// must be [`lock_text_recordable`].
     pub fn recordable(self) -> bool {
         match self {
-            Self::Other(text) => {
-                (1..=255).contains(&text.chars().count())
-                    && text != "?"
-                    && crate::is_terminal_safe(text)
-                    && !text.chars().any(char::is_whitespace)
-            }
+            Self::Other(text) => lock_text_recordable(text),
             _ => true,
         }
     }
@@ -99,6 +101,52 @@ impl Scope {
             Self::Empty => "",
         }
     }
+}
+
+/// Whether raeva.lock can record `text` where it records a scope Maven does
+/// not know or a dependency's type: 1 to 255 characters, no control or
+/// invisible character, and not `?`, the empty scope's mark.
+pub fn lock_text_recordable(text: &str) -> bool {
+    (1..=255).contains(&text.chars().count()) && text != "?" && crate::is_terminal_safe(text)
+}
+
+/// How raeva.lock spells `text`: each whitespace character, which separates
+/// a line's fields, and `%` percent-encoded in UTF-8.
+pub fn encode_lock_text<'a>(text: &'a str) -> std::borrow::Cow<'a, str> {
+    if !text.contains(|c: char| c == '%' || c.is_whitespace()) {
+        return text.into();
+    }
+    let mut encoded = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if c == '%' || c.is_whitespace() {
+            let mut utf8 = [0; 4];
+            for byte in c.encode_utf8(&mut utf8).bytes() {
+                encoded.push_str(&format!("%{byte:02X}"));
+            }
+        } else {
+            encoded.push(c);
+        }
+    }
+    encoded.into()
+}
+
+/// [`encode_lock_text`] undone, or `None` for a `%` that is not followed by
+/// two hex digits or bytes that are not UTF-8. Another spelling of the same
+/// text decodes too; a reader compares the text encoded again.
+pub fn decode_lock_text(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        rest = tail;
+        if byte != b'%' {
+            bytes.push(byte);
+            continue;
+        }
+        let hex = std::str::from_utf8(rest.get(..2)?).ok()?;
+        bytes.push(u8::from_str_radix(hex, 16).ok()?);
+        rest = &rest[2..];
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// `text` as a `&'static str`, leaked once per distinct text, so that
@@ -203,23 +251,61 @@ mod tests {
             &"é".repeat(255),
         ] {
             assert_eq!(Scope::read(kept).map(Scope::as_str), Some(kept), "{kept:?}");
+            assert_eq!(Scope::declared(kept).lock_text(), kept);
+        }
+        // Whitespace, which separates an edge line's fields, and `%` are
+        // percent-encoded, as `provided, test` from manifold's POMs.
+        for (scope, text) in [
+            ("provided, test", "provided,%20test"),
+            (" compile ", "%20compile%20"),
+            ("no\u{a0}break", "no%C2%A0break"),
+            ("100%", "100%25"),
+            // 255 characters as written, however long encoded.
+            (
+                &format!("{}  ", "x".repeat(253)),
+                &format!("{}%20%20", "x".repeat(253)),
+            ),
+            (&"%".repeat(255), &"%25".repeat(255)),
+        ] {
+            assert_eq!(Scope::declared(scope).lock_text(), text, "{scope:?}");
+            assert_eq!(
+                Scope::read(text).map(Scope::as_str),
+                Some(scope),
+                "{text:?}"
+            );
         }
         for bad in [
             "",
             "?",
             "two words",
+            "two%2fwords",
+            "%63ompile",
+            "50%",
+            "%2",
+            "%FF",
+            "tab%09here",
             "tab\there",
             "line\nbreak",
-            "no\u{a0}break",
             "esc\u{1b}[31m",
             "zero\u{200b}width",
             &"x".repeat(256),
             &"é".repeat(256),
+            &format!("{}%20%20", "x".repeat(254)),
+            &"%25".repeat(256),
             "x\u{e0100}y",
         ] {
             assert_eq!(Scope::read(bad), None, "{bad:?}");
+        }
+        for bad in [
+            "",
+            "?",
+            "tab\there",
+            "esc\u{1b}[31m",
+            &format!("{} ", "x".repeat(255)),
+        ] {
             assert!(!Scope::declared(bad).recordable(), "{bad:?}");
         }
+        assert!(Scope::declared("two words").recordable());
         assert_eq!(Scope::declared("two words").as_str(), "two words");
         assert_eq!(Scope::declared("test"), Scope::Test);
     }

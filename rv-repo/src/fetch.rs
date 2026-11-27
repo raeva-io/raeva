@@ -8,12 +8,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
+use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
-use reqwest::{Client, StatusCode};
+use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
-use crate::auth::Auth;
+use crate::auth::{Auth, CredentialFile, SentCredential};
 use crate::error::{IntegritySource, RepoError, Result};
+use crate::transport::Routed;
 use rv_config::{redact_url, redacted_url};
 use rv_http::body::{BodyError, read_limited};
 use rv_http::retry::{Cooldowns, Outcome, RetryPolicy};
@@ -65,6 +67,7 @@ fn request_error(error: reqwest::Error, url: &Url) -> RetryError {
             return RetryError::permanent(RepoError::Unauthorized {
                 status: StatusCode::PROXY_AUTHENTICATION_REQUIRED,
                 url: redact_url(url),
+                redirected_to: None,
                 sent: None,
             });
         }
@@ -225,19 +228,39 @@ const MAX_METADATA_SIZE: u64 = 20 * 1024 * 1024; // 20MB
 const MAX_CHECKSUM_SIZE: u64 = 4 * 1024; // 4KB
 
 /// Classifies an HTTP status into permanent/transient; a 401 or 403 names
-/// the credential `auth` sent. On 429/502/503/504 the
+/// the credential `sent`. On 429/502/503/504 the
 /// `Retry-After` header (delta-seconds or HTTP-date, per RFC 9110 §10.2.3)
 /// is parsed and attached so the backoff layer sleeps at least that long.
+/// Classify `status`, the answer from `answered` to a request of
+/// `requested`, `left_origin` when a redirect between them left the
+/// origin, though it may have led back to `requested`. The answer is named
+/// by the request URL, and after a redirect that left the origin by the
+/// origin that answered too, never the redirected path or query, which may
+/// hold a download ticket no configuration registered as a secret; a
+/// refusal from another origin by that origin alone, the party that
+/// refused.
 fn classify_response_status_with_headers(
     status: StatusCode,
-    url: &Url,
+    requested: &Url,
+    answered: &Url,
+    left_origin: bool,
     headers: Option<&HeaderMap>,
-    auth: Option<&Auth>,
+    sent: Option<&SentCredential>,
 ) -> std::result::Result<(), RetryError> {
     if status.is_success() {
         return Ok(());
     }
-    let url = redact_url(url);
+    let origin = answered.origin().ascii_serialization();
+    let redirected_to = left_origin.then(|| origin.clone());
+    let request = redact_url(requested);
+    let url = match &redirected_to {
+        Some(origin) => format!("{request} (redirected to {origin})"),
+        None => request.clone(),
+    };
+    let (refuser, refused_after) = match answered.origin() == requested.origin() {
+        true => (request.clone(), redirected_to.clone()),
+        false => (format!("{origin}/"), None),
+    };
     Err(match status {
         StatusCode::NOT_FOUND => {
             RetryError::permanent(RepoError::NotFound(format!("{url} (HTTP 404)").into()))
@@ -245,14 +268,16 @@ fn classify_response_status_with_headers(
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
             RetryError::permanent(RepoError::Unauthorized {
                 status,
-                url,
-                sent: auth.map(|auth| Box::new(auth.sent.clone())),
+                url: refuser,
+                redirected_to: refused_after,
+                sent: sent.cloned().map(Box::new),
             })
         }
         StatusCode::PROXY_AUTHENTICATION_REQUIRED => {
             RetryError::permanent(RepoError::Unauthorized {
                 status,
-                url,
+                url: refuser,
+                redirected_to: refused_after,
                 sent: None,
             })
         }
@@ -261,7 +286,8 @@ fn classify_response_status_with_headers(
             RetryError::Busy {
                 error: RepoError::HttpStatus {
                     status,
-                    url,
+                    url: request,
+                    redirected_to,
                     retry_after,
                 },
                 status,
@@ -270,7 +296,8 @@ fn classify_response_status_with_headers(
         }
         _ => RetryError::permanent(RepoError::HttpStatus {
             status,
-            url,
+            url: request,
+            redirected_to,
             retry_after: None,
         }),
     })
@@ -396,11 +423,13 @@ impl Refusers {
             Some(refuser) => RepoError::HttpStatus {
                 status: refuser.status,
                 url: refuser.url.clone(),
+                redirected_to: None,
                 retry_after: Some(refuser.retry_after),
             },
             None => RepoError::HttpStatus {
                 status,
                 url: redact_url(url),
+                redirected_to: None,
                 retry_after: Some(retry_after),
             },
         }
@@ -524,7 +553,7 @@ const SIDECAR: Bounded = Bounded {
 };
 
 pub(crate) async fn fetch_bytes(
-    client: &Client,
+    client: &Routed,
     url: &Url,
     repository_root: Option<&Url>,
     auth: Option<&Auth>,
@@ -544,7 +573,7 @@ pub(crate) async fn fetch_bytes(
 }
 
 async fn fetch_bounded(
-    client: &Client,
+    client: &Routed,
     url: &Url,
     repository_root: Option<&Url>,
     auth: Option<&Auth>,
@@ -559,21 +588,19 @@ async fn fetch_bounded(
         return Err(RepoError::NoTransport);
     }
     execute_retry(config, url, || async {
-        let mut request = client.get(wire_url(url).as_ref()).timeout(config.timeout);
-        if let Some(auth) = auth {
-            request = auth.apply(request);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| request_error(error, url))?;
-
+        let answer = send_for_headers(client, url, auth, config, |request| {
+            request.timeout(config.timeout)
+        })
+        .await?;
+        let response = answer.response;
         let content_length = response.content_length();
         if let Err(error) = classify_response_status_with_headers(
             response.status(),
             url,
+            &answer.url,
+            answer.left_origin,
             Some(response.headers()),
-            auth,
+            answer.sent,
         ) {
             drain_error_body(response).await;
             return Err(error);
@@ -958,14 +985,168 @@ async fn open_local_stream(
     Ok((Some(len), Box::pin(stream)))
 }
 
-/// Wait for response headers without imposing a deadline on the body.
-async fn send_for_headers(
-    request: reqwest::RequestBuilder,
+/// The response that ended a GET's redirect chain.
+struct Answer<'a> {
+    response: reqwest::Response,
+    /// The URL that gave it, without userinfo.
+    url: Url,
+    /// Whether a redirect on the way left the request's origin.
+    left_origin: bool,
+    /// The credential that went with that last request.
+    sent: Option<&'a SentCredential>,
+}
+
+/// What a request carrying a redirect target's userinfo sent.
+static REDIRECT_USERINFO: SentCredential = SentCredential {
+    id: None,
+    file: CredentialFile::Redirect,
+    unset_variables: Vec::new(),
+};
+
+/// Whether `answered` is another URL than `requested`, userinfo aside: an
+/// answer after a redirect.
+fn redirected(requested: &Url, answered: &Url) -> bool {
+    let bare = |url: &Url| {
+        let mut url = url.clone();
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url
+    };
+    bare(requested) != bare(answered)
+}
+
+/// The credential a hop of a redirect chain sends.
+enum HopAuth<'a> {
+    Configured(&'a Auth),
+    /// A redirect target's userinfo, sent as Basic auth to its origin.
+    Userinfo {
+        username: String,
+        password: Option<SecretString>,
+    },
+}
+
+/// Take `url`'s userinfo off it, percent-decoded. Userinfo that does not
+/// decode to UTF-8 is dropped.
+fn take_userinfo(url: &mut Url) -> Option<HopAuth<'static>> {
+    if url.username().is_empty() && url.password().is_none() {
+        return None;
+    }
+    let username = rv_config::percent_decode(url.username());
+    let password = url.password().map(rv_config::percent_decode);
+    // The target's path or a later message may repeat the userinfo, which
+    // no configuration registered. A username beside a password may be an
+    // ordinary word; alone it is the token.
+    let register = match url.password() {
+        Some(_) => rv_config::register_named_secret,
+        None => rv_config::register_secret,
+    };
+    for value in [Some(url.username()), username.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        register(value);
+    }
+    for value in [url.password(), password.as_ref().and_then(|p| p.as_deref())]
+        .into_iter()
+        .flatten()
+    {
+        rv_config::register_secret(value);
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    let password = match password {
+        Some(password) => Some(SecretString::from(password?)),
+        None => None,
+    };
+    Some(HopAuth::Userinfo {
+        username: username?,
+        password,
+    })
+}
+
+/// Send a GET of `url`, following redirects by `client`'s rules, and wait
+/// for the headers of the last response without imposing a deadline on its
+/// body. One deadline covers the whole chain.
+///
+/// `auth` goes only to `url`'s origin, and never again once a hop leaves it.
+/// A hop target's userinfo, which no request puts on the wire, is sent as
+/// Basic auth to that target's origin until a hop leaves it, as Maven does.
+async fn send_for_headers<'a>(
+    client: &Routed,
     url: &Url,
+    auth: Option<&'a Auth>,
     config: &FetchConfig,
-) -> std::result::Result<reqwest::Response, RetryError> {
-    match tokio::time::timeout(config.timeout, request.send()).await {
-        Ok(result) => result.map_err(|error| request_error(error, url)),
+    decorate: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> std::result::Result<Answer<'a>, RetryError> {
+    let follow = async {
+        let mut chain = vec![url.clone()];
+        let mut hop_auth = auth.map(HopAuth::Configured);
+        loop {
+            let current = chain.last().expect("the chain starts at url");
+            let request = decorate(client.client.get(wire_url(current).as_ref()));
+            let request = match &hop_auth {
+                Some(HopAuth::Configured(auth)) => auth.apply(request),
+                Some(HopAuth::Userinfo { username, password }) => {
+                    request.basic_auth(username, password.as_ref().map(ExposeSecret::expose_secret))
+                }
+                None => request,
+            };
+            // A redirected hop is named as a status it answers is: by the
+            // request URL on its origin, else by its own origin alone.
+            let shown = match (redirected(url, current), current.origin() == url.origin()) {
+                (false, _) => current.clone(),
+                (true, true) => url.clone(),
+                (true, false) => current.join("/").unwrap_or_else(|_| current.clone()),
+            };
+            let response = request
+                .send()
+                .await
+                .map_err(|error| request_error(error, &shown))?;
+            let target = matches!(
+                response.status(),
+                StatusCode::MOVED_PERMANENTLY
+                    | StatusCode::FOUND
+                    | StatusCode::SEE_OTHER
+                    | StatusCode::TEMPORARY_REDIRECT
+                    | StatusCode::PERMANENT_REDIRECT
+            )
+            .then(|| response.headers().get(reqwest::header::LOCATION))
+            .flatten()
+            .and_then(|location| location.to_str().ok())
+            .and_then(|location| current.join(location).ok());
+            let Some(mut target) = target else {
+                let sent = match hop_auth {
+                    Some(HopAuth::Configured(auth)) => Some(&auth.sent),
+                    Some(HopAuth::Userinfo { .. }) => Some(&REDIRECT_USERINFO),
+                    None => None,
+                };
+                let left_origin = chain.iter().any(|hop| hop.origin() != url.origin());
+                let url = current.clone();
+                return Ok(Answer {
+                    response,
+                    url,
+                    left_origin,
+                    sent,
+                });
+            };
+            let userinfo = take_userinfo(&mut target);
+            client
+                .may_follow(&chain, &target)
+                .map_err(RetryError::permanent)?;
+            // Followed on its headers: a body it declares and sends late
+            // would spend the timeout.
+            drop(response);
+            if target.origin() != current.origin() {
+                hop_auth = None;
+            }
+            if userinfo.is_some() {
+                hop_auth = userinfo;
+            }
+            chain.push(target);
+        }
+    };
+    match tokio::time::timeout(config.timeout, follow).await {
+        Ok(result) => result,
         Err(_) => Err(RetryError::transient(RepoError::Transfer(
             std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -1213,7 +1394,7 @@ pub(crate) struct ArtifactChecks<'a> {
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_artifact_into_store(
-    client: &Client,
+    client: &Routed,
     url: &Url,
     repository_root: Option<&Url>,
     auth: Option<&Auth>,
@@ -1226,7 +1407,7 @@ pub(crate) async fn fetch_artifact_into_store(
         .into_iter()
         .flatten()
         .any(|digest| digest.algorithm() == HashAlgorithm::Sha1);
-    let (staged, transfer) = fetch_artifact_staged(
+    let (staged, transfer, _) = fetch_artifact_staged(
         client,
         url,
         repository_root,
@@ -1242,12 +1423,13 @@ pub(crate) async fn fetch_artifact_into_store(
 }
 
 /// Download an artifact into a private temporary file of the store,
-/// hashed with SHA-256 and, with `sha1`, SHA-1, retrying as configured.
+/// hashed with SHA-256 and, with `sha1`, SHA-1, retrying as configured,
+/// with the SHA-1 the server sent in a header ([`included_sha1`]).
 /// Nothing is published; see [`publish_artifact`], which also ends the
 /// returned transfer. `index` only names the artifact in errors.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fetch_artifact_staged(
-    client: &Client,
+    client: &Routed,
     url: &Url,
     repository_root: Option<&Url>,
     auth: Option<&Auth>,
@@ -1256,7 +1438,7 @@ pub(crate) async fn fetch_artifact_staged(
     store: &Store,
     index: Option<&ArtifactCoord>,
     sha1: bool,
-) -> Result<(Staged, Transfer)> {
+) -> Result<(Staged, Transfer, Option<Digest>)> {
     let attempts = AtomicU64::new(0);
     let local = url.scheme() == "file";
     if !local && !matches!(url.scheme(), "http" | "https") {
@@ -1265,29 +1447,29 @@ pub(crate) async fn fetch_artifact_staged(
     execute_retry(config, url, || async {
         let retry = attempts.fetch_add(1, Ordering::Relaxed) != 0;
         let context = download_context(index, url);
-        let (total, raw_stream) = if local {
-            open_local_stream(url, repository_root)
+        let (total, raw_stream, included) = if local {
+            let (total, stream) = open_local_stream(url, repository_root)
                 .await
-                .map_err(RetryError::permanent)?
+                .map_err(RetryError::permanent)?;
+            (total, stream, None)
         } else {
-            let mut request = client.get(wire_url(url).as_ref());
             // Dropping an incomplete HTTP/1 body discards its connection.
             // Close retry connections too, preserving the configured proxy, TLS, and redirect policy.
-            if retry {
-                request = request.header(reqwest::header::CONNECTION, "close");
-            }
-            if let Some(auth) = auth {
-                request = auth.apply(request);
-            }
-
-            let response = send_for_headers(request, url, config).await?;
-
+            let answer = send_for_headers(client, url, auth, config, |request| match retry {
+                true => request.header(reqwest::header::CONNECTION, "close"),
+                false => request,
+            })
+            .await?;
+            let response = answer.response;
             let content_length = response.content_length();
+            let included = included_sha1(response.headers());
             if let Err(error) = classify_response_status_with_headers(
                 response.status(),
                 url,
+                &answer.url,
+                answer.left_origin,
                 Some(response.headers()),
-                auth,
+                answer.sent,
             ) {
                 drain_error_body(response).await;
                 return Err(error);
@@ -1306,7 +1488,7 @@ pub(crate) async fn fetch_artifact_staged(
                     std::io::Error::other(format!("{reason}{http_context}"))
                 })
             }));
-            (content_length, stream)
+            (content_length, stream, included)
         };
         let too_large = |declared| {
             RetryError::permanent(RepoError::TooLarge {
@@ -1331,7 +1513,7 @@ pub(crate) async fn fetch_artifact_staged(
             progress.cloned(),
         );
         match idle.run(store.stage_stream(body, sha1)).await {
-            Ok(staged) => Ok((staged, transfer)),
+            Ok(staged) => Ok((staged, transfer, included.clone())),
             Err(PutError::Stream(BodyFault::TooLarge)) => Err(too_large(None)),
             Err(PutError::Stream(BodyFault::Transfer(err))) if local => {
                 Err(RetryError::permanent(RepoError::Io(err)))
@@ -1346,6 +1528,31 @@ pub(crate) async fn fetch_artifact_staged(
         }
     })
     .await
+}
+
+/// The SHA-1 a server sent with a file, which maven-resolver 1.9's HTTP
+/// transport checks before the checksum files and, when it matches, instead
+/// of them: `X-Checksum-SHA1`, which Central sends,
+/// else, when neither it nor `X-Checksum-MD5` came, Google Cloud Storage's
+/// `x-goog-meta-checksum-sha1`, which Central's Google mirror sends, else
+/// Nexus 2's `ETag` of `{SHA1{<hex>}}`, whole and maybe quoted, where
+/// maven-resolver takes a `SHA1{...}` anywhere in it. A value that is no
+/// SHA-1 is none.
+fn included_sha1(headers: &HeaderMap) -> Option<Digest> {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    let checksum = if header("x-checksum-sha1").is_some() || header("x-checksum-md5").is_some() {
+        header("x-checksum-sha1")
+    } else {
+        header("x-goog-meta-checksum-sha1")
+    };
+    let nexus2 = || {
+        let etag = header("etag")?;
+        let etag = (etag.strip_prefix('"'))
+            .and_then(|etag| etag.strip_suffix('"'))
+            .unwrap_or(etag);
+        etag.strip_prefix("{SHA1{")?.strip_suffix("}}")
+    };
+    Digest::from_hex(HashAlgorithm::Sha1, checksum.or_else(nexus2)?).ok()
 }
 
 /// Publish an artifact [`fetch_artifact_staged`] downloaded from `url`, if
@@ -1385,7 +1592,7 @@ pub(crate) async fn publish_artifact(
                     IntegritySource::LockPin,
                 ),
                 (Expectation::Sidecar, _) => (
-                    redacted_url(url).path().to_string(),
+                    rv_config::redact_url(url.as_str()),
                     IntegritySource::Sidecar,
                 ),
             };
@@ -1408,7 +1615,7 @@ pub(crate) async fn publish_artifact(
 /// [`MAX_CHECKSUM_SIZE`] cap rather than the 20MB metadata limit, since a
 /// sidecar is only ever a single hex token plus an optional filename.
 pub(crate) async fn fetch_text(
-    client: &Client,
+    client: &Routed,
     url: &Url,
     repository_root: Option<&Url>,
     auth: Option<&Auth>,
@@ -1474,6 +1681,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use crate::transport::Routed;
+
     use rv_maven_types::{ArtifactCoord, BlobId};
     use rv_store::Store;
     use rv_test_support::http::{Response, StubServer};
@@ -1483,15 +1692,80 @@ mod tests {
     use super::{
         ArtifactChecks, Digest, FetchConfig, FetchProgress, HashAlgorithm, MAX_CHECKSUM_SIZE,
         RetryError, classify_response_status_with_headers, execute_retry,
-        fetch_artifact_into_store, fetch_text, parse_checksum, verify_checksum, wire_url,
+        fetch_artifact_into_store, fetch_text, included_sha1, parse_checksum, verify_checksum,
+        wire_url,
     };
     use crate::error::{IntegritySource, RepoError};
 
-    fn client() -> reqwest::Client {
-        rv_http::client_builder()
-            .no_proxy()
-            .build()
-            .expect("client")
+    /// Which header gives the SHA-1 a server sends with a file, in
+    /// maven-resolver 1.9.27's order.
+    #[test]
+    fn the_included_sha1_follows_maven_resolver() {
+        let sha1 = "aaf4c61ddcc5e8a2dabede0f3b482cd9aea9434d";
+        let other = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+        let included = |headers: &[(&str, &str)]| {
+            let mut map = reqwest::header::HeaderMap::new();
+            for (name, value) in headers {
+                map.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    value.parse().unwrap(),
+                );
+            }
+            included_sha1(&map).map(|digest| digest.hex().to_string())
+        };
+        assert_eq!(
+            included(&[("X-Checksum-SHA1", sha1)]).as_deref(),
+            Some(sha1)
+        );
+        assert_eq!(
+            included(&[("x-goog-meta-checksum-sha1", sha1)]).as_deref(),
+            Some(sha1)
+        );
+        assert_eq!(
+            included(&[
+                ("X-Checksum-SHA1", sha1),
+                ("x-goog-meta-checksum-sha1", other)
+            ])
+            .as_deref(),
+            Some(sha1)
+        );
+        // An `X-Checksum-MD5` alone keeps the Google headers unread.
+        assert_eq!(
+            included(&[
+                ("X-Checksum-MD5", "5d41402abc4b2a76b9719d911017c592"),
+                ("x-goog-meta-checksum-sha1", sha1)
+            ]),
+            None
+        );
+        assert_eq!(
+            included(&[("ETag", &format!("\"{{SHA1{{{sha1}}}}}\""))]).as_deref(),
+            Some(sha1)
+        );
+        assert_eq!(
+            included(&[("ETag", &format!("{{SHA1{{{sha1}}}}}"))]).as_deref(),
+            Some(sha1)
+        );
+        // Only the whole of Nexus 2's form is a checksum.
+        for opaque in [
+            format!("\"build-SHA1{{{sha1}}}-v1\""),
+            format!("W/\"{{SHA1{{{sha1}}}}}\""),
+            format!("\"{{SHA1{{{sha1}}}}}x\""),
+            format!("{{SHA1{{{sha1}}}}}\""),
+        ] {
+            assert_eq!(included(&[("ETag", &opaque)]), None, "{opaque}");
+        }
+        assert_eq!(included(&[("ETag", "\"5d41402a\"")]), None);
+        assert_eq!(included(&[("X-Checksum-SHA1", "<html>")]), None);
+    }
+
+    fn client() -> Routed {
+        Routed::same_origin(
+            rv_http::client_builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("client"),
+        )
     }
 
     fn config(retries: usize, timeout: Duration) -> FetchConfig {
@@ -1587,7 +1861,7 @@ mod tests {
             let held =
                 (execute_retry(&cfg, &c, || async { Ok::<(), RetryError>(()) }).await).unwrap_err();
             assert!(
-                matches!(&held, RepoError::HttpStatus { status, url, retry_after: Some(wait) }
+                matches!(&held, RepoError::HttpStatus { status, url, retry_after: Some(wait), .. }
                     if status.as_u16() == 503
                         && url.ends_with("/a.pom.sha256")
                         && *wait == Duration::from_secs(600)),
@@ -1689,7 +1963,8 @@ mod tests {
         let url = Url::parse("https://alice:hunter2@repo.example/com/foo/1.0/foo.jar").unwrap();
         for status in [401, 403, 404, 407, 418, 503] {
             let status = StatusCode::from_u16(status).unwrap();
-            let err = classify_response_status_with_headers(status, &url, None, None).unwrap_err();
+            let err = classify_response_status_with_headers(status, &url, &url, false, None, None)
+                .unwrap_err();
             let rendered = format!("{err:?}");
             assert!(
                 !rendered.contains("hunter2") && !rendered.contains("alice"),
@@ -1699,6 +1974,8 @@ mod tests {
         let proxy_auth = classify_response_status_with_headers(
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,
             &url,
+            &url,
+            false,
             None,
             None,
         )
@@ -1715,6 +1992,8 @@ mod tests {
         let err = classify_response_status_with_headers(
             StatusCode::TOO_MANY_REQUESTS,
             &url,
+            &url,
+            false,
             Some(&headers),
             None,
         )
@@ -1936,11 +2215,13 @@ mod tests {
                 fails: AtomicUsize::new(fails),
                 lookups: AtomicUsize::new(0),
             });
-            let client = rv_http::client_builder()
-                .no_proxy()
-                .dns_resolver(Arc::clone(&resolver))
-                .build()
-                .unwrap();
+            let client = Routed::same_origin(
+                rv_http::client_builder()
+                    .no_proxy()
+                    .dns_resolver(Arc::clone(&resolver))
+                    .build()
+                    .unwrap(),
+            );
             let url = format!("http://repo.example:{}/a.sha1", server.addr().port());
             let result = fetch_text(&client, &Url::parse(&url).unwrap(), None, None, &cfg).await;
             assert_eq!(resolver.lookups.load(Ordering::SeqCst), 2);

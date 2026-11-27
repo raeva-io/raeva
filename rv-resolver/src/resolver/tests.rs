@@ -2185,9 +2185,23 @@ mod workspace_resolution {
     }
 
     /// Per-path repository contexts match Maven 3.9.12 across subtrees,
-    /// siblings, ranges, nested contexts, and parent POMs.
-    #[tokio::test]
-    async fn transitive_repository_contexts_follow_dependency_paths() {
+    /// siblings, ranges, nested contexts, and parent POMs. The resolver runs
+    /// on raeva's 8 MiB threads; unoptimized, this many nested contexts
+    /// come close to a test thread's 2 MiB.
+    #[test]
+    fn transitive_repository_contexts_follow_dependency_paths() {
+        let test = || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(repository_contexts_follow_dependency_paths());
+        };
+        let thread = std::thread::Builder::new().stack_size(8 << 20).spawn(test);
+        thread.unwrap().join().unwrap();
+    }
+
+    async fn repository_contexts_follow_dependency_paths() {
         ensure_crypto_provider();
         let dep = |artifact: &str, version: &str| {
             format!(
@@ -4787,7 +4801,9 @@ fn an_evicted_range_is_one_whose_highest_version_no_node_holds() {
     use crate::graph::{Edge, Graph, Node};
     let node = |coord: &str| Node {
         coord: Coord::parse(coord).unwrap(),
+        type_: None,
         scope: rv_maven_model::Scope::Compile,
+        optional: false,
         repo_url: None,
         build_repo: None,
         repos: crate::context::RepoContext::default(),

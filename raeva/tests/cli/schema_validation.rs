@@ -70,8 +70,10 @@ fn lock_schema_rejects_hostile_rows() {
     let mut scopes = document.clone();
     scopes["platforms"][0]["modules"][0]["packages"] = json!(format!(
         "g:a:1\tjar\t\truntime\ng:b:1\tjar\tRUNTIME\ng:c:1\tjar\t\t?\ng:d:1\tjar\tcompile-only\n\
-         g:e:1\tjar\tfoo:bar\tx/y\ng:f:1\tjar\t\t{}",
-        "é".repeat(255)
+         g:e:1\tjar\tfoo:bar\tx/y\ng:f:1\tjar\t\t{}\ng:g:1\tjar:tests\ttest\t\ttest-jar\n\
+         g:h:1\twar\tsystem\t\texecutable-war\t\tlib/h.war\t{}",
+        "é".repeat(255),
+        "a".repeat(64)
     ));
     scopes["platforms"][0]["modules"][0]["edges"] =
         json!("0 1 optional\n1 2 ${scope} optional\n2 3 compile\n3 4 foo:bar");
@@ -84,6 +86,12 @@ fn lock_schema_rejects_hostile_rows() {
     taken["platforms"][0]["modules"][0]["range_versions"] =
         json!("g:a\t1-SNAPSHOT\t./repo/\ng:a\t2\thttps://r.example/");
     assert!(schema.is_valid(&taken), "range versions");
+    let mut sibling = document.clone();
+    sibling["platforms"][0]["modules"][0]["path"] = json!("../../app/pom.xml");
+    assert!(
+        schema.is_valid(&sibling),
+        "a module beside the lock's directory"
+    );
     // The empty origin: a mirror served a repository the lock cannot record.
     taken["platforms"][0]["modules"][0]["range_versions"] = json!("g:a\t2\t");
     taken["platforms"][0]["modules"][0]["evicted_ranges"] = json!("g:a\t[1,3)\t\t1");

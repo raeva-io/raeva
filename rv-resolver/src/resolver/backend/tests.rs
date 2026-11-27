@@ -455,6 +455,7 @@ fn snapshot_fallback_names_both_mirrors_and_requires_served_metadata() {
                         RepoError::Unauthorized {
                             status: reqwest::StatusCode::UNAUTHORIZED,
                             url: "https://mirror.example/g/a/1-SNAPSHOT/maven-metadata.xml".into(),
+                            redirected_to: None,
                             sent: None,
                         },
                     )
@@ -1487,6 +1488,7 @@ fn exhausted_auth_search_keeps_refusals_and_coordinate() {
                 RepoError::Unauthorized {
                     status: reqwest::StatusCode::from_u16(code).unwrap(),
                     url: repo.url.clone(),
+                    redirected_to: None,
                     sent: None,
                 }
             };
@@ -1534,6 +1536,7 @@ fn an_auth_refusal_does_not_relax_checksum_enforcement() {
                 RepoError::Unauthorized {
                     status: reqwest::StatusCode::UNAUTHORIZED,
                     url: repo.url.clone(),
+                    redirected_to: None,
                     sent: None,
                 },
             )

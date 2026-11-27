@@ -231,7 +231,7 @@ impl Resolver {
         let resolution = PlatformResolver::new(ctx)
             .resolve_workspace_with_stall_timeout(workspace, self.stall_timeout)
             .await
-            .map_err(|error| ResolveContext::naming_filtered_models(&misses, error))?;
+            .map_err(|error| ResolveContext::naming_model_searches(&misses, error))?;
         backend::refuse_split_listings(&listings, self.config.lock.maven.mode)?;
         Ok(resolution)
     }
@@ -720,8 +720,9 @@ async fn watch_for_stall(progress: Arc<WorkspaceProgress>, timeout: Duration) ->
     }
 }
 
-/// Normalized declared repository and serving endpoint URLs.
-type RepositoryScope = (String, String);
+/// The normalized repository and endpoint URLs a blob was read through,
+/// and the id of the endpoint, whose credential went with the request.
+type RepositoryScope = (String, String, Option<String>);
 
 struct WorkspaceStoreState {
     support_poms: WorkspaceSupportPomBuffer,
@@ -841,6 +842,14 @@ pub struct WorkspaceResolution {
     pub host_reads: std::collections::BTreeSet<rv_maven_model::HostInput>,
 }
 
+/// How a pass over the reactor ended.
+enum Pass {
+    Resolved(WorkspaceResolution),
+    /// Run again, taking these parents and imported BOMs, by
+    /// `group:artifact:version`, from the model cache first.
+    ReadFirst(BTreeSet<String>),
+}
+
 impl PlatformResolver {
     pub(crate) fn new(ctx: ResolveContext) -> Self {
         Self { ctx }
@@ -917,6 +926,23 @@ impl PlatformResolver {
         workspace: Workspace,
         progress: Arc<WorkspaceProgress>,
     ) -> Result<WorkspaceResolution> {
+        let mut resolver = self.clone();
+        loop {
+            let pass = resolver.workspace_pass(workspace.clone(), Arc::clone(&progress));
+            match pass.await? {
+                Pass::Resolved(resolution) => return Ok(resolution),
+                Pass::ReadFirst(read_first) => {
+                    resolver = Self::new(resolver.ctx.reading_first(read_first));
+                }
+            }
+        }
+    }
+
+    async fn workspace_pass(
+        &self,
+        workspace: Workspace,
+        progress: Arc<WorkspaceProgress>,
+    ) -> Result<Pass> {
         // What the pass reads outside the modules' own builds counts for
         // every graph.
         let reactor_reads = rv_maven_model::HostReads::default();
@@ -943,7 +969,7 @@ impl PlatformResolver {
                 (
                     index,
                     module.pom_path.clone(),
-                    workspace.root().join(&module.pom_path),
+                    module.pom_file().to_path_buf(),
                 )
             })
             .collect();
@@ -964,7 +990,8 @@ impl PlatformResolver {
         // own dependencies pass their checks, beside the graphs, which start
         // once one would be, or until every graph is in; after a failed
         // graph, none is. A failed check is not one: a POM it could not
-        // fetch, the graph may.
+        // fetch, the graph may. A build extension's realm is not held: its
+        // module's graph reads the jars.
         // Without a prefetcher nothing is downloaded, and a lone module
         // checks its own dependencies before it reads any.
         let prefetcher = (self.ctx.prefetcher.as_ref()).filter(|_| workspace.len() > 1);
@@ -1154,6 +1181,7 @@ impl PlatformResolver {
                             &pending.backend,
                             &mut pending.graph,
                             Some(&store_state),
+                            true,
                         ))
                         .await;
                     let platform = module.resolver.ctx.platform.clone();
@@ -1216,6 +1244,18 @@ impl PlatformResolver {
             futures::join!(checking, resolving, finishing);
         store_state.models.clear();
         crate::util::drop_in_background(retired);
+        // Maven reads a parent or imported BOM once for the whole build, and
+        // the first module to read it in Maven's order decides the bytes
+        // every other module gets. Each module here reads its repositories
+        // first, so where two read different bytes the pass runs again, and
+        // every module takes those from the model cache first, which holds
+        // them in Maven's order. Nothing of this pass is kept or shown.
+        let differing = session.differing_reads();
+        if !differing.is_subset(&self.ctx.read_first) {
+            let mut read_first = (*self.ctx.read_first).clone();
+            read_first.extend(differing);
+            return Ok(Pass::ReadFirst(read_first));
+        }
         // Maven sorts the reactor before it builds a module. The sort's
         // plugin links are read first, so the checks below cover their POMs.
         let invalid_plugins = session.invalid_plugins().await;
@@ -1237,7 +1277,7 @@ impl PlatformResolver {
                 })?;
         }
         if let Some((index, message)) = invalid_plugins {
-            let path = workspace.root().join(&workspace.modules()[index].pom_path);
+            let path = workspace.modules()[index].pom_file().to_path_buf();
             return Err(ResolveError::LocalPom {
                 path: path.display().to_string(),
                 source: rv_maven_model::PomError::InvalidProject(message),
@@ -1296,12 +1336,12 @@ impl PlatformResolver {
             }
         }
 
-        Ok(WorkspaceResolution {
+        Ok(Pass::Resolved(WorkspaceResolution {
             platform: self.ctx.platform.clone(),
             modules,
             reactor_through_dependencies: self.ctx.reactor_through_dependencies(),
             host_reads: reactor_reads.take(),
-        })
+        }))
     }
 
     /// os-maven-plugin's `os.detection.classifierWithLikes` for this
@@ -1364,7 +1404,7 @@ impl PlatformResolver {
         // what its own builds log.
         let imports = Arc::<KeptImports>::default();
         let build = |index: usize| {
-            let path = workspace.root().join(&workspace.modules()[index].pom_path);
+            let path = workspace.modules()[index].pom_file().to_path_buf();
             let imports = &imports;
             async move {
                 let built = self
@@ -1428,7 +1468,7 @@ impl PlatformResolver {
         index: usize,
         read: Arc<backend::ModelCache>,
     ) -> std::result::Result<Vec<usize>, String> {
-        let path = workspace.root().join(&workspace.modules()[index].pom_path);
+        let path = workspace.modules()[index].pom_file().to_path_buf();
         // The parents it reads are the project build's, kept by that build.
         let discarded = WorkspaceSupportPomBuffer::default();
         let inputs = self.root_model_inputs(
@@ -1472,7 +1512,7 @@ impl PlatformResolver {
         let models = backend::ReadModels::default();
         let mut gavs = Vec::new();
         for (index, module) in workspace.modules().iter().enumerate().take(count) {
-            let path = workspace.root().join(&module.pom_path);
+            let path = module.pom_file().to_path_buf();
             // The module's own state: its repositories decide what is missing.
             let ctx = self.ctx.for_module(self.ctx.config.clone());
             let resolver = Self::new(match take(index) {
@@ -1586,7 +1626,7 @@ impl PlatformResolver {
             .map_err(|error| match error {
                 crate::WorkspaceError::DuplicateGav { ref second_pom, .. } => {
                     ResolveError::LocalPom {
-                        path: workspace.root().join(second_pom).display().to_string(),
+                        path: workspace.module_file(second_pom).display().to_string(),
                         source: rv_maven_model::PomError::InvalidModel(error.to_string()),
                     }
                 }
@@ -1610,7 +1650,7 @@ impl PlatformResolver {
             self.ctx.store.record_served(served).await?;
         }
         let mut pending = pending;
-        self.populate_artifacts(&pending.backend, &mut pending.graph, None)
+        self.populate_artifacts(&pending.backend, &mut pending.graph, None, true)
             .await?;
         complete_resolution(self.ctx.platform.clone(), pending)
     }
@@ -2094,12 +2134,14 @@ impl PlatformResolver {
     /// Fetch, or find in the store, the artifact of every node of `graph`.
     /// Within a reactor pass the index rows are left to `workspace`'s
     /// pending rows, and rows pending there count as indexed; otherwise
-    /// they are written before this returns.
+    /// they are written before this returns. Downloads wait for the
+    /// prefetcher's release when `held`.
     async fn populate_artifacts(
         &self,
         backend: &ModelService,
         graph: &mut Graph,
         workspace: Option<&WorkspaceStoreState>,
+        held: bool,
     ) -> Result<()> {
         let workspace_artifacts = workspace.map(|state| &state.artifact_blobs);
         let root_repos = backend.root_effective_repos_snapshot();
@@ -2228,18 +2270,36 @@ impl PlatformResolver {
                     (
                         rv_repo::normalize_repo_url(&repo.url),
                         rv_repo::normalize_repo_url(&endpoint.url),
+                        endpoint.id.clone(),
                     )
                 });
 
             // Within one reactor pass, a blob already verified from the same
-            // repository and endpoint is reused rather than hashed again. One
-            // seen from another repository is not: this repository's own
-            // bytes, stored or fetched, are compared with it when the lock is
-            // assembled.
+            // repository and endpoint, under the same id and so the same
+            // credential, is reused rather than hashed again; under another
+            // id only when raeva.lock pins exactly those bytes, which then
+            // vouch for them as a stored copy does. One seen from another
+            // repository is not: this repository's own bytes, stored or
+            // fetched, are compared with it when the lock is assembled. Nor is
+            // one this module's filters keep from the repository.
+            let admitted = (selected_repo.zip(self.ctx.client.as_ref()))
+                .is_none_or(|(repo, client)| client.filters_admit(repo, &key));
             let seen = match (workspace_artifacts, repo_scope.as_ref()) {
-                (Some(state), Some(repo)) => lock(state)
-                    .get(&key)
-                    .and_then(|by_repo| by_repo.get(repo).cloned()),
+                (Some(state), Some(scope)) if admitted => {
+                    let pinned = |blob: &BlobId| {
+                        (self.ctx.client.as_ref())
+                            .is_some_and(|client| client.pins_bytes(&key, blob))
+                    };
+                    lock(state).get(&key).and_then(|by_repo| {
+                        by_repo.get(scope).cloned().or_else(|| {
+                            (by_repo.iter())
+                                .find(|((repo, endpoint, _), blob)| {
+                                    (repo, endpoint) == (&scope.0, &scope.1) && pinned(blob)
+                                })
+                                .map(|(_, blob)| blob.clone())
+                        })
+                    })
+                }
                 _ => None,
             };
             if let Some(blob) = seen {
@@ -2361,7 +2421,7 @@ impl PlatformResolver {
             return Ok(());
         }
         // Refused only once a graph fails, whose error is reported.
-        if let Some(prefetcher) = self.ctx.prefetcher.as_deref()
+        if let Some(prefetcher) = self.ctx.prefetcher.as_deref().filter(|_| held)
             && !prefetcher.may_download().await
         {
             return Err(ResolveError::InternalError(
@@ -2424,7 +2484,7 @@ impl PlatformResolver {
         let mut origins = Vec::with_capacity(results.len());
         for (idx, artifact_req, key, result) in results {
             match result {
-                Ok((blob_id, origin)) => {
+                Ok((blob_id, origin, endpoint_id)) => {
                     rows.push((key.clone(), blob_id.clone()));
                     let repo_url = origin.repo_url.clone();
                     if let Some(state) = workspace_artifacts {
@@ -2432,6 +2492,7 @@ impl PlatformResolver {
                             (
                                 rv_repo::normalize_repo_url(&repo_url),
                                 rv_repo::normalize_repo_url(&origin.endpoint_url),
+                                endpoint_id,
                             ),
                             blob_id.clone(),
                         );

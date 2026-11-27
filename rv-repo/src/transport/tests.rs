@@ -16,6 +16,7 @@ use url::Url;
 
 use super::guard::*;
 use super::*;
+use crate::auth::Auth;
 use crate::error::{RedirectRejectionKind, RepoError, Result};
 use crate::fetch::{FetchConfig, fetch_bytes};
 
@@ -41,6 +42,15 @@ impl HttpsStub {
 
 /// Answers one HTTPS request with `handler`'s bytes.
 fn spawn_https_stub(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> HttpsStub {
+    spawn_https_stubs(1, handler)
+}
+
+/// Answers the requests of `connections` HTTPS connections in turn, one
+/// each, with `handler`'s bytes.
+fn spawn_https_stubs(
+    connections: usize,
+    handler: impl Fn(&str) -> Vec<u8> + Send + 'static,
+) -> HttpsStub {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cert = CertificateDer::from(hex::decode(TEST_CERT_DER).unwrap());
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(hex::decode(TEST_KEY_DER).unwrap()));
@@ -55,17 +65,19 @@ fn spawn_https_stub(handler: impl Fn(&str) -> Vec<u8> + Send + 'static) -> Https
     let request = Arc::new(Mutex::new(None));
     let captured = Arc::clone(&request);
     thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let connection = rustls::ServerConnection::new(tls).unwrap();
-        let mut stream = rustls::StreamOwned::new(connection, stream);
-        let bytes = rv_test_support::http::read_request_head_blocking(&mut stream).unwrap();
-        let raw_request = String::from_utf8_lossy(&bytes).into_owned();
-        *captured.lock().unwrap() = Some(raw_request.clone());
-        stream.write_all(&handler(&raw_request)).unwrap();
-        stream.flush().unwrap();
+        for _ in 0..connections {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let connection = rustls::ServerConnection::new(Arc::clone(&tls)).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            let bytes = rv_test_support::http::read_request_head_blocking(&mut stream).unwrap();
+            let raw_request = String::from_utf8_lossy(&bytes).into_owned();
+            *captured.lock().unwrap() = Some(raw_request.clone());
+            stream.write_all(&handler(&raw_request)).unwrap();
+            stream.flush().unwrap();
+        }
     });
     HttpsStub { addr, request }
 }
@@ -111,13 +123,16 @@ fn origins_guard(origins: HashSet<String>) -> RedirectGuard {
     }
 }
 
-fn redirect_test_client(trusted_origins: HashSet<String>) -> reqwest::Client {
-    rv_http::client_builder()
-        .danger_accept_invalid_certs(true)
-        .no_proxy()
-        .redirect(trusted_redirect_policy(origins_guard(trusted_origins)))
-        .build()
-        .unwrap()
+fn redirect_test_client(trusted_origins: HashSet<String>) -> Routed {
+    Routed {
+        client: rv_http::client_builder()
+            .danger_accept_invalid_certs(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        redirects: Arc::new(origins_guard(trusted_origins)),
+    }
 }
 
 fn url(raw: &str) -> Url {
@@ -138,7 +153,7 @@ fn repo(url: impl ToString) -> Repository {
     Repository::new(None, url.to_string(), true, false)
 }
 
-async fn fetch_redirect_test(client: &reqwest::Client, url: &Url) -> Result<Bytes> {
+async fn fetch_redirect_test(client: &Routed, url: &Url) -> Result<Bytes> {
     let config = FetchConfig {
         retries: 0,
         ..Default::default()
@@ -147,7 +162,7 @@ async fn fetch_redirect_test(client: &reqwest::Client, url: &Url) -> Result<Byte
 }
 
 async fn fetch_via(client: &ClientSet, url: &Url) -> Result<Bytes> {
-    fetch_redirect_test(client.client_for(url).unwrap().as_ref(), url).await
+    fetch_redirect_test(&client.client_for(url).unwrap(), url).await
 }
 
 #[track_caller]
@@ -176,8 +191,8 @@ fn loopback_name_url(port: u16, path: &str) -> Url {
 }
 
 /// A cross-origin redirect, through a configured pair or from a root-POM
-/// grant, drops the credential and cookie the source received, and names
-/// no source URL, whose path may hold a token, in a `Referer`.
+/// grant, drops the credential the source received, and names no source
+/// URL, whose path may hold a token, in a `Referer`.
 #[tokio::test]
 async fn cross_origin_redirect_strips_sensitive_headers() {
     for root in [false, true] {
@@ -188,21 +203,17 @@ async fn cross_origin_redirect_strips_sensitive_headers() {
         let client = if root {
             let client = screened_test_client(origins_guard(origin_set([target_url.as_str()])));
             client.trust_root_repositories(&[repo(&source_url)]);
-            client.client_for(&source_url).unwrap().into_owned()
+            client.client_for(&source_url).unwrap()
         } else {
             redirect_test_client(origin_set([source_url.as_str(), target_url.as_str()]))
         };
-        let response = client
-            .get(source_url)
-            .bearer_auth("registry-secret")
-            .header(reqwest::header::COOKIE, "session=private")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            response.bytes().await.unwrap(),
-            Bytes::from_static(b"artifact bytes")
-        );
+        let config = FetchConfig {
+            retries: 0,
+            ..Default::default()
+        };
+        let auth = settings_bearer("registry-secret");
+        let bytes = fetch_bytes(&client, &source_url, None, Some(&auth), &config, None).await;
+        assert_eq!(bytes.unwrap(), Bytes::from_static(b"artifact bytes"));
         let at_source = source
             .request
             .lock()
@@ -218,7 +229,7 @@ async fn cross_origin_redirect_strips_sensitive_headers() {
             .clone()
             .unwrap()
             .to_ascii_lowercase();
-        assert!(!at_target.contains("authorization:") && !at_target.contains("cookie:"));
+        assert!(!at_target.contains("authorization:"), "{at_target}");
         assert!(
             !at_target.contains("referer:") && !at_target.contains("path-token"),
             "{at_target}"
@@ -262,7 +273,14 @@ fn redirect_guard_decisions() {
         root  https://dependency.example/a S                                  OriginNotConfigured
         root  https://root.example:8443/a  S                                  OriginNotConfigured
         root  R                      http://storage.example/artifact          HttpsDowngrade
-        root  R,S                    https://another.example/a                SecondCrossOriginHop
+        root  R,S                    https://another.example/a                -
+        root  R,S,S                  https://another.example/a                -
+        root  R,S                    http://another.example/a                 HttpsDowngrade
+        root  R,S                    https://10.0.0.1/a                       NonGlobalTarget
+        root  R,S,R,S,R              https://another.example/a                -
+        root  R,S,R,S,R,S            https://another.example/a                ChainLimit
+        exempt M,https://cdn.example/a https://nexus.corp:8443/demo-1.0.jar   ExemptHostOriginMismatch
+        root  https://dependency.example/a,R https://another.example/a        OriginNotConfigured
         root  R                      https://127.0.0.1/secret                 NonGlobalTarget
         http  http://root.example/artifact S                                  InsecureOrigin
         exempt M                     https://nexus.corp:8443/demo-1.0.jar     ExemptHostOriginMismatch
@@ -346,7 +364,7 @@ async fn transitive_grant_does_not_authorize_redirects_but_root_grant_does() {
 }
 
 /// A configured issuer cannot send raeva to a non-global literal or over plain
-/// HTTP, or a second cross-origin hop away; an unconfigured one cannot
+/// HTTP, at the first hop or a later one; an unconfigured one cannot
 /// redirect at all. The refused target is never contacted.
 #[tokio::test]
 async fn redirect_rejections_end_to_end() {
@@ -386,22 +404,238 @@ async fn redirect_rejections_end_to_end() {
     assert!(result.unwrap_err().to_string().contains(&origin));
     assert!(!target.contacted());
 
-    // The middle origin is configured so the first hop clears the address
-    // guard and the second hop is what fails.
-    let last = spawn_https_stub(|_| ok_response(b"must not arrive"));
-    let middle = redirecting(last.url("/artifact"));
+    // A later hop of the chain cannot leave HTTPS either, even for a
+    // configured origin.
+    let last = StubServer::start(|_| Response::new(200, "must not arrive"));
+    let last_url = url(&format!("http://{}/artifact", last.addr()));
+    let middle = redirecting(&last_url);
     let first = redirecting(middle.url("/middle"));
     let first_url = first.url("/start");
-    let client = redirect_test_client(origin_set([first_url.as_str(), middle.url("/").as_str()]));
+    let client = redirect_test_client(origin_set([
+        first_url.as_str(),
+        middle.url("/").as_str(),
+        last_url.as_str(),
+    ]));
     let result = fetch_redirect_test(&client, &first_url).await;
-    assert_rejected(&result, SecondCrossOriginHop);
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("second cross-origin hop")
-    );
-    assert!(middle.contacted() && !last.contacted());
+    assert_rejected(&result, HttpsDowngrade);
+    assert!(middle.contacted());
+    assert_eq!(last.connections(), 0);
+}
+
+fn settings_bearer(token: &str) -> Auth {
+    Auth {
+        scheme: crate::auth::Scheme::Bearer {
+            token: token.into(),
+        },
+        sent: crate::auth::SentCredential {
+            id: None,
+            file: crate::auth::CredentialFile::Settings,
+            unset_variables: Vec::new(),
+        },
+    }
+}
+
+/// A repository that redirects to a URL with userinfo, as GitHub Packages
+/// does to a token-bearing package host, gets the userinfo sent as Basic
+/// auth to that origin alone, which may redirect again to a third origin.
+/// The settings credential stays with the repository, the userinfo with its
+/// origin, and no hop puts userinfo on the wire.
+#[tokio::test]
+async fn a_userinfo_redirect_authenticates_its_origin_alone() {
+    let storage = spawn_https_stub(|_| ok_response(b"artifact bytes"));
+    let storage_url = storage.url("/blob");
+    let location = storage_url.to_string();
+    let packages = spawn_https_stub(move |request| {
+        let request = request.to_ascii_lowercase();
+        if request.contains("authorization: basic y2ktdxnlcjpob3atc2vjcmv0lze=") {
+            redirect_response(&location)
+        } else {
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+        }
+    });
+    let mut credentialed = packages.url("/package");
+    credentialed.set_username("ci-user").unwrap();
+    credentialed.set_password(Some("hop-secret%2F1")).unwrap();
+    let repository = redirecting(&credentialed);
+    let repository_url = repository.url("/maven/demo-1.0.jar");
+    let client = redirect_test_client(origin_set([
+        repository_url.as_str(),
+        credentialed.as_str(),
+        storage_url.as_str(),
+    ]));
+    let auth = settings_bearer("registry-secret");
+    let config = FetchConfig {
+        retries: 0,
+        ..Default::default()
+    };
+    let bytes = fetch_bytes(&client, &repository_url, None, Some(&auth), &config, None)
+        .await
+        .unwrap();
+    assert_eq!(bytes, Bytes::from_static(b"artifact bytes"));
+    let head = |stub: &HttpsStub| stub.request.lock().unwrap().clone().unwrap();
+    assert!(head(&repository).contains("Bearer registry-secret"));
+    for stub in [&packages, &storage] {
+        let head = head(stub);
+        assert!(
+            !head.contains("registry-secret") && !head.contains("ci-user"),
+            "{head}"
+        );
+    }
+    let at_storage = head(&storage).to_ascii_lowercase();
+    assert!(!at_storage.contains("authorization:"), "{at_storage}");
+}
+
+/// A 401 from a redirect target names that target and what went to it:
+/// the Basic auth of the redirect's userinfo, or nothing once the chain
+/// left the repository's origin.
+#[tokio::test]
+async fn a_refusing_redirect_target_is_named_with_what_it_was_sent() {
+    let refusing =
+        || spawn_https_stub(|_| b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec());
+    for userinfo in [true, false] {
+        let target = refusing();
+        let mut location = target.url("/package");
+        if userinfo {
+            location.set_username("ci-user").unwrap();
+            location.set_password(Some("hop-secret")).unwrap();
+        }
+        let repository = redirecting(&location);
+        let repository_url = repository.url("/maven/demo-1.0.jar");
+        let client = redirect_test_client(origin_set([repository_url.as_str(), location.as_str()]));
+        let auth = settings_bearer("registry-secret");
+        let config = FetchConfig {
+            retries: 0,
+            ..Default::default()
+        };
+        let err = fetch_bytes(&client, &repository_url, None, Some(&auth), &config, None)
+            .await
+            .unwrap_err();
+        let RepoError::Unauthorized { url, sent, .. } = err.cause() else {
+            panic!("{err:?}");
+        };
+        assert_eq!(url, target.url("/").as_str());
+        let file = sent.as_deref().map(|sent| sent.file);
+        let expected = userinfo.then_some(crate::auth::CredentialFile::Redirect);
+        assert_eq!(file, expected, "{err:?}");
+    }
+}
+
+/// A redirect target on another origin, whose path holds a download ticket
+/// nothing registered as a secret, is named by its origin alone when it
+/// refuses or fails the request, beside the request URL.
+#[tokio::test]
+async fn a_failing_redirect_target_is_named_by_its_origin() {
+    for status in ["403 Forbidden", "410 Gone", "404 Not Found"] {
+        let answer = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+        let target = spawn_https_stub(move |_| answer.clone().into_bytes());
+        let location = target.url("/download/zqTICKETzq/demo-1.0.jar?sig=zqSIGzq");
+        let repository = redirecting(&location);
+        let repository_url = repository.url("/maven/demo-1.0.jar");
+        let client = redirect_test_client(origin_set([repository_url.as_str(), location.as_str()]));
+        let config = FetchConfig {
+            retries: 0,
+            ..Default::default()
+        };
+        let err = fetch_bytes(&client, &repository_url, None, None, &config, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("zqTICKETzq"), "{status}: {shown}");
+        assert!(!shown.contains("zqSIGzq"), "{status}: {shown}");
+        let origin = target.url("/").origin().ascii_serialization();
+        assert!(shown.contains(&origin), "{status}: {shown}");
+        if !status.starts_with("403") {
+            assert!(shown.contains(repository_url.as_str()), "{status}: {shown}");
+        }
+    }
+}
+
+/// A redirect on the request's own origin, directly or after leaving it
+/// and coming back, to a path that holds a download ticket names the
+/// request URL and that origin when the redirected request fails, never the
+/// redirected path or query. One that left the origin is named as
+/// redirected, though it came back to the request URL itself.
+#[tokio::test]
+async fn a_failing_redirected_request_names_no_redirected_path() {
+    let cases = [(false, false), (true, false), (true, true)]
+        .into_iter()
+        .flat_map(|(leaves, returns)| {
+            ["410 Gone", "403 Forbidden", "503 Service Unavailable"]
+                .map(|status| (leaves, returns, status))
+        });
+    for (leaves, returns, status) in cases {
+        let away = Arc::new(std::sync::OnceLock::<Url>::new());
+        let back = Arc::clone(&away);
+        let asked = AtomicU32::new(0);
+        let repository = spawn_https_stubs(2, move |request| {
+            let path = request.split_whitespace().nth(1).unwrap_or_default();
+            let first = path != "/maven/demo-1.0.jar" || asked.fetch_add(1, Ordering::SeqCst) == 0;
+            match (path, back.get()) {
+                ("/maven/demo-1.0.jar", Some(away)) if first => redirect_response(away.as_str()),
+                ("/maven/demo-1.0.jar", None) => {
+                    redirect_response("/download/zqTICKETzq/demo-1.0.jar?sig=zqSIGzq")
+                }
+                _ => format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .into_bytes(),
+            }
+        });
+        let repository_url = repository.url("/maven/demo-1.0.jar");
+        let ticket = match returns {
+            true => repository_url.clone(),
+            false => repository.url("/download/zqTICKETzq/demo-1.0.jar?sig=zqSIGzq"),
+        };
+        let mut origins = vec![repository_url.to_string()];
+        let _hop;
+        if leaves {
+            let hop = redirecting(&ticket);
+            away.set(hop.url("/hop")).unwrap();
+            origins.push(hop.url("/").to_string());
+            _hop = hop;
+        }
+        let origins: HashSet<String> = (origins.iter())
+            .map(|raw| url(raw).origin().ascii_serialization())
+            .collect();
+        let client = redirect_test_client(origins);
+        let config = FetchConfig {
+            retries: 0,
+            ..Default::default()
+        };
+        let err = fetch_bytes(&client, &repository_url, None, None, &config, None)
+            .await
+            .unwrap_err();
+        let shown = format!("{err} {err:?}");
+        for hidden in ["zqTICKETzq", "zqSIGzq", "/download"] {
+            assert!(
+                !shown.contains(hidden),
+                "{status} leaves={leaves} returns={returns}: {shown}"
+            );
+        }
+        let origin = repository_url.origin().ascii_serialization();
+        let named = match leaves {
+            true => format!("{repository_url} (redirected to {origin})"),
+            false => repository_url.to_string(),
+        };
+        assert!(
+            shown.contains(&named),
+            "{status} leaves={leaves} returns={returns}: {shown}"
+        );
+        // The error keeps the request URL apart from the note, so a cache
+        // that matches it on the requested path still finds it.
+        let request = repository_url.to_string();
+        match err.cause() {
+            RepoError::HttpStatus {
+                url, redirected_to, ..
+            }
+            | RepoError::Unauthorized {
+                url, redirected_to, ..
+            } => {
+                let note = leaves.then_some(&origin);
+                assert_eq!((url, redirected_to.as_ref()), (&request, note));
+            }
+            RepoError::NotFound(_) => {}
+            other => panic!("{status} leaves={leaves} returns={returns}: {other:?}"),
+        }
+    }
 }
 
 /// Minimal CONNECT-capable stub proxy. Records each request head it
@@ -798,7 +1032,7 @@ async fn environment_proxy_credentials_and_refusals() {
             ..Default::default()
         };
         let error = fetch_bytes(
-            client.client_for(&target).unwrap().as_ref(),
+            &client.client_for(&target).unwrap(),
             &target,
             None,
             None,
@@ -937,7 +1171,6 @@ fn client_routing_follows_configuration_and_grants() {
     let client = screened_test_client(origins_guard(origin_set(["https://mirror.example"])));
     let routed = |client: &ClientSet, raw: &str| {
         let chosen = client.client_for(&url(raw)).unwrap();
-        let chosen: *const reqwest::Client = chosen.as_ref();
         let clients = client.clients.get().unwrap();
         [
             &clients.configured,
@@ -946,7 +1179,7 @@ fn client_routing_follows_configuration_and_grants() {
             &clients.direct,
         ]
         .iter()
-        .position(|candidate| std::ptr::eq(*candidate, chosen))
+        .position(|candidate| Arc::ptr_eq(&candidate.redirects, &chosen.redirects))
         .unwrap()
     };
     let (configured, screened, runtime, direct) = (0, 1, 2, 3);
@@ -1074,19 +1307,18 @@ async fn trust_granted_after_policy_evaluation_leaves_the_target_screened() {
 /// Otherwise a hostile mirror could bounce raeva to another server.
 #[tokio::test]
 async fn same_origin_policy_follows_only_its_own_origin() {
-    let client = rv_http::client_builder()
-        .no_proxy()
-        .redirect(same_origin_redirect_policy())
-        .build()
-        .unwrap();
+    let client = Routed::same_origin(
+        rv_http::client_builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+    );
     let target = StubServer::start(|_| Response::new(200, "hello"));
     let elsewhere = format!("http://{}/jar", target.addr());
     let source = StubServer::start(move |_| Response::new(302, "").header("Location", &elsewhere));
-    let result = client
-        .get(format!("http://{}/jar", source.addr()))
-        .send()
-        .await;
-    assert!(result.is_err(), "{result:?}");
+    let result = fetch_redirect_test(&client, &url(&format!("http://{}/jar", source.addr()))).await;
+    assert_rejected(&result, RedirectRejectionKind::OriginNotConfigured);
     assert_eq!(target.connections(), 0);
 
     let counter = AtomicU32::new(0);
@@ -1147,11 +1379,13 @@ async fn h2_server_that_freezes() -> (std::net::SocketAddr, Arc<AtomicU32>) {
 /// than each attempt waiting out the request timeout on the dead one.
 #[tokio::test]
 async fn a_dead_http2_connection_is_replaced_quickly() {
-    let client = BuildOptions::default()
-        .builder()
-        .http2_prior_knowledge()
-        .build()
-        .unwrap();
+    let client = Routed::same_origin(
+        BuildOptions::default()
+            .builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap(),
+    );
     let config = FetchConfig::default();
     let metadata = async {
         let (addr, accepted) = h2_server_that_freezes().await;
@@ -1223,11 +1457,13 @@ async fn an_http2_body_short_of_its_length_fails() {
             });
         }
     });
-    let client = BuildOptions::default()
-        .builder()
-        .http2_prior_knowledge()
-        .build()
-        .unwrap();
+    let client = Routed::same_origin(
+        BuildOptions::default()
+            .builder()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap(),
+    );
     let config = FetchConfig {
         retries: 0,
         ..FetchConfig::default()
@@ -1287,4 +1523,101 @@ fn a_repository_url_that_does_not_parse_names_no_origin() {
     assert!(guard.origins.contains("https://mirror.example"));
     assert!(guard.origins.contains("https://repo.example"));
     assert!(!guard.origins.iter().any(|origin| origin.contains("secret")));
+}
+
+/// A redirect is followed on its headers: a body the redirect declares and
+/// never sends does not hold the request until the timeout.
+#[tokio::test]
+async fn a_redirect_is_followed_without_its_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let head = rv_test_support::http::read_request_head(&mut socket)
+                    .await
+                    .unwrap_or_default();
+                let answer: &[u8] = if String::from_utf8_lossy(&head).starts_with("GET /target") {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbytes"
+                } else {
+                    b"HTTP/1.1 302 Found\r\nLocation: /target\r\nContent-Length: 1\r\n\r\n"
+                };
+                socket.write_all(answer).await.unwrap();
+                // The redirect's one body byte never comes.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    let source = url(&format!("http://{addr}/g/a/1/a-1.jar"));
+    let client = redirect_test_client(origin_set([source.as_str()]));
+    let config = FetchConfig {
+        retries: 0,
+        timeout: Duration::from_millis(500),
+        ..FetchConfig::default()
+    };
+    let body = fetch_bytes(&client, &source, None, None, &config, None).await;
+    assert_eq!(body.unwrap(), Bytes::from_static(b"bytes"));
+}
+
+/// A redirect that stays on the request's origin, back to the request URL
+/// or to another path, is no redirect for the refusal there: the origin
+/// refused the credential, and the refusal names the request URL alone, as
+/// 0.6.0 did, so it is kept across runs.
+#[tokio::test]
+async fn a_refusal_after_a_same_origin_round_trip_is_the_request_urls() {
+    let asked = AtomicU32::new(0);
+    let repository = spawn_https_stubs(3, move |request| {
+        match request.split_whitespace().nth(1).unwrap_or_default() {
+            "/maven/demo-1.0.jar" if asked.fetch_add(1, Ordering::SeqCst) == 0 => {
+                redirect_response("/hop")
+            }
+            "/hop" => redirect_response("/maven/demo-1.0.jar"),
+            _ => {
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            }
+        }
+    });
+    let repository_url = repository.url("/maven/demo-1.0.jar");
+    let client = redirect_test_client(origin_set([repository_url.as_str()]));
+    let config = FetchConfig {
+        retries: 0,
+        ..Default::default()
+    };
+    let err = fetch_bytes(&client, &repository_url, None, None, &config, None)
+        .await
+        .unwrap_err();
+    match err.cause() {
+        RepoError::Unauthorized {
+            url, redirected_to, ..
+        } => assert_eq!((url, redirected_to), (&repository_url.to_string(), &None)),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The same, for a redirect to another path on the origin.
+#[tokio::test]
+async fn a_refusal_after_a_same_origin_redirect_is_the_request_urls() {
+    let repository = spawn_https_stubs(2, |request| {
+        match request.split_whitespace().nth(1).unwrap_or_default() {
+            "/g/a/1/a-1.pom" => redirect_response("/protected/a-1.pom"),
+            _ => {
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+            }
+        }
+    });
+    let repository_url = repository.url("/g/a/1/a-1.pom");
+    let client = redirect_test_client(origin_set([repository_url.as_str()]));
+    let config = FetchConfig {
+        retries: 0,
+        ..Default::default()
+    };
+    let err = fetch_bytes(&client, &repository_url, None, None, &config, None)
+        .await
+        .unwrap_err();
+    match err.cause() {
+        RepoError::Unauthorized {
+            url, redirected_to, ..
+        } => assert_eq!((url, redirected_to), (&repository_url.to_string(), &None)),
+        other => panic!("{other:?}"),
+    }
 }

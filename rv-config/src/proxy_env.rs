@@ -223,7 +223,9 @@ fn parse_proxy(value: &str) -> Result<ProxyConfig, String> {
     Ok(proxy)
 }
 
-fn percent_decode(text: &str) -> Option<String> {
+/// Decode a URL's percent-encoded userinfo part, `None` when the bytes it
+/// names are not UTF-8.
+pub fn percent_decode(text: &str) -> Option<String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;

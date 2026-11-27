@@ -176,6 +176,7 @@ mod tests {
         let error = rv_repo::RepoError::HttpStatus {
             status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
             url: "https://repo.example/a.pom".to_string(),
+            redirected_to: None,
             retry_after: None,
         };
         let note = super::retry_note(&error, std::time::Duration::from_millis(5200), 2, 4);

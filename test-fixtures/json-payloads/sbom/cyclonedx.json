@@ -88,7 +88,7 @@
         "version": "1.0"
       },
       {
-        "bom-ref": "pkg:maven/org.golden/lib@1.0?classifier=tests",
+        "bom-ref": "pkg:maven/org.golden/lib@1.0?classifier=tests&type=test-jar",
         "group": "org.golden",
         "hashes": [
           {
@@ -107,7 +107,7 @@
             "value": "test"
           }
         ],
-        "purl": "pkg:maven/org.golden/lib@1.0?classifier=tests",
+        "purl": "pkg:maven/org.golden/lib@1.0?classifier=tests&type=test-jar",
         "scope": "excluded",
         "type": "library",
         "version": "1.0"
@@ -208,7 +208,7 @@
           "pkg:maven/org.golden/core@1.1",
           "pkg:maven/org.golden/lib@1.0",
           "pkg:maven/org.golden/lib@1.0?classifier=jdk11",
-          "pkg:maven/org.golden/lib@1.0?classifier=tests",
+          "pkg:maven/org.golden/lib@1.0?classifier=tests&type=test-jar",
           "pkg:maven/org.golden/runtime-only@1.0",
           "pkg:maven/org.golden/testlib@1.0",
           "pkg:maven/org.golden/vendored@0.9"
@@ -231,7 +231,7 @@
         "ref": "pkg:maven/org.golden/lib@1.0?classifier=jdk11"
       },
       {
-        "ref": "pkg:maven/org.golden/lib@1.0?classifier=tests"
+        "ref": "pkg:maven/org.golden/lib@1.0?classifier=tests&type=test-jar"
       },
       {
         "ref": "pkg:maven/org.golden/runtime-only@1.0"

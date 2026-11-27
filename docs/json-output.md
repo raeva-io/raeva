@@ -38,6 +38,10 @@ redacted URL, or `null`). Distinct warnings are kept once and sorted.
 whose `context.count` counts the files. Text mode prints one `warning: CODE: ...` line per code
 on stderr at the end: the first warning, and `and N more` when that code
 fired for several things (`'raeva --json <command>' lists them`).
+`CHECKSUM_MISSING` names `raeva sync --frozen` instead: the warning comes
+only with a download, and a later run that finds the files stored lists
+none, while the `CHECKSUM_MISSING_LOCKED` warning of `--frozen` lists every
+file raeva.lock marks.
 `AUTH_FALLBACK` and `REPOSITORY_FALLBACK` print each skipped/serving
 repository pair, naming an example coordinate and counting further files. The text
 summary omits `WEAK_HASH_FALLBACK` and `TRANSITIVE_REPO_DROPPED`. Without
@@ -60,7 +64,8 @@ falls back to another, with a `PLATFORM_FALLBACK` warning.
 section has a target JDK), and `modules`. Each module has `dependencies`.
 Each dependency has `coordinate`, `scope` (the scope the package resolves to
 in the module, as `mvn dependency:list` shows it), `optional` (that of the
-declaration that brings it in on this path),
+declaration that brings it in on this path; for a direct dependency, whether
+the module declares it optional),
 `workspace`, `workspace_module` for a project module, and `children`. A later
 appearance of a dependency whose dependencies were listed where it first
 appeared has `repeated` true and empty `children`. A dependency without
@@ -516,6 +521,7 @@ A warning does not change the exit status. Codes are stable. Messages may change
 | `CROSS_HOST_MIRROR` | A mirror on another host serves a repository, so an `[[auth]]` entry without an `id` was not sent. |
 | `DATABASE_RECREATED` | The store index or the metadata cache was damaged or was not an SQLite database, as a partial CI cache restore can leave it, so `raeva` deleted it and started a new one. `context.path` names it. A damaged file that another raeva process has open is recreated once that process closes it. raeva waits about 2 s for that, and otherwise fails and names the file. Stored files are still checked against `raeva.lock`; what the lost entries held is hashed or downloaded again. |
 | `DEFAULT_CREDENTIAL_WITHHELD` | An `[[auth]]` entry without an `id` was not sent to an origin your own files do not name ([Authentication](authentication.md#precedence)). |
+| `DUPLICATE_DEPENDENCY` | In the Maven 3.9 mode, the project's POM or a parent it reads through `<relativePath>` declares a dependency or managed dependency twice, in a profile too, which Maven 3.9 warns of in the same words and builds with the last declaration. Once per POM, and not shown with `--quiet`, as `mvn -q` does not show it. The Maven 3.10 mode refuses the POM, as Maven 3.10 does. |
 | `ENV_VALUE_IN_LOCKFILE` | A `raeva.lock` field holds the value of an allowlisted environment variable. |
 | `ENV_VAR_HIDDEN` | A POM reads an environment variable other than `JAVA_HOME` and `PWD` that is set, as `${env.NAME}`, `${NAME}` in the model, or an `env.NAME` activation, and that `allow_env_substitution` does not list, so `raeva` treats it as unset where Maven reads its value. `context.variable` names it; the value is never shown. Allow it in `[security] allow_env_substitution` in `config.toml` if the value may be public; this is part of `raeva.lock`'s configuration, so set it on every machine that syncs, or on none. |
 | `EXPORT_LOSING_RANGE_VERSIONS` | Version ranges that lose mediation name no version `raeva export-m2` lists otherwise. Into a repository of its own it lists the lowest version a repository listed for each under that repository's ids, so `mvn -o` resolves the ranges, and Maven warns that their POMs are missing; into the shared local repository it lists none. `context.coordinates` names the versions and `context.listed` says whether they were listed. See [Offline builds](offline-builds.md). |
@@ -559,6 +565,7 @@ A warning does not change the exit status. Codes are stable. Messages may change
 | `REPO_URL_BACKSLASH` | A fetched POM's `http` or `https` repository URL has a `\` in it, which Maven's HTTP transport refuses, so each request to it fails in Maven and the search goes on. Ignored. In the Maven 3.9 mode, a `\` after the port of one raeva admits fails the sync once a search reaches the repository, as Maven 3.9 fails the build. `context` holds `repository` and `declared_by`. |
 | `REPO_URL_SECRET_REFUSED` | A fetched POM's repository URL has userinfo, a query, or a fragment, or the value of an input named like a secret in its path, or its id holds such a value (see [Configuration](configuration.md#repositories-and-mirrors)), which may hold a credential. Ignored, and the URL is not shown, nor an id that holds the value. `context` holds `repository` (the id) and `declared_by` (the declaring POM, when known). |
 | `SETTING_IGNORED` | An unusable setting was ignored: an environment variable such as `RAEVA_MAX_ARTIFACT_SIZE`, `RAEVA_HOME`, `SSL_CERT_FILE`, or `SSL_CERT_DIR` with a value `raeva` cannot use; `settings-security.xml` that is not valid XML or that `raeva` cannot read; a `settings.xml` proxy protocol other than `http`, `https`, or `all`, or a proxy `<port>` that is not a number, read as 0 as Maven reads it; a `settings.xml` repository or mirror URL that does not parse or is not `http`, `https` or `file`, which Maven skips too unless a mirror serves the repository; a `<mirrorOf>` pattern Maven does not know; or `-pl`, `-am`, `-amd`, `-rf` or `-N` in `.mvn/maven.config`, `MAVEN_ARGS`, or a `MAVEN_CONFIG` a Maven Wrapper script passes, since `raeva` locks the whole reactor; or, in the Maven 3.10 mode, a remote repository prefixes file without the `## repository-prefixes/2.0` header. `context.env` names the variable. |
+| `SHA256_FILE_MISMATCH` | A file did not match its `.sha256` while its `.sha1`, or its `.md5` without one, the file Maven checks, did, so raeva used it under any checksum policy; metadata only after a second download ([Checksum policy](configuration.md#checksum-policy)). `context` has the `repository_url` and the `path`. |
 | `STORE_FILE_REFETCHED` | A stored locked file did not match its `raeva.lock` checksum and was downloaded again. Every mode reports it, including `--frozen`. |
 | `SYSTEM_SCOPE` | A `system` dependency names a local file. |
 | `TRANSITIVE_REPO_DROPPED` | A repository dependency POMs declare was ignored. Not reported for Maven Central, which is searched anyway, or for a snapshot-only repository that a release POM declares. One warning per repository: `context` holds `url` (redacted) and `declared_by`, the POMs that declare it, sorted. See `security.transitive_repository_allowlist` in [Configuration](configuration.md). |

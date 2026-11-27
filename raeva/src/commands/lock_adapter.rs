@@ -136,8 +136,9 @@ pub(crate) fn adapt_sbom_modules_listing(
         .collect::<BTreeMap<_, _>>();
     // Keyed by reference.
     let mut components = BTreeMap::<String, Component>::new();
-    // Each component's resolved scope in each selected module that reaches it.
-    let mut scopes = BTreeMap::<String, BTreeSet<(&str, Scope)>>::new();
+    // Each component's resolved scope and optionality in each selected
+    // module that reaches it.
+    let mut scopes = BTreeMap::<String, BTreeSet<(&str, Scope, bool)>>::new();
     let mut module_packages = Vec::with_capacity(modules.len());
 
     for module in modules {
@@ -179,10 +180,11 @@ pub(crate) fn adapt_sbom_modules_listing(
             models.entry(reference.clone()).or_insert(model);
             package_components.insert(reference.clone(), component.purl.clone());
             insert_component(&mut components, component)?;
-            scopes
-                .entry(reference.clone())
-                .or_default()
-                .insert((module.path.as_str(), package.scope));
+            scopes.entry(reference.clone()).or_default().insert((
+                module.path.as_str(),
+                package.scope,
+                package.optional,
+            ));
             package_refs.push(reference);
         }
         module_packages.push((module.path.clone(), module_purl.clone(), package_components));
@@ -235,18 +237,22 @@ pub(crate) fn adapt_sbom_modules_listing(
 
 /// Write the scope the modules resolve the component to: one property when
 /// they agree, else one per module, so a large reactor does not repeat a
-/// module list on every component. Test scope is `excluded`, every other
-/// scope is on the runtime call graph and `required`, and `scope` is
-/// `required` when any module needs it at runtime. A module that resolves
-/// it to the empty scope adds no property.
-fn set_scope(component: &mut Component, scopes: &BTreeSet<(&str, Scope)>) {
-    let test_only = scopes.iter().all(|(_, scope)| *scope == Scope::Test);
-    component.scope = Some(if test_only {
-        ComponentScope::Excluded
-    } else {
-        ComponentScope::Required
+/// module list on every component. Test scope is `excluded`. Another scope
+/// is `optional` where the module resolves the component as optional, as
+/// the CycloneDX Maven plugin writes Maven's `isOptional()`, and `required`
+/// otherwise. `scope` is `required` when any module needs it at runtime,
+/// else `optional` when any module has it outside tests. A module that
+/// resolves it to the empty scope adds no property.
+fn set_scope(component: &mut Component, scopes: &BTreeSet<(&str, Scope, bool)>) {
+    let mut outside_tests = (scopes.iter()).filter(|(_, scope, _)| *scope != Scope::Test);
+    component.scope = Some(match outside_tests.next() {
+        None => ComponentScope::Excluded,
+        Some((.., true)) if outside_tests.all(|(.., optional)| *optional) => {
+            ComponentScope::Optional
+        }
+        Some(_) => ComponentScope::Required,
     });
-    if test_only {
+    if component.scope == Some(ComponentScope::Excluded) {
         // Registered in the CycloneDX property taxonomy.
         component.properties.push(Property {
             name: "cdx:maven:package:test".to_string(),
@@ -257,7 +263,7 @@ fn set_scope(component: &mut Component, scopes: &BTreeSet<(&str, Scope)>) {
         name: "raeva:maven:scope".to_string(),
         value,
     };
-    let mut distinct = scopes.iter().map(|(_, scope)| scope);
+    let mut distinct = scopes.iter().map(|(_, scope, _)| scope);
     match distinct.next() {
         Some(first) if distinct.all(|scope| scope == first) => {
             if *first != Scope::Empty {
@@ -266,8 +272,8 @@ fn set_scope(component: &mut Component, scopes: &BTreeSet<(&str, Scope)>) {
         }
         _ => component.properties.extend(
             (scopes.iter())
-                .filter(|(_, scope)| *scope != Scope::Empty)
-                .map(|(path, scope)| property(format!("{scope} {path}"))),
+                .filter(|(_, scope, _)| *scope != Scope::Empty)
+                .map(|(path, scope, _)| property(format!("{scope} {path}"))),
         ),
     }
 }
@@ -356,13 +362,13 @@ fn package_purl(
                 &module.packaging,
             );
         }
-        let mut dependency = dependency_from_coordinate(&package.coordinate);
+        let mut dependency = dependency_of(package);
         dependency.group_id = module.gav.group.to_string();
         dependency.artifact_id = module.gav.artifact.to_string();
         dependency.version = module.gav.version().to_string();
         return Ok(dependency.purl()?);
     }
-    Ok(dependency_from_coordinate(&package.coordinate).purl()?)
+    Ok(dependency_of(package).purl()?)
 }
 
 fn insert_component(
@@ -419,7 +425,7 @@ pub(crate) fn adapt_vulnerability_modules(
             if package.workspace_module.is_some() {
                 continue;
             }
-            let dependency = dependency_from_coordinate(&package.coordinate);
+            let dependency = dependency_of(package);
             let purl = dependency.purl()?;
             let entry = by_purl
                 .entry(purl)
@@ -460,12 +466,15 @@ pub(crate) fn adapt_vulnerability_modules(
     })
 }
 
-pub(crate) fn dependency_from_coordinate(coordinate: &ArtifactCoord) -> Dependency {
+/// The purl names the Maven type, as purl-spec's `maven` type and the
+/// CycloneDX Maven plugin do, not the extension.
+fn dependency_of(package: &LockModulePackage) -> Dependency {
+    let coordinate = &package.coordinate;
     Dependency {
         group_id: coordinate.group_id().to_string(),
         artifact_id: coordinate.artifact_id().to_string(),
         version: coordinate.version().to_string(),
-        packaging: coordinate.extension().to_string(),
+        packaging: package.maven_type().to_string(),
         classifier: coordinate.classifier().map(str::to_string),
     }
 }
@@ -751,6 +760,62 @@ mod tests {
             properties("mixed"),
             ["raeva:maven:scope=compile lib/pom.xml"]
         );
+    }
+
+    /// Across modules, a component is `optional` only where every module
+    /// that has it outside tests resolves it as optional: one module that
+    /// needs it makes it `required`, and test scope elsewhere does not count.
+    #[test]
+    fn optional_across_modules_yields_to_required() {
+        use rv_lock::Scope::{Compile, Test};
+        let optional = |artifact: &str, scope| {
+            let mut package = scoped(artifact, Some(scope), scope);
+            package.optional = true;
+            package
+        };
+        let app = scoped_module(
+            "app/pom.xml",
+            vec![
+                optional("both", Compile),
+                optional("everywhere", Compile),
+                optional("tested", Compile),
+            ],
+            &[],
+        );
+        let lib = scoped_module(
+            "lib/pom.xml",
+            vec![
+                scoped("both", Some(Compile), Compile),
+                optional("everywhere", Compile),
+                scoped("tested", Some(Test), Test),
+            ],
+            &[],
+        );
+        let mut platform = LockPlatform::new(
+            Platform::new("linux", "x86_64").expect("platform"),
+            "a".repeat(64),
+        );
+        platform.artifacts = ["both", "everywhere", "tested"]
+            .map(|artifact| {
+                LockArtifact::new(
+                    ArtifactCoord::new("org.example", artifact, "1", "jar", None),
+                    "https://repo.example/".to_string(),
+                )
+            })
+            .into();
+        platform.modules = vec![app, lib];
+        let selected = platform.modules.iter().collect::<Vec<_>>();
+        let adapted = adapt_sbom_modules(&platform, &selected).expect("adapt");
+        let scope = |artifact: &str| {
+            let purl = format!("pkg:maven/org.example/{artifact}@1");
+            (adapted.components.iter())
+                .find(|component| component.purl == purl)
+                .expect("component")
+                .scope
+        };
+        assert_eq!(scope("both"), Some(ComponentScope::Required));
+        assert_eq!(scope("everywhere"), Some(ComponentScope::Optional));
+        assert_eq!(scope("tested"), Some(ComponentScope::Optional));
     }
 
     /// Test-only packages are dropped per module before the union, and the

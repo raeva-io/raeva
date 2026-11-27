@@ -80,7 +80,7 @@ pub use paths::{MAVEN_USER_HOME_TEST_ENV, PASSWD_HOME_TEST_ENV, REAL_HOME_GUARD_
 pub use paths::{ResolvedPaths, UNKNOWN_USER_HOME, is_unknown_user_home};
 pub use plugins::{PluginTrace, PluginsConfig};
 pub use prime::prime_secrets;
-pub use proxy_env::{EnvironmentProxy, NoProxy, environment_proxies};
+pub use proxy_env::{EnvironmentProxy, NoProxy, environment_proxies, percent_decode};
 pub use redact::{
     Redactor, UNPARSABLE_URL, UNRECORDED_REPOSITORY, UNRECORDED_URL, redact_repository_url,
     redact_secrets, redact_secrets_in_json, redact_url, redacted_url, register_named_secret,

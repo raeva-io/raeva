@@ -213,7 +213,10 @@ impl PlatformResolver {
                     graph.clear_incoming(idx);
                 }
             }
-            self.populate_artifacts(&backend, &mut graph, None).await?;
+            // A build extension's realm is read by its module's graph, which
+            // a held download would wait for.
+            self.populate_artifacts(&backend, &mut graph, None, !extension)
+                .await?;
             read_poms.extend(backend.read_poms(false));
             pom_reads.extend(backend.pom_reads());
             let resolution = complete_resolution(
@@ -317,7 +320,7 @@ impl PlatformResolver {
             match stored {
                 Some(found) => found,
                 None => {
-                    let (blob, origin) =
+                    let (blob, origin, _) =
                         match fetch_artifact_from_repos(client, store, &jar, &coordinate, repos)
                             .await
                         {
@@ -372,8 +375,10 @@ impl PlatformResolver {
         };
         Ok(ResolvedPackage {
             coordinate,
+            type_: None,
             direct_scope: None,
             scope: rv_lock::Scope::Runtime,
+            optional: false,
             workspace_module: None,
             system_path: None,
             managed: None,

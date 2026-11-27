@@ -1676,3 +1676,86 @@ fn a_jdk_range_that_is_not_ascii_refuses() {
         }
     }
 }
+
+/// CXF 3.x's parent POM, a dependency's, turns on its `ibmjdk` profile
+/// where `java.vendor` is `IBM Corporation`. raeva takes the vendor of the
+/// JDK `mvn` runs from its `release` file, from JDK 11 on, and raeva.lock
+/// records what the test gave, not the vendor: another vendor with the same
+/// outcome keeps the lock, one with another makes `--frozen` exit 7, also
+/// under `[lock] jdks`, and on a JDK 8, whose `release` file does not tell
+/// its `java.vendor`, `--frozen` exits 7 and a sync refuses as before
+/// unless `-Djava.vendor` sets it.
+#[test]
+fn a_dependency_parent_profile_on_java_vendor_takes_the_host_jdk() {
+    let project = Project::with(&[]);
+    let root = project.root();
+    let jdks = root.parent().unwrap().join("jdks");
+    let jdk = |dir: &str, version: &str, implementor: &str| {
+        let home = fake_jdk(&jdks.join(dir), version);
+        fs::write(
+            Path::new(&home).join("release"),
+            format!("JAVA_VERSION=\"{version}\"\nIMPLEMENTOR=\"{implementor}\"\n"),
+        )
+        .unwrap();
+        home
+    };
+    let temurin = jdk("temurin", "21.0.9", "Eclipse Adoptium");
+    let corretto = jdk("corretto", "17.0.13", "Amazon.com Inc.");
+    let semeru = jdk("semeru", "17.0.13", "IBM Corporation");
+    let temurin8 = jdk("temurin8", "1.8.0_472", "Eclipse Adoptium");
+    project.publish("org.test:p1:1.0", "");
+    let ibm = profile(
+        "ibmjdk",
+        "<property><name>java.vendor</name><value>IBM Corporation</value></property>",
+        "p1",
+    );
+    project.publish(
+        "org.test:parent:1.0",
+        &format!("<packaging>pom</packaging><profiles>{ibm}</profiles>"),
+    );
+    project.publish(
+        "org.test:dep:1.0",
+        "<parent><groupId>org.test</groupId><artifactId>parent</artifactId>\
+         <version>1.0</version></parent>",
+    );
+    let dependency = "<dependencies><dependency><groupId>org.test</groupId>\
+                      <artifactId>dep</artifactId><version>1.0</version></dependency>\
+                      </dependencies>";
+    fs::write(root.join("pom.xml"), pom("", dependency)).unwrap();
+    let run = |jdk: &str, args: &[&str]| project.raeva_with(&[("JAVA_HOME", jdk)], args);
+    let (sync, frozen) = (["sync", "--offline"], ["sync", "--frozen", "--offline"]);
+    let condition = |holds: bool| format!("property:java.vendor=IBM Corporation is {holds}");
+    for mode in MODES {
+        for jdks in ["", "jdks = [\"17\", \"21\"]\n"] {
+            let case = format!("{mode} {jdks}");
+            set_mode(&root, mode);
+            let toml = fs::read_to_string(root.join("raeva.toml")).unwrap();
+            fs::write(root.join("raeva.toml"), toml + jdks).unwrap();
+            assert_success(&run(&temurin, &sync), &case);
+            assert_eq!(locked(&root), ["dep"], "{case} Temurin");
+            let lock = fs::read_to_string(root.join("raeva.lock")).unwrap();
+            assert!(
+                lock.contains(&condition(false)) && !lock.contains("Adoptium"),
+                "{case}: {lock}"
+            );
+            assert_success(&run(&corretto, &frozen), &format!("{case} Corretto"));
+            assert_status(&run(&semeru, &frozen), 7, &format!("{case} Semeru"));
+            assert_success(&run(&semeru, &sync), &format!("{case} Semeru"));
+            assert_eq!(locked(&root), ["dep", "p1"], "{case} Semeru");
+            let lock = fs::read_to_string(root.join("raeva.lock")).unwrap();
+            assert!(lock.contains(&condition(true)), "{case}: {lock}");
+        }
+        assert_status(&run(&temurin8, &frozen), 7, &format!("{mode} JDK 8"));
+        let output = run(&temurin8, &sync);
+        assert_status(&output, 3, &format!("{mode} JDK 8"));
+        assert!(
+            stderr(&output).contains("depends on java.vendor")
+                && stderr(&output).contains("-Djava.vendor="),
+            "{mode}: {}",
+            stderr(&output)
+        );
+        let defined = [&sync[..], &["-Djava.vendor=Temurin"]].concat();
+        assert_success(&run(&temurin8, &defined), &format!("{mode} JDK 8 -D"));
+        assert_eq!(locked(&root), ["dep"], "{mode} JDK 8 -D");
+    }
+}

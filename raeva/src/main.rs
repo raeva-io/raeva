@@ -34,6 +34,8 @@ fn main() -> ExitCode {
             Err(_) => ExitCode::FAILURE,
         };
     }
+    #[cfg(unix)]
+    raise_open_file_limit();
     let cli = std::thread::Builder::new()
         .name("main".to_string())
         .stack_size(STACK_SIZE)
@@ -46,6 +48,23 @@ fn main() -> ExitCode {
             eprintln!("failed to start the main thread: {err}");
             error::ExitStatus::Startup.into()
         }
+    }
+}
+
+/// Raise the soft limit on open files toward the hard one, as the JVM
+/// does for Maven: macOS starts every shell at 256, which a sync that
+/// downloads and reads many jars at once can exceed. It stops at 10240,
+/// macOS's `OPEN_MAX`, and is never lowered; when the system refuses,
+/// raeva runs with the limit it has.
+#[cfg(unix)]
+fn raise_open_file_limit() {
+    use rustix::process::{Resource, getrlimit, setrlimit};
+    const ENOUGH: u64 = 10240;
+    let mut limit = getrlimit(Resource::Nofile);
+    let target = limit.maximum.map_or(ENOUGH, |hard| hard.min(ENOUGH));
+    if limit.current.is_some_and(|soft| soft < target) {
+        limit.current = Some(target);
+        let _ = setrlimit(Resource::Nofile, limit);
     }
 }
 

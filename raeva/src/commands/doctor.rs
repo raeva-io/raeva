@@ -728,6 +728,17 @@ async fn probe(
                 ),
                 (None, None) => missing_credential_hint(&route.endpoint, &settings),
             };
+            let unsent = match &err {
+                RepoError::Unauthorized { url, .. }
+                    if http_origin(url) != http_origin(&route.endpoint.url) =>
+                {
+                    format!(
+                        "the redirect target {url} answered, and a repository's credentials go \
+                         only to its own origin"
+                    )
+                }
+                _ => unsent,
+            };
             classify_probe_error(err, &path, &settings, credential, &unsent)
         }
     };
@@ -912,13 +923,17 @@ fn classify_probe_error(
     credential: Option<(&CredentialSource, &[String])>,
     unsent: &str,
 ) -> (String, Outcome) {
-    let sent = match &err {
-        RepoError::Unauthorized { sent, .. } => sent.as_deref(),
-        _ => None,
+    let (sent, refused) = match &err {
+        RepoError::Unauthorized { sent, url, .. } => (sent.as_deref(), url.as_str()),
+        _ => (None, ""),
     };
     match err.status_code() {
         Some(code @ (401 | 403)) => {
             let details = match sent {
+                Some(sent) if sent.file == rv_repo::CredentialFile::Redirect => format!(
+                    "{code} (the Basic auth of the redirect's userinfo was sent to {refused} but \
+                     rejected; the repository chose it, so check with its operator)"
+                ),
                 Some(sent) => {
                     let label = report::credential_label(sent.id.as_deref());
                     let file = report::credential_file(sent.file, settings);
@@ -1099,6 +1114,7 @@ mod tests {
             version: Some(version.to_string()),
             version_date: date.map(str::to_string),
             openj9: false,
+            ..Default::default()
         };
         let row = |release: rv_maven_model::JdkRelease, vbmi: bool| {
             super::java4shell_row(Some(&release), Some("/opt/jdk"), vbmi, &[])
@@ -1181,6 +1197,7 @@ mod tests {
             version: Some("21.0.9".to_string()),
             version_date: date.map(str::to_string),
             openj9: false,
+            ..Default::default()
         };
         let row = |date: Option<&str>, vbmi: bool, jvm_config: Option<&str>, opts: Option<&str>| {
             let release = release(date);
@@ -1270,6 +1287,7 @@ mod tests {
             version: Some("21.0.9".to_string()),
             version_date: Some("2026-10-21".to_string()),
             openj9: false,
+            ..Default::default()
         };
         let outcome = |options: &[(&'static str, &str)]| {
             super::java4shell_row(Some(&release), Some("/opt/jdk"), true, options)

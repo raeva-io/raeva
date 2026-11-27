@@ -65,6 +65,18 @@ impl Resolved {
         let id = self.ids.get(node).copied().flatten()?;
         self.winners.get(&id).copied().flatten()
     }
+
+    /// Make `node` the winner of its group if the group has none. A group
+    /// sorted before the cycle that holds its parents gathers nothing, and
+    /// Maven keeps its nodes unmediated, each with its own version and
+    /// scope; the first one left in the tree stands for them.
+    pub(super) fn stand_in(&mut self, node: usize) {
+        if let Some(id) = self.ids.get(node).copied().flatten()
+            && let Some(winner @ None) = self.winners.get_mut(&id)
+        {
+            *winner = Some(node);
+        }
+    }
 }
 
 const ROOT: usize = 0;

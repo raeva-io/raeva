@@ -325,9 +325,9 @@ mod tests {
             format!("{line}not toml\n"),
             format!("=======\n{line}"),
             format!("<<<<<<< ours\n{line}"),
-            format!("<<<<<<< ours\nschema_version = 9\n[[platforms]]\n=======\n{line}"),
+            format!("<<<<<<< ours\nschema_version = 10\n[[platforms]]\n=======\n{line}"),
             format!(
-                "<<<<<<< ours\nschema_version = 9\n[[platforms]]\nx = 1\n=======\n{line}{line}"
+                "<<<<<<< ours\nschema_version = 10\n[[platforms]]\nx = 1\n=======\n{line}{line}"
             ),
         ] {
             assert_eq!(super::newer_schema(&text), Some(newer), "{text:?}");

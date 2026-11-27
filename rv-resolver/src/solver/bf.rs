@@ -336,7 +336,9 @@ impl<'s, 'a, B: Backend> Walk<'s, 'a, B> {
             root: Node {
                 workspace_module: solver.backend.workspace_module(&coord),
                 coord,
+                type_: None,
                 scope,
+                optional: false,
                 repo_url: None,
                 build_repo: None,
                 repos: RepoContext::default(),
@@ -1292,7 +1294,7 @@ impl<'s, 'a, B: Backend> Walk<'s, 'a, B> {
 
     fn finish(mut self) -> Result<Graph> {
         let declared = self.tree.lists.clone();
-        let resolved = match conflict::resolve(&mut self.tree, self.root.scope, self.mode) {
+        let mut resolved = match conflict::resolve(&mut self.tree, self.root.scope, self.mode) {
             Ok(resolved) => resolved,
             Err(unsolvable) => return Err(self.conflict(unsolvable)),
         };
@@ -1310,6 +1312,7 @@ impl<'s, 'a, B: Backend> Walk<'s, 'a, B> {
                 continue;
             };
             *next += 1;
+            resolved.stand_in(child);
             if resolved.winner_of(child) == Some(child)
                 && !std::mem::replace(&mut seen[child], true)
             {
@@ -1414,12 +1417,18 @@ impl<'s, 'a, B: Backend> Walk<'s, 'a, B> {
             let repo_url = (build_repo.as_ref().map(|repo| Arc::clone(&repo.url)))
                 .or_else(|| project.and_then(|p| p.repo_url.clone()))
                 .filter(|_| !local);
+            let type_ = (dep.item.dependency.type_.as_deref())
+                .filter(|type_| !type_.is_empty())
+                .unwrap_or("jar");
+            let extension = dep.coord.packaging.as_deref().unwrap_or("jar");
             let node = graph.insert_node(Node {
                 coord: Coord {
                     version: dep.resolved.version.clone(),
                     ..dep.coord.clone()
                 },
+                type_: (type_ != extension).then(|| type_.to_string()),
                 scope: entry.scope,
+                optional: entry.optional,
                 repo_url,
                 build_repo,
                 repos: dep.item.path.repos.clone(),

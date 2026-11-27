@@ -41,6 +41,7 @@ fn full_resolution_inputs() -> ResolutionInputs {
         ],
         plugin_repositories: Vec::new(),
         allow_transitive_repositories: true,
+        ignore_transitive_repositories: false,
         allow_env_substitution: strings(&["HOME", "CI", "HOME"]),
         transitive_repository_allowlist: strings(&["https://b.example/", "https://a.example/"]),
         jdks: Vec::new(),
@@ -90,6 +91,7 @@ fn config_hash_frames_every_input() {
         "releases flag unset": |i| i.repositories[0].releases = None;
         "update policy": |i| i.repositories[1].releases_update_policy = "daily".into();
         "transitive repositories": |i| i.allow_transitive_repositories = false;
+        "-itr": |i| i.ignore_transitive_repositories = true;
         "command line": |i| i.profile_selections.push("-Pci".into());
         "maven mode": |i| i.maven = MavenMode::Maven310;
         "repository filters": |i| i.repository_filters = Some(String::new());

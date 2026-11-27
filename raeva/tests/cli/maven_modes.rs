@@ -955,15 +955,61 @@ fn a_project_scope_maven_does_not_know_is_warned_of() {
     }
 }
 
-/// A scope raeva.lock cannot write, one with a space, is refused with exit
-/// 3 naming the dependency, in the project or in a dependency's POM, where
-/// Maven would follow it: Maven keeps it as written, and reading it as
-/// compile would put the dependency's own dependencies on the compile
-/// classpath. Where Maven does not follow it, it is not refused.
+/// A scope with whitespace, as manifold's `provided, test`, Maven keeps as
+/// written and warns of, and so does raeva, in the project or in a
+/// dependency's POM: raeva.lock writes it percent-encoded, `--frozen` reads
+/// it back, and `raeva tree` shows it as written. A scope raeva.lock cannot
+/// write, one with an invisible character, is refused with exit 3 naming
+/// the dependency, where Maven would follow it: reading it as compile would
+/// put the dependency's own dependencies on the compile classpath. Where
+/// Maven does not follow it, it is not refused.
 #[test]
-fn a_scope_the_lock_cannot_write_is_refused_naming_the_dependency() {
+fn a_scope_with_whitespace_is_locked_and_one_the_lock_cannot_write_refused() {
     for mode in ["3.9", "3.10"] {
-        let project = unknown_scope_project(mode, "two words", "compile");
+        let project = unknown_scope_project(mode, "provided, test", "compile");
+        let output = project.raeva(&["sync", "--offline"]);
+        assert_success(&output, mode);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("'dependencies.dependency.scope' for org.test:d:jar must be one of")
+                && stderr.contains("but is 'provided, test'."),
+            "{mode}: {stderr}"
+        );
+        let lock = fs::read_to_string(project.root().join("raeva.lock")).expect("lock");
+        assert!(
+            lock.contains(r"org.test:d:1\tjar\tprovided,%20test"),
+            "{mode}\n{lock}"
+        );
+        assert_success(&project.raeva(&["sync", "--frozen", "--offline"]), mode);
+        let tree = project.raeva(&["tree"]);
+        let stdout = String::from_utf8_lossy(&tree.stdout);
+        assert!(
+            stdout.contains("org.test:d:1 (provided, test)"),
+            "{mode}: {stdout}"
+        );
+
+        // Maven trims no interpolated value: ` compile ` from a property is
+        // a scope it does not know, with `runtime` below it.
+        let project = unknown_scope_project(mode, "${s}", "compile");
+        let output = project.raeva(&["sync", "--offline", "-Ds= compile "]);
+        assert_success(&output, &format!("interpolated {mode}"));
+        let lock = fs::read_to_string(project.root().join("raeva.lock")).expect("lock");
+        assert!(
+            lock.contains(r"org.test:d:1\tjar\t%20compile%20"),
+            "{mode}\n{lock}"
+        );
+
+        let project = unknown_scope_project(mode, "compile", "two words");
+        assert_success(
+            &project.raeva(&["sync", "--offline"]),
+            &format!("transitive {mode}"),
+        );
+        let lock = fs::read_to_string(project.root().join("raeva.lock")).expect("lock");
+        assert!(lock.contains(" two%20words"), "{mode}\n{lock}");
+        assert_success(&project.raeva(&["sync", "--frozen", "--offline"]), mode);
+
+        let hidden = "two\u{200b}words";
+        let project = unknown_scope_project(mode, hidden, "compile");
         let output = project.raeva(&["sync", "--offline"]);
         assert_status(&output, 3, mode);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -973,32 +1019,19 @@ fn a_scope_the_lock_cannot_write_is_refused_naming_the_dependency() {
         );
         assert!(!project.root().join("raeva.lock").exists(), "{mode}");
 
-        // Maven trims no interpolated value: ` compile ` from a property is
-        // a scope it does not know, with `runtime` below it.
-        let project = unknown_scope_project(mode, "${s}", "compile");
-        let output = project.raeva(&["sync", "--offline", "-Ds= compile "]);
-        assert_status(&output, 3, &format!("interpolated {mode}"));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("'dependencies.dependency.scope' for org.test:d:jar"),
-            "{mode}: {stderr}"
-        );
-
-        let project = unknown_scope_project(mode, "compile", "two words");
+        let project = unknown_scope_project(mode, "compile", hidden);
         let output = project.raeva(&["sync", "--offline"]);
         assert_status(&output, 3, &format!("transitive {mode}"));
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("org.test:b:1") && stderr.contains("\"two words\""),
-            "{mode}: {stderr}"
-        );
+        assert!(stderr.contains("org.test:b:1"), "{mode}: {stderr}");
         assert!(!project.root().join("raeva.lock").exists(), "{mode}");
 
         // Below a test dependency Maven derives `test`, and an optional
         // dependency of a dependency is not followed at all.
+        let optional = format!("{hidden}</scope><optional>true");
         for (scope, below, b) in [
-            ("test", "two words", Some("org.test:b:1\\tjar\\t\\ttest")),
-            ("compile", "two words</scope><optional>true", None),
+            ("test", hidden, Some("org.test:b:1\\tjar\\t\\ttest")),
+            ("compile", optional.as_str(), None),
         ] {
             let project = unknown_scope_project(mode, "compile", below);
             let root = project.root().join("pom.xml");
@@ -1822,4 +1855,68 @@ fn another_platforms_settings_urls_are_checked_there() {
         assert!(ignored(&output).is_empty(), "{line}");
         assert_eq!(lib(), "1.0", "{line}");
     }
+}
+
+/// Maven 3.9 warns of a dependency a POM declares twice, in its words, and
+/// builds with the last declaration; a parent that each module reads warns
+/// once, and `--quiet` hides it, as `mvn -q` does.
+#[test]
+fn maven_39_warns_once_of_a_dependency_declared_twice() {
+    use rv_test_support::http::{Response, StubServer};
+    const LIB: &str = "<project><modelVersion>4.0.0</modelVersion><groupId>test</groupId>\
+                       <artifactId>lib</artifactId><version>1</version></project>";
+    let server = StubServer::start(|request| match request.path.as_str() {
+        "/test/lib/1/lib-1.pom" => Response::new(200, LIB),
+        "/test/lib/1/lib-1.pom.sha1" => Response::new(200, crate::common::sha1_hex(LIB.as_bytes())),
+        "/test/lib/1/lib-1.jar" => Response::new(200, "jar"),
+        "/test/lib/1/lib-1.jar.sha1" => Response::new(200, crate::common::sha1_hex(b"jar")),
+        _ => Response::new(404, ""),
+    });
+    let project = tempfile::TempDir::new().unwrap();
+    let lib = "<dependency><groupId>test</groupId><artifactId>lib</artifactId>\
+               <version>1</version></dependency>";
+    fs::write(
+        project.path().join("pom.xml"),
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules><module>a</module><module>b</module></modules>\
+             <dependencies>{lib}{lib}</dependencies></project>"
+        ),
+    )
+    .unwrap();
+    for module in ["a", "b"] {
+        fs::create_dir_all(project.path().join(module)).unwrap();
+        fs::write(
+            project.path().join(module).join("pom.xml"),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><parent><groupId>t</groupId>\
+                 <artifactId>parent</artifactId><version>1</version></parent>\
+                 <artifactId>{module}</artifactId></project>"
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        project.path().join("raeva.toml"),
+        format!(
+            "[lock]\nmaven = \"3.9\"\n\n[[repositories]]\nid = \"central\"\nurl = \"http://{}/\"\n",
+            server.addr()
+        ),
+    )
+    .unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let warning = "'dependencies.dependency.(groupId:artifactId:type:classifier)' must be \
+                   unique: test:lib:jar -> duplicate declaration of version 1";
+    let synced = crate::common::run_raeva(project.path(), home.path(), &["sync"]);
+    assert_success(&synced, "sync");
+    let stderr = String::from_utf8_lossy(&synced.stderr);
+    assert_eq!(stderr.matches(warning).count(), 1, "{stderr}");
+    assert!(stderr.contains("warning: "), "{stderr}");
+
+    fs::remove_file(project.path().join("raeva.lock")).unwrap();
+    let quiet = crate::common::run_raeva(project.path(), home.path(), &["--quiet", "sync"]);
+    assert_success(&quiet, "sync --quiet");
+    let stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(!stderr.contains("must be unique"), "{stderr}");
 }

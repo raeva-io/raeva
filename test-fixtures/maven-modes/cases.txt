@@ -154,6 +154,45 @@ d:1
 expect 3.9: a:1 b:1
 expect 3.10: a:1 b:1
 
+## cycle-sorted-after-a-group-leaves-it-no-winner
+# Depth first, sniffer:1.14 below the losing guava:24 makes sniffer's
+# depth 3, less than that of core and util, which depend on each other, so
+# the sorter breaks their cycle at sniffer. By then guava:24 is cut, and
+# gathering does not enter core or util: the group has no items and no
+# winner, and Maven keeps its nodes as they are (dynamic-tp). Were they of
+# two versions, Maven would keep both, and raeva keeps the first, as a lock
+# holds one version of an artifact.
+root: guava:31 x:1 y:1
+x:1 > guava:24
+guava:24 > sniffer:1.14
+guava:31
+y:1 > w:1
+w:1 > z:1
+z:1 > core:1
+core:1 > util:1 sniffer:1.23
+util:1 > core:1 sniffer:1.23
+sniffer:1.14
+sniffer:1.23
+expect 3.9: core:1 guava:31 sniffer:1.23 util:1 w:1 x:1 y:1 z:1
+expect 3.10: core:1 guava:31 sniffer:1.23 util:1 w:1 x:1 y:1 z:1
+
+## cycle-sorted-after-a-group-leaves-its-declared-scope
+# As above, below a test dependency: the node left keeps the scope its
+# POM declares, as no scope is selected for a group without a winner.
+root: guava:31 x:1 y:1@test
+x:1 > guava:24
+guava:24 > sniffer:1.14
+guava:31
+y:1 > w:1
+w:1 > z:1
+z:1 > core:1
+core:1 > util:1 sniffer:1.23
+util:1 > core:1 sniffer:1.23
+sniffer:1.14
+sniffer:1.23
+expect 3.9: core:1@test guava:31 sniffer:1.23 util:1@test w:1@test x:1 y:1@test z:1@test
+expect 3.10: core:1@test guava:31 sniffer:1.23@test util:1@test w:1@test x:1 y:1@test z:1@test
+
 ## optional-and-exclusion
 root: a:1 b:1!x
 a:1 > c:1

@@ -17,7 +17,7 @@ fn every_field_lock() -> String {
     let digest = "a".repeat(64);
     format!(
         r#"
-schema_version = 9
+schema_version = 10
 config_hash = "{MODEL_HASH}"
 
 [resolution]
@@ -54,7 +54,7 @@ gav = "com.example:root:1"
 packaging = "pom"
 packages = """
 com.example:alpha:1.0-SNAPSHOT\tjar:tests\tcompile
-com.sun:tools:1.8\tjar\tsystem\t\t\tlib/tools.jar\t{digest}"""
+com.sun:tools:1.8\tjar\tsystem\t\t\t\tlib/tools.jar\t{digest}"""
 edges = "0 1 system"
 
 [[platforms.support_poms]]
@@ -107,11 +107,11 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         "coordinate = \"com.example:parent:1\"" => "x = 1\ncoordinate = \"com.example:parent:1\"", r#"field "x" in support POM 'com.example:parent:1'"#;
         "parent/\"\n" => "parent/\"\nsnapshot = { timestamp = \"20240101.010101\" }\n", r#"missing field "build_number" in the snapshot table of support POM"#;
         // Schema versions.
-        "schema_version = 9" => "schema_version = 5", "unsupported lockfile schema version 5";
-        "schema_version = 9" => "schema_version = 99", "unsupported lockfile schema version 99";
-        "schema_version = 9" => "schema_version = \"6\"", "must be a whole number";
-        "schema_version = 9" => "", r#"missing field "schema_version""#;
-        "schema_version = 9" => "schema_version = 8", "unsupported lockfile schema version 8";
+        "schema_version = 10" => "schema_version = 5", "unsupported lockfile schema version 5";
+        "schema_version = 10" => "schema_version = 99", "unsupported lockfile schema version 99";
+        "schema_version = 10" => "schema_version = \"6\"", "must be a whole number";
+        "schema_version = 10" => "", r#"missing field "schema_version""#;
+        "schema_version = 10" => "schema_version = 9", "unsupported lockfile schema version 9";
         // The shared record of a target.
         "\n\n[resolution]" => "\nmaven = \"3.10\"\n\n[resolution]", "";
         "\n\n[resolution]" => "\nmaven = \"3.9\"\n\n[resolution]", r#"maven "3.9" must be "3.10" or left out"#;
@@ -158,8 +158,23 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         // Module and package rows.
         // A `<module>` entry may name its POM file under any name.
         "path = \"pom.xml\"" => "path = \"app/mypom.xml\"", "";
-        "path = \"pom.xml\"" => "path = \"../pom.xml\"", "normalized root-relative POM path";
-        "path = \"pom.xml\"" => "path = \"app/..\"", "normalized root-relative POM path";
+        // A sibling module, which `<module>../app</module>` declares.
+        "path = \"pom.xml\"" => "path = \"../pom.xml\"", "";
+        "path = \"pom.xml\"" => "path = \"../../app/pom.xml\"", "";
+        "path = \"pom.xml\"" => "path = \"app/..\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"..\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"../\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"../..\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"./pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"../app/../pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"../app//pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"/pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"/../pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"//server/share/pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"..\\\\pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"C:/pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"../C:/pom.xml\"", "with any '..' parts first";
+        "path = \"pom.xml\"" => "path = \"\"", "with any '..' parts first";
         "classifier = \"tests\"" => "classifier = \"\"", "must be omitted rather than empty";
         "gav = \"com.example:root:1\"" => "gav = \"com.example:root\"", "must be 'group:artifact:version'";
         "\"0 1 system\"" => "\"0 5 system\"", "edge (0 -> 5) is out of bounds for 2 packages";
@@ -185,17 +200,17 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         "\"0 1 system\"\n" => "\"0 1 system\"\nsupport_poms = \"com.example:parent:1\"\nparents = \"com.example:parent:1\\ncom.example:parent:1\"\n", "or is named twice";
         "jar:tests\\t" => "jar:\\t", "it must start with group:artifact:version";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT", "package line 1 of module 'pom.xml'";
-        "{A}\"\"\"" => "{A}\\tx\"\"\"", "more than seven columns";
+        "{A}\"\"\"" => "{A}\\tx\"\"\"", "more than eight columns";
         // System rows stay inside the project and are pinned.
         "\\t\\tlib/" => "\\t\\t/opt/lib/", "the path is absolute";
         "\\t\\tlib/" => "\\t\\t../lib/", "'..' part";
         "\\t\\tlib/" => "\\t\\tC:/lib/", r"'\' or ':'";
         "tools.jar\\t{A}" => "tools.jar", "has a system_path but no system_sha256";
         "tools.jar\\t{A}" => "tools.jar\\t{UPPER}", "system SHA-256 must be 64 lowercase";
-        "\\tsystem\\t\\t\\tlib" => "\\tcompile\\t\\t\\tlib", "but scope \"compile\"";
+        "\\tsystem\\t\\t\\t\\tlib" => "\\tcompile\\t\\t\\t\\tlib", "but scope \"compile\"";
         // A system file a range picks over a compile declaration is system.
-        "\\tsystem\\t\\t\\tlib" => "\\tcompile\\tsystem\\t\\tlib", "";
-        "\\tsystem\\t\\t\\tlib" => "\\tsystem\\tsystem\\t\\tlib", "must be empty when it is the direct scope";
+        "\\tsystem\\t\\t\\t\\tlib" => "\\tcompile\\tsystem\\t\\t\\tlib", "";
+        "\\tsystem\\t\\t\\t\\tlib" => "\\tsystem\\tsystem\\t\\t\\tlib", "must be empty when it is the direct scope";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t\\tcompile", "must be empty when it is the direct scope";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t\\ttest", "";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\tmerged", "";
@@ -203,10 +218,16 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tfoo:bar\\tx/y", "";
         // `?` is the empty scope, only as the scope a package resolves to.
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t\\t?", "";
+        // The type column, set only when the type is not the extension.
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\t\\ttest-jar", "";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\t\\tjar", "its type column must be empty when the type is the extension";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\t\\ttest:jar", "";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\t\\tmy%20type", "";
+        "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\tcompile\\t\\tmy type", "its type must be written with each whitespace character";
         "SNAPSHOT\\tjar:tests\\tcompile" => "SNAPSHOT\\tjar:tests\\t?", "the direct scope in the package line 1";
         "\"0 1 system\"" => "\"0 1 ?\"", "which is not a scope";
         "\\t\\tlib/tools.jar\\t" => "\\t\\t\\t", "has a system_sha256 but no system_path";
-        "\\tjar\\tsystem\\t\\t\\tlib/tools.jar\\t{A}" => "\\tjar\\tsystem", "has no artifact-table row";
+        "\\tjar\\tsystem\\t\\t\\t\\tlib/tools.jar\\t{A}" => "\\tjar\\tsystem", "has no artifact-table row";
         // Resolution settings and snapshot builds.
         "ambient_inputs = [" => "strategy = \"nearest\"\nambient_inputs = [", r#"field "strategy" in the [resolution] table"#;
         "[\"env.CI\"]" => "[\"env.CI\", \"env.CI\"]", "duplicate ambient input \"env.CI\"";
@@ -298,6 +319,160 @@ fn every_rule_of_the_schema_is_enforced_on_read() {
         .replace(&fill("digest = \"{A}\""), &fill("digest = \"{UPPER}\""));
     let checksum = &read(&spelled).expect("spellings").platforms[0].artifacts[0].checksums[0];
     assert_eq!(checksum, &Digest::parse("sha256", &"a".repeat(64)).unwrap());
+}
+
+/// The published schema, which holds what [`Lockfile::read`] holds.
+fn schema() -> jsonschema::Validator {
+    let schema = include_str!("../../schemas/raeva-lock.json");
+    jsonschema::validator_for(&serde_json::from_str(schema).expect("schema JSON"))
+        .expect("compile schema")
+}
+
+/// Whether the schema takes the lock `raw`.
+fn schema_takes(schema: &jsonschema::Validator, raw: &str) -> bool {
+    let document: toml::Value = toml::from_str(raw).expect("TOML");
+    schema.is_valid(&serde_json::to_value(document).expect("JSON"))
+}
+
+/// The schema takes a module path, a package's workspace module and a
+/// system path exactly when [`Lockfile::read`] does: each case runs through
+/// both, for the structure and for every character that may hide.
+#[test]
+fn the_schema_takes_the_paths_the_reader_takes() {
+    let schema = schema();
+    let base: toml::Value = toml::from_str(&every_field_lock()).expect("base lock");
+    let digest = "a".repeat(64);
+    // The reader takes a workspace module only where a module row has its
+    // path, which the schema does not check; that row gets the path for the
+    // reader, a valid one for the schema.
+    let document = |module: &str, workspace: &str, system: &str, row: &str| {
+        let mut document = base.clone();
+        let modules = document["platforms"][0]["modules"].as_array_mut().unwrap();
+        let mut module_row = modules[0].clone();
+        module_row["path"] = row.into();
+        module_row["gav"] = "org.example:module:1".into();
+        module_row["packaging"] = "jar".into();
+        module_row["packages"] = "".into();
+        module_row["edges"] = "".into();
+        modules.push(module_row);
+        let row = &mut modules[0];
+        row["path"] = module.into();
+        row["packages"] = format!(
+            "com.example:alpha:1.0-SNAPSHOT\tjar:tests\tcompile\n\
+             com.sun:tools:1.8\tjar\tsystem\t\t\t\t{system}\t{digest}\n\
+             org.example:module:1\tjar\tcompile\t\t\t{workspace}"
+        )
+        .into();
+        toml::to_string(&document).expect("TOML")
+    };
+    let both = |module: &str, workspace: &str, system: &str| {
+        let reader = read(&document(module, workspace, system, workspace));
+        let valid = document(module, workspace, system, "app/pom.xml");
+        (reader.is_ok(), schema_takes(&schema, &valid))
+    };
+    if let Err(err) = read(&document(
+        "pom.xml",
+        "app/pom.xml",
+        "lib/tools.jar",
+        "app/pom.xml",
+    )) {
+        panic!("{err}");
+    }
+    assert_eq!(
+        both("pom.xml", "app/pom.xml", "lib/tools.jar"),
+        (true, true)
+    );
+    let module_paths = [
+        "pom.xml",
+        "app/my pom.xml",
+        "../pom.xml",
+        "../../app/pom.xml",
+        "..",
+        "../",
+        "",
+        "/pom.xml",
+        "app/../pom.xml",
+        "../app/./pom.xml",
+        "./pom.xml",
+        "app//pom.xml",
+        "app/",
+        "C:/app/pom.xml",
+        "app\\pom.xml",
+        "app:x/pom.xml",
+        "../app/..",
+        ".../pom.xml",
+    ];
+    // The reader's limit is 4096 bytes, which the schema checks as
+    // characters: the same for an ASCII path.
+    let longest = format!("lib/{}", "x".repeat(4092));
+    let too_long = format!("lib/{}", "x".repeat(4093));
+    let system_paths = [
+        "lib/x.jar",
+        &longest,
+        &too_long,
+        "../lib/x.jar",
+        "/x.jar",
+        "lib//x.jar",
+        "lib/./x.jar",
+        "a:b",
+        "a\\b",
+        "lib/",
+        ".",
+    ];
+    // Every character where the reader's or the schema's verdict on a POM
+    // path changes, and the one before it; between two of them both stay
+    // as they were.
+    let raw: serde_json::Value =
+        serde_json::from_str(include_str!("../../schemas/raeva-lock.json")).expect("schema");
+    let pom_path = jsonschema::validator_for(&raw["$defs"]["pomPath"]).expect("pomPath");
+    let verdicts = |c: char| {
+        let path = format!("../app/{c}pom.xml");
+        (
+            rv_maven_types::is_terminal_safe(&path),
+            pom_path.is_valid(&serde_json::Value::String(path)),
+        )
+    };
+    let mut characters = vec!['a'];
+    let mut last = verdicts('\0');
+    for c in ('\0'..=char::MAX).skip(1) {
+        let now = verdicts(c);
+        if now != last {
+            characters.extend(char::from_u32(c as u32 - 1));
+            characters.push(c);
+            last = now;
+        }
+    }
+    let mut mismatches = Vec::new();
+    let mut check = |what: String, module: &str, workspace: &str, system: &str| {
+        let (reader, schema) = both(module, workspace, system);
+        if reader != schema {
+            mismatches.push(format!("{what}: reader {reader}, schema {schema}"));
+        }
+    };
+    // The root module's path, which no other row may share, and an empty
+    // workspace column, which names no module, are no cases of their own.
+    let (root, module, system) = ("main/pom.xml", "app/pom.xml", "lib/tools.jar");
+    for path in module_paths {
+        check(format!("module {path:?}"), path, module, system);
+        if !path.is_empty() {
+            check(format!("workspace {path:?}"), root, path, system);
+        }
+    }
+    for path in system_paths {
+        check(format!("system {path:?}"), root, module, path);
+    }
+    for c in characters {
+        let path = format!("../app/{c}pom.xml");
+        check(format!("module {c:?}"), &path, module, system);
+        check(format!("workspace {c:?}"), root, &path, system);
+        check(
+            format!("system {c:?}"),
+            root,
+            module,
+            &format!("lib/{c}x.jar"),
+        );
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
 #[test]
@@ -414,7 +589,7 @@ fn hostile_values_are_refused_without_echoing_control_characters() {
         "maven2/\tcentral\"" => "maven2/\tcen{ESC}tral\"", "";
         "config_hash = \"" => "config_hash = \"{ESC}", "";
         r#"["env.CI"]"# => r#"["env.A\u0007"]"#, "";
-        r#"["env.CI"]"# => r#"["java.vendor"]"#, "";
+        r#"["env.CI"]"# => r#"["java.vm.vendor"]"#, "";
         r#"["env.CI"]"# => r#"["env.1"]"#, "";
         r#"["env.CI"]"# => r#"["jdk:[17,)"]"#, "";
         r#"["env.CI"]"# => r#"["property:os.name is true"]"#, "";
@@ -1226,6 +1401,36 @@ fn managed_sources_round_trip_and_are_strict() {
     }
 }
 
+/// A module's optional packages read back as written, and a line that
+/// does not name packages in ascending order is refused.
+#[test]
+fn optional_packages_round_trip_and_are_strict() {
+    let base = every_field_lock();
+    let with = |optional: &str| {
+        base.replace(
+            "edges = \"0 1 system\"",
+            &format!("edges = \"0 1 system\"\noptional = \"{optional}\""),
+        )
+    };
+    let lock = read(&with("1")).unwrap();
+    let packages = &lock.platforms[0].modules[0].packages;
+    assert_eq!(
+        packages
+            .iter()
+            .map(|package| package.optional)
+            .collect::<Vec<_>>(),
+        [false, true]
+    );
+    let text = lock.to_toml().unwrap();
+    assert!(text.contains("\noptional = \"1\"\n"), "{text}");
+    assert_eq!(read(&text).unwrap().to_toml().unwrap(), text);
+    assert!(!read(&base).unwrap().to_toml().unwrap().contains("optional"));
+    for optional in ["", "2", "1 0", "0 0", "0  1", "+1", "01", " 0", "x"] {
+        let err = read(&with(optional)).unwrap_err().to_string();
+        assert!(err.contains("ascending"), "{optional:?}: {err}");
+    }
+}
+
 /// A module's evicted ranges read back as written, sorted and checked in
 /// the lock's Maven order, and a malformed line is refused.
 #[test]
@@ -1454,4 +1659,215 @@ fn parent_range_evidence_is_checked_and_controls_shared_graphs_and_drift() {
     let decoded: toml::Value = toml::from_str(&text).unwrap();
     assert_eq!(decoded["platforms"].as_array().unwrap().len(), 2);
     assert_eq!(read(&text).unwrap().to_toml().unwrap(), text);
+}
+
+/// The schema takes a scope Maven does not know, in an edge and in either
+/// scope column of a package, exactly when [`Lockfile::read`] does,
+/// percent-encoded whitespace among them.
+#[test]
+fn the_schema_takes_the_scopes_the_reader_takes() {
+    let schema = schema();
+    let base: toml::Value = toml::from_str(&every_field_lock()).expect("base lock");
+    let document = |edge: &str, direct: &str, resolved: &str| {
+        let mut document = base.clone();
+        let row = &mut document["platforms"][0]["modules"][0];
+        row["edges"] = format!("0 1 {edge}").into();
+        row["packages"] = format!(
+            "com.example:alpha:1.0-SNAPSHOT\tjar:tests\t{direct}\t{resolved}\n\
+             com.sun:tools:1.8\tjar\tsystem\t\t\t\tlib/tools.jar\t{}",
+            "a".repeat(64)
+        )
+        .into();
+        toml::to_string(&document).expect("TOML")
+    };
+    // The 255-character bound is on the scope as written, before encoding.
+    let nbsp = format!("x%C2%A0{}", "y".repeat(253));
+    let long = format!("{}%20", "x".repeat(254));
+    let longer = format!("{}%20", "x".repeat(255));
+    let percents = "%25".repeat(255);
+    let more_percents = "%25".repeat(256);
+    let scopes = [
+        "foo:bar",
+        "provided,%20test",
+        "%20compile%20",
+        "100%25",
+        "a%C2%A0b",
+        "a%E2%80%8Ab",
+        "a%E3%80%80b",
+        &nbsp,
+        &long,
+        &longer,
+        &percents,
+        &more_percents,
+        "50%",
+        "%2",
+        "%63ompile",
+        "a%2fb",
+        "a%2Fb",
+        "a%c2%a0b",
+        "tab%09here",
+        "a%C2%85b",
+        "a%E2%80%8Bb",
+        "a%E2%80%A8b",
+        "%FF",
+        "a b",
+    ];
+    for scope in scopes {
+        for (edge, direct, resolved) in [
+            (scope, "compile", "test"),
+            ("system", scope, ""),
+            ("system", "compile", scope),
+        ] {
+            let raw = document(edge, direct, resolved);
+            assert_eq!(
+                read(&raw).is_ok(),
+                schema_takes(&schema, &raw),
+                "{edge:?} {direct:?} {resolved:?}"
+            );
+        }
+    }
+    for scope in [
+        "provided,%20test",
+        "100%25",
+        "a%C2%A0b",
+        &nbsp,
+        &long,
+        &percents,
+    ] {
+        let raw = document(scope, "compile", "test");
+        assert!(
+            read(&raw).is_ok() && schema_takes(&schema, &raw),
+            "{scope:?}"
+        );
+    }
+}
+
+/// The schema takes a package's type exactly when [`Lockfile::read`] does:
+/// any text a scope Maven does not know may be, with each whitespace
+/// character and `%` percent-encoded, as a build extension's handler may
+/// name any type.
+#[test]
+fn the_schema_takes_the_types_the_reader_takes() {
+    let schema = schema();
+    let base: toml::Value = toml::from_str(&every_field_lock()).expect("base lock");
+    let document = |type_: &str| {
+        let mut document = base.clone();
+        let row = &mut document["platforms"][0]["modules"][0];
+        row["packages"] = format!(
+            "com.example:alpha:1.0-SNAPSHOT\tjar:tests\tcompile\t\t{type_}\n\
+             com.sun:tools:1.8\tjar\tsystem\t\t\t\tlib/tools.jar\t{}",
+            "a".repeat(64)
+        )
+        .into();
+        toml::to_string(&document).expect("TOML")
+    };
+    let long = "x".repeat(255);
+    let longer = "x".repeat(256);
+    let read_back = [
+        ("my%20type", "my type"),
+        ("a:b", "a:b"),
+        ("é", "é"),
+        ("50%25", "50%"),
+        ("test-jar", "test-jar"),
+        (&long, &long),
+    ];
+    for (written, type_) in read_back {
+        let raw = document(written);
+        let lock = read(&raw).expect(written);
+        let package = &lock.platforms[0].modules[0].packages[0];
+        assert_eq!(package.type_.as_deref(), Some(type_), "{written:?}");
+        assert!(schema_takes(&schema, &raw), "{written:?}");
+        let again: toml::Value = toml::from_str(&lock.to_toml().unwrap()).expect("TOML");
+        let line = again["platforms"][0]["modules"][0]["packages"]
+            .as_str()
+            .map(str::lines);
+        let first = line.and_then(|mut lines| lines.next()).unwrap_or_default();
+        assert!(
+            first.ends_with(&format!("\t{written}")),
+            "{written:?}: {first:?}"
+        );
+    }
+    for type_ in [
+        "my type",
+        "50%",
+        "%6Dy",
+        "tab%09here",
+        "a%E2%80%8Bb",
+        "?",
+        &longer,
+    ] {
+        let raw = document(type_);
+        assert!(read(&raw).is_err(), "{type_:?}");
+        assert!(!schema_takes(&schema, &raw), "{type_:?}");
+    }
+    // The schema cannot compare columns: only the reader refuses a type
+    // that is the extension.
+    assert!(read(&document("jar")).is_err());
+}
+
+/// The schema takes the repository ids in `metadata.repo_ids` and a
+/// target's `repo_ids` exactly when [`Lockfile::read`] does: no control or
+/// invisible character, also above U+FFFF.
+#[test]
+fn the_schema_takes_the_repo_ids_the_reader_takes() {
+    let schema = schema();
+    let base: toml::Value = toml::from_str(&every_field_lock()).expect("base lock");
+    for (id, taken) in [
+        ("central", true),
+        ("cen tral", true),
+        ("central\u{e0100}", false),
+        ("cen\u{200b}tral", false),
+        ("cen\u{1b}tral", false),
+    ] {
+        let mut document = base.clone();
+        document["metadata"]["repo_ids"] =
+            format!("https://other.example/\t{id}\nhttps://repo.example/maven2/\tcentral").into();
+        let raw = toml::to_string(&document).expect("TOML");
+        assert_eq!(read(&raw).is_ok(), taken, "{id:?}");
+        assert_eq!(schema_takes(&schema, &raw), taken, "{id:?}");
+        if !taken {
+            let mut document = base.clone();
+            let lines =
+                format!("https://repo.example/maven2/\tcentral\nhttps://other.example/\t{id}");
+            let target = document["inputs"][0].as_table_mut().expect("target");
+            target.insert("repo_ids".into(), lines.into());
+            let raw = toml::to_string(&document).expect("TOML");
+            assert!(read(&raw).is_err(), "{id:?}");
+            assert!(!schema_takes(&schema, &raw), "target {id:?}");
+        }
+    }
+}
+
+/// The schema takes a plugin set's coordinate exactly when
+/// [`Lockfile::read`] does: no control or invisible character, also above
+/// U+FFFF.
+#[test]
+fn the_schema_takes_the_plugin_coordinates_the_reader_takes() {
+    let schema = schema();
+    let base: toml::Value = toml::from_str(&every_field_lock()).expect("base lock");
+    for (coordinate, taken) in [
+        ("g:p:1", true),
+        ("g:p:1\u{e0100}", false),
+        ("g:p\u{200b}:1", false),
+        ("g:p\u{1b}:1", false),
+    ] {
+        let mut document = base.clone();
+        let mut plugins: toml::Value = toml::from_str(&format!(
+            "inputs = \"{MODEL_HASH}\"\n[[sets]]\nkey = \"sha256:{MODEL_HASH}\"\n\
+             role = \"plugin\""
+        ))
+        .expect("plugins");
+        let set = plugins["sets"][0].as_table_mut().expect("set");
+        set.insert("coordinates".into(), vec![coordinate].into());
+        let platform = document["platforms"][0].as_table_mut().expect("platform");
+        platform.insert("plugins".into(), plugins);
+        let raw = toml::to_string(&document).expect("TOML");
+        assert_eq!(
+            read(&raw).is_ok(),
+            taken,
+            "{coordinate:?}: {:?}",
+            read(&raw).err()
+        );
+        assert_eq!(schema_takes(&schema, &raw), taken, "{coordinate:?}");
+    }
 }

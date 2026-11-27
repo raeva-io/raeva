@@ -65,15 +65,22 @@ Known differences:
   for every module that uses it, or, where one module finds no POM,
   resolve as Maven 3.10. Plugin locking compares the plugins' reads too,
   as below.
+- Maven 3.9.12 and 3.10.0 read a parent or an imported BOM once for the
+  whole build, and the first module to read it decides the bytes every
+  other module gets, also one whose repositories serve other bytes or do
+  not include the one that served it. The project builds read first, in
+  the reactor order, then the dependency graphs, in the order Maven sorts
+  the modules. Raeva locks the same copy for every module, with the
+  repository that served it. A build with `-T` or `-pl` can read the other
+  copy first.
 - Maven 3.10 reads each module's POM of an artifact from that module's
   repositories. Raeva's 3.10 mode locks a module that finds no POM beside
   one that finds a POM, also one with dependencies, and the export labels
   the POM with the repositories that served it, so `mvn -o` reads it only
   for the modules that read it online. When two modules read different
-  bytes for one POM, as a dependency, a parent, an imported BOM or a
-  version that loses mediation, raeva refuses in either mode (exit 5),
-  naming the coordinate and the modules, though Maven 3.10.0 builds such a
-  project: raeva.lock pins one file for each POM path, as a local
+  bytes for one POM, as a dependency or a version that loses mediation,
+  raeva refuses in either mode (exit 5), naming the coordinate and the
+  modules, though Maven 3.10.0 builds such a project: raeva.lock pins one file for each POM path, as a local
   repository holds one. Declare the repository that serves the POM for
   every module that uses it. One exception ends in exit 3
   (`LOCKFILE_INVALID`) without naming the modules: a SNAPSHOT support POM
@@ -114,12 +121,12 @@ Known differences:
   is conservative there. Declare a repository that serves the POM, or
   resolve as Maven 3.10, which reads each module's and plugin's POMs
   apart.
-- Raeva reads a local `<relativePath>` parent only inside the project
-  directory or, when the project is a single module, inside the directory
-  that holds it, such as `../parent/pom.xml`, after resolving symlinks, and
-  only when its coordinates match the declared parent. Such a parent's
-  properties and repositories count as the project's own, so keep an
-  untrusted single-module checkout in a directory of its own. Maven reads
+- Raeva reads a local `<relativePath>` parent only inside the directory
+  that holds the project, such as `../pom.xml` or `../parent/pom.xml`,
+  after resolving symlinks, and only when its coordinates match the
+  declared parent. Such a parent's properties and repositories count as
+  the project's own, so keep an untrusted checkout in a directory of its
+  own. Maven reads
   the parent wherever the path points. Run raeva from a directory that
   contains the parent, or publish the parent to a repository.
 - During resolution, Maven moves on to the next repository after any failed

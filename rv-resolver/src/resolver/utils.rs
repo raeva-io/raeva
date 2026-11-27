@@ -53,7 +53,7 @@ pub(super) async fn fetch_artifact_from_repos(
     artifact_req: &ArtifactRequest,
     key: &ArtifactCoord,
     repos: &[Repository],
-) -> std::result::Result<(BlobId, rv_store::Origin), FetchError> {
+) -> std::result::Result<(BlobId, rv_store::Origin, Option<String>), FetchError> {
     let mut fallback = rv_repo::RepositoryFallback::default();
     let mut last_error: Option<RepoError> = None;
     let mut searched: Vec<RepoSearchStatus> = Vec::with_capacity(repos.len());
@@ -74,10 +74,10 @@ pub(super) async fn fetch_artifact_from_repos(
                     err: err.into(),
                     searched: std::mem::take(&mut searched),
                 })?;
-            if let Some(found) = served {
+            if let Some((blob, origin)) = served {
                 let endpoint = client.effective_repository(repo);
                 fallback.served(&endpoint, artifact_req, artifact_req.to_path());
-                return Ok(found);
+                return Ok((blob, origin, endpoint.id));
             }
         }
         match client
@@ -85,18 +85,15 @@ pub(super) async fn fetch_artifact_from_repos(
             .await
         {
             Ok(fetched) => {
-                fallback.served(
-                    &client.effective_repository(repo),
-                    artifact_req,
-                    fetched.path,
-                );
+                let endpoint = client.effective_repository(repo);
+                fallback.served(&endpoint, artifact_req, fetched.path);
                 let origin = rv_store::Origin {
                     repo_url: repo.url.clone(),
                     endpoint_url: fetched.served_by,
                     checksum_verified: fetched.checksum_verified,
                     served: true,
                 };
-                return Ok((fetched.blob, origin));
+                return Ok((fetched.blob, origin, endpoint.id));
             }
             Err(err) => {
                 fallback.failed(&client.effective_repository(repo), &err);
@@ -295,8 +292,10 @@ pub(super) fn build_lock_data(
         if node.local || node.workspace_module.is_some() {
             packages.push(ResolvedPackage {
                 coordinate,
+                type_: node.type_.clone(),
                 direct_scope,
                 scope,
+                optional: node.optional,
                 workspace_module: node.workspace_module.clone(),
                 system_path: node.system_path.clone(),
                 managed: node.version_origin.0.clone(),
@@ -337,8 +336,10 @@ pub(super) fn build_lock_data(
         let pom_base = pom_origin.base && snapshot.is_some();
         packages.push(ResolvedPackage {
             coordinate,
+            type_: node.type_.clone(),
             direct_scope,
             scope,
+            optional: node.optional,
             workspace_module: None,
             system_path: None,
             managed: node.version_origin.0.clone(),
@@ -525,12 +526,14 @@ mod tests {
         let refusal = || RepoError::Unauthorized {
             status: reqwest::StatusCode::UNAUTHORIZED,
             url: "https://private.example/".to_string(),
+            redirected_to: None,
             sent: None,
         };
         for auth_first in [true, false] {
             let hard = RepoError::HttpStatus {
                 status: reqwest::StatusCode::BAD_GATEWAY,
                 url: "https://broken.example/".to_string(),
+                redirected_to: None,
                 retry_after: None,
             };
             let errors = if auth_first {
@@ -572,7 +575,9 @@ mod tests {
     fn node(artifact_id: &str, version: &str) -> Node {
         Node {
             coord: Coord::parse(&format!("com.example:{artifact_id}:{version}")).unwrap(),
+            type_: None,
             scope: Scope::Compile,
+            optional: false,
             repo_url: Some(std::sync::Arc::from("https://central.example/")),
             build_repo: None,
             repos: crate::context::RepoContext::default(),

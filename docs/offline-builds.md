@@ -118,7 +118,10 @@ Maven 3.9.12, or 3.10.0 under `[lock] maven = "3.10"`, reads to run the
 build: the plugins the POMs and the packaging's lifecycle bind,
 their dependencies, the Surefire and Failsafe test providers, the
 annotation processor paths, build extensions and `.mvn/extensions.xml`,
-with every POM Maven reads to collect them. They go in the plugin tables
+with every POM Maven reads to collect them. A processor path the reactor
+builds brings in its POM's dependencies, collected as the compiler
+plugin's version collects them: from 3.11 without the module's dependency
+management, so their versions can differ from the module's own. They go in the plugin tables
 of `raeva.lock`, which record the inputs they were resolved from.
 `raeva sync --frozen` refuses tables that a resolution of the same inputs
 does not give. A plain `raeva sync` keeps the tables without resolving
@@ -564,6 +567,26 @@ by name in its own `<modules>`, with no `raeva.lock` or `raeva.toml` there,
 `raeva sync` without `-C` refuses and names the root;
 `raeva -C . sync` locks that module on its own.
 
+A module may sit beside the reactor root, as `<module>../model</module>`
+declares one in a build-helper layout, and is locked as Maven builds it,
+while `raeva.lock`, `raeva.toml` and `.mvn` stay in the directory raeva runs
+in. `raeva.lock` records each module's POM path relative to its own
+directory: `pom.xml` for the root, `../model/pom.xml` for that module. Only
+leading `..` parts are allowed, and nothing absolute or on another drive.
+Such a module must sit below the directory its `..` parts reach, not
+somewhere else through a symbolic link. A local `<relativePath>` parent is
+still read at most one level above the reactor root. raeva.lock records
+system files only inside the directory raeva runs in, so a module beside
+the root that depends on a system-scoped file of its own is refused. A
+`<file>` activation of such a module is not listed among the lock's host
+inputs; a sync still resolves it again and sees a profile it changes.
+
+No command reads a file by a module path from `raeva.lock`. `--frozen`,
+`tree`, `why`, `sbom`, `vuln`, `lock verify`, `lock diff`, `export-m2` and
+`export-checksums` compare the lock's paths with the modules found on disk,
+or only show them, so a `raeva.lock` edited to name a POM elsewhere reads
+nothing there.
+
 ### Frozen checks
 
 `raeva sync --frozen` checks configuration and the POMs against the lock,
@@ -671,7 +694,7 @@ check.
 
 ### Lockfile schema
 
-`raeva.lock` is schema 9
+`raeva.lock` is schema 10
 ([`schemas/raeva-lock.json`](../schemas/raeva-lock.json)). Every artifact
 row pins its `.pom`, and each platform pins the bytes, origin and SNAPSHOT
 build of every parent and BOM from a repository that its modules'
@@ -681,8 +704,16 @@ dependency edges one per line, which keeps a large reactor's lock small
 and fast to read. A package line gives the scope the module declares it
 with and the scope it resolves to, as written when Maven does not know the
 scope, and `?` for the empty scope Maven gives a package reached only in
-scopes it does not know. An edge line is `from to scope`, then `optional`
-for an optional dependency. A module that resolves a dependency type
+scopes it does not know. It names the file by its extension, which the
+artifact rows and `raeva export-m2` use, and also gives the Maven type the
+package was declared with when that is not the extension: `jar:tests` and
+`test-jar`, or `war` and `executable-war`. `raeva tree`, `raeva why` and
+the purls of `raeva sbom` and `raeva vuln` name the type, as
+`mvn dependency:list` and the CycloneDX Maven plugin do. An edge line is `from to scope`, then `optional`
+for an optional dependency. A module's `optional` line lists the packages
+Maven resolves as optional: a dependency the module declares
+`<optional>true</optional>`, in its POM or a parent, and one reached only
+below such a dependency. A module that resolves a dependency type
 Maven's core does not define, such as Jenkins' `executable-war`, reads the
 type's handler from every jar Maven loads for each of its build extensions:
 the extension's own and those of its dependencies, but the ones Maven's core

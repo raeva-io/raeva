@@ -671,3 +671,72 @@ fn a_nested_parent_or_import_the_filter_keeps_out_names_the_filter() {
     );
     assert_eq!(import["exit_code"], 5, "{import}");
 }
+
+/// Modules `a` and `b` declare one server under the ids `full` and `poms`,
+/// and the prefixes filter lets `poms` serve `x`'s POM, not its jar. `a`
+/// resolves `x` first; `b` must not take `a`'s jar for the server's URL, as
+/// its own filter keeps the jar from it and no other repository of `b`'s
+/// has it: Maven fails `b` the same way.
+#[test]
+fn a_module_takes_no_file_its_filter_keeps_from_a_repository_of_that_url() {
+    let base = TempDir::new().unwrap();
+    let served = base.path().join("served");
+    publish(&served, "org.ex", "x");
+    let server = file_server(&served);
+    let empty = file_server(&base.path().join("empty"));
+    let project = base.path().join("project");
+    let home = TempDir::new().unwrap();
+    fs::create_dir_all(project.join(".mvn/rrf")).unwrap();
+    fs::write(
+        project.join(".mvn/maven.config"),
+        "-Daether.remoteRepositoryFilter.prefixes=true\n\
+         -Daether.remoteRepositoryFilter.prefixes.basedir=${session.rootDirectory}/.mvn/rrf/\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join(".mvn/rrf/prefixes-poms.txt"),
+        "## repository-prefixes/2.0\n/org/ex/x/1.0/x-1.0.pom\n",
+    )
+    .unwrap();
+    fs::create_dir_all(home.path().join(".m2")).unwrap();
+    fs::write(
+        home.path().join(".m2/settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>none</id><mirrorOf>central</mirrorOf>\
+             <url>{}</url></mirror></mirrors></settings>",
+            url(&empty)
+        ),
+    )
+    .unwrap();
+    let module = |name: &str, id: &str| {
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>org.ex</groupId>\
+             <artifactId>root</artifactId><version>1</version></parent>\
+             <artifactId>{name}</artifactId><repositories><repository><id>{id}</id>\
+             <url>{}</url></repository></repositories><dependencies><dependency>\
+             <groupId>org.ex</groupId><artifactId>x</artifactId><version>1.0</version>\
+             </dependency></dependencies></project>",
+            url(&server)
+        )
+    };
+    for (path, text) in [
+        (
+            "pom.xml",
+            "<project><modelVersion>4.0.0</modelVersion><groupId>org.ex</groupId>\
+             <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules><module>a</module><module>b</module></modules></project>"
+                .to_string(),
+        ),
+        ("a/pom.xml", module("a", "full")),
+        ("b/pom.xml", module("b", "poms")),
+    ] {
+        let path = project.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    let output = run_raeva(&project, home.path(), &["sync"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("org.ex:x:1.0"), "{stderr}");
+    assert!(stderr.contains("b/pom.xml"), "{stderr}");
+}

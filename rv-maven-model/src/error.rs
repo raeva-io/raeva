@@ -14,7 +14,7 @@ pub enum PomError {
     Deserialize(#[from] quick_xml::de::DeError),
     /// The XML declaration names an encoding raeva does not decode.
     #[error(
-        "the POM declares encoding {}, which raeva does not read; raeva reads UTF-8, UTF-16, ISO-8859-1, US-ASCII and windows-1252",
+        "the POM declares encoding {}, which raeva does not read; raeva reads UTF-8, UTF-16, ISO-8859-1, ISO-8859-15, US-ASCII and windows-1252",
         bounded(.0)
     )]
     UnsupportedEncoding(String),
@@ -22,7 +22,7 @@ pub enum PomError {
     /// not decode, such as `IBM037`. Maven reads it in that encoding; raeva
     /// refuses it rather than reading other text.
     #[error(
-        "the POM is in EBCDIC, declared as {}, which raeva does not read; raeva reads UTF-8, UTF-16, ISO-8859-1, US-ASCII and windows-1252",
+        "the POM is in EBCDIC, declared as {}, which raeva does not read; raeva reads UTF-8, UTF-16, ISO-8859-1, ISO-8859-15, US-ASCII and windows-1252",
         bounded(.0)
     )]
     Ebcdic(String),
@@ -140,10 +140,29 @@ pub enum PomError {
     /// for the unexpanded text, which names no published POM.
     #[error(
         "parent {} cannot be resolved: no POM at its relativePath declares these coordinates as \
-         written, and Maven does not expand properties in <parent> before looking it up",
+         written, and Maven does not expand properties in <parent> before looking it up; write \
+         them as the parent POM declares its own",
         bounded(.0)
     )]
     ParentExpression(String),
+    /// A [`PomError::ParentExpression`] whose `<relativePath>` names a POM
+    /// more than one directory above the project root, which raeva does not
+    /// read.
+    #[error(
+        "parent {} cannot be resolved: its relativePath names {}, more than one directory above \
+         the project, where raeva reads no parent, and Maven does not expand properties in \
+         <parent> to look it up in a repository; run raeva from a directory at most one level \
+         below that POM",
+        bounded(.parent),
+        bounded(.path)
+    )]
+    ParentBeyondProject {
+        /// The `<parent>` coordinates as written.
+        parent: String,
+        /// The existing POM the `<relativePath>` names, in its resolved
+        /// directory.
+        path: String,
+    },
     /// A [`PomError::ParentExpression`] in a POM fetched from a repository,
     /// which `pom` names. Like a missing parent, it fails a dependency's
     /// model, where most model errors only make it an invalid descriptor.

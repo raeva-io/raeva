@@ -463,7 +463,7 @@ impl<'r> Planner<'r> {
         root: Option<&ActivationContext>,
     ) -> Result<(PlannedModule, BTreeSet<HostInput>)> {
         let invalid = |error: rv_maven_model::PomError| {
-            let path = self.workspace.root().join(pom_path);
+            let path = self.workspace.module_file(pom_path);
             super::super::project_model_error(error.into(), &path)
         };
         let mut model = project.plugins().map_err(invalid)?.ok_or_else(|| {
@@ -811,9 +811,11 @@ impl<'r> Planner<'r> {
                     if !planned.built_in_reactor.contains(&key) {
                         planned.built_in_reactor.push(key);
                     }
-                    // Before 3.9.0 the legacy request is rooted at the first
-                    // path, whose POM's dependencies come in beside it.
-                    if index > 0 || !below("3.9.0") {
+                    // Its POM's dependencies come in beside it, collected as
+                    // the path's version collects them, not as the module's
+                    // graph: before 3.9.0 only the first path's, at the root
+                    // of the legacy request.
+                    if index > 0 && below("3.9.0") {
                         continue;
                     }
                 }

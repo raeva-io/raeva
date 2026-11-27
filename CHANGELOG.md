@@ -5,6 +5,107 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-11-26
+
+`raeva.lock` is schema 10. After you upgrade, run `raeva sync` once and
+commit `raeva.lock` in the same pull request as the version bump. Until
+then, `raeva sync --frozen` refuses the schema 9 lock (exit 3) and says to
+run `raeva sync`. `raeva vuln --baseline` cannot read a schema 9 base lock
+either (exit 3), so on that pull request run `raeva vuln` without
+`--baseline`.
+
+### Fixed
+
+- A cold `raeva sync` could hang when a module's dependency check failed
+  while a build extension's dependencies waited to download
+  (alibaba/canal).
+- `-itr` in `.mvn/maven.config` is read, not refused, so Quarkus can be
+  locked.
+- A POM that declares ISO-8859-15 is read, as Maven reads it. raeva
+  refused it, which stopped projects on Netflix's ribbon, zuul or rxnetty.
+- A JitPack branch snapshot such as `main-SNAPSHOT` resolves to the build
+  Maven takes, instead of failing with "missing snapshot version data".
+- raeva raises its soft limit on open files toward the hard limit, as the
+  JVM does for Maven. At macOS's default of 256, syncs of
+  kubernetes-client/java and others failed with "Too many open files".
+- A repository that redirects to a URL with userinfo, as GitHub Packages
+  does, works as in Maven: the userinfo goes as Basic auth to that origin
+  alone. raeva put it into the request, and GitHub reset the stream.
+- A reactor whose root lists sibling modules, such as re3gistry's
+  `<module>../Re3gistry2Model</module>`, is read as Maven reads it, and
+  their paths in `raeva.lock` start with `../`.
+- A project with several modules reads its parent at `../pom.xml`, as
+  Maven does (dataease). raeva still reads no local parent more than one
+  directory above the reactor root.
+- The lock, `tree`, `why`, `lock diff` and the purls of `sbom` and `vuln`
+  name a dependency's declared type where it differs from the file
+  extension, as `mvn dependency:list` does: a test-jar shows as
+  `test-jar:tests`, not `jar:tests`.
+  A reactor module's own purl keeps its packaging.
+- A scope with whitespace, as manifold's `<scope>provided, test</scope>`,
+  is kept as written with Maven's warning; raeva refused the project.
+- A SNAPSHOT without version metadata, such as the JPMS Attic's
+  `checker-qual:3.43.0-SNAPSHOT`, resolves to its plain `-SNAPSHOT` files,
+  as Maven does.
+- A jar's SHA-1 from a response header, such as `X-Checksum-SHA1`, that
+  matches the bytes is used whatever the checksum files say, as in Maven.
+  Central's stale checksum files for `com.anji-plus:captcha:1.4.0`
+  stopped pig.
+- A file whose `.sha256` is wrong while its `.sha1`, else its `.md5`,
+  from the same repository matches is used with a `SHA256_FILE_MISMATCH`
+  warning, as Maven checks only those by default (maven.aliyun.com).
+  `raeva.lock` still pins the SHA-256. A `.sha256` answered with an error
+  counts as missing.
+- A `java.vendor` profile, such as CXF 3.x's `ibmjdk`, no longer stops the
+  sync. raeva reads the vendor from the JDK's `release` file and locks the
+  profile's outcome. On a JDK 8, or with no JDK, pass
+  `-Djava.vendor=<vendor>`.
+- `raeva sbom` writes the CycloneDX scope `optional`, not `required`, for
+  a component used outside tests only as an optional dependency, as the
+  CycloneDX Maven plugin does.
+- `[plugins] lock` locks what an `annotationProcessorPaths` entry built by
+  the reactor brings in, which raeva left out with maven-compiler-plugin
+  3.9.0 and later (Error Prone Support).
+- A parent or imported BOM that two repositories serve with different
+  bytes no longer stops the sync. As in Maven, the first module to read it
+  in Maven's order decides the copy every module gets (mapstruct).
+- In the Maven 3.9 mode, a dependency whose conflict group Maven sorts
+  ahead of a cycle that holds its parents is kept (dynamic-tp).
+
+### Changed
+
+- After a redirect, a status error never names the redirected path or
+  query. A 401 or 403 from a redirect target names that origin and says
+  whether the userinfo went to it.
+- An edited `raeva.lock` reaches fewer files outside the project: no
+  command reads a file by a module path from it, and the freshness check
+  skips a `<file>` path that leads out through a symbolic link.
+- `schemas/raeva-lock.json` follows the `raeva.lock` reader more closely on
+  paths and invisible characters.
+- A module no longer takes a file another module downloaded from the same
+  URL when its own repository filter keeps it from that repository. Within
+  one run, it also takes none downloaded under another repository id,
+  unless `raeva.lock` pins it.
+- An empty repository, mirror or auth `id` is refused, as Maven refuses
+  one.
+- `raeva export-m2` replaces a symbolic link where an artifact goes that
+  points elsewhere, without reading what it names.
+- A mismatch with a checksum file names the file, the checksum file and,
+  when it has one, the repository id, and says how to tell which is
+  wrong. It no
+  longer says to run again later (repo.osgeo.org's opendap 2.1). A missing
+  checksum file puts `--allow-missing-checksums` in the JSON error's
+  `hints`.
+- When two modules resolve a dependency with different bytes from two
+  repositories, the refusal (exit 5) names both.
+- A `<module>` whose path does not exist fails naming the entry and its
+  POM (onedev), and a BOM that no repository has fails with "BOM not found"
+  (gravitee).
+- In the Maven 3.9 mode, a dependency declared twice in a project POM gets
+  Maven's `DUPLICATE_DEPENDENCY` warning.
+- The library crates changed in ways that can break code using them, such
+  as new enum variants and fields; see docs.rs.
+
 ## [0.6.0] - 2026-11-23
 
 `raeva.lock` is now a lock you can review, build from, and not get past by
@@ -707,6 +808,7 @@ Initial public release.
 - TLS trust is delegated to the OS trust store on every platform via
   `rustls-tls-native-roots`.
 
+[0.6.1]: https://github.com/raeva-io/raeva/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/raeva-io/raeva/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/raeva-io/raeva/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/raeva-io/raeva/compare/v0.5.1...v0.5.2

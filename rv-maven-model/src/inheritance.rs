@@ -211,6 +211,8 @@ pub(crate) async fn apply_inheritance_tracked<S: ModelSource>(
     }
     if strict_310 {
         reject_310_raw_model(&pom)?;
+    } else if project_validation {
+        warn_39_duplicate_declarations(&pom);
     }
     let mut parent_ranges = std::collections::BTreeMap::new();
     let mut parents = Vec::new();
@@ -302,6 +304,8 @@ pub(crate) async fn apply_inheritance_tracked<S: ModelSource>(
                     reject_classified_imports(&parent_pom)?;
                     if strict_310 {
                         reject_310_raw_model(&parent_pom)?;
+                    } else {
+                        warn_39_duplicate_declarations(&parent_pom);
                     }
                 }
                 reject_incomplete_repositories(&parent_pom, Some(&parent))?;
@@ -1044,7 +1048,35 @@ fn reject_310_raw_model(pom: &Pom) -> Result<(), PomError> {
     if let Some(path) = pom.written_relative_path() {
         crate::project::reject_banned_characters("parent.relativePath", path, ":\"<>|?*")?;
     }
-    let unique = |prefix: &str, dependencies: &[Dependency]| {
+    match duplicate_declarations(pom).into_iter().next() {
+        Some(problem) => Err(PomError::InvalidModel(problem)),
+        None => Ok(()),
+    }
+}
+
+/// Maven 3.9's warnings, in its words, of the dependencies that the same
+/// POMs as [`reject_310_raw_model`] declare twice, each named with the POM.
+/// The warnings are kept once, so a parent each module reads warns once.
+fn warn_39_duplicate_declarations(pom: &Pom) {
+    let parent = pom.parent.as_ref();
+    let group_id = (pom.group_id.as_deref()).or(parent.map(|parent| parent.group_id.as_str()));
+    let version = (pom.version.as_deref()).or(parent.map(|parent| parent.version.as_str()));
+    for problem in duplicate_declarations(pom) {
+        tracing::warn!(
+            sec_code = "DUPLICATE_DEPENDENCY",
+            "{}:{}:{}: {problem}",
+            bounded(group_id.unwrap_or("?")),
+            bounded(pom.artifact_id.as_deref().unwrap_or("?")),
+            bounded(version.unwrap_or("?")),
+        );
+    }
+}
+
+/// Maven's message for each dependency or managed dependency that `pom`
+/// declares again, in its profiles too, in Maven's order.
+fn duplicate_declarations(pom: &Pom) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut unique = |prefix: &str, dependencies: &[Dependency]| {
         let mut seen: HashMap<String, &Dependency> = HashMap::default();
         for dependency in dependencies {
             let (group_id, artifact_id, type_, classifier) = dependency.maven_key();
@@ -1062,33 +1094,32 @@ fn reject_310_raw_model(pom: &Pom) -> Result<(), PomError> {
             } else {
                 format!("version {} vs {}", version(existing), version(dependency))
             };
-            return Err(PomError::InvalidModel(format!(
+            problems.push(format!(
                 "'{prefix}(groupId:artifactId:type:classifier)' must be unique: {} -> {message}",
                 bounded(&key)
-            )));
+            ));
         }
-        Ok(())
     };
     fn management(management: &Option<DependencyManagement>) -> &[Dependency] {
         (management.as_ref()).map_or(&[], |management| &management.dependencies)
     }
-    unique("dependencies.dependency.", &pom.dependencies)?;
+    unique("dependencies.dependency.", &pom.dependencies);
     unique(
         "dependencyManagement.dependencies.dependency.",
         management(&pom.dependency_management),
-    )?;
+    );
     for profile in &pom.profiles {
         let prefix = format!("profiles.profile[{}].", bounded(&profile.id));
         unique(
             &format!("{prefix}dependencies.dependency."),
             &profile.dependencies,
-        )?;
+        );
         unique(
             &format!("{prefix}dependencyManagement.dependencies.dependency."),
             management(&profile.dependency_management),
-        )?;
+        );
     }
-    Ok(())
+    problems
 }
 
 /// Maven 3.10's check, a warning in 3.9, that no plugin key appears twice

@@ -1,11 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::Path;
 
 use clap::Args;
 use rv_lock::LockModule;
 use rv_lock::Scope;
-use rv_maven_model::ArtifactTypes;
 use serde::Serialize;
 
 use crate::commands::module_selector::{LockModuleExt, ModuleSelector};
@@ -108,33 +106,12 @@ pub(crate) fn run(args: &TreeArgs, session: &Session) -> Result<Report> {
         .target
         .select(&lock, config.host().named_java_version())?;
     let selection = args.module.select(platform)?;
-    let lock_dir = config
-        .lock_path
-        .parent()
-        .map_or_else(|| config.project_root.clone(), Path::to_path_buf);
     let show_headers = selection.is_aggregate();
-    let mode = lock.maven;
-    // The store holds the extension jars whose handlers type a dependency.
-    let store = (selection.modules().iter())
-        .any(|module| !module.extensions.is_empty())
-        .then(|| rv_store::Store::open(&config.paths.store_dir).ok())
-        .flatten();
-    // A reactor's modules mostly pin the same jars, which are read once.
-    let mut read = std::collections::BTreeMap::new();
     let modules = selection
         .modules()
         .iter()
         .map(|module| {
             let mut tree = ModuleTree::new(module, args.scope)?;
-            let types = match &store {
-                Some(store) => (read.entry(&module.extensions))
-                    .or_insert_with(|| {
-                        rv_resolver::locked_artifact_types(store, mode, &module.extensions)
-                    })
-                    .clone(),
-                None => ArtifactTypes::core(mode),
-            };
-            tree.mark_declared_optional(&lock_dir, module, &types);
             if show_headers {
                 tree.header = Some(format!("Module: {}", module.display_label()));
             }
@@ -184,57 +161,6 @@ impl ModuleTree {
             header: None,
             data: build_dep_tree_data(module, scope_filter)?,
         })
-    }
-
-    /// Mark the direct dependencies the module's own POM declares
-    /// `<optional>true</optional>`, their types read with `types`. raeva.lock
-    /// records the flag on edges only, so a direct dependency has no edge to
-    /// carry it. A dependency the POM inherits from a parent, takes from a
-    /// profile, or names through a property is not matched, and a POM that
-    /// cannot be read marks nothing.
-    fn mark_declared_optional(
-        &mut self,
-        lock_dir: &Path,
-        module: &LockModule,
-        types: &ArtifactTypes,
-    ) {
-        let Ok(bytes) = rv_config::read_project_input(&lock_dir.join(&module.path)) else {
-            return;
-        };
-        let Ok(pom) =
-            rv_maven_model::decode_pom(&bytes).and_then(|text| rv_maven_model::Pom::parse(&text))
-        else {
-            return;
-        };
-        let declared: HashSet<(&str, &str, &str, Option<&str>)> = pom
-            .dependencies
-            .iter()
-            .filter(|dependency| {
-                dependency
-                    .optional
-                    .as_deref()
-                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
-            })
-            .map(|dependency| {
-                (
-                    dependency.group_id.trim(),
-                    dependency.artifact_id.trim(),
-                    dependency.effective_type_in(types),
-                    dependency.effective_classifier_in(types),
-                )
-            })
-            .collect();
-        for &root in &self.data.roots {
-            let coordinate = &module.packages[root].coordinate;
-            if declared.contains(&(
-                coordinate.group_id(),
-                coordinate.artifact_id(),
-                coordinate.extension(),
-                coordinate.classifier(),
-            )) {
-                self.data.declared_optional.insert(root);
-            }
-        }
     }
 }
 
@@ -290,9 +216,9 @@ struct TreeData {
     roots: Vec<usize>,
     /// The scope each package resolves to.
     scopes: Vec<Scope>,
-    /// Direct dependencies the module's POM declares optional; the flag
-    /// belongs to that declaration, not to other edges to the package.
-    declared_optional: HashSet<usize>,
+    /// Whether each package resolves as optional, which for a direct
+    /// dependency is its declaration's flag.
+    optional: Vec<bool>,
 }
 
 fn build_dep_tree_data(module: &LockModule, scope_filter: Option<Scope>) -> Result<TreeData> {
@@ -301,8 +227,8 @@ fn build_dep_tree_data(module: &LockModule, scope_filter: Option<Scope>) -> Resu
         .packages
         .iter()
         .map(|package| NodeInfo {
-            coordinate: package.coordinate.to_string(),
-            display: crate::commands::util::display_coordinate(&package.coordinate),
+            coordinate: crate::commands::util::package_coordinate(package),
+            display: crate::commands::util::display_coordinate(package),
             workspace_module: package.workspace_module.clone(),
             system: package.system_path.is_some(),
         })
@@ -354,7 +280,11 @@ fn build_dep_tree_data(module: &LockModule, scope_filter: Option<Scope>) -> Resu
         children,
         roots,
         scopes,
-        declared_optional: HashSet::new(),
+        optional: module
+            .packages
+            .iter()
+            .map(|package| package.optional)
+            .collect(),
     })
 }
 
@@ -484,7 +414,7 @@ impl<'a> Walk<'a> {
         let tree = self.tree;
         let info = &tree.nodes[node];
         let scope = tree.scopes[node];
-        let optional = edge.map_or(tree.declared_optional.contains(&node), |edge| edge.optional);
+        let optional = edge.map_or(tree.optional[node], |edge| edge.optional);
         let visit = self.visit(node, depth);
         let mut notes = vec![scope.to_string()];
         if optional {
@@ -559,7 +489,7 @@ impl<'a> Walk<'a> {
     fn json_node(&mut self, node: usize, depth: usize, edge: Option<&EdgeInfo>) -> JsonFrame<'a> {
         let tree = self.tree;
         let scope = tree.scopes[node];
-        let optional = edge.map_or(tree.declared_optional.contains(&node), |edge| edge.optional);
+        let optional = edge.map_or(tree.optional[node], |edge| edge.optional);
         let visit = self.visit(node, depth);
         let expanded = matches!(visit, Visit::Expand);
         let children: &'a [EdgeInfo] = if expanded {
@@ -784,45 +714,22 @@ mod tests {
         drop(deep);
     }
 
-    /// Only the declaration with the same type and classifier marks a direct
-    /// dependency optional, in a POM of any encoding Maven reads.
+    /// A direct dependency, which has no edge, shows the optionality
+    /// raeva.lock records for its package.
     #[test]
-    fn optional_is_matched_by_type_and_classifier() {
-        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\
-             <project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
-             <artifactId>app</artifactId><version>1</version><dependencies>\
-             <dependency><groupId>com.example</groupId><artifactId>lib</artifactId>\
-             <version>1</version></dependency>\
-             <dependency><groupId>com.example</groupId><artifactId>lib</artifactId>\
-             <version>1</version><type>test-jar</type><optional>true</optional></dependency>\
-             </dependencies></project>";
-        let utf16: Vec<u8> = (text.encode_utf16()).flat_map(u16::to_le_bytes).collect();
-        for bytes in [text.replace("UTF-16", "UTF-8").into_bytes(), utf16] {
-            optional_in_pom(&bytes);
-        }
-    }
-
-    fn optional_in_pom(bytes: &[u8]) {
-        let dir = tempfile::tempdir().expect("dir");
-        std::fs::write(dir.path().join("pom.xml"), bytes).expect("pom");
+    fn a_direct_dependency_shows_its_locked_optionality() {
         let mut module = LockModule::new(
             "pom.xml".to_string(),
             Gav::new("com.example", "app", "1"),
             "jar".to_string(),
         );
-        module.packages = vec![
-            package("lib", true, None),
-            LockModulePackage::new(
-                ArtifactCoord::new("com.example", "lib", "1", "jar", Some("tests")),
-                Some(rv_lock::Scope::Compile),
-            ),
-        ];
-        let mut tree = ModuleTree::new(&module, None).expect("tree");
-        tree.mark_declared_optional(
-            dir.path(),
-            &module,
-            &rv_maven_model::ArtifactTypes::default(),
+        let mut tests = LockModulePackage::new(
+            ArtifactCoord::new("com.example", "lib", "1", "jar", Some("tests")),
+            Some(rv_lock::Scope::Compile),
         );
+        tests.optional = true;
+        module.packages = vec![package("lib", true, None), tests];
+        let tree = ModuleTree::new(&module, None).expect("tree");
         assert_eq!(
             lines(&tree, None),
             [

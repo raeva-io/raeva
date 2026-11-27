@@ -2829,6 +2829,14 @@ impl Config {
             || crate::maven_config::sets_offline(self.inputs.maven_config.as_deref())
     }
 
+    /// Whether `.mvn/maven.config` holds `-itr`, with which Maven reads no
+    /// repository a dependency's or a plugin's POM declares, for its
+    /// dependencies or for its own parents and imports, whatever
+    /// `[security]` admits.
+    pub fn ignores_transitive_repositories(&self) -> bool {
+        crate::maven_config::ignores_transitive_repositories(self.inputs.maven_config.as_deref())
+    }
+
     /// The settings.xml `<pluginGroups>`.
     pub fn plugin_groups(&self) -> &[String] {
         self.settings
@@ -3747,6 +3755,17 @@ impl Config {
                     reads,
                 } = self.replay_lookup(&lookup, environment.detached());
                 let expanded = expanded.ok()?;
+                // Resolution records a `<file>` path that reads nothing but
+                // the POM properties the lookup holds as a file condition,
+                // so such a lookup is text an edited raeva.lock holds and
+                // its path is not tested.
+                if lookup.mode == LookupMode::File
+                    && !(reads.iter()).any(|name| {
+                        !lookup.properties.contains_key(name) || properties.is_external(name)
+                    })
+                {
+                    return None;
+                }
                 let system = ctx.activation_system_properties();
                 let read_values: BTreeMap<_, _> = reads
                     .into_iter()
@@ -7121,6 +7140,23 @@ mod tests {
         });
     }
 
+    /// An empty id would pick another credential than an omitted one while
+    /// caches keyed by id treat them alike, so neither file takes one.
+    #[test]
+    fn an_empty_id_is_refused() {
+        for toml in [
+            "[[repositories]]\nid = ''\nurl = 'https://repo.example/'",
+            "[[repositories]]\nid = ' '\nurl = 'https://repo.example/'",
+            "[[mirrors]]\nid = ''\nurl = 'https://mirror.example/'\nmirror_of = '*'",
+            "[[auth]]\nid = ''\ntoken = 't'",
+        ] {
+            let error = toml::from_str::<ConfigFile>(toml).expect_err(toml);
+            assert!(error.to_string().contains("an empty id"), "{error}");
+        }
+        let omitted = "[[repositories]]\nurl = 'https://repo.example/'\n[[auth]]\ntoken = 't'";
+        toml::from_str::<ConfigFile>(omitted).expect(omitted);
+    }
+
     #[test]
     fn unknown_and_removed_keys_are_rejected() {
         for toml in [
@@ -7816,6 +7852,38 @@ mod tests {
             fs::rename(project, &moved).unwrap();
             assert_eq!(present, value(&moved));
             assert!(!template.contains("private"));
+        });
+    }
+
+    /// A `<file>` lookup whose path no input of the run supplies, a literal
+    /// only an edited raeva.lock holds, is not tested: resolution records a
+    /// literal path as a file condition, never as a lookup.
+    #[test]
+    fn a_lookup_of_a_literal_path_tests_no_file() {
+        with_homes(|home, project| {
+            let outside = home.join("outside-marker");
+            let lookup = |expression: &str| {
+                crate::maven_config::PropertyLookup {
+                    expression: expression.into(),
+                    properties: [("alias".into(), outside.to_string_lossy().into_owned())].into(),
+                    file: Some(crate::maven_config::FileLookup {
+                        base_dir: Some(String::new()),
+                    }),
+                    default_packaging: None,
+                    source: rv_maven_model::PropertySource::User,
+                    mode: crate::maven_config::LookupMode::File,
+                    model: None,
+                }
+                .encode()
+            };
+            let config = Config::load(project).unwrap();
+            for template in [lookup(&outside.to_string_lossy()), lookup("${alias}")] {
+                let absent = config.user_property_lookup_value(&template);
+                fs::write(&outside, "x").unwrap();
+                let present = config.user_property_lookup_value(&template);
+                fs::remove_file(&outside).unwrap();
+                assert_eq!(absent, present, "{template}");
+            }
         });
     }
 

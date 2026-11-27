@@ -129,6 +129,7 @@ fn api_built_lock() -> Lockfile {
         {
             let mut legacy = package(coordinate("legacy", "0.1", None), None);
             legacy.scope = Scope::Runtime;
+            legacy.type_ = Some("ejb".to_string());
             legacy
         },
         package(

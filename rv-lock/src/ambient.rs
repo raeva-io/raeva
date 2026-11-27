@@ -7,7 +7,8 @@ use rv_maven_types::is_terminal_safe;
 
 /// A value from outside the project that a resolution read, or a
 /// condition on one it tested: the JDK version (`java.version`), the JDK
-/// home (`java.home`), an environment variable (`env.NAME`), a
+/// home (`java.home`), its vendor (`java.vendor`), an environment variable
+/// (`env.NAME`), a
 /// user-property lookup (`user-property:NAME`), a settings.xml profile
 /// property (`settings-property:NAME`), the Linux
 /// release os-maven-plugin reads (`os-release`), or a profile activation
@@ -30,6 +31,8 @@ pub enum AmbientInput {
     Env(String),
     /// `java.home`: the JDK home directory.
     JavaHome,
+    /// `java.vendor`: the JDK vendor.
+    JavaVendor,
     /// `java.version`: the JDK version.
     JavaVersion,
     /// `os-release`: the ID, VERSION_ID and ID_LIKE of the Linux release.
@@ -61,7 +64,8 @@ pub enum HostCondition {
     /// `jdk:SPEC`: a `<jdk>` condition, as interpolated.
     Jdk(String),
     /// `property:NAME` or `property:NAME=VALUE`: a `<property>` condition
-    /// on `java.version`, `java.home` or `env.NAME`, the name with its
+    /// on `java.version`, `java.home`, `java.vendor` or `env.NAME`, the name
+    /// with its
     /// `!`, and the expected value when it is not empty.
     Property {
         /// The property name, with a leading `!` when the POM negates it.
@@ -80,7 +84,8 @@ pub enum HostCondition {
     Settings(String),
 }
 
-/// A name that is not `java.version`, `java.home`, `env.NAME` with a valid
+/// A name that is not `java.version`, `java.home`, `java.vendor`, `env.NAME`
+/// with a valid
 /// variable name, or a valid condition. Holds the rejected text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -90,7 +95,8 @@ impl fmt::Display for InvalidAmbientInput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ambient input {} is not java.version, java.home, os-release, env.NAME with \
+            "ambient input {} is not java.version, java.home, java.vendor, os-release, \
+             env.NAME with \
              NAME made of ASCII letters, digits and '_', not starting with a digit, \
              user-property:NAME or user-override:NAME with a printable option name, \
              settings-property:NAME with NAME made of ASCII letters, digits, '.', '-' and '_', \
@@ -146,6 +152,17 @@ fn is_condition_text(text: &str) -> bool {
 /// Whether `path` is a relative path inside the project, in the form
 /// raeva.lock records it: `/`-separated names, none empty or `.`, where a
 /// `..` never climbs above the project.
+/// A lookup's POM directory as raeva.lock records it: empty for the lock's
+/// directory, else names relative to it with any `..` parts first.
+fn is_lookup_base(base: &str) -> bool {
+    let parts: Vec<&str> = base.split('/').collect();
+    let below = &parts[parts.iter().take_while(|part| **part == "..").count()..];
+    base.is_empty()
+        || (is_terminal_safe(base)
+            && !base.contains(['\\', ':'])
+            && below.iter().all(|part| !matches!(*part, "" | "." | "..")))
+}
+
 fn is_project_path(path: &str) -> bool {
     let mut depth = 0usize;
     is_condition_text(path)
@@ -314,7 +331,7 @@ impl AmbientInput {
         holds: bool,
     ) -> Result<Self, InvalidAmbientInput> {
         let property = name.strip_prefix('!').unwrap_or(name);
-        let host = matches!(property, "java.version" | "java.home")
+        let host = matches!(property, "java.version" | "java.home" | "java.vendor")
             || property.strip_prefix("env.").is_some_and(is_env_var_name);
         if host && value.is_none_or(is_condition_text) {
             Ok(Self::Condition {
@@ -392,6 +409,7 @@ impl AmbientInput {
         match self {
             Self::Env(name) => ["env.", name, "", "", "", ""],
             Self::JavaHome => ["java.home", "", "", "", "", ""],
+            Self::JavaVendor => ["java.vendor", "", "", "", "", ""],
             Self::JavaVersion => ["java.version", "", "", "", "", ""],
             Self::OsRelease => ["os-release", "", "", "", "", ""],
             Self::SettingsProperty(name) => ["settings-property:", name, "", "", "", ""],
@@ -463,6 +481,7 @@ impl FromStr for AmbientInput {
         let invalid = || InvalidAmbientInput(value.to_string());
         match value {
             "java.home" => return Ok(Self::JavaHome),
+            "java.vendor" => return Ok(Self::JavaVendor),
             "java.version" => return Ok(Self::JavaVersion),
             "os-release" => return Ok(Self::OsRelease),
             _ => {}
@@ -476,6 +495,19 @@ impl FromStr for AmbientInput {
         if let Some(template) = value.strip_prefix("user-property-lookup:") {
             return rv_config::maven_config::PropertyLookup::parse(template)
                 .filter(|_| is_terminal_safe(template))
+                .filter(|lookup| {
+                    let file = lookup
+                        .file
+                        .as_ref()
+                        .and_then(|file| file.base_dir.as_deref());
+                    let model = lookup
+                        .model
+                        .as_ref()
+                        .and_then(|model| model.base_dir.as_ref());
+                    file.into_iter()
+                        .chain(model.map(|base| base.to_str().unwrap_or("\\")))
+                        .all(is_lookup_base)
+                })
                 .map(|lookup| Self::UserPropertyLookup(lookup.encode()))
                 .ok_or_else(invalid);
         }
@@ -522,15 +554,27 @@ mod tests {
             rv_config::maven_config::PropertySource::User,
         );
         assert_eq!(input.to_string().parse::<AmbientInput>().unwrap(), input);
-        for base_dir in [None, Some("module".into())] {
-            let file = AmbientInput::file_lookup(
+        let file = |base_dir: Option<&str>| {
+            AmbientInput::file_lookup(
                 "${activation.path}",
                 &Default::default(),
-                base_dir,
+                base_dir.map(str::to_string),
                 None,
                 rv_config::maven_config::PropertySource::User,
-            );
+            )
+        };
+        for base_dir in [None, Some(""), Some("module"), Some("../app"), Some("..")] {
+            let file = file(base_dir);
             assert_eq!(file.to_string().parse::<AmbientInput>().unwrap(), file);
+        }
+        // A base raeva.lock names is relative to its directory, `..` first,
+        // as a module path is: joined to that directory, it stays there or
+        // climbs only by name.
+        for base_dir in [
+            "/etc", "C:/x", "C:x", "a/../b", "a/..", "..\\x", "./a", "a//b", "a/",
+        ] {
+            let text = file(Some(base_dir)).to_string();
+            assert!(text.parse::<AmbientInput>().is_err(), "{base_dir}");
         }
         assert!(
             "user-property-lookup:invalid"
@@ -548,6 +592,7 @@ mod tests {
             "file:a/../shared.txt is false",
             "file:mod b/is true is true",
             "java.home",
+            "java.vendor",
             "java.version",
             "jdk:1.8 is false",
             "jdk:[1.8, 11) is true",
@@ -556,6 +601,7 @@ mod tests {
             "property:!env.CI is true",
             "property:env.CI=yes=no is false",
             "property:java.home is true",
+            "property:java.vendor=IBM Corporation is false",
             "settings-property:a_b-1.2",
             "settings:0123456789abcdef is true",
         ];
@@ -577,14 +623,14 @@ mod tests {
             AmbientInput::file("mod b/is true", true).unwrap()
         );
         assert_eq!(
-            parsed[9],
+            parsed[10],
             AmbientInput::Condition {
                 condition: HostCondition::Jdk("x is true".to_string()),
                 holds: false,
             }
         );
         assert_eq!(
-            parsed[12],
+            parsed[13],
             AmbientInput::property("env.CI", Some("yes=no"), false).unwrap()
         );
         let widest = format!("jdk:{} is true", "\u{e9}".repeat(MAX_CONDITION_TEXT_LEN));
@@ -596,7 +642,7 @@ mod tests {
         let long = format!("jdk:{} is true", "1".repeat(MAX_CONDITION_TEXT_LEN + 1));
         for bad in [
             "",
-            "java.vendor",
+            "java.vm.vendor",
             "JAVA_HOME",
             "env.",
             "env.1A",

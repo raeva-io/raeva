@@ -460,7 +460,9 @@ pub(crate) fn class_code(class: ErrorClass) -> &'static str {
         ErrorClass::Network => "NETWORK",
         ErrorClass::Tls => "TLS",
         ErrorClass::Config => "REPOSITORY_CONFIG",
-        ErrorClass::Integrity(rv_repo::IntegritySource::Sidecar) => "INTEGRITY",
+        ErrorClass::Integrity(
+            rv_repo::IntegritySource::Sidecar | rv_repo::IntegritySource::Header,
+        ) => "INTEGRITY",
         ErrorClass::Integrity(rv_repo::IntegritySource::LockPin) => "LOCKFILE_MISMATCH",
         ErrorClass::NotFound => "NOT_FOUND",
         ErrorClass::Store => "STORE",
@@ -493,10 +495,12 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
         ResolveError::Store(source) => {
             Diagnostic::new(S::Failure, "STORE", report::render_store_error(source, env))
         }
-        ResolveError::FilteredModel { error, searched } => {
+        ResolveError::SearchedModel { error, searched } => {
             let mut diagnostic = diagnose_resolve(error, env);
             report::append_searched_section(&mut diagnostic.message, Some(searched));
-            diagnostic.hints.insert(0, report::FILTERED_HINT.to_string());
+            if (searched.iter()).any(|entry| entry.status == rv_resolver::RepoStatus::Filtered) {
+                diagnostic.hints.insert(0, report::FILTERED_HINT.to_string());
+            }
             diagnostic
         }
         ResolveError::MultipleArtifactErrors { first, rest } => {
@@ -523,7 +527,7 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
             );
             if let ResolveError::Pom(rv_maven_model::PomError::ParentNotFound(..)) = error.cause()
                 && !searched.is_empty()
-                && !names_filtered_model(error)
+                && !names_searched_model(error)
             {
                 diagnostic.message.push_str(
                     "\n  None of the repositories the plugin pass searched for this plugin has it:\n",
@@ -845,10 +849,10 @@ pub(crate) fn diagnose_resolve(err: &ResolveError, env: &HintEnv) -> Diagnostic 
 
 /// Whether `err` lists how the repositories answered for the parent or BOM
 /// it misses.
-fn names_filtered_model(err: &ResolveError) -> bool {
+fn names_searched_model(err: &ResolveError) -> bool {
     match err {
-        ResolveError::FilteredModel { .. } => true,
-        ResolveError::Declared { error, .. } => names_filtered_model(error),
+        ResolveError::SearchedModel { .. } => true,
+        ResolveError::Declared { error, .. } => names_searched_model(error),
         _ => false,
     }
 }
@@ -1227,7 +1231,12 @@ mod tests {
         let refused_with = |code, id: Option<&str>, sent| {
             let mut status = searched(code);
             let (id, url) = (id.map(s), s("https://repo.example/m2/"));
-            status.refused_by = Some(rv_resolver::CredentialTarget { id, url, sent });
+            status.refused_by = Some(rv_resolver::CredentialTarget {
+                id,
+                url,
+                sent,
+                redirect_target: false,
+            });
             status
         };
         let refused = |code, id| refused_with(code, id, None);
@@ -1252,6 +1261,7 @@ mod tests {
         let auth = |code| RepoError::Unauthorized {
             status: reqwest::StatusCode::from_u16(code).unwrap(),
             url: s("https://repo.example/m2/a.pom"),
+            redirected_to: None,
             sent: None,
         };
         let pom = |err| CliError::Resolve(ResolveError::Pom(err));
@@ -1346,6 +1356,7 @@ mod tests {
                 RepoError::HttpStatus {
                     status: reqwest::StatusCode::TOO_MANY_REQUESTS,
                     url: s("https://repo.example/m2/a.pom"),
+                    redirected_to: None,
                     retry_after: None,
                 },
                 Vec::new(),
@@ -1354,6 +1365,7 @@ mod tests {
                 RepoError::HttpStatus {
                     status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
                     url: s("https://repo.example/m2/a.pom"),
+                    redirected_to: None,
                     retry_after: None,
                 },
                 vec![searched(500)],

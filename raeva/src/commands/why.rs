@@ -232,7 +232,7 @@ fn explain_module(
             .collect()
     };
     let display_paths = labels(display_label);
-    let paths = labels(|package| package.coordinate.to_string());
+    let paths = labels(crate::commands::util::package_coordinate);
     Ok(WhyModuleOutput {
         module: module.path.clone(),
         gav: module.gav(),
@@ -245,7 +245,7 @@ fn explain_module(
 }
 
 pub(super) fn display_label(package: &LockModulePackage) -> String {
-    let coordinate = crate::commands::util::display_coordinate(&package.coordinate);
+    let coordinate = crate::commands::util::display_coordinate(package);
     if package.workspace_module.is_some() {
         format!("{coordinate} (workspace)")
     } else if package.system_path.is_some() {
@@ -404,7 +404,9 @@ fn matches_target(package: &LockModulePackage, target: &PartialCoord, maven: Mav
             rv_maven_types::Version::parse(coordinate.version())
                 .is_ok_and(|locked| locked.cmp_in(version, maven).is_eq())
         })
-        && (target.packaging.as_ref()).is_none_or(|packaging| coordinate.extension() == *packaging)
+        && (target.packaging.as_ref()).is_none_or(|packaging| {
+            package.maven_type() == *packaging || coordinate.extension() == *packaging
+        })
         && (target.classifier.as_ref())
             .is_none_or(|classifier| coordinate.classifier() == Some(classifier.as_str()))
 }
@@ -413,6 +415,27 @@ fn matches_target(package: &LockModulePackage, target: &PartialCoord, maven: Mav
 mod tests {
     use super::{MAX_DEP_PATHS, collect_paths, matches_target};
     use rv_maven_types::MavenMode;
+
+    /// The coordinate `raeva tree` prints for a package names it again in
+    /// `raeva why`, whatever type a build extension declared it with.
+    #[test]
+    fn a_printed_coordinate_finds_its_package() {
+        for type_ in ["test-jar", "a:b", "my type", " pad", "50%"] {
+            let coordinate = rv_maven_types::ArtifactCoord::new("g", "a", "1", "jar", None);
+            let mut package = rv_lock::LockModulePackage::new(coordinate, None);
+            package.type_ = Some(type_.to_string());
+            for shown in [
+                crate::commands::util::display_coordinate(&package),
+                crate::commands::util::package_coordinate(&package),
+            ] {
+                let target = rv_maven_types::PartialCoord::parse(&shown).expect(&shown);
+                assert!(
+                    matches_target(&package, &target, MavenMode::Maven39),
+                    "{type_:?}: {shown}"
+                );
+            }
+        }
+    }
 
     /// Paths are numbered, a wrapped one is indented past its number, and a
     /// direct dependency says so.

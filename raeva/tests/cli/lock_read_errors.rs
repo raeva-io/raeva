@@ -206,7 +206,7 @@ fn a_missing_lockfile_sync_cannot_create_does_not_ask_for_a_sync() {
         assert_eq!(envelope["hints"], serde_json::json!([]), "{envelope}");
     }
     let old = project.path().join("old.lock");
-    fs::write(&old, "schema_version = 9\n").expect("write old lock");
+    fs::write(&old, "schema_version = 10\n").expect("write old lock");
     let missing = project.path().join("nowhere");
     let envelope = raeva(&missing, &["--json", "lock", "diff", old.to_str().unwrap()]);
     assert_eq!(envelope["code"], "CONFIG", "{envelope}");

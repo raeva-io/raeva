@@ -2189,6 +2189,9 @@ impl ModelService {
         declared_by: Option<&str>,
         from: Declaration,
     ) -> (Vec<Repository>, Vec<Repository>) {
+        if self.ctx.config.ignores_transitive_repositories() {
+            return (Vec::new(), Vec::new());
+        }
         let admission = self.admission(extra.into_iter().collect(), from);
         self.warn_secret_urls(&admission.secret_urls, declared_by);
         if let Some(declared_by) = declared_by {
@@ -2842,7 +2845,7 @@ impl ModelService {
         let mut failure = None;
         let mut specific: Option<(&'r Repository, rv_repo::SnapshotResolution)> = None;
         let mut generic: Option<(&'r Repository, rv_repo::SnapshotResolution)> = None;
-        let mut base = None;
+        let mut bases = Vec::new();
         let mut pinned = None;
         let first = repos.first().copied();
         // Every repository is read, so all are asked at once.
@@ -2860,7 +2863,7 @@ impl ModelService {
                     pinned.get_or_insert((repo, resolution));
                 }
                 Ok(resolution) if resolution.candidate == SnapshotCandidate::Absent => {
-                    base.get_or_insert((repo, resolution));
+                    bases.push((repo, resolution));
                 }
                 Ok(resolution) => {
                     let best = if resolution.candidate == SnapshotCandidate::Specific {
@@ -2903,17 +2906,27 @@ impl ModelService {
                 Some(generic)
             }
             (specific, generic) => specific.or(generic),
-        }
-        .or(base);
-        match (best, failure, first) {
+        };
+        // A repository whose metadata failed may hold a build that would
+        // stand over plain files no metadata names. Metadata that names no
+        // build keeps the version asked for, and a local repository's plain
+        // files stand, as Maven reads them without metadata.
+        let base = match failure {
+            Some(_) => (bases.into_iter()).find(|(repo, resolution)| {
+                resolution.metadata_served || source.effective_repository(repo).is_local()
+            }),
+            None => bases.into_iter().next(),
+        };
+        match (best, failure, base, first) {
             (Some(best), ..) => Ok(best),
+            (None, _, Some(base), _) => Ok(base),
             // As in Maven, a SNAPSHOT that no repository has metadata for is
             // read at its base version, from whichever repository serves it.
-            (None, None, Some(first)) => Ok((
+            (None, None, None, Some(first)) => Ok((
                 first,
                 rv_repo::SnapshotResolution::base(coord.version.to_string()),
             )),
-            (None, failure, _) => Err(failure),
+            (None, failure, None, _) => Err(failure),
         }
     }
 
@@ -3106,11 +3119,7 @@ impl ModelService {
                     workspace_module: Some(pom_path),
                 });
             }
-            let base_dir = workspace
-                .root()
-                .join(&pom_path)
-                .parent()
-                .map(std::path::Path::to_path_buf);
+            let base_dir = module.pom_file().parent().map(std::path::Path::to_path_buf);
             let local_parents = match base_dir.clone() {
                 Some(base_dir) => LocalParents::new(base_dir, workspace.local_parent_boundary())
                     .cached_in(self.ctx.local_parents()),
@@ -3133,9 +3142,8 @@ impl ModelService {
             let project = scope.project(pom, &activation).await;
             let reads = Arc::new(activation.environment.take_reads());
             environment.record_reads(&reads);
-            let project = project.map_err(|err| {
-                super::project_model_error(err, &workspace.root().join(&pom_path))
-            })?;
+            let project =
+                project.map_err(|err| super::project_model_error(err, module.pom_file()))?;
             let project = Arc::new(project);
             let effective_gav = format!(
                 "{}:{}:{}",
@@ -3415,6 +3423,9 @@ impl ModelService {
     /// ignoring it would lock what Maven does not.
     fn unfollowed_id(&self, declared: &[Repository], declared_by: &str) -> Option<ResolveError> {
         let config = &self.ctx.config;
+        if config.ignores_transitive_repositories() {
+            return None;
+        }
         let (secrets, names) = self.secret_inputs();
         declared.iter().find_map(|repo| {
             let secret = rv_repo::secret_part_refusal(&repo.url, repo.url_reads(), secrets, names)
@@ -3797,12 +3808,8 @@ impl ModelService {
             let newest = self
                 .newest_snapshot(source, eligible_repos.clone(), &pom, &mut probe)
                 .await;
-            // A repository that failed a retried request may have the
-            // newest build.
-            let retried = |err: &ResolveError| match err {
-                ResolveError::Repo { source, .. } => source.is_transient(),
-                _ => false,
-            };
+            // A repository that failed may have the newest build, as it may
+            // for a dependency.
             match newest {
                 Ok((newest, resolution)) if resolution.candidate != SnapshotCandidate::Absent => {
                     eligible_repos = vec![newest];
@@ -3811,7 +3818,7 @@ impl ModelService {
                         ..coord.clone()
                     });
                 }
-                Err(Some(err)) if retried(&err) => return Err(err),
+                Err(Some(err)) => return Err(err),
                 _ => {}
             }
             // The repository that serves the POM is a fallback past those

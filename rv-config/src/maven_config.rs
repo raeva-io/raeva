@@ -330,15 +330,6 @@ pub enum MavenConfigError {
          remove it"
     )]
     ProjectFile,
-    /// `-itr` (`--ignore-transitive-repositories`), with which Maven also
-    /// leaves out the repositories a dependency's POM declares for its
-    /// parent, which raeva searches.
-    #[error(
-        "-itr (--ignore-transitive-repositories) makes mvn ignore every repository a dependency's \
-         POM declares, also the one raeva searches for its parent; remove it, and leave \
-         [security] allow_transitive_repositories off"
-    )]
-    IgnoreTransitiveRepositories,
     /// `-gs` (`--global-settings`), whose file Maven reads below the user
     /// settings, and raeva does not.
     #[error(
@@ -377,7 +368,8 @@ pub enum MavenConfigError {
 }
 
 /// `(short, long, takes a value, value optional)` for every option in
-/// Maven 3.9.11's `CLIManager`.
+/// Maven 3.9.11's `CLIManager`, and the four update options 3.10.0 adds,
+/// which raeva ignores as it ignores `-U`.
 const OPTIONS: &[(Option<&str>, Option<&str>, bool, bool)] = &[
     (Some("h"), Some("help"), false, false),
     (Some("f"), Some("file"), true, false),
@@ -425,6 +417,10 @@ const OPTIONS: &[(Option<&str>, Option<&str>, bool, bool)] = &[
     (Some("llr"), Some("legacy-local-repository"), false, false),
     (None, Some("raw-streams"), false, false),
     (None, Some("color"), true, true),
+    (Some("UA"), Some("update-artifacts"), false, false),
+    (Some("UM"), Some("update-metadata"), false, false),
+    (None, Some("artifacts-update-policy"), true, false),
+    (None, Some("metadata-update-policy"), true, false),
 ];
 
 #[derive(Clone, Copy)]
@@ -1043,6 +1039,14 @@ pub(crate) fn sets_offline(content: Option<&str>) -> bool {
     content.is_some_and(|content| written_values(content).is_ok_and(|written| written.offline))
 }
 
+/// Whether `.mvn/maven.config` holds `-itr`
+/// (`--ignore-transitive-repositories`).
+pub(crate) fn ignores_transitive_repositories(content: Option<&str>) -> bool {
+    content.is_some_and(|content| {
+        written_values(content).is_ok_and(|written| written.ignore_transitive_repositories)
+    })
+}
+
 /// Whether a `-P` value of `.mvn/maven.config` or `command_line` holds a
 /// `${...}`, so the profiles it selects can differ by platform.
 pub(crate) fn selects_profiles_by_expression(
@@ -1067,6 +1071,7 @@ struct Written {
     settings: Option<String>,
     global_settings: bool,
     offline: bool,
+    ignore_transitive_repositories: bool,
     /// The [`REACTOR_SELECTION`] options, each once.
     selection: Vec<&'static str>,
 }
@@ -1090,10 +1095,10 @@ fn written_values(content: &str) -> Result<Written, MavenConfigError> {
         match option.name {
             "llr" => return Err(MavenConfigError::UnsupportedOption),
             "f" => return Err(MavenConfigError::ProjectFile),
-            "itr" => return Err(MavenConfigError::IgnoreTransitiveRepositories),
             _ => {}
         }
         written.offline |= option.name == "o";
+        written.ignore_transitive_repositories |= option.name == "itr";
         if let Some(selection) = reactor_selection(option)
             && !written.selection.contains(&selection)
         {
@@ -1483,6 +1488,15 @@ mod tests {
         }
         assert_eq!(property("-D=x\n", "x").as_deref(), Some("true"));
         assert_eq!(parse("-llr\n"), Err(MavenConfigError::UnsupportedOption));
+        for content in [
+            "-itr\n",
+            "--ignore-transitive-repositories\n",
+            "-UA\n-UM\n--artifacts-update-policy\nnever\n--metadata-update-policy=daily\n",
+        ] {
+            assert!(parse(content).is_ok(), "{content:?}");
+        }
+        assert!(ignores_transitive_repositories(Some("-B\n-itr\n")));
+        assert!(!ignores_transitive_repositories(Some("-B\n")));
         for content in ["-D\n\"\"\n", "--define= =x\n"] {
             assert!(
                 matches!(parse(content), Err(MavenConfigError::EmptyPropertyName(_))),

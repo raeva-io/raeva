@@ -1841,6 +1841,27 @@ async fn a_foreign_symlink_with_matching_bytes_is_replaced() {
     }
 }
 
+/// A destination symlink to a file elsewhere is replaced without reading
+/// that file, whatever bytes it holds: the export neither hashes it nor
+/// names its digest, and the file stays as it was.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_foreign_symlink_is_replaced_unread() {
+    let mut f = Fixture::new();
+    f.row(jar("com.example", "demo", "1.0.0"), b"jar", b"<project/>")
+        .await;
+    let jar_path = f.m2().join("com/example/demo/1.0.0/demo-1.0.0.jar");
+    fs::create_dir_all(jar_path.parent().unwrap()).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let foreign = outside.path().join("private");
+    fs::write(&foreign, b"private bytes").unwrap();
+    std::os::unix::fs::symlink(&foreign, &jar_path).unwrap();
+    f.export().await.expect("the link is replaced");
+    assert!(fs::symlink_metadata(&jar_path).unwrap().is_file());
+    assert_eq!(f.read("com/example/demo/1.0.0/demo-1.0.0.jar"), "jar");
+    assert_eq!(fs::read(&foreign).unwrap(), b"private bytes");
+}
+
 /// A destination hard-linked to a file outside the store, even when those
 /// bytes currently match the locked blob, must be replaced. Leaving the
 /// shared inode would let later writes to that foreign path change what

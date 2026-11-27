@@ -1683,5 +1683,150 @@ fn sbom_lists_a_reactor_test_jar_without_its_module() {
         .iter()
         .map(|component| component["purl"].as_str().unwrap())
         .collect();
-    assert_eq!(purls, ["pkg:maven/com.example/lib@1?classifier=tests"]);
+    assert_eq!(
+        purls,
+        ["pkg:maven/com.example/lib@1?classifier=tests&type=test-jar"]
+    );
+}
+
+/// The CycloneDX `scope` of a component Maven resolves as optional is
+/// `optional`, as the CycloneDX Maven plugin writes it: a dependency the
+/// module declares optional, here or in its parent, and one reached only
+/// below one. A component also reached on a path without an optional
+/// dependency is `required`, and a test one `excluded`. `raeva tree` shows
+/// the direct ones optional from the same lock.
+#[test]
+fn sbom_scope_is_optional_for_what_maven_resolves_as_optional() {
+    let (project, home) = temp_project();
+    let write_pom = |artifact: &str, dependencies: &[(&str, bool)]| {
+        let dir = project
+            .path()
+            .join("repository/org/example")
+            .join(artifact)
+            .join("1");
+        fs::create_dir_all(&dir).unwrap();
+        let dependencies: String = (dependencies.iter())
+            .map(|(artifact, optional)| {
+                format!(
+                    "<dependency><groupId>org.example</groupId><artifactId>{artifact}</artifactId>\
+                     <version>1</version><optional>{optional}</optional></dependency>"
+                )
+            })
+            .collect();
+        fs::write(
+            dir.join(format!("{artifact}-1.pom")),
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>org.example</groupId>\
+                 <artifactId>{artifact}</artifactId><version>1</version>\
+                 <dependencies>{dependencies}</dependencies></project>"
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join(format!("{artifact}-1.jar")), artifact).unwrap();
+    };
+    write_pom("opt", &[("under", false), ("shared", false)]);
+    write_pom("req", &[("shared", false), ("dropped", true)]);
+    for artifact in ["under", "shared", "inherited", "tested", "dropped"] {
+        write_pom(artifact, &[]);
+    }
+    let dependency = |artifact: &str, extra: &str| {
+        format!(
+            "<dependency><groupId>org.example</groupId><artifactId>{artifact}</artifactId>\
+             <version>1</version>{extra}</dependency>"
+        )
+    };
+    fs::create_dir_all(project.path().join("build-parent")).unwrap();
+    fs::write(
+        project.path().join("build-parent/pom.xml"),
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.example</groupId>\
+             <artifactId>parent</artifactId><version>1</version><packaging>pom</packaging>\
+             <dependencies>{}</dependencies></project>",
+            dependency("inherited", "<optional>true</optional>")
+        ),
+    )
+    .unwrap();
+    let url = url::Url::from_directory_path(project.path().join("repository")).unwrap();
+    fs::write(
+        project.path().join("pom.xml"),
+        format!(
+            "<project><modelVersion>4.0.0</modelVersion><parent><groupId>com.example</groupId>\
+             <artifactId>parent</artifactId><version>1</version>\
+             <relativePath>build-parent/pom.xml</relativePath></parent><artifactId>demo</artifactId>\
+             <repositories><repository><id>fixture</id><url>{url}</url></repository></repositories>\
+             <dependencies>{}{}{}</dependencies></project>",
+            dependency("opt", "<optional>true</optional>"),
+            dependency("req", ""),
+            dependency("tested", "<scope>test</scope>"),
+        ),
+    )
+    .unwrap();
+    let sync = raeva_command(project.path(), home.path())
+        .args(["sync", "--offline"])
+        .output()
+        .unwrap();
+    assert_success(&sync, "sync");
+    let lock = fs::read_to_string(project.path().join("raeva.lock")).unwrap();
+    // Packages sort as inherited, opt, req, shared, tested, under.
+    assert!(lock.contains("\noptional = \"0 1 5\"\n"), "{lock}");
+    let document: toml::Value = toml::from_str(&lock).unwrap();
+    assert_schema_valid(
+        &crate::schemas::validator(crate::schemas::RAEVA_LOCK_SCHEMA),
+        &serde_json::to_value(document).unwrap(),
+    );
+    let frozen = || {
+        raeva_command(project.path(), home.path())
+            .args(["sync", "--offline", "--frozen"])
+            .output()
+            .unwrap()
+    };
+    assert_success(&frozen(), "frozen sync");
+    // The line is resolved, not trusted: --frozen refuses an edited one.
+    let lock_path = project.path().join("raeva.lock");
+    fs::write(
+        &lock_path,
+        lock.replace("\noptional = \"0 1 5\"\n", "\noptional = \"0 1\"\n"),
+    )
+    .unwrap();
+    assert!(!frozen().status.success());
+    fs::write(&lock_path, &lock).unwrap();
+
+    let output = sbom(project.path(), home.path());
+    assert_success(&output, "sbom");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_schema_valid(&cyclonedx_validator(), &document);
+    let scopes: std::collections::BTreeMap<&str, &str> = (document["components"].as_array())
+        .unwrap()
+        .iter()
+        .map(|component| {
+            let name = component["name"].as_str().unwrap();
+            (name, component["scope"].as_str().unwrap())
+        })
+        .collect();
+    assert_eq!(
+        scopes,
+        [
+            ("inherited", "optional"),
+            ("opt", "optional"),
+            ("req", "required"),
+            ("shared", "required"),
+            ("tested", "excluded"),
+            ("under", "optional"),
+        ]
+        .into(),
+    );
+
+    let tree = raeva_command(project.path(), home.path())
+        .args(["tree", "--offline"])
+        .output()
+        .unwrap();
+    assert_success(&tree, "tree");
+    let tree = String::from_utf8_lossy(&tree.stdout);
+    for line in [
+        "org.example:inherited:1 (compile, optional)",
+        "org.example:opt:1 (compile, optional)",
+        "org.example:req:1 (compile)",
+    ] {
+        assert!(tree.contains(line), "{line}\n{tree}");
+    }
 }

@@ -24,10 +24,11 @@ use crate::PomError;
 /// # Errors
 ///
 /// [`PomError::UnsupportedEncoding`] when the declaration names an encoding
-/// other than UTF-8, UTF-16, ISO-8859-1, US-ASCII or windows-1252, which
-/// Maven might read but raeva does not, [`PomError::Ebcdic`] when the document
-/// starts with `<?xm` in EBCDIC and declares such an encoding, which Maven
-/// reads it in, [`PomError::UnknownEncoding`] when it names
+/// other than UTF-8, UTF-16, ISO-8859-1, ISO-8859-15, US-ASCII or
+/// windows-1252, which Maven might read but raeva does not,
+/// [`PomError::Ebcdic`] when the document starts with `<?xm` in EBCDIC and
+/// declares such an encoding, which Maven reads it in,
+/// [`PomError::UnknownEncoding`] when it names
 /// `default`, which Java does not read, [`PomError::EncodingMismatch`] when a
 /// UTF-16 byte order mark comes before text in another encoding, and
 /// [`PomError::UnterminatedDeclaration`] when a document that starts with
@@ -162,6 +163,7 @@ enum Charset {
     Utf16Be,
     Utf16Le,
     Latin1,
+    Latin9,
     Ascii,
     Windows1252,
 }
@@ -173,6 +175,7 @@ impl Charset {
             Charset::Utf16Be => "UTF-16BE",
             Charset::Utf16Le => "UTF-16LE",
             Charset::Latin1 => "ISO-8859-1",
+            Charset::Latin9 => "ISO-8859-15",
             Charset::Ascii => "US-ASCII",
             Charset::Windows1252 => "windows-1252",
         }
@@ -182,6 +185,7 @@ impl Charset {
         match self {
             Charset::Utf8 => String::from_utf8_lossy(bytes),
             Charset::Latin1 => Cow::Owned(bytes.iter().map(|&b| char::from(b)).collect()),
+            Charset::Latin9 => Cow::Owned(bytes.iter().map(|&b| latin9(b)).collect()),
             Charset::Ascii => Cow::Owned(
                 bytes
                     .iter()
@@ -213,6 +217,9 @@ impl Charset {
             "iso-8859-1" | "iso8859-1" | "iso_8859-1" | "iso8859_1" | "iso_8859_1"
             | "iso_8859-1:1987" | "iso-ir-100" | "8859_1" | "latin1" | "l1" | "ibm819"
             | "ibm-819" | "cp819" | "819" | "csisolatin1" => Self::Latin1,
+            "iso-8859-15" | "iso8859-15" | "iso_8859-15" | "iso8859_15" | "iso8859_15_fdis"
+            | "8859_15" | "latin9" | "latin-9" | "latin0" | "l9" | "ibm923" | "ibm-923"
+            | "cp923" | "923" | "csiso885915" | "csisolatin0" | "csisolatin9" => Self::Latin9,
             "us-ascii" | "ascii" | "us" | "iso646-us" | "iso_646.irv:1983" | "ansi_x3.4-1968"
             | "ansi_x3.4-1986" | "ascii7" | "646" | "cp367" | "ibm367" | "csascii" | "iso-ir-6" => {
                 Self::Ascii
@@ -291,6 +298,21 @@ fn utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
         text.push(char::REPLACEMENT_CHARACTER);
     }
     text
+}
+
+/// ISO-8859-15, which replaces eight ISO-8859-1 characters.
+fn latin9(byte: u8) -> char {
+    match byte {
+        0xA4 => '\u{20AC}',
+        0xA6 => '\u{0160}',
+        0xA8 => '\u{0161}',
+        0xB4 => '\u{017D}',
+        0xB8 => '\u{017E}',
+        0xBC => '\u{0152}',
+        0xBD => '\u{0153}',
+        0xBE => '\u{0178}',
+        _ => char::from(byte),
+    }
 }
 
 /// windows-1252 as Java decodes it: five bytes it leaves undefined become
@@ -637,6 +659,44 @@ mod tests {
         );
     }
 
+    /// netty-transport-native-epoll 4.0.x declares ISO-8859-15, which Java
+    /// reads under these names. It differs from ISO-8859-1 in eight bytes.
+    #[test]
+    fn iso_8859_15_is_read_as_java_reads_it() {
+        for name in [
+            "ISO-8859-15",
+            "iso8859_15",
+            "ISO_8859-15",
+            "8859_15",
+            "ISO8859-15",
+            "ISO8859_15_FDIS",
+            "LATIN9",
+            "Latin-9",
+            "LATIN0",
+            "L9",
+            "IBM923",
+            "IBM-923",
+            "cp923",
+            "923",
+            "csISO885915",
+            "csISOlatin0",
+            "csISOlatin9",
+        ] {
+            let pom = format!(
+                "<?xml version=\"1.0\" encoding=\"{name}\"?><p>\u{A4}\u{A6}\u{A8}\u{B4}\u{B8}\
+                 \u{BC}\u{BD}\u{BE}\u{E9}</p>"
+            );
+            let bytes: Vec<u8> = pom.chars().map(|c| u8::try_from(c).unwrap()).collect();
+            assert_eq!(
+                decode_pom(&bytes).unwrap_or_else(|err| panic!("{name}: {err}")),
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"{name}\"?><p>\u{20AC}\u{160}\u{161}\
+                     \u{17D}\u{17E}\u{152}\u{153}\u{178}\u{E9}</p>"
+                )
+            );
+        }
+    }
+
     #[test]
     fn without_a_declaration_utf8_is_read_leniently() {
         assert_eq!(decode_pom(b"<p>Caf\xE9</p>").unwrap(), "<p>Caf\u{FFFD}</p>");
@@ -879,7 +939,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "the POM is in EBCDIC, declared as IBM037, which raeva does not read; raeva reads UTF-8, \
-             UTF-16, ISO-8859-1, US-ASCII and windows-1252"
+             UTF-16, ISO-8859-1, ISO-8859-15, US-ASCII and windows-1252"
         );
         for pom in [
             "<?xml version=\"1.0\"?><p/>",

@@ -14,7 +14,7 @@ use rv_maven_types::{
     layout::metadata_path, resolves_through_snapshot_metadata,
 };
 
-use super::requests::{self, DeferredWarnings, LateCheck, LateSha256};
+use super::requests::{self, DeferredWarnings, LateCheck, LateSha256, wrong_sha256};
 use super::{RepoClient, SnapshotResolution, validate_coord_components};
 use crate::artifact::ArtifactRequest;
 use crate::auth::{Auth, SentCredential};
@@ -64,11 +64,13 @@ pub(super) enum Miss {
     Refused {
         status: reqwest::StatusCode,
         url: String,
+        redirected_to: Option<String>,
         sent: Option<Box<SentCredential>>,
     },
     Busy {
         status: reqwest::StatusCode,
         url: String,
+        redirected_to: Option<String>,
         retry_after: Option<std::time::Duration>,
         /// The attempts made, when there were retries.
         attempts: Option<usize>,
@@ -76,25 +78,29 @@ pub(super) enum Miss {
 }
 
 impl Miss {
-    fn of(err: &RepoError, path: &str) -> Option<Self> {
+    pub(super) fn of(err: &RepoError, path: &str) -> Option<Self> {
         match err.cause() {
             RepoError::NotFound(missing) => Some(Self::Absent(missing.clone())),
-            RepoError::Unauthorized { status, url, sent }
-                if matches!(status.as_u16(), 401 | 403) =>
-            {
-                Some(Self::Refused {
-                    status: *status,
-                    url: url.clone(),
-                    sent: sent.clone(),
-                })
-            }
+            RepoError::Unauthorized {
+                status,
+                url,
+                redirected_to,
+                sent,
+            } if matches!(status.as_u16(), 401 | 403) => Some(Self::Refused {
+                status: *status,
+                url: url.clone(),
+                redirected_to: redirected_to.clone(),
+                sent: sent.clone(),
+            }),
             RepoError::HttpStatus {
                 status,
                 url,
+                redirected_to,
                 retry_after,
             } if err.is_transient() && url.ends_with(path) => Some(Self::Busy {
                 status: *status,
                 url: url.clone(),
+                redirected_to: redirected_to.clone(),
                 retry_after: *retry_after,
                 attempts: match err {
                     RepoError::Retried { attempts, .. } => Some(*attempts),
@@ -105,11 +111,25 @@ impl Miss {
         }
     }
 
-    /// The status a miss is kept as across runs. A busy answer is not kept.
-    fn kept_status(&self) -> Option<u16> {
+    /// The status a miss of `path` on `route` is kept as across runs. A
+    /// busy answer is not kept, nor a refusal [`Self::kept`] would not
+    /// restore as it was, refused to the route's credential: one from a
+    /// redirect target, of a redirect's userinfo, or of a chain that left
+    /// the origin, which withheld the credential, and came back.
+    pub(super) fn kept_status(&self, route: &Route<'_>, path: &str) -> Option<u16> {
         match self {
             Self::Absent(_) => Some(404),
-            Self::Refused { status, .. } => Some(status.as_u16()),
+            Self::Refused {
+                status,
+                url,
+                redirected_to,
+                sent,
+            } => {
+                let requested = route.endpoint.url_for_path(path).ok().map(redact_url);
+                let routed = route.auth().ok().flatten().map(|auth| &auth.sent);
+                let direct = redirected_to.is_none() && requested.as_ref() == Some(url);
+                (direct && sent.as_deref() == routed).then_some(status.as_u16())
+            }
             Self::Busy { .. } => None,
         }
     }
@@ -123,6 +143,7 @@ impl Miss {
             b"401" | b"403" => Some(Self::Refused {
                 status: reqwest::StatusCode::from_bytes(status).ok()?,
                 url,
+                redirected_to: None,
                 sent: sent.map(|auth| Box::new(auth.sent.clone())),
             }),
             _ => None,
@@ -132,16 +153,28 @@ impl Miss {
     fn error(self) -> RepoError {
         match self {
             Self::Absent(missing) => RepoError::NotFound(missing),
-            Self::Refused { status, url, sent } => RepoError::Unauthorized { status, url, sent },
+            Self::Refused {
+                status,
+                url,
+                redirected_to,
+                sent,
+            } => RepoError::Unauthorized {
+                status,
+                url,
+                redirected_to,
+                sent,
+            },
             Self::Busy {
                 status,
                 url,
+                redirected_to,
                 retry_after,
                 attempts,
             } => {
                 let error = RepoError::HttpStatus {
                     status,
                     url,
+                    redirected_to,
                     retry_after,
                 };
                 match attempts {
@@ -533,9 +566,20 @@ impl RepoClient {
             .await
         {
             Ok(metadata) => metadata,
-            // Maven reads a plain `-SNAPSHOT` layout from a local repository
-            // that has no remote `maven-metadata.xml`.
-            Err(RepoError::NotFound(_)) if route.endpoint.is_local() => {
+            // Without a `maven-metadata.xml` for the version, as a Maven 2
+            // style deploy has none, Maven's DefaultVersionResolver keeps the
+            // version asked for and reads the plain `-SNAPSHOT` files.
+            Err(RepoError::NotFound(_)) => return Ok(SnapshotResolution::base(version)),
+            // Maven 3.9 and 3.10 warn of metadata that does not parse and
+            // read on as without it.
+            Err(RepoError::InvalidMetadata(reason)) => {
+                if read != PomRead::Prefetch {
+                    warn!(
+                        sec_code = "POM_PROBLEM",
+                        repository = %redact_url(&route.endpoint.url),
+                        "ignoring {coord} snapshot metadata that cannot be read: {reason}"
+                    );
+                }
                 return Ok(SnapshotResolution::base(version));
             }
             Err(err) => return Err(err),
@@ -562,11 +606,8 @@ impl RepoClient {
             });
         }
         let extension = coord.packaging.as_deref().unwrap_or("jar");
-        let resolved = metadata
-            .snapshot_version_for(coord.classifier.as_deref(), extension)
-            .ok_or_else(|| {
-                RepoError::InvalidMetadata("missing snapshot version data".to_string())
-            })?;
+        let resolved =
+            metadata.snapshot_version_for(&version, coord.classifier.as_deref(), extension);
 
         // The snapshot `<value>` comes straight from server-controlled
         // maven-metadata.xml and is about to be spliced into the artifact
@@ -1011,8 +1052,9 @@ impl RepoClient {
             checks.rely_on(check, warns);
             return Ok(());
         }
-        if check.outcome().await? && warns {
-            check.weak_hash()();
+        let vouched = check.outcome().await?;
+        if warns && let Some(warning) = check.warning(vouched) {
+            warning();
         }
         Ok(())
     }
@@ -1409,7 +1451,8 @@ impl RepoClient {
         scope: Option<&str>,
         err: &RepoError,
     ) {
-        let Some(status) = Miss::of(err, path).and_then(|miss| miss.kept_status()) else {
+        let Some(status) = Miss::of(err, path).and_then(|miss| miss.kept_status(route, path))
+        else {
             return;
         };
         let expiry = route.endpoint.update_policy_expiry(version);
@@ -1692,6 +1735,32 @@ impl RepoClient {
         })
     }
 
+    /// Whether `bytes`, which do not match `checksum`, are vouched for all
+    /// the same: when `checksum` is the `.sha256`, the `.sha1`, else the
+    /// `.md5`, which Maven checks, decides, with a warning. Checksum files
+    /// guard against a broken transfer from the server that publishes them,
+    /// which a matching one rules out, and raeva.lock pins the SHA-256 of
+    /// the bytes.
+    pub(super) async fn maven_vouches(
+        &self,
+        route: &Route<'_>,
+        path: &str,
+        bytes: &[u8],
+        checksum: &Digest,
+        warnings: &mut DeferredWarnings,
+    ) -> bool {
+        if checksum.algorithm() != HashAlgorithm::Sha256 {
+            return false;
+        }
+        match self.maven_checksum(route, path).await {
+            Ok(Some(maven)) if verify_checksum(bytes, &maven, path).is_ok() => {
+                warnings.push(wrong_sha256(&route.endpoint, path, maven.algorithm()));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The bytes at `path`, checked against its checksum sidecar. Warnings
     /// go to `warnings`, for the caller to log. For a POM that
     /// [`RepoClient::checking_sha256_late`] took on its `.sha1`, the check of
@@ -1740,7 +1809,13 @@ impl RepoClient {
                             if let Some(checksum) =
                                 self.probe_checksum(route, path, &mut probed, None).await?
                             {
-                                verify_checksum(&bytes, &checksum, path)?;
+                                if let Err(err) = verify_checksum(&bytes, &checksum, path)
+                                    && !self
+                                        .maven_vouches(route, path, &bytes, &checksum, &mut probed)
+                                        .await
+                                {
+                                    return Err(err);
+                                }
                                 verified = true;
                             }
                             warnings.append(probed);
@@ -1809,10 +1884,28 @@ impl RepoClient {
                 Some(checksum) => {
                     if let Err(err) = verify_checksum(&bytes, &checksum, path) {
                         if !remote_metadata {
+                            if self
+                                .maven_vouches(route, path, &bytes, &checksum, warnings)
+                                .await
+                            {
+                                return Ok((bytes, Checked::Verified, late));
+                            }
                             return Err(err);
                         }
                         if attempt == 0 {
                             continue;
+                        }
+                        // Maven checks the `.sha1`, else the `.md5`, under
+                        // either policy. A repository that generated the
+                        // `.sha256` of metadata once and never again, as
+                        // Central's snapshot repository did for publishers
+                        // that deploy only Maven's default checksums, leaves
+                        // it stale while those still match the bytes.
+                        if self
+                            .maven_vouches(route, path, &bytes, &checksum, warnings)
+                            .await
+                        {
+                            return Ok((bytes, Checked::Verified, None));
                         }
                         if fail {
                             return Err(err);

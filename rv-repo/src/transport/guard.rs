@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use rv_config::{Config, redact_url};
+use rv_config::Config;
 use url::Url;
 
 use crate::error::{RedirectRejectionKind, Result};
@@ -237,18 +237,16 @@ pub(super) fn normalized_host(host: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Longest redirect chain followed before the request is abandoned.
+/// Most redirects one request follows.
 pub(super) const MAX_REDIRECT_HOPS: usize = 5;
 
-/// Follow same-origin redirects plus one explicitly trusted cross-origin hop.
+/// The redirect rules of a client, which [`crate::fetch`] applies to each hop
+/// it follows: same-origin redirects, and cross-origin ones in a chain that
+/// starts at a repository or mirror origin present when the client was
+/// built, or at its root-model issuer. Both sides of each cross-origin hop
+/// must use HTTPS. The chain is capped at [`MAX_REDIRECT_HOPS`] redirects.
 ///
-/// The issuer of the cross-origin redirect must be a repository or mirror
-/// origin present when the client was built, or its root-model issuer.
-/// Both sides of that hop must use
-/// HTTPS, and any later redirect must stay on the new origin. The chain is
-/// capped at [`MAX_REDIRECT_HOPS`] redirects.
-///
-/// The cross-origin target must also be a public-internet address, established
+/// Each cross-origin target must also be a public-internet address, established
 /// by one of three screens depending on what `raeva` can know at redirect time:
 ///
 /// * An IP literal carries its address, so it is screened here.
@@ -275,35 +273,25 @@ pub(super) const MAX_REDIRECT_HOPS: usize = 5;
 /// followed only to a configured origin. Users behind a proxy whose repository
 /// redirects to a CDN must name that CDN origin in their configuration.
 ///
-/// reqwest's default policy follows redirects to any origin, which would let a
-/// hostile mirror bounce a fetch to `http://attacker/` and bypass both
-/// `Repository::url_for_path`'s origin check and TLS, or aim it at
-/// `https://169.254.169.254/` and turn `raeva` into an SSRF probe for the private
-/// network it runs on.
-pub(super) fn trusted_redirect_policy(guard: RedirectGuard) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| {
-        match guard.evaluate(attempt.previous(), attempt.url()) {
-            Ok(()) => attempt.follow(),
-            Err(rejection) => attempt.error(rejection),
-        }
-    })
-}
-
+/// Without these rules a hostile mirror could bounce a fetch to
+/// `http://attacker/` and bypass both `Repository::url_for_path`'s origin
+/// check and TLS, or aim it at `https://169.254.169.254/` and turn `raeva`
+/// into an SSRF probe for the private network it runs on.
 impl RedirectGuard {
-    /// Decide a single redirect hop. Split out of the policy closure so each
-    /// branch is unit-testable without staging a server per case.
+    /// Decide a single redirect hop.
     pub(super) fn evaluate(
         &self,
         previous: &[Url],
         target: &Url,
     ) -> std::result::Result<(), RedirectPolicyError> {
         use RedirectRejectionKind as Kind;
-        if previous.len() >= MAX_REDIRECT_HOPS {
+        // `previous` holds the first request and each redirect followed.
+        if previous.len() > MAX_REDIRECT_HOPS {
             return reject(
                 Kind::ChainLimit,
                 format!(
-                    "redirect chain reached {MAX_REDIRECT_HOPS} hops before {}",
-                    redact_url(target)
+                    "redirect chain followed {MAX_REDIRECT_HOPS} redirects before {}",
+                    shown_target(target)
                 ),
             );
         }
@@ -312,39 +300,26 @@ impl RedirectGuard {
                 Kind::OriginNotConfigured,
                 format!(
                     "redirect to {} has no issuing request origin",
-                    redact_url(target)
+                    shown_target(target)
                 ),
             );
         };
         if issuer.origin() == target.origin() {
             return Ok(());
         }
-        if previous
-            .windows(2)
-            .any(|pair| pair[0].origin() != pair[1].origin())
-        {
+        // Every hop before the first cross-origin one stayed on the origin
+        // the chain started at, so that origin is the one that left it.
+        let start = previous[0].origin().ascii_serialization();
+        if !self.origins.contains(&start) && self.root_issuer.as_ref() != Some(&start) {
             return reject(
-                Kind::SecondCrossOriginHop,
+                Kind::OriginNotConfigured,
                 format!(
-                    "redirect chain already crossed origin once; refusing {} -> {}",
-                    issuer.origin().ascii_serialization(),
-                    redact_url(target)
+                    "redirect issuer {start} is not a configured repository, mirror or root-model \
+                     repository"
                 ),
             );
         }
         let issuer_origin = issuer.origin().ascii_serialization();
-        if !self.origins.contains(&issuer_origin)
-            && self.root_issuer.as_ref() != Some(&issuer_origin)
-        {
-            return reject(
-                Kind::OriginNotConfigured,
-                format!(
-                    "redirect issuer {} is not a configured repository, mirror or root-model \
-                     repository",
-                    issuer_origin
-                ),
-            );
-        }
         if issuer.scheme() != "https" {
             return reject(
                 Kind::InsecureOrigin,
@@ -352,7 +327,7 @@ impl RedirectGuard {
                     "plain-http trusted origin {} may redirect only within its own origin, not \
                      to {}; configure the repository or a mirror with the URL it redirects to",
                     issuer_origin,
-                    redact_url(target)
+                    shown_target(target)
                 ),
             );
         }
@@ -362,7 +337,7 @@ impl RedirectGuard {
                 format!(
                     "redirect from {} to {} would downgrade transport",
                     issuer_origin,
-                    redact_url(target)
+                    shown_target(target)
                 ),
             );
         }
@@ -379,7 +354,7 @@ impl RedirectGuard {
         let Some(host) = target.host() else {
             return reject(
                 RedirectRejectionKind::NonGlobalTarget,
-                format!("redirect target {} has no host", redact_url(target)),
+                format!("redirect target of scheme {} has no host", target.scheme()),
             );
         };
         let url::Host::Domain(domain) = host else {
@@ -408,7 +383,7 @@ impl RedirectGuard {
                      ([[mirrors]] with id = \"{domain}\", url = \"{origin}/\" and no mirror_of), \
                      or, if this machine reaches {domain} without the proxy, add it to NO_PROXY \
                      or the proxy's non_proxy_hosts",
-                    redact_url(target)
+                    shown_target(target)
                 ),
             );
         }
@@ -425,7 +400,7 @@ impl RedirectGuard {
                     "{} is exempt from the address screen because it is configured, but {} is \
                      not a configured origin",
                     domain,
-                    redact_url(target)
+                    shown_target(target)
                 ),
             );
         }
@@ -433,6 +408,12 @@ impl RedirectGuard {
         // the connection is made.
         Ok(())
     }
+}
+
+/// A redirect target as a rejection names it: by its origin alone, as its
+/// path may hold a download ticket no configuration registered as a secret.
+fn shown_target(target: &Url) -> String {
+    target.origin().ascii_serialization()
 }
 
 /// Reject a cross-origin target whose host is an IP literal outside the public
@@ -450,7 +431,7 @@ pub(super) fn non_global_literal_target(
     }
     Some(format!(
         "redirect target {} resolves to non-global address {addr}",
-        redact_url(target)
+        shown_target(target)
     ))
 }
 
@@ -638,14 +619,7 @@ pub(super) fn embedded_ipv4(addr: Ipv6Addr) -> Option<Ipv4Addr> {
     .then(|| Ipv4Addr::from_bits(addr.to_bits() as u32))
 }
 
-/// Strict same-origin policy retained for callers that do not have a resolved
-/// repository configuration. Production `RepoClient` instances use
-/// `trusted_redirect_policy` with the configured repository and mirror
-/// origins.
-pub(crate) fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    trusted_redirect_policy(RedirectGuard::default())
-}
-
+/// The rule a request broke, when the address screen refused its host.
 pub(crate) fn redirect_rejection_from_reqwest(
     error: &reqwest::Error,
 ) -> Option<(RedirectRejectionKind, String)> {

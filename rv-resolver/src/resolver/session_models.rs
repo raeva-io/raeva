@@ -1,6 +1,6 @@
 //! Maven's model cache across the modules of one reactor resolution.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
@@ -182,6 +182,31 @@ impl SessionModels {
             .map(|module| module.project.clone().flatten())
             .collect();
         self.sort(projects).await.err()
+    }
+
+    /// The parents and imported BOMs, by `group:artifact:version`, that
+    /// two modules read with different bytes, which Maven reads once for
+    /// the whole build.
+    pub(super) fn differing_reads(&self) -> BTreeSet<String> {
+        let mut first = HashMap::new();
+        let mut differing = BTreeSet::new();
+        let mut note = |cache: &ModelCache| {
+            for pom in cache.poms.values() {
+                let blob = (first.entry(pom.name.clone())).or_insert_with(|| pom.blob.clone());
+                if *blob != pom.blob {
+                    differing.insert(pom.name.clone());
+                }
+            }
+        };
+        for module in lock(&self.modules).iter() {
+            let models = module.models.as_ref().map(|models| lock(models));
+            let project = module.project.clone().flatten().map(|(read, _)| read);
+            let lineage = module.lineage.clone().flatten();
+            for cache in [models.as_deref(), project.as_deref(), lineage.as_deref()] {
+                cache.into_iter().for_each(&mut note);
+            }
+        }
+        differing
     }
 
     /// The first module, in reactor order, whose effective build plugins

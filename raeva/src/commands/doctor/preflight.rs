@@ -356,14 +356,14 @@ fn extensions_row(
     };
     let root = workspace.root();
     let paths: Vec<PathBuf> = (workspace.modules().iter())
-        .map(|module| root.join(&module.pom_path))
+        .map(|module| module.pom_file().to_path_buf())
         .chain(workspace.local_parent_poms().iter().cloned())
         .collect();
     // Each module POM, then its local parents nearest first: a POM inherits
     // the plugin management of the ones after it.
     let lineages = (workspace.modules().iter())
         .map(|module| {
-            std::iter::once(root.join(&module.pom_path))
+            std::iter::once(module.pom_file().to_path_buf())
                 .chain(module.local_parents().iter().cloned())
                 .collect::<Vec<_>>()
         })

@@ -8,7 +8,7 @@ Commands:
 
 Options:
       --module <MODULE>
-          Select a module by root-relative POM path or unique groupId:artifactId
+          Select a module by its POM path in raeva.lock or unique groupId:artifactId
 
       --platform <OS-ARCH>
           Report only this recorded platform (default: all platforms)

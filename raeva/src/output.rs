@@ -348,7 +348,11 @@ impl Output {
     /// that has it.
     fn print_warnings_and_error(&self, failure: Option<&Diagnostic>, document: bool) {
         let list_all = list_all(&self.0.command, document);
-        for line in warnings::summarize(&self.0.warnings.take(), &list_all) {
+        let mut warnings = self.0.warnings.take();
+        if self.is_quiet() {
+            warnings.retain(|warning| warning.code != warnings::WarningCode::DuplicateDependency);
+        }
+        for line in warnings::summarize(&warnings, &list_all) {
             self.eprint(self.style().warning(&line));
         }
         if let Some(failure) = failure {

@@ -338,7 +338,7 @@ impl PlatformResolver {
         let blob = match stored_in_first(client, store, &key, repos).await? {
             Some((blob, _)) => blob,
             None => match fetch_artifact_from_repos(client, store, &request, &key, repos).await {
-                Ok((blob, _)) => blob,
+                Ok((blob, ..)) => blob,
                 Err(
                     FetchError::NotFound { .. }
                     | FetchError::Failed {

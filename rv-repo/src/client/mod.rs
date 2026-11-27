@@ -307,11 +307,7 @@ impl RepoClient {
 
     /// Whether the remote repository filters let the repository that
     /// receives `repo`'s requests serve `key`.
-    pub(crate) fn filters_admit(
-        &self,
-        repo: &Repository,
-        key: &rv_maven_types::ArtifactCoord,
-    ) -> bool {
+    pub fn filters_admit(&self, repo: &Repository, key: &rv_maven_types::ArtifactCoord) -> bool {
         let route = self.router.route(repo);
         (self.ensure_filters_admit(&route, key.gav.group.as_str(), &file_path(key))).is_ok()
     }
@@ -629,6 +625,18 @@ impl RepoClient {
     /// Whether [`Self::with_lock_pins`] pinned the file of `key`.
     pub fn pins(&self, key: &rv_maven_types::ArtifactCoord) -> bool {
         self.lock_pin(&file_path(key)).is_some()
+    }
+
+    /// Whether raeva.lock pins the file of `key` to `blob` by its SHA-256,
+    /// and this run takes the pin as it stands.
+    pub fn pins_bytes(
+        &self,
+        key: &rv_maven_types::ArtifactCoord,
+        blob: &rv_maven_types::BlobId,
+    ) -> bool {
+        let path = file_path(key);
+        !self.rechecks(&path)
+            && (self.lock_pin(&path).and_then(Digest::as_sha256)).is_some_and(|pin| pin == blob)
     }
 
     /// The digest raeva.lock pins for the file at `path`.

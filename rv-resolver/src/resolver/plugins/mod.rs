@@ -203,7 +203,7 @@ impl Resolver {
         let mut resolution = PlatformResolver::new(ctx)
             .resolve_plugins(Arc::new(workspace.clone()), request)
             .await
-            .map_err(|error| ResolveContext::naming_filtered_models(&misses, error))?;
+            .map_err(|error| ResolveContext::naming_model_searches(&misses, error))?;
         let mode = self.config.lock.maven.mode;
         super::backend::refuse_split_listings(&listings, mode)?;
         let split_id = workspace.split_repository_id(&self.config).is_some();
@@ -246,7 +246,7 @@ impl Resolver {
         let (models, _) = lineages.await?;
         let mut unversioned = BTreeSet::new();
         for module in workspace.modules() {
-            let path = workspace.root().join(&module.pom_path);
+            let path = module.pom_file().to_path_buf();
             let module_resolver =
                 PlatformResolver::new(resolver.ctx.for_module(resolver.ctx.config.clone()));
             let (project, _) = (module_resolver.plugin_project(
@@ -289,7 +289,7 @@ impl PlatformResolver {
         let (models, _) = lineages.await?;
         planner.models = Arc::clone(&models);
         for (index, module) in workspace.modules().iter().enumerate() {
-            let path = workspace.root().join(&module.pom_path);
+            let path = module.pom_file().to_path_buf();
             // The module's own state: its repositories decide what is missing.
             let resolver = Self::new(self.ctx.for_module(self.ctx.config.clone()));
             let (project, activation) = resolver

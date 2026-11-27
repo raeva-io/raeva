@@ -101,6 +101,10 @@ pub enum CredentialFile {
     User,
     /// Maven's `settings.xml`.
     Settings,
+    /// The userinfo of a URL a redirect named, which raeva sends as Basic
+    /// auth to that URL's origin, as Maven does. The server that redirected
+    /// chose it.
+    Redirect,
 }
 
 impl CredentialFile {
@@ -109,6 +113,7 @@ impl CredentialFile {
             Self::Project => "project raeva.toml",
             Self::User => "user config",
             Self::Settings => "settings.xml",
+            Self::Redirect => "redirect userinfo",
         }
     }
 }

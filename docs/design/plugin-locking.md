@@ -1,6 +1,6 @@
 # Plugin locking
 
-Status: raeva 0.6 writes the plugin tables of [Lock schema 9](#lock-schema-9)
+Status: raeva 0.6 writes the plugin tables of [Lock schema 10](#lock-schema-10)
 when `[plugins] lock = true` in `raeva.toml` asks for them.
 
 The goal: `raeva sync` pins every file a Maven 3.9 build of the project reads
@@ -125,7 +125,9 @@ In the order Maven reads it. "Repositories" is where each piece comes from.
      and, with `annotationProcessorPathsUseDepMgmt`, that management below
      the paths (3.12 and later); each execution that runs `compile` or
      `testCompile` resolves its own paths with its own setting, so each is
-     a set of its own;
+     a set of its own; a path the reactor builds gives its POM from the
+     reactor, and its dependencies are collected by the same rule, not as
+     that module's own graph holds them;
    - comparison and report plugins resolve other versions of the project
      (japicmp, bnd-baseline, revapi), skins and site descriptors
      (`commons-skin`, `*-site.xml`), Checkstyle and PMD rule artifacts,
@@ -236,7 +238,7 @@ use.
   (commons-io: seven `plexus-utils` versions). Merging them would change the
   project's graph and lock bytes.
 
-## Lock schema 9
+## Lock schema 10
 
 The plugin tables are a `[platforms.plugins]` table of each platform. Their
 files are ordinary rows of the platform's `artifacts` and `support_poms`, so

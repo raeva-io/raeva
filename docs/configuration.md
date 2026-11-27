@@ -379,9 +379,15 @@ the sync. With `[plugins] trace` set, a `raeva sync` that is neither
 to date and no trace build runs, as that build would not build the whole
 reactor. On the command
 line they are a usage error (exit 2). `-f` (`--file`) in `.mvn/maven.config`, with
-which `mvn` builds another POM, fails the load (exit 3), as does `-itr`
-(`--ignore-transitive-repositories`), with which Maven also leaves out
-the repositories a dependency's POM declares for its parent. `-o` (`--offline`)
+which `mvn` builds another POM, fails the load (exit 3). `-itr`
+(`--ignore-transitive-repositories`) there makes raeva read no repository
+a dependency's POM declares, as Maven 3.9 and 3.10 do: not
+for its dependencies, whatever `[security]` admits, and not for that POM's
+own parent and imports either, which Maven reads from such a repository
+without the flag. In `MAVEN_ARGS`, a host's own, it still fails the load.
+Maven 3.10's `-UA`, `-UM`, `--artifacts-update-policy` and
+`--metadata-update-policy` are read and ignored, as `-U` is, also where
+raeva follows Maven 3.9, which refuses them. `-o` (`--offline`)
 there runs every command as `--offline` does. Everything this
 page says about `-D` and `-P` in
 `.mvn/maven.config` holds for the command-line options too.
@@ -778,7 +784,12 @@ a POM or `settings.xml` `<repository>` leaves out.
   refused (the search goes on at the next repository) unless its host
   bypasses the proxy.
 - Only an HTTPS repository your configuration or the project names may
-  redirect to another origin, once per request and only to HTTPS. If the
+  redirect to another origin, and only to HTTPS. The chain may cross
+  origins again, over HTTPS, up to 5 redirects. A credential goes only to
+  the origin it was configured for, and never again once a redirect leaves
+  it. Userinfo in a redirect target, such as the token GitHub Packages puts
+  in its download URL, is sent as Basic auth to that target's origin alone,
+  as Maven does, and appears in no output. If a
   target goes through a configured proxy, its hostname must name a configured
   repository or mirror origin, since the proxy resolves it where `raeva`
   cannot screen the address. Targets that bypass proxies through
@@ -1112,7 +1123,7 @@ whole reactor. With `[plugins] trace` set, a `raeva sync` that is neither
 raeva.lock is up to date and no trace build runs, as the trace build would
 not build the whole reactor.
 The load fails (exit 3), naming the option, for `-gs`, `-t`, `-gt`, `-f`,
-`-itr` and `-llr`, an option Maven 3.9 does not know, a quote that no word closes, which joins
+`-itr` and `-llr`, an option neither Maven 3.9 nor 3.10 knows, a quote that no word closes, which joins
 `mvn`'s own arguments, and a `*`, `?` or `[`, which the shell expands as
 a file pattern. On Windows a `"`, `!`, `&`, `|`, `<`, `>`, `^`,
 `%` or line break fails too, which `mvn.cmd` or the java launcher reads;
@@ -1185,9 +1196,25 @@ path in a dependency's POM tested from `raeva.lock`, while `sync --frozen`
 and `export-m2` test it again. A name every measured
 JVM sets to one value, `java.specification.name`,
 `java.specification.vendor`, `java.vm.specification.name`,
-`java.vm.specification.vendor` and `sun.java.launcher`, has that value. Any
-other name the JVM or `mvn` always sets, such as `os.version`, `java.vendor`,
-`user.name`, `user.home` or `user.dir`, is present to a `<property>`
+`java.vm.specification.vendor` and `sun.java.launcher`, has that value.
+A `<property>` condition that compares `java.vendor` with a `<value>`,
+such as the `ibmjdk` profile of CXF 3.x's parent POM, takes the vendor of
+the JDK `mvn` runs from the `IMPLEMENTOR` line of its `release` file, which
+is what JDK 11 and later report as `java.vendor` (measured on Temurin,
+Corretto, Zulu, Semeru and the Arch Linux builds; a JDK 8 can differ, as
+Temurin 8 reports `Temurin`). raeva.lock records the condition and its
+outcome, such as `property:java.vendor=IBM Corporation is false`, not the
+vendor, so a host whose JDK gives the same outcome keeps the lock, and one
+that gives another makes `--frozen` exit 7 and a plain sync resolve again.
+Under `[lock] jdks` the condition takes the host JDK's vendor for every
+listed JDK, and each host checks it with its own. On a host whose vendor
+raeva cannot tell, such as one with no JDK, a JDK 8 or a JDK without an
+`IMPLEMENTOR` line, `--frozen` exits 7 and a plain sync fails (exit 3)
+until `-Djava.vendor=<vendor>` sets it; put that in `.mvn/maven.config`
+when the team runs such JDKs, so every host takes the same value. Any
+other name the JVM or `mvn` always sets, such as `os.version`,
+`java.vm.vendor`, `user.name`, `user.home` or `user.dir`, and
+`java.vendor` read as `${java.vendor}`, is present to a `<property>`
 condition, but raeva does not read its value from the host. A name only
 some JVMs set, such as `sun.cpu.isalist`, `sun.os.patch.level`,
 `user.script` and `user.variant` on Windows, `http.nonProxyHosts` on macOS,
@@ -1362,9 +1389,9 @@ with exit 7.
 `raeva.lock` never holds a host value. `[resolution] ambient_inputs` lists
 what resolution read from the host, and the hash covers the outcome:
 
-- A profile condition on the JDK version, `java.home`, or an allowlisted
-  variable is listed with the POM's text and outcome, such as
-  `jdk:[17,) is true` or `property:env.CI=true is false`.
+- A profile condition on the JDK version, `java.home`, `java.vendor`, or
+  an allowlisted variable is listed with the POM's text and outcome, such
+  as `jdk:[17,) is true` or `property:env.CI=true is false`.
 - A `<file>` condition is listed by its path relative to the project, such
   as `file:marker.txt is true`. A file outside the project, and a path
   built from a host value or from a `-D` value written with `${...}`, are
@@ -1455,17 +1482,48 @@ Each download is checked against the checksum published next to the file:
 `.sha256`, else `.sha1`, else `.md5`. SHA-1 and MD5 match Maven. Each is
 read as Maven reads it, by the first word of its first non-empty line, or
 the hex after `= ` in a `SHA256(file)= <hex>` line, and one whose word is
-no checksum, such as an HTML error page, counts as missing. When
-`maven-metadata.xml` does not match, `raeva` downloads both again. If they
-still disagree, the default `warn` policy keeps the metadata and warns
-`METADATA_CHECKSUM_MISMATCH`. `fail` rejects it. `ignore` acts as `warn`
-for metadata. Set `releases-checksum-policy` and
+no checksum, such as an HTML error page, counts as missing. So does a
+`.sha256` the repository answers with an error, such as a 429 or a 5xx:
+Maven never reads one, so the `.sha1` and `.md5` decide, and a long
+`Retry-After` on it holds back only other `.sha256` requests.
+
+A file whose `.sha256` does not match while the `.sha1`, else the `.md5`,
+of the same repository does is used under any policy, with a
+`SHA256_FILE_MISMATCH` warning naming the repository, the file and the
+checksum file that matched. Those are the files Maven checks by default,
+so `mvn` builds with it too. Central's snapshot repository serves a stale
+`.sha256` of `maven-metadata.xml` for publishers that deploy only `.sha1`
+and `.md5` files, Maven's default, and some mirrors, such as
+maven.aliyun.com, serve wrong `.sha256` files for POMs and jars whose
+bytes and `.sha1` match Central's. A repository's checksum files guard
+against a broken download from it, which a matching one rules out;
+`raeva.lock` pins the SHA-256 raeva computes of the bytes, and from then
+on the pin, not the checksum files, decides, in `--frozen` and
+`lock verify` too. When no checksum file matches, the `.sha256` mismatch
+is the error.
+
+A jar or other artifact whose response carries a SHA-1 that matches its
+bytes is used whatever its checksum files say, as maven-resolver does:
+`X-Checksum-SHA1`, which Central sends, else
+`x-goog-meta-checksum-sha1` from Central's Google mirror, else a Nexus 2
+`ETag` of `{SHA1{<hex>}}`. Central serves stale `.sha1` and `.md5` files
+for `com.anji-plus:captcha:1.4.0`. A header that does not match fails
+the file as a broken transfer would (exit 9), whatever its checksum files
+say, as in Maven. POMs and metadata are still checked against their
+checksum files.
+
+When `maven-metadata.xml` does not match, `raeva` downloads both again
+before it reads the `.sha1`. If no checksum file matches, the default
+`warn` policy keeps the metadata and warns `METADATA_CHECKSUM_MISMATCH`.
+`fail` rejects it.
+`ignore` acts as `warn` for metadata. Set `releases-checksum-policy` and
 `snapshots-checksum-policy` in `raeva.toml`, or `<checksumPolicy>` in a POM
 or `settings.xml`. Any other value, such as `FAIL` or an empty element,
 refuses every download from that repository for the versions it covers, as
 in Maven (exit 3).
 
-An artifact or POM checksum mismatch always fails. `raeva.lock` pins those
+An artifact or POM that no checksum file matches always fails, whatever
+the policy. `raeva.lock` pins those
 hashes, and a sync that resolves again fails (exit 7) when it finds other
 bytes for a release file or timestamped SNAPSHOT build the lock pins,
 whichever repository serves it. This check precedes POM parsing and storage,

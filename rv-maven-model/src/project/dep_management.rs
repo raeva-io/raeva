@@ -89,8 +89,7 @@ pub(super) fn resolve_dependencies(
             return Err(PomError::InvalidProject(dep.problem(
                 "dependencies.dependency.scope",
                 "is a scope Maven does not know, which raeva.lock can record only as 1 to 255 \
-                 characters without whitespace, control or invisible characters; write a scope \
-                 Maven knows",
+                 characters without control or invisible characters; write a scope Maven knows",
             )));
         }
         if !transitive {

@@ -203,6 +203,10 @@ struct RawModule {
     packages: String,
     /// One edge per line: `from to scope`, then `optional` when set.
     edges: String,
+    /// The indexes of the packages that resolve as optional, ascending and
+    /// separated by spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    optional: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parent_ranges: Vec<crate::ParentRange>,
     /// One support POM coordinate per line.
@@ -841,6 +845,9 @@ fn decode_module(raw: &RawModule, platform: &Platform) -> Result<LockModule, Loc
         })
         .collect::<Result<_, _>>()?;
     decode_managed(&raw.managed, &mut packages, &row)?;
+    if let Some(optional) = &raw.optional {
+        decode_optional(optional, &mut packages, &row)?;
+    }
     let edges = lines(&raw.edges)
         .enumerate()
         .map(|(index, line)| decode_edge(line, || format!("edge line {} of {row}", index + 1)))
@@ -1120,6 +1127,18 @@ fn decode_package(line: &str, row: impl Fn() -> String) -> Result<LockModulePack
         }
         package.scope = scope;
     }
+    package.type_ = column()
+        .map(|type_| {
+            rv_maven_types::decode_lock_text(type_)
+                .filter(|decoded| rv_maven_types::encode_lock_text(decoded) == type_)
+                .ok_or_else(|| {
+                    invalid(
+                        "its type must be written with each whitespace character and % \
+                         percent-encoded",
+                    )
+                })
+        })
+        .transpose()?;
     package.workspace_module = column().map(str::to_string);
     package.system_path = column().map(str::to_string);
     package.system_sha256 = column()
@@ -1129,7 +1148,7 @@ fn decode_package(line: &str, row: impl Fn() -> String) -> Result<LockModulePack
         })
         .transpose()?;
     if columns.next().is_some() {
-        return Err(invalid("it has more than seven columns"));
+        return Err(invalid("it has more than eight columns"));
     }
     Ok(package)
 }
@@ -1175,15 +1194,22 @@ pub(crate) fn encode_packages(module: &LockModule) -> String {
             None => Cow::Borrowed(coordinate.extension()),
         };
         let system_sha256 = package.system_sha256.as_ref().map(ToString::to_string);
+        let direct_scope = package.direct_scope.map(Scope::lock_text);
+        let type_ = package
+            .type_
+            .as_deref()
+            .map(rv_maven_types::encode_lock_text);
+        let scope = match package.direct_scope.unwrap_or(Scope::Compile) {
+            scope if scope == package.scope => Cow::Borrowed(""),
+            _ if package.scope == Scope::Empty => Cow::Borrowed(EMPTY_SCOPE),
+            _ => package.scope.lock_text(),
+        };
         let columns = [
             gav.as_str(),
             &kind,
-            package.direct_scope.map_or("", Scope::as_str),
-            match package.direct_scope.unwrap_or(Scope::Compile) {
-                scope if scope == package.scope => "",
-                _ if package.scope == Scope::Empty => EMPTY_SCOPE,
-                _ => package.scope.as_str(),
-            },
+            direct_scope.as_deref().unwrap_or_default(),
+            &scope,
+            type_.as_deref().unwrap_or_default(),
             package.workspace_module.as_deref().unwrap_or_default(),
             package.system_path.as_deref().unwrap_or_default(),
             system_sha256.as_deref().unwrap_or_default(),
@@ -1235,6 +1261,39 @@ pub(crate) fn encode_managed(module: &LockModule) -> String {
         }
     }
     block
+}
+
+/// The `optional` line of `module`: the indexes of its optional packages.
+pub(crate) fn encode_optional(module: &LockModule) -> String {
+    let indexes = (module.packages.iter().enumerate())
+        .filter(|(_, package)| package.optional)
+        .map(|(index, _)| index.to_string());
+    indexes.collect::<Vec<_>>().join(" ")
+}
+
+/// Mark optional each package `line` names.
+fn decode_optional(
+    line: &str,
+    packages: &mut [LockModulePackage],
+    row: &str,
+) -> Result<(), LockError> {
+    let mut last = None;
+    for index in line.split(' ') {
+        // Written as `usize` displays it, so `+1` or `01` is no index.
+        let index: usize = (index.parse().ok())
+            .filter(|parsed: &usize| parsed.to_string() == index)
+            .filter(|index| last.is_none_or(|last| *index > last))
+            .filter(|index| *index < packages.len())
+            .ok_or_else(|| {
+                LockError::Invalid(format!(
+                    "optional of {row}: package indexes must be ascending, separated by single \
+                     spaces, and name packages"
+                ))
+            })?;
+        packages[index].optional = true;
+        last = Some(index);
+    }
+    Ok(())
 }
 
 /// Set the `managed` source of each package `block` names.
@@ -1306,7 +1365,13 @@ pub(crate) fn encode_edges(module: &LockModule) -> String {
         if index > 0 {
             block.push('\n');
         }
-        let _ = write!(block, "{} {} {}", edge.from, edge.to, edge.scope);
+        let _ = write!(
+            block,
+            "{} {} {}",
+            edge.from,
+            edge.to,
+            edge.scope.lock_text()
+        );
         if edge.optional {
             block.push_str(" optional");
         }
@@ -1428,6 +1493,7 @@ fn encode_platform(platform: &LockPlatform) -> Result<RawPlatform, LockError> {
             packaging: module.packaging.clone(),
             packages: encode_packages(module),
             edges: encode_edges(module),
+            optional: Some(encode_optional(module)).filter(|line| !line.is_empty()),
             parent_ranges: module.parent_ranges.clone(),
             support_poms: module.support_poms.join("\n"),
             parents: module.parents.join("\n"),
@@ -1527,6 +1593,7 @@ const MODULE: &Shape = &[
     "packaging",
     "packages",
     "edges",
+    "optional?",
     "parent_ranges?",
     "support_poms?",
     "parents?",

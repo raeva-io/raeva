@@ -1172,3 +1172,29 @@ fn a_project_pom_is_read_strictly_and_a_repository_pom_leniently() {
     let lock = fs::read_to_string(project.root().join("raeva.lock")).unwrap();
     assert!(lock.contains("org.test:dep:1"), "{lock}");
 }
+
+/// macOS starts every shell with a soft limit of 256 open files, too few
+/// for a sync of kubernetes-client/java. raeva raises its soft limit
+/// toward the hard one at startup, so a sync passes at a soft limit
+/// below what it needs.
+#[cfg(unix)]
+#[test]
+fn a_low_soft_open_file_limit_is_raised() {
+    let project = Project::synced();
+    let raeva = raeva_command(&project.root(), project.raeva_home());
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("ulimit -Sn 16 && exec \"$0\" \"$@\"")
+        .arg(raeva.get_program())
+        .args(raeva.get_args())
+        .args(["sync", "--offline", "--frozen"]);
+    for (name, value) in raeva.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    let output = command.output().expect("run raeva");
+    assert_success(&output, "a frozen sync at a soft limit of 16 open files");
+}

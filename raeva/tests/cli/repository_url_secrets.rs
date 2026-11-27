@@ -960,12 +960,253 @@ fn a_secret_in_a_rejected_redirect_target_is_hidden() {
             let case = format!("{token} userinfo={userinfo} {args:?}");
             assert!(!output.status.success(), "{case}: {text}");
             assert!(!text.contains(token), "{case}: {text}");
-            // The target, which doctor's probe and sync's fetch name.
-            let rejected = format!("http://{target_addr}/***/");
+            // The target's origin, which doctor's probe and sync's fetch name.
+            let rejected = format!("to http://{target_addr};");
             assert!(
                 text.contains("cross-origin redirect rejected") && text.contains(&rejected),
                 "{case}: {text}"
             );
+        }
+    }
+}
+
+/// A mirror that redirects to a URL with userinfo, as GitHub Packages does,
+/// is followed with the userinfo sent as Basic auth, as Maven does. Neither
+/// the userinfo nor the header it becomes reaches any output, at any `-v`
+/// level, or raeva.lock.
+#[test]
+fn a_userinfo_redirect_is_followed_and_hidden() {
+    const TOKEN: &str = "zqHOPzq";
+    let own = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let address = std::sync::Arc::clone(&own);
+    let server = StubServer::start(move |request| {
+        if let Some(rest) = request.path.strip_prefix("/m2/") {
+            let location = format!("http://u:{TOKEN}@{}/files/{rest}", address.get().unwrap());
+            return rv_test_support::http::Response::new(302, "").header("Location", location);
+        }
+        if request.header("authorization") != Some("Basic dTp6cUhPUHpx") {
+            return rv_test_support::http::Response::new(401, "");
+        }
+        with_sha1(
+            &request.path,
+            [
+                ("/files/t/a/1/a-1.pom", pom("a", "")),
+                ("/files/t/a/1/a-1.jar", "a jar".to_string()),
+            ],
+        )
+    });
+    own.set(server.addr().to_string()).unwrap();
+    let project = tempfile::tempdir().expect("project");
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(project.path().join("pom.xml"), pom("app", DEPENDENCY)).expect("pom.xml");
+    std::fs::create_dir_all(home.path().join(".m2")).expect(".m2");
+    std::fs::write(
+        home.path().join(".m2").join("settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf>\
+             <url>http://{}/m2/</url></mirror></mirrors></settings>",
+            server.addr()
+        ),
+    )
+    .expect("settings.xml");
+    for args in [&["sync"][..], &["-vvv", "sync"], &["--json", "-vv", "sync"]] {
+        let output = raeva_command(project.path(), home.path())
+            .env("RAEVA_RETRIES", "0")
+            .env("RUST_LOG", "trace")
+            .args(args)
+            .output()
+            .expect("run raeva");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_success(&output, &format!("{args:?}"));
+        for secret in [TOKEN, "dTp6cUhPUHpx"] {
+            assert!(!text.contains(secret), "{args:?}: {text}");
+        }
+        let lock = std::fs::read_to_string(project.path().join("raeva.lock")).expect("lock");
+        assert!(!lock.contains(TOKEN) && !lock.contains("/files/"), "{lock}");
+    }
+}
+
+/// A redirect target's userinfo is hidden wherever else it appears, as in
+/// the target's path, when a hop fails or the chain is refused: in sync's
+/// error and in doctor's probe, as text and JSON. A username alone is the
+/// token, and a percent-encoded one is hidden in both spellings.
+#[test]
+fn a_redirect_secret_is_hidden_from_a_failed_hop() {
+    // (userinfo, path segment, spellings that must not appear, last answer)
+    let cases: [(&str, &str, &[&str], Option<&str>); 4] = [
+        ("u:zqHOPzq", "zqHOPzq", &["zqHOPzq"], Some("410")),
+        ("zqHOPzq", "zqHOPzq", &["zqHOPzq"], Some("410")),
+        (
+            "u:zq%2FHOPzq",
+            "zq%2FHOPzq",
+            &["zq%2FHOPzq", "zq/HOPzq"],
+            Some("410"),
+        ),
+        ("u:zqHOPzq", "zqHOPzq", &["zqHOPzq"], None),
+    ];
+    for (userinfo, segment, hidden, answer) in cases {
+        let own = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+        let address = std::sync::Arc::clone(&own);
+        let looping = answer.is_none();
+        let server = StubServer::start(move |request| {
+            let rest = match request.path.strip_prefix("/m2/") {
+                Some(rest) => rest,
+                // A chain that never ends is refused at its sixth redirect.
+                None if looping => request.path.trim_start_matches('/'),
+                None => return rv_test_support::http::Response::new(410, ""),
+            };
+            let location = format!(
+                "http://{userinfo}@{}/files/{segment}/{rest}",
+                address.get().unwrap()
+            );
+            rv_test_support::http::Response::new(302, "").header("Location", location)
+        });
+        own.set(server.addr().to_string()).unwrap();
+        let project = tempfile::tempdir().expect("project");
+        let home = tempfile::tempdir().expect("home");
+        std::fs::write(project.path().join("pom.xml"), pom("app", DEPENDENCY)).expect("pom.xml");
+        std::fs::create_dir_all(home.path().join(".m2")).expect(".m2");
+        std::fs::write(
+            home.path().join(".m2").join("settings.xml"),
+            format!(
+                "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf>\
+                 <url>http://{}/m2/</url></mirror></mirrors></settings>",
+                server.addr()
+            ),
+        )
+        .expect("settings.xml");
+        for args in [
+            &["sync"][..],
+            &["--json", "sync"],
+            &["doctor"],
+            &["--json", "doctor"],
+        ] {
+            let output = raeva_command(project.path(), home.path())
+                .env("RAEVA_RETRIES", "0")
+                .args(args)
+                .output()
+                .expect("run raeva");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let shown = answer.unwrap_or("redirect");
+            assert!(text.contains(shown), "{userinfo} {args:?}: {text}");
+            for secret in hidden {
+                assert!(!text.contains(secret), "{userinfo} {args:?}: {text}");
+            }
+        }
+    }
+}
+
+/// A redirect to another origin whose path carries a download ticket, and
+/// no userinfo, is rejected naming that origin alone, never the path, in
+/// sync's error and doctor's probe, as text and JSON.
+#[test]
+fn a_rejected_redirect_to_another_origin_shows_only_that_origin() {
+    let cdn = StubServer::start(|_| rv_test_support::http::Response::new(403, ""));
+    let cdn_origin = format!("http://{}", cdn.addr());
+    let target = cdn_origin.clone();
+    let server = StubServer::start(move |request| {
+        let location = format!("{target}/download/zqTICKETzq{}?sig=zqSIGzq", request.path);
+        rv_test_support::http::Response::new(302, "").header("Location", location)
+    });
+    let project = tempfile::tempdir().expect("project");
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(project.path().join("pom.xml"), pom("app", DEPENDENCY)).expect("pom.xml");
+    std::fs::create_dir_all(home.path().join(".m2")).expect(".m2");
+    std::fs::write(
+        home.path().join(".m2").join("settings.xml"),
+        format!(
+            "<settings><mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf>\
+             <url>http://{}/m2/</url></mirror></mirrors></settings>",
+            server.addr()
+        ),
+    )
+    .expect("settings.xml");
+    for args in [
+        &["sync"][..],
+        &["--json", "sync"],
+        &["doctor"],
+        &["--json", "doctor"],
+    ] {
+        let output = raeva_command(project.path(), home.path())
+            .env("RAEVA_RETRIES", "0")
+            .args(args)
+            .output()
+            .expect("run raeva");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{args:?}: {text}");
+        for hidden in ["zqTICKETzq", "zqSIGzq", "/download"] {
+            assert!(!text.contains(hidden), "{args:?}: {text}");
+        }
+        assert!(text.contains(&cdn_origin), "{args:?}: {text}");
+    }
+    assert_eq!(cdn.answered(), 0);
+}
+
+/// A redirect target that refuses the Basic auth its userinfo gave is
+/// reported as refusing those credentials, not the repository's or none,
+/// in sync's error, again on the next run, and in doctor's probe.
+#[test]
+fn a_refused_redirect_userinfo_is_reported_as_sent() {
+    let own = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
+    let address = std::sync::Arc::clone(&own);
+    let server = StubServer::start(move |request| match request.path.strip_prefix("/m2/") {
+        Some(rest) => {
+            let location = format!("http://u:zqHOPzq@{}/files/{rest}", address.get().unwrap());
+            rv_test_support::http::Response::new(302, "").header("Location", location)
+        }
+        None => rv_test_support::http::Response::new(401, ""),
+    });
+    own.set(server.addr().to_string()).unwrap();
+    let project = tempfile::tempdir().expect("project");
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(project.path().join("pom.xml"), pom("app", DEPENDENCY)).expect("pom.xml");
+    std::fs::create_dir_all(home.path().join(".m2")).expect(".m2");
+    std::fs::write(
+        home.path().join(".m2").join("settings.xml"),
+        format!(
+            "<settings><servers><server><id>corp</id><username>me</username>\
+             <password>pw-zqCORPzq</password></server></servers>\
+             <mirrors><mirror><id>corp</id><mirrorOf>*</mirrorOf>\
+             <url>http://{}/m2/</url></mirror></mirrors></settings>",
+            server.addr()
+        ),
+    )
+    .expect("settings.xml");
+    for command in ["sync", "sync", "doctor"] {
+        let output = raeva_command(project.path(), home.path())
+            .env("RAEVA_RETRIES", "0")
+            .arg(command)
+            .output()
+            .expect("run raeva");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let words = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("401"), "{command}: {text}");
+        assert!(
+            words.contains("redirect's userinfo was sent"),
+            "{command}: {text}"
+        );
+        assert!(
+            !text.contains("no credentials were sent"),
+            "{command}: {text}"
+        );
+        for secret in ["zqHOPzq", "zqCORPzq"] {
+            assert!(!text.contains(secret), "{command}: {text}");
         }
     }
 }

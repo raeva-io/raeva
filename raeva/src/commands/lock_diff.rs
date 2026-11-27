@@ -640,7 +640,11 @@ impl LockDiffReport {
                         .iter()
                         .map(|path| {
                             path.iter()
-                                .map(|&index| module.packages[index].coordinate.to_string())
+                                .map(|&index| {
+                                    crate::commands::util::package_coordinate(
+                                        &module.packages[index],
+                                    )
+                                })
                                 .collect()
                         })
                         .collect();
@@ -823,7 +827,8 @@ impl PackageKey {
             },
             group_id: coordinate.group_id().to_string(),
             artifact_id: coordinate.artifact_id().to_string(),
-            packaging: coordinate.extension().to_string(),
+            packaging: package.maven_type().to_string(),
+            extension: coordinate.extension().to_string(),
             classifier: coordinate.classifier().map(str::to_string),
         }
     }
@@ -867,6 +872,9 @@ struct PackageKey {
     group_id: String,
     artifact_id: String,
     packaging: String,
+    /// The file's, which a type no longer names: another one is another
+    /// file.
+    extension: String,
     classifier: Option<String>,
 }
 
@@ -2157,6 +2165,23 @@ mod tests {
         let (stdout, stderr) = render(false, |human| report.render_human(human));
         assert_eq!(stdout, "  no dependency changes\n");
         assert_eq!(stderr, "Lockfile diff\n");
+    }
+
+    /// A package whose type stays while its handler's extension changes is
+    /// another file, as it was when the extension named the package.
+    #[test]
+    fn a_new_extension_under_the_same_type_is_a_change() {
+        let typed = |extension: &str| {
+            let mut lock = lock_from("https://repo.example/");
+            let coordinate = ArtifactCoord::new("com.example", "lib", "1.0", extension, None);
+            lock.platforms[0].artifacts[0].coordinate = coordinate.clone();
+            let package = &mut lock.platforms[0].modules[0].packages[0];
+            package.coordinate = coordinate;
+            package.type_ = Some("my type".into());
+            lock
+        };
+        assert!(report(&typed("jar"), &typed("zip")).changed);
+        assert!(!report(&typed("jar"), &typed("jar")).changed);
     }
 
     #[test]

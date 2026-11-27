@@ -143,6 +143,22 @@ impl ChecksumPolicy {
     }
 }
 
+/// An `id` that, when written, is not blank. An empty id would take the
+/// credential of an `[[auth]]` entry with an empty id where an omitted one
+/// takes the default credential, while caches keyed by id name both alike;
+/// Maven refuses an empty id in settings.xml and a POM.
+fn non_empty_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let id = Option::<String>::deserialize(deserializer)?;
+    if id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+        return Err(serde::de::Error::custom(
+            "an empty id; leave `id` out or give it a value",
+        ));
+    }
+    Ok(id)
+}
+
 /// A repository to resolve from: a `[[repositories]]` entry in `raeva.toml` or
 /// `config.toml`, or a repository of an active settings.xml profile.
 ///
@@ -153,7 +169,11 @@ impl ChecksumPolicy {
 pub struct RepoConfig {
     /// The id that `[[auth]]` entries, settings.xml `<server>`s and mirrors'
     /// `mirror_of` patterns match.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "non_empty_id"
+    )]
     pub id: Option<String>,
     /// The repository's base URL.
     pub url: String,
@@ -213,7 +233,7 @@ pub struct RepoConfig {
 #[non_exhaustive]
 pub struct MirrorConfig {
     /// The id that `[[auth]]` entries and settings.xml `<server>`s match.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "non_empty_id")]
     pub id: Option<String>,
     /// The mirror's base URL.
     pub url: String,
@@ -244,7 +264,7 @@ pub struct MirrorConfig {
 #[non_exhaustive]
 pub struct AuthConfig {
     /// The repository or mirror id these credentials apply to.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "non_empty_id")]
     pub id: Option<String>,
     /// The basic-auth username.
     #[serde(default)]

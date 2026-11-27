@@ -269,6 +269,9 @@ impl<'a> ModelScope<'a> {
         project_parent: bool,
         model: Option<ModelKey>,
     ) -> Result<Option<Pom>, ResolveError> {
+        if let Some(cached) = self.read_first(&coord, model.as_ref()).await? {
+            return self.parse_fetched(&coord, cached, project_parent).map(Some);
+        }
         let build = self.model_build();
         let entries = self.backend.model_entries(&self.repo_ctx, &build);
         let search = model_list::search(&entries, coord.version.as_str());
@@ -352,6 +355,27 @@ impl<'a> ModelScope<'a> {
     /// read before.
     pub(super) fn borrowed(&self) -> bool {
         lock(&self.reads).borrowed
+    }
+
+    /// `coord`'s POM from the reactor's model cache, where the pass takes
+    /// it from there before any repository; see
+    /// [`ResolveContext::read_first`](crate::context::ResolveContext::read_first).
+    async fn read_first(
+        &self,
+        coord: &Coord,
+        model: Option<&ModelKey>,
+    ) -> Result<Option<Arc<SupportPom>>, ResolveError> {
+        let Some(key) = model.filter(|_| self.backend.ctx.reads_first(coord)) else {
+            return Ok(None);
+        };
+        let Some(cached) = self.cached(key).await else {
+            return Ok(None);
+        };
+        self.note_borrowed();
+        (self.backend)
+            .record_support_poms(std::slice::from_ref(&cached))
+            .await?;
+        Ok(Some(cached))
     }
 
     async fn cached(&self, key: &ModelKey) -> Option<Arc<SupportPom>> {
@@ -1131,6 +1155,11 @@ impl ModelScope<'_> {
         // for the parent lookup, so it serves nothing without a mirror, but
         // holds its id as Maven's model resolver does.
         let config = &self.backend.ctx.config;
+        // Under `-itr` Maven's model resolver for a dependency's or a
+        // plugin's model adds no repository its POMs declare.
+        if self.trust == RepoTrust::Transitive && config.ignores_transitive_repositories() {
+            return Ok(());
+        }
         // The project's own are refused before resolution starts, and an
         // imported BOM's are ignored as a dependency's are.
         if replace && self.trust == RepoTrust::Root && lock(&self.import_repos).is_empty() {
@@ -1408,6 +1437,9 @@ impl ModelScope<'_> {
             || rv_maven_types::resolves_through_snapshot_metadata(&version)
         {
             return Ok(None);
+        }
+        if let Some(cached) = self.read_first(coord, model.as_ref()).await? {
+            return self.parse_fetched(coord, cached, false).map(Some);
         }
         // In Maven 3.9.12 the interpolated declaration that takes a request
         // repository's id, which an imported BOM is read after, replaces
